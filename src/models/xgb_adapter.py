@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.models.labels import mask_probabilities_at_unsupported_lines
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
 from src.models.residuals import (
     CountDispersion,
@@ -167,7 +168,15 @@ class XGBoostAdapter:
     ) -> pd.Series:
         if not self._fitted or self._pipe.model is None:
             raise RuntimeError("XGBoost adapter is not fitted — cannot silently substitute another model")
-        return pd.Series(self._pipe.predict_proba_over(features), index=features.index)
+        # See mask_probabilities_at_unsupported_lines: the classifier's
+        # probability is valid only at the line its labels were built from.
+        masked, _ = mask_probabilities_at_unsupported_lines(
+            pd.Series(self._pipe.predict_proba_over(features), index=features.index),
+            features,
+            line,
+            model_name=f"xgboost/{self.target_market}",
+        )
+        return masked
 
     def predict_rows(
         self,

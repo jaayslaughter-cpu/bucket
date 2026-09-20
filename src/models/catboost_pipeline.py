@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.models.labels import mask_probabilities_at_unsupported_lines
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
 from src.models.residuals import (
     CountDispersion,
@@ -281,7 +282,16 @@ class CatBoostPropPipeline:
             if c not in self.categorical_features:
                 work[c] = work[c].fillna(0.0)
         proba = self.model.predict_proba(work[self.feature_cols])[:, 1]
-        return pd.Series(proba, index=features.index)
+        # The line is not a model input, so this probability answers only the
+        # line the labels were built from. Asking at any other line abstains
+        # rather than returning that number under a different label.
+        masked, _ = mask_probabilities_at_unsupported_lines(
+            pd.Series(proba, index=features.index),
+            features,
+            line,
+            model_name=f"catboost/{self.target_market}",
+        )
+        return masked
 
     def predict_rows(
         self,

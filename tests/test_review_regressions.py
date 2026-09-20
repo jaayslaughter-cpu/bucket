@@ -538,6 +538,73 @@ def test_stake_of_zero_is_not_promoted_to_one_unit():
 
 
 # --------------------------------------------------------------------------
+# A classifier answers only the line it was labelled against
+# --------------------------------------------------------------------------
+
+def test_classifier_abstains_when_asked_at_a_line_it_was_not_labelled_on():
+    """The same P(over) was returned for every line, including a real one.
+
+    `over_hit` is P(stat > RESEARCH_LINE) and the line is not a model input,
+    so a fitted classifier returns the identical number at any line. Written
+    beside a posted sportsbook line, that is a confident, precise answer to
+    a question nobody asked. NaN is the honest output.
+    """
+    pytest.importorskip("xgboost")
+    from src.models.xgb_adapter import XGBoostAdapter
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    cols = ["PTS_L5", "PTS_L10", "MIN_L5"]
+    model = XGBoostAdapter(cols, target_market="PTS", model_params={"n_estimators": 20})
+    model.fit(panel)
+
+    scoring = panel.head(20).copy()
+
+    # At the labelled line the model is entitled to an opinion.
+    at_labelled = model.predict_probability_over(scoring, scoring["RESEARCH_LINE"])
+    assert at_labelled.notna().all()
+
+    # Shifted by two points, it is not.
+    shifted = scoring["RESEARCH_LINE"] + 2.0
+    at_shifted = model.predict_probability_over(scoring, shifted)
+    assert at_shifted.isna().all(), (
+        "a classifier that ignores the line returned a probability for one anyway"
+    )
+
+    # And the answers must not have been identical in the first place — that
+    # is the property that makes reusing them across lines wrong.
+    raw = model._pipe.predict_proba_over(scoring)
+    assert len(set(np.round(raw, 6))) > 1, "fixture is degenerate"
+
+
+def test_line_mask_abstains_when_there_is_nothing_to_verify_against():
+    """No RESEARCH_LINE means validity cannot be established, so abstain."""
+    from src.models.labels import mask_probabilities_at_unsupported_lines
+
+    features = pd.DataFrame({"PTS_L5": [10.0, 12.0]})
+    probs = pd.Series([0.6, 0.4])
+    masked, n = mask_probabilities_at_unsupported_lines(
+        probs, features, 20.5, model_name="test"
+    )
+    assert n == 2
+    assert masked.isna().all()
+
+
+def test_line_mask_keeps_rows_matching_the_labelled_line():
+    """Partial mismatch must mask only the mismatched rows."""
+    from src.models.labels import mask_probabilities_at_unsupported_lines
+
+    features = pd.DataFrame({"RESEARCH_LINE": [20.5, 18.5, np.nan]})
+    probs = pd.Series([0.6, 0.4, 0.5])
+    masked, n = mask_probabilities_at_unsupported_lines(
+        probs, features, pd.Series([20.5, 22.5, 20.5]), model_name="test"
+    )
+    assert n == 2                      # the shifted row and the unknowable one
+    assert masked.iloc[0] == pytest.approx(0.6)
+    assert pd.isna(masked.iloc[1])
+    assert pd.isna(masked.iloc[2])     # a NaN line is itself unanswerable
+
+
+# --------------------------------------------------------------------------
 # A calendar date is not an instant
 # --------------------------------------------------------------------------
 

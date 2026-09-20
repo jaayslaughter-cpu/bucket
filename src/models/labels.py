@@ -132,3 +132,63 @@ def attach_research_over_labels(
     if labelled == 0:
         logger.warning("No labelled rows for %s — every row lacked a line or an outcome.", stat)
     return work
+
+
+def mask_probabilities_at_unsupported_lines(
+    probabilities: pd.Series,
+    features: pd.DataFrame,
+    requested_line: "float | pd.Series",
+    *,
+    model_name: str,
+    tolerance: float = 1e-6,
+) -> tuple[pd.Series, int]:
+    """
+    Null out classifier probabilities asked for at a line they cannot answer.
+
+    WHY: a binary classifier trained on ``over_hit`` learns P(stat > L) for
+    the ONE line L its labels were built from — ``RESEARCH_LINE``. The line
+    is not one of its inputs, so asking the same fitted model for a
+    probability at a different line returns the identical number. That
+    number is not wrong about nothing; it is a confident, precise answer to
+    a question nobody asked, published beside the line the caller *did* ask
+    about.
+
+    Returning NaN is the honest alternative: the model has no opinion at
+    that line. Callers that need arbitrary lines should use the
+    distribution path, which derives them from a fitted count distribution
+    and is correct at any line.
+
+    Returns ``(masked_probabilities, n_masked)``.
+    """
+    if RESEARCH_LINE_COL not in features.columns:
+        # Nothing to compare against, so validity cannot be established —
+        # and an unverifiable probability is not a usable one.
+        logger.warning(
+            "%s: no %s column, so the scoring line cannot be checked against the "
+            "labelled line. Abstaining on all %d rows rather than publishing "
+            "probabilities that may belong to a different line.",
+            model_name, RESEARCH_LINE_COL, len(features),
+        )
+        return pd.Series(float("nan"), index=features.index, dtype=float), len(features)
+
+    labelled = pd.to_numeric(features[RESEARCH_LINE_COL], errors="coerce")
+    asked = (
+        pd.to_numeric(requested_line, errors="coerce")
+        if isinstance(requested_line, pd.Series)
+        else pd.Series(float(requested_line), index=features.index, dtype=float)
+    )
+
+    # A NaN on either side is itself unanswerable.
+    mismatched = ~((labelled - asked).abs() <= tolerance)
+
+    out = pd.Series(probabilities, index=features.index, dtype=float).copy()
+    n_masked = int(mismatched.sum())
+    if n_masked:
+        out.loc[mismatched] = float("nan")
+        logger.warning(
+            "%s: %d of %d rows were scored at a line differing from the labelled "
+            "%s. The classifier has no opinion at those lines, so they abstain. "
+            "Use the distribution model for arbitrary lines.",
+            model_name, n_masked, len(out), RESEARCH_LINE_COL,
+        )
+    return out, n_masked

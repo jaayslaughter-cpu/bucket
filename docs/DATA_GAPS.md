@@ -149,15 +149,26 @@ player lines.
 
 **Still open**
 
-13. **The classifiers ignore the line they are scored at.** `CatBoost`,
-    `XGBoostAdapter` and `XGBoostPropPipeline` are binary classifiers
-    trained against one line definition, so asking for a probability at a
-    different line returns the same number. The distribution path handles
-    arbitrary lines correctly because it derives them from a fitted count
-    distribution. Making the classifiers line-aware means retraining with
-    the line as a feature — a modelling change, not a patch. Until then,
-    treat classifier probabilities as valid only at the line they were
-    labelled against.
+13. **The classifiers are not line-aware — they now abstain instead.**
+    `CatBoost` and `XGBoostAdapter` are binary classifiers trained against
+    one line definition, so the line is not one of their inputs and asking
+    at a different line returns the identical number. That number is not
+    wrong about nothing: it is a confident, precise answer to a question
+    nobody asked, and writing it beside a posted sportsbook line presents
+    one line's probability as another's.
+
+    They no longer do that. `mask_probabilities_at_unsupported_lines`
+    compares the scoring line to the labelled `RESEARCH_LINE` per row and
+    returns NaN where they differ, including when there is no
+    `RESEARCH_LINE` to verify against. The ensemble degrades to the
+    distribution model, which derives probabilities from a fitted count
+    distribution and is correct at any line.
+
+    **This is containment, not a fix.** The underlying limitation stands:
+    on real prop lines the classifiers will abstain on nearly every row.
+    Making them genuinely line-aware means retraining with the line as a
+    feature and labels built against it — a modelling change, not a patch,
+    and one that wants real lines to train on.
 
 14. **Orchestrator paths carry known defects** that cannot be verified
     until player data lands: `main.py` scores the whole lookback panel

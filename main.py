@@ -65,6 +65,10 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.models.labels import (
+    RESEARCH_LINE_COL,
+    mask_probabilities_at_unsupported_lines,
+)
 from src.utils.timezones import DISPLAY_TZ_NAME, now_pacific, pacific_calendar_date
 
 load_dotenv()
@@ -325,12 +329,22 @@ def score_prob_over(
         booster.load_model(str(model_path))
         pipeline.model = booster
 
-        probs = pipeline.predict_proba_over(features)
-        logger.info(
-            "P(Over) scored for %d rows (mean %.4f) for market %s",
-            len(probs), float(pd.Series(probs).mean()), scored_market,
+        raw = pd.Series(pipeline.predict_proba_over(features), index=features.index)
+        # The classifier does not take the line as an input, so this number
+        # is P(over) at the line its labels were built from. Writing it beside
+        # a posted sportsbook line would present one line's probability as
+        # another's. Rows scored at a different line abstain instead.
+        scored, n_masked = mask_probabilities_at_unsupported_lines(
+            raw, features, features.get(RESEARCH_LINE_COL, float("nan")),
+            model_name=f"xgboost/{scored_market}",
         )
-        scored = pd.Series(probs, index=features.index)
+        usable = scored.notna().sum()
+        logger.info(
+            "P(Over) scored for %d of %d rows for market %s (mean %.4f); "
+            "%d abstained on an unsupported line",
+            usable, len(scored), scored_market,
+            float(scored.mean()) if usable else float("nan"), n_masked,
+        )
         scored.attrs["target_market"] = scored_market
         return scored
 
