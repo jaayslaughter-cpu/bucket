@@ -134,6 +134,7 @@ class EnsemblePropModel:
             p_under = 0.0
             p_push = 0.0
             push_known = True
+            contributing = 0
             extras: dict[str, Any] = {"component_weights": weights, "component_probabilities": {}}
             warnings = list(base_warnings)
             raw_mean = blended_means.iloc[i]
@@ -148,6 +149,7 @@ class EnsemblePropModel:
                 if pred.probability_over is None:
                     warnings.append(f"{name} missing probability_over")
                     continue
+                contributing += 1
                 p_over += w * float(pred.probability_over)
                 if pred.probability_under is not None:
                     p_under += w * float(pred.probability_under)
@@ -168,6 +170,23 @@ class EnsemblePropModel:
                 if s > 0:
                     p_over, p_under, p_push_out = p_over / s, p_under / s, p_push / s
 
+            # No component produced a probability for this row. Emitting the
+            # accumulator's 0.0 would publish "certainly under" — an invented
+            # certainty that downstream scoring cannot tell from a real one.
+            if not contributing:
+                warnings.append("No component supplied a probability for this row")
+                probabilities: dict[str, float | None] = {
+                    "probability_over": None,
+                    "probability_under": None,
+                    "probability_push": None,
+                }
+            else:
+                probabilities = {
+                    "probability_over": round(p_over, 6),
+                    "probability_under": round(p_under, 6),
+                    "probability_push": None if p_push_out is None else round(float(p_push_out), 6),
+                }
+
             out.append(
                 ModelPrediction(
                     model_name=self.model_name,
@@ -178,9 +197,7 @@ class EnsemblePropModel:
                     player_name=row.get("PLAYER_NAME"),
                     prediction_mean=mean_val,
                     prop_line=float(row[line_col]) if pd.notna(row.get(line_col)) else None,
-                    probability_over=round(p_over, 6),
-                    probability_under=round(p_under, 6),
-                    probability_push=None if p_push_out is None else round(float(p_push_out), 6),
+                    **probabilities,
                     feature_schema_version=self.feature_schema_version,
                     warnings=warnings,
                     extras=extras,

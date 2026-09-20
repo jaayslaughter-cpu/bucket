@@ -102,29 +102,61 @@ class CatBoostPropPipeline:
                 work[c] = pd.to_numeric(work[c], errors="coerce")
         return work
 
+    def _carve_early_stopping_split(
+        self,
+        train: pd.DataFrame,
+        *,
+        holdout_fraction: float = 0.15,
+        min_holdout_rows: int = 50,
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        """Split the tail off train for early stopping, chronologically.
+
+        Returns (fit_rows, stop_rows). When train is too small to spare a
+        holdout, stop_rows is None and the model trains for its full
+        iteration count rather than stopping against rows it also fits.
+        """
+        if len(train) < min_holdout_rows * 3:
+            logger.info(
+                "catboost %s: %d training rows is too few to carve an early-stopping "
+                "holdout — training the full iteration count instead",
+                self.target_market, len(train),
+            )
+            return train, None
+        cut = int(len(train) * (1.0 - holdout_fraction))
+        return train.iloc[:cut], train.iloc[cut:]
+
     def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "CatBoostPropPipeline":
         if "over_hit" not in train_data.columns:
             raise ValueError("DATA_NOT_AVAILABLE: missing over_hit")
         train = self._prepare(train_data).dropna(subset=self.feature_cols + ["over_hit"])
         if "GAME_DATE" in train.columns:
             train = train.sort_values("GAME_DATE")
-        y_train = train["over_hit"].astype(int)
+
+        # EARLY STOPPING NEVER SEES validation_data. Handing the scoring set
+        # to CatBoost as its eval_set lets early stopping pick the iteration
+        # count by reading those labels, which makes every metric later
+        # computed on that same set optimistic. The holdout is carved from
+        # the tail of train instead; validation_data is used only to record
+        # what it covered.
+        fit_rows, stop_rows = self._carve_early_stopping_split(train)
+        val_rows = 0
+        if validation_data is not None and not validation_data.empty:
+            val_rows = len(
+                self._prepare(validation_data).dropna(subset=self.feature_cols + ["over_hit"])
+            )
+
         train_pool = Pool(
-            train[self.feature_cols],
-            y_train,
+            fit_rows[self.feature_cols],
+            fit_rows["over_hit"].astype(int),
             cat_features=self.categorical_features or None,
         )
         eval_set = None
-        val_rows = 0
-        if validation_data is not None and not validation_data.empty:
-            val = self._prepare(validation_data).dropna(subset=self.feature_cols + ["over_hit"])
-            if not val.empty:
-                eval_set = Pool(
-                    val[self.feature_cols],
-                    val["over_hit"].astype(int),
-                    cat_features=self.categorical_features or None,
-                )
-                val_rows = len(val)
+        if stop_rows is not None and not stop_rows.empty:
+            eval_set = Pool(
+                stop_rows[self.feature_cols],
+                stop_rows["over_hit"].astype(int),
+                cat_features=self.categorical_features or None,
+            )
 
         params = {k: v for k, v in self.hyperparameters.items() if k != "early_stopping_rounds"}
         early = int(self.hyperparameters.get("early_stopping_rounds") or 0)
@@ -135,7 +167,7 @@ class CatBoostPropPipeline:
             fit_kwargs["early_stopping_rounds"] = early
         self.model.fit(train_pool, **fit_kwargs)
 
-        self._fit_mean_head(train, validation_data)
+        self._fit_mean_head(train)
 
         self._meta_extra = {
             "train_row_count": len(train),
@@ -157,12 +189,13 @@ class CatBoostPropPipeline:
         )
         return self
 
-    def _fit_mean_head(
-        self,
-        train: pd.DataFrame,
-        validation_data: pd.DataFrame | None,
-    ) -> None:
-        """Fit the regressor and estimate dispersion from its training residuals."""
+    def _fit_mean_head(self, train: pd.DataFrame) -> None:
+        """Fit the regressor and estimate dispersion from training rows only.
+
+        Takes no validation frame by design: dispersion comes from
+        out-of-fold residuals within train, so nothing here may see the
+        rows this model will later be scored on.
+        """
         target = self.target_market
         if target not in train.columns:
             logger.warning(
@@ -326,8 +359,15 @@ class CatBoostPropPipeline:
             raise RuntimeError("Cannot save unfitted CatBoost model")
         model_path = path if path.suffix else path.with_suffix(".cbm")
         self.model.save_model(str(model_path))
+        # Remove a stale sidecar when this fit has no mean head, or load()
+        # would resurrect a previous run's regressor as the current
+        # projection without anything indicating the mismatch.
+        mean_path = model_path.with_name(model_path.stem + ".mean.cbm")
         if self.mean_model is not None:
-            self.mean_model.save_model(str(model_path.with_name(model_path.stem + ".mean.cbm")))
+            self.mean_model.save_model(str(mean_path))
+        elif mean_path.exists():
+            mean_path.unlink()
+            logger.info("Removed stale mean-head artifact at %s", mean_path)
         meta = {
             "feature_cols": self.feature_cols,
             "categorical_features": self.categorical_features,

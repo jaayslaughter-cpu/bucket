@@ -188,13 +188,33 @@ def fit_dispersion_out_of_fold(
 
     y = np.asarray(y, dtype=float)
     n = len(y)
+
+    def _in_sample_fallback(reason: str) -> CountDispersion:
+        """In-sample residuals understate spread — say so in the artifact.
+
+        Returned unlabelled, this would be indistinguishable from a real
+        out-of-fold fit while being systematically overconfident, which is
+        the exact failure this function exists to prevent.
+        """
+        fitted = fit_count_dispersion(y, np.asarray(train_predict(X, y, X)), market=market)
+        return CountDispersion(
+            family=fitted.family,
+            phi=fitted.phi,
+            n_train_rows=fitted.n_train_rows,
+            selection_scores=fitted.selection_scores,
+            fallback_reason=(
+                f"{reason} — dispersion estimated IN-SAMPLE, so the spread is "
+                "likely understated and the distribution overconfident"
+            ),
+        )
+
     if n < MIN_ROWS_TO_FIT * 2:
-        logger.info(
-            "dispersion %s: %d rows is too few for out-of-fold folds; "
-            "falling back to a single in-sample fit.",
+        logger.warning(
+            "dispersion %s: %d rows is too few for out-of-fold folds; falling back "
+            "to an in-sample fit, which understates spread.",
             market or "?", n,
         )
-        return fit_count_dispersion(y, np.asarray(train_predict(X, y, X)), market=market)
+        return _in_sample_fallback(f"only {n} training rows")
 
     splits = min(n_folds, max(2, n // MIN_ROWS_TO_FIT))
     oof_pred = np.full(n, np.nan)
@@ -212,7 +232,7 @@ def fit_dispersion_out_of_fold(
             "dispersion %s: only %d out-of-fold rows survived; using in-sample instead",
             market or "?", int(scored.sum()),
         )
-        return fit_count_dispersion(y, np.asarray(train_predict(X, y, X)), market=market)
+        return _in_sample_fallback(f"only {int(scored.sum())} out-of-fold rows survived")
 
     logger.info(
         "dispersion %s: estimating from %d out-of-fold residuals across %d folds",

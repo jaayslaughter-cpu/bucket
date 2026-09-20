@@ -171,13 +171,26 @@ def settle_pending_props(
                     logger.warning("Could not grade %s %s: %s", prop.player_name, prop.market, exc)
                     continue
 
-                clv = compute_clv(
-                    predicted_line=prop.predicted_line,
-                    predicted_side=prop.predicted_side,
-                    closing_line=prop.closing_line,
-                    bet_odds=prop.odds,
-                    closing_odds=prop.closing_odds,
-                )
+                # CLV is a market-quality signal, not part of grading. A bad
+                # closing price must not abort the surrounding transaction and
+                # leave every other prop in this batch stuck PENDING.
+                try:
+                    clv = compute_clv(
+                        predicted_line=prop.predicted_line,
+                        predicted_side=prop.predicted_side,
+                        closing_line=prop.closing_line,
+                        bet_odds=prop.odds,
+                        closing_odds=prop.closing_odds,
+                    )
+                except SettlementError as exc:
+                    report.errors.append(
+                        f"{game_id}/{prop.player_name}/{prop.market}: CLV unavailable ({exc})"
+                    )
+                    logger.warning(
+                        "CLV skipped for %s %s (%s) — the prop is still graded",
+                        prop.player_name, prop.market, exc,
+                    )
+                    clv = {"clv_line_points": None, "clv_prob_points": None}
 
                 if not dry_run:
                     prop.outcome_status = str(result.outcome)

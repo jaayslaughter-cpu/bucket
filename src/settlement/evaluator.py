@@ -105,9 +105,15 @@ def _to_decimal(value: Any, field: str) -> Decimal:
     if value is None:
         raise SettlementError(f"{field} is None")
     try:
-        return Decimal(str(value))
+        decimal_value = Decimal(str(value))
     except (InvalidOperation, TypeError) as exc:
         raise SettlementError(f"{field}={value!r} is not numeric") from exc
+    # Decimal accepts 'nan' and 'inf' from a string. Left through, a NaN line
+    # compares False against everything and grades as a confident LOSS, while
+    # an infinite stake poisons the P/L ledger.
+    if not decimal_value.is_finite():
+        raise SettlementError(f"{field}={value!r} is not finite")
+    return decimal_value
 
 
 def is_whole_number_line(line: Decimal) -> bool:
@@ -235,6 +241,10 @@ def settle_prop(
         )
 
     stake = _to_decimal(stake_units, "stake_units")
+    # A negative stake flips the sign of every outcome — wins book as losses
+    # and losses as gains — which corrupts ROI silently rather than loudly.
+    if stake <= 0:
+        raise SettlementError(f"stake_units must be strictly positive, got {stake}")
     profit = stake * american_to_profit_per_unit(odds) if won else -stake
 
     return Settlement(

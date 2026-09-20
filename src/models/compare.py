@@ -309,9 +309,16 @@ def compare_models_on_panel(
                     p_cal[usable] = calibrator.transform(p_over[usable])
                 for pred, value in zip(preds, p_cal):
                     if np.isfinite(value):
-                        pred.probability_over_calibrated = round(float(value), 6)
+                        # Treat the calibrated number as P(over | not a push) and
+                        # scale it into the non-push mass. Subtracting push from
+                        # the calibrated over instead lets the under go negative
+                        # whenever isotonic saturates at 1.0 on a whole line.
+                        push = float(pred.probability_push or 0.0)
+                        open_mass = max(0.0, 1.0 - push)
+                        conditional_over = float(np.clip(value, 0.0, 1.0))
+                        pred.probability_over_calibrated = round(conditional_over * open_mass, 6)
                         pred.probability_under_calibrated = round(
-                            float(1.0 - value - (pred.probability_push or 0.0)), 6
+                            (1.0 - conditional_over) * open_mass, 6
                         )
                 calibration_meta[(market, name)] = calib_info
             else:

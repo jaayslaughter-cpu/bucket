@@ -121,9 +121,12 @@ def test_ev_gate_requires_two_way_american_odds():
     assert verdict["status"] == "DATA_NOT_AVAILABLE"
     assert verdict["ev"] is None
 
+    # A posted line is required too: EV is a claim about a probability AT a
+    # number, so a ready verdict without one would be meaningless.
     ctx_full = MarketContext(
         game_id="0022500001",
         status="VALID",
+        line=25.5,
         over_odds_american=-110,
         under_odds_american=-110,
     )

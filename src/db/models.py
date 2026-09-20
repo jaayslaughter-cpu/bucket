@@ -312,6 +312,14 @@ class PropResult(Base):
             name="ck_outcome_status",
         ),
         CheckConstraint("predicted_side IN ('OVER','UNDER')", name="ck_predicted_side"),
+        # Mirrors ck_settled_has_result in migrations/002_prop_results.sql.
+        # Without it here, a table created by Base.metadata.create_all()
+        # accepts graded rows carrying no actual_result, which the metrics
+        # views then count as settled.
+        CheckConstraint(
+            "outcome_status IN ('PENDING','VOID') OR actual_result IS NOT NULL",
+            name="ck_settled_has_result",
+        ),
         CheckConstraint(
             "outcome_status <> 'PUSH' OR predicted_line = ROUND(predicted_line)",
             name="ck_push_requires_whole_line",

@@ -33,8 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """DataFrame -> list of dicts with NaN converted to None (Postgres NULL)."""
-    return df.where(pd.notna(df), None).to_dict(orient="records")
+    """DataFrame -> list of dicts with NaN converted to None (Postgres NULL).
+
+    The astype(object) is load-bearing: on a numeric column pandas coerces
+    the None straight back to NaN, so the driver receives a float NaN where
+    an integer column expects NULL and the insert fails.
+    """
+    return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
 def upsert_team_game_stats(df: pd.DataFrame) -> int:

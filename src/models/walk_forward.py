@@ -22,6 +22,16 @@ class ChronoSplit:
 
 
 def sort_by_game_date(df: pd.DataFrame, date_col: str = "GAME_DATE") -> pd.DataFrame:
+    """Sort chronologically, RESETTING the index.
+
+    The reset is deliberate and is part of this module's contract: the
+    ``ChronoSplit`` indices returned by the split functions refer to this
+    sorted, re-indexed frame, not to the caller's original ordering.
+    Callers must therefore apply them to a frame prepared the same way —
+    ``compare_models_on_panel`` does so by resetting before splitting.
+    Preserving the caller's labels here would silently change which rows
+    every existing split selects.
+    """
     if date_col not in df.columns:
         raise ValueError(f"DATA_NOT_AVAILABLE: missing {date_col}")
     out = df.copy()
@@ -43,6 +53,11 @@ def expanding_window_splits(
 
     Never places a later row in train than an earlier validation row.
     """
+    if step_days <= 0:
+        raise ValueError("CONFIG_INVALID: step_days must be > 0 or the cursor never advances")
+    if validation_days <= 0:
+        raise ValueError("CONFIG_INVALID: validation_days must be > 0")
+
     work = sort_by_game_date(df, date_col=date_col)
     if work.empty:
         return []

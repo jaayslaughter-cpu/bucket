@@ -93,14 +93,33 @@ class MinutesModel:
         train = train.loc[y.notna()]
         y = y.loc[train.index]
 
-        train_pool = Pool(train[feats], y, cat_features=cats or None)
+        # Early stopping uses the tail of train, never validation_data: an
+        # eval_set drawn from the scoring rows lets the stopping point be
+        # chosen by their labels, which flatters every metric measured on
+        # them afterwards.
+        if "GAME_DATE" in train.columns:
+            train = train.sort_values("GAME_DATE")
+            y = y.loc[train.index]
+
         eval_set = None
+        if len(train) >= 150:
+            cut = int(len(train) * 0.85)
+            fit_part, stop_part = train.iloc[:cut], train.iloc[cut:]
+            train_pool = Pool(fit_part[feats], y.iloc[:cut], cat_features=cats or None)
+            eval_set = Pool(stop_part[feats], y.iloc[cut:], cat_features=cats or None)
+        else:
+            train_pool = Pool(train[feats], y, cat_features=cats or None)
+            logger.info(
+                "minutes model: %d rows is too few to carve an early-stopping holdout",
+                len(train),
+            )
+
         if validation_data is not None and not validation_data.empty:
-            val = validation_data.dropna(subset=feats + ["MIN"]).copy()
-            for c in cats:
-                val[c] = val[c].astype(str).fillna("MISSING")
-            if not val.empty:
-                eval_set = Pool(val[feats], pd.to_numeric(val["MIN"], errors="coerce"), cat_features=cats or None)
+            logger.info(
+                "minutes model: validation_data (%d rows) is recorded but not used for "
+                "early stopping — it is the scoring set.",
+                len(validation_data),
+            )
 
         params = {k: v for k, v in self.hyperparameters.items() if k != "early_stopping_rounds"}
         early = int(self.hyperparameters.get("early_stopping_rounds") or 0)
@@ -126,29 +145,51 @@ class MinutesModel:
         return self
 
     def predict_mean(self, features: pd.DataFrame) -> pd.Series:
+        """Projected minutes, null where the inputs were never there.
+
+        A row with no prior minutes history (a debut, or a player returning
+        with a gap) used to have its features zero-filled and came back with
+        a confident-looking projection built from invented zeros. Those rows
+        now return null.
+        """
         if self.mean_model is None:
             raise RuntimeError("Minutes model not fitted")
+        work, usable = self._prepare_for_predict(features)
+        out = pd.Series([np.nan] * len(features), index=features.index, dtype=float)
+        if usable.any():
+            pred = self.mean_model.predict(work.loc[usable, self.feature_cols])
+            out.loc[usable] = np.clip(pred, 0, 48)
+        if (~usable).any():
+            logger.warning(
+                "minutes model: %d of %d rows lack fitted features — returned null "
+                "rather than a projection built from zeros",
+                int((~usable).sum()), len(features),
+            )
+        return out
+
+    def _prepare_for_predict(self, features: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+        """Coerce inputs and flag which rows actually have the numeric features."""
         work = features.copy()
         for c in self.categorical_features:
             if c in work.columns:
                 work[c] = work[c].astype(str).fillna("MISSING")
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
-        pred = self.mean_model.predict(work[self.feature_cols])
-        return pd.Series(np.clip(pred, 0, 48), index=features.index)
+        numeric = [c for c in self.feature_cols if c not in self.categorical_features]
+        for c in numeric:
+            work[c] = pd.to_numeric(work.get(c), errors="coerce")
+        usable = work[numeric].notna().all(axis=1) if numeric else pd.Series(True, index=work.index)
+        return work, usable
 
     def predict_quantiles(self, features: pd.DataFrame) -> pd.DataFrame:
-        work = features.copy()
-        for c in self.categorical_features:
-            if c in work.columns:
-                work[c] = work[c].astype(str).fillna("MISSING")
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
-        cols = {}
+        """P10/P50/P90 minutes, null where the inputs were never there."""
+        work, usable = self._prepare_for_predict(features)
+        cols: dict[str, pd.Series] = {}
         for q, model in self.quantile_models.items():
-            cols[f"MIN_P{int(q * 100)}"] = np.clip(model.predict(work[self.feature_cols]), 0, 48)
+            series = pd.Series([np.nan] * len(features), index=features.index, dtype=float)
+            if usable.any():
+                series.loc[usable] = np.clip(
+                    model.predict(work.loc[usable, self.feature_cols]), 0, 48
+                )
+            cols[f"MIN_P{int(q * 100)}"] = series
         return pd.DataFrame(cols, index=features.index)
 
     def uncertainty(self, features: pd.DataFrame) -> pd.Series:

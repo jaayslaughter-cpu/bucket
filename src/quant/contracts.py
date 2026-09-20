@@ -13,6 +13,7 @@ accident.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -95,20 +96,29 @@ def market_ev_gate(context: MarketContext) -> dict[str, Any]:
         verdict["reason"] = f"Market status is {context.status}, not VALID"
         return verdict
 
-    if context.over_odds_american is None or context.under_odds_american is None:
+    # Pick'em first, and unconditionally. Checking odds first would let a
+    # pick'em row that happens to carry two odds fields through the gate,
+    # and a payout multiplier is not a two-way price however it is labelled.
+    if context.is_pickem or context.payout_multiplier is not None:
         verdict["reason"] = (
-            "Two-way American odds required; "
-            + (
-                "a pick'em payout multiplier is not a price and cannot be de-vigged"
-                if context.is_pickem or context.payout_multiplier is not None
-                else "one or both sides are missing"
-            )
+            "Pick'em board: a payout multiplier is not a two-way price and "
+            "cannot be de-vigged, so EV is undefined here"
         )
+        return verdict
+
+    if context.over_odds_american is None or context.under_odds_american is None:
+        verdict["reason"] = "Two-way American odds required; one or both sides are missing"
+        return verdict
+
+    # EV is a claim about a probability at a specific number. Without the
+    # line there is nothing for the probability to be "at".
+    if context.line is None or not math.isfinite(float(context.line)):
+        verdict["reason"] = "A finite posted line is required before EV can be evaluated"
         return verdict
 
     try:
         fair = devig_two_way(context.over_odds_american, context.under_odds_american)
-    except ValueError as exc:
+    except (ValueError, TypeError, OverflowError, ArithmeticError) as exc:
         verdict["reason"] = f"Could not de-vig: {exc}"
         return verdict
 

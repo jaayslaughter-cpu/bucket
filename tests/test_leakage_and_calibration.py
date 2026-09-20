@@ -212,7 +212,43 @@ def test_ev_gate_abstains_without_two_way_odds():
     verdict = market_ev_gate(pickem)
     assert verdict["status"] == "DATA_NOT_AVAILABLE"
     assert verdict["ev"] is None
-    assert "not a price" in verdict["reason"]
+    assert "not a two-way price" in verdict["reason"]
+
+
+def test_pickem_carrying_odds_fields_still_refuses():
+    """A pick'em row with two odds attached must not slip past the gate.
+
+    Checking odds before the pick'em flag let exactly this through, because
+    the odds branch returned early and the refusal was never reached.
+    """
+    from src.quant.contracts import MarketContext, market_ev_gate
+
+    verdict = market_ev_gate(
+        MarketContext(
+            game_id="0022500001",
+            status="VALID",
+            line=25.5,
+            is_pickem=True,
+            over_odds_american=-110,
+            under_odds_american=-110,
+        )
+    )
+    assert verdict["status"] == "DATA_NOT_AVAILABLE"
+    assert "not a two-way price" in verdict["reason"]
+
+
+def test_gate_requires_a_finite_line():
+    """EV is a claim about a probability at a number; without one there is none."""
+    from src.quant.contracts import MarketContext, market_ev_gate
+
+    for bad_line in (None, float("nan"), float("inf")):
+        verdict = market_ev_gate(
+            MarketContext(
+                game_id="0022500001", status="VALID", line=bad_line,
+                over_odds_american=-110, under_odds_american=-110,
+            )
+        )
+        assert verdict["status"] == "DATA_NOT_AVAILABLE"
 
 
 def test_ev_gate_devigs_a_real_two_way_market():
@@ -222,6 +258,7 @@ def test_ev_gate_devigs_a_real_two_way_market():
         MarketContext(
             game_id="0022500001",
             status="VALID",
+            line=25.5,
             over_odds_american=-110,
             under_odds_american=-110,
         )

@@ -66,6 +66,10 @@ class ModelMetadata(BaseModel):
     model_name: str
     model_version: str
     target_market: str
+    # Every adapter passes this; without the field pydantic silently drops it
+    # and the saved artifact loses the feature contract needed to reproduce
+    # or audit its predictions.
+    feature_schema_version: str = "fs_v1_shift1_l2"
     feature_cols: list[str] = Field(default_factory=list)
     categorical_cols: list[str] = Field(default_factory=list)
     hyperparameters: dict[str, Any] = Field(default_factory=dict)

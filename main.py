@@ -161,7 +161,19 @@ def ingest_market_lines(xlsx_path: Path, persist: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) -> pd.DataFrame:
-    from src.ingestion.pickem import pull_pickem_boards
+    try:
+        from src.ingestion.pickem import pull_pickem_boards
+    except ImportError:
+        # No pick'em loader in this repository yet. An absent source is not a
+        # pipeline failure — it is the same "no lines available" state the
+        # off-season produces, and downstream stages already abstain on it.
+        # Crashing here would take out feature building, scoring and
+        # persistence for a source that only supplies optional prop lines.
+        logger.warning(
+            "Prop-line ingest skipped: src/ingestion/pickem.py is not present. "
+            "Downstream stages will abstain on prop lines; see docs/DATA_GAPS.md."
+        )
+        return pd.DataFrame()
 
     sources = None
     if guideline and "approved_prop_sources" in guideline:

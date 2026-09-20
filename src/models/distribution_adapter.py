@@ -169,9 +169,57 @@ class DistributionPropModel:
         return out
 
     def save(self, path: Any) -> None:
-        logger.info("distribution model has no binary artifact (%s)", path)
+        """Persist the fitted dispersion.
+
+        There is no booster here, but the dispersion family and phi ARE
+        learned parameters. Treating this model as artifact-free meant a
+        reload silently reverted to Poisson, quietly changing every
+        probability it produced.
+        """
+        import json
+        from pathlib import Path
+
+        target = Path(path)
+        target = target if target.suffix == ".json" else target.with_suffix(".json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model_version": self.model_version,
+            "target_market": self.target_market,
+            "feature_schema_version": self.feature_schema_version,
+            "dispersion": None if self.dispersion is None else {
+                "family": self.dispersion.family,
+                "phi": self.dispersion.phi,
+                "n_train_rows": self.dispersion.n_train_rows,
+                "selection_scores": self.dispersion.selection_scores,
+                "fallback_reason": self.dispersion.fallback_reason,
+            },
+        }
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Saved distribution dispersion to %s", target)
 
     def load(self, path: Any) -> "DistributionPropModel":
+        import json
+        from pathlib import Path
+
+        target = Path(path)
+        target = target if target.suffix == ".json" else target.with_suffix(".json")
+        if not target.exists():
+            raise FileNotFoundError(
+                f"No distribution artifact at {target} — refusing to score with an "
+                "unfitted Poisson fallback that would look like a trained model."
+            )
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        self.model_version = payload.get("model_version", self.model_version)
+        self.target_market = payload.get("target_market", self.target_market)
+        stored = payload.get("dispersion")
+        self.dispersion = None if stored is None else CountDispersion(
+            family=stored["family"],
+            phi=float(stored["phi"]),
+            n_train_rows=int(stored.get("n_train_rows", 0)),
+            selection_scores=stored.get("selection_scores") or {},
+            fallback_reason=stored.get("fallback_reason"),
+        )
+        self._fitted = True
         return self
 
     def get_model_metadata(self) -> ModelMetadata:
