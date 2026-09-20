@@ -64,6 +64,17 @@ COLUMN_MAP = {
     "AST": "AST",
     "FG3M": "FG3M",
     "FG3A": "FG3A",
+    # Shooting volume. Needed for True Shooting, which is
+    # PTS / (2 * (FGA + 0.44 * FTA)) — without FGA and FTA the efficiency
+    # layer cannot be computed at all, only guessed at.
+    "FGM": "FGM",
+    "FGA": "FGA",
+    "FTM": "FTM",
+    "FTA": "FTA",
+    # Offensive rebounds are required by the possessions estimate
+    # (FGA - OREB + TOV + 0.44*FTA) that pace is derived from.
+    "OREB": "OREB",
+    "DREB": "DREB",
     "STL": "STL",
     "BLK": "BLK",
     "TOV": "TOV",
@@ -185,7 +196,8 @@ def parse_league_game_log(payload: dict[str, Any], *, season: str) -> pd.DataFra
     out["OPPONENT_ABBREVIATION"] = opponents
     out["IS_HOME"] = is_home
 
-    for col in ("MIN", "PTS", "REB", "AST", "FG3M", "FG3A", "STL", "BLK", "TOV"):
+    for col in ("MIN", "PTS", "REB", "AST", "FG3M", "FG3A", "FGM", "FGA",
+                "FTM", "FTA", "OREB", "DREB", "STL", "BLK", "TOV"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
     unparsed = int(out["OPPONENT_ABBREVIATION"].isna().sum())

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -615,6 +616,191 @@ def predict_slate(
             err=True,
         )
         raise SystemExit(4)
+
+
+
+# ---------------------------------------------------------------------------
+# Paper-research layer (waves 3 / 4 / 5a / 5b)
+#
+# MANUAL_ONLY throughout. These commands log what YOU decided and grade it
+# afterwards; nothing here places a wager, sizes a stake, or ranks a slate
+# by edge.
+# ---------------------------------------------------------------------------
+
+@app.command("write-run-manifest")
+def write_run_manifest_cmd(
+    output_dir: str = typer.Option("outputs/demo", "--output-dir"),
+    demo: bool = True,
+    verbose: bool = False,
+) -> None:
+    """Write a forward-only run manifest for an existing export directory."""
+    _setup_logging(verbose)
+    from src.models.artifact_registry import write_run_manifest
+
+    root = Path(output_dir)
+    if not root.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {root} missing — run compare-models first", err=True)
+        raise SystemExit(2)
+    files = sorted(p for p in root.glob("*") if p.is_file())
+    manifest = write_run_manifest(
+        root,
+        steps=[{"step_name": "cli_write_run_manifest", "notes": "Wave 4 checksum snapshot"}],
+        output_files=files,
+        meta={"demo_mode": demo, "wave": 4, "source": "nba_model_cli"},
+    )
+    typer.echo(json.dumps({k: v for k, v in manifest.items() if not str(k).startswith("_")}, indent=2, default=str))
+
+
+@app.command("research-slate")
+def research_slate(
+    markets: str = typer.Option("PTS,REB,AST", "--markets"),
+    train_end: str = typer.Option("2025-01-15", "--train-end"),
+    validation_end: str = typer.Option("2025-02-15", "--validation-end"),
+    preferred_model: str = typer.Option("distribution", "--preferred-model"),
+    out: Path = typer.Option(Path("outputs/demo/research_slate.csv"), "--out"),
+    demo: bool = typer.Option(True, help="DEMO panel for wiring"),
+    verbose: bool = False,
+) -> None:
+    """Build a MANUAL research slate board (no wager placement)."""
+    _setup_logging(verbose)
+    from src.models.compare import compare_models_on_panel, load_comparison_config
+    from src.quant.paper_research import (
+        WAVE3_DISCLAIMER,
+        research_slate_from_predictions,
+        write_slate_csv,
+    )
+    from src.utils.timezones import pacific_calendar_date
+
+    panel, is_demo = _load_real_or_demo(demo)
+    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    result = compare_models_on_panel(
+        panel,
+        markets=mkt,
+        train_end=train_end,
+        validation_end=validation_end,
+        cfg=load_comparison_config(),
+    )
+    slate = str(pacific_calendar_date())
+    rows = research_slate_from_predictions(
+        result.get("predictions") or [],
+        slate_date=slate,
+        preferred_model=preferred_model or None,
+    )
+    n = write_slate_csv(rows, out)
+    typer.echo(
+        json.dumps(
+            {
+                "placement_mode": "MANUAL_ONLY",
+                "disclaimer": WAVE3_DISCLAIMER,
+                "slate_date": slate,
+                "rows": n,
+                "out": str(out),
+                "demo": demo or is_demo,
+            },
+            indent=2,
+        )
+    )
+
+
+@app.command("log-manual-bet")
+def log_manual_bet_cmd(
+    game_id: str = typer.Option(..., "--game-id"),
+    prop_stat: str = typer.Option(..., "--prop-stat"),
+    line: float = typer.Option(..., "--line"),
+    side: str = typer.Option(..., "--side", help="over|under"),
+    odds: int = typer.Option(..., "--odds", help="American odds you took"),
+    model_prob: float = typer.Option(..., "--model-prob", help="Model P(over)"),
+    player_id: Optional[str] = typer.Option(None, "--player-id"),
+    player_name: Optional[str] = typer.Option(None, "--player-name"),
+    bookmaker: Optional[str] = typer.Option(None, "--bookmaker"),
+    unit_stake: float = typer.Option(1.0, "--unit-stake", help="YOUR stake units (not model Kelly)"),
+    store_dir: Path = typer.Option(Path("data/external/market_store"), "--store-dir"),
+    verbose: bool = False,
+) -> None:
+    """Log a bet YOU placed manually (paper research). Never places a wager."""
+    _setup_logging(verbose)
+    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
+    from src.quant.paper_research import ManualBetInput, log_manual_bet
+
+    side_l = side.lower().strip()
+    if side_l not in {"over", "under"}:
+        typer.echo("DATA_NOT_AVAILABLE: --side must be over|under", err=True)
+        raise SystemExit(2)
+    store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
+    bet = ManualBetInput(
+        game_id=game_id,
+        player_id=player_id,
+        player_name=player_name,
+        prop_stat=prop_stat.upper(),
+        line=line,
+        bet_side=side_l,  # type: ignore[arg-type]
+        taken_odds_american=odds,
+        model_prob=model_prob,
+        bookmaker=bookmaker,
+        unit_stake=unit_stake,
+    )
+    result = log_manual_bet(store, bet)
+    typer.echo(json.dumps(result, indent=2, default=str))
+
+
+@app.command("paper-report")
+def paper_report_cmd(
+    store_dir: Path = typer.Option(Path("data/external/market_store"), "--store-dir"),
+    verbose: bool = False,
+) -> None:
+    """Paper-book improvement report (ROI / calibration) — research audit only."""
+    _setup_logging(verbose)
+    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
+    from src.quant.paper_research import paper_improvement_report
+
+    store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
+    typer.echo(json.dumps(paper_improvement_report(store), indent=2, default=str))
+
+
+@app.command("pocket-roi")
+def pocket_roi_cmd(
+    store_dir: Path = typer.Option(Path("data/external/market_store"), "--store-dir"),
+    out: Path = typer.Option(Path("outputs/demo/pocket_roi.csv"), "--out"),
+    verbose: bool = False,
+) -> None:
+    """BookieX-style pocket ROI board from manual paper log (no stake sizing)."""
+    _setup_logging(verbose)
+    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
+    from src.quant.pocket_roi import write_pocket_roi_csv
+
+    store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
+    result = write_pocket_roi_csv(store, out)
+    # Drop large pocket list noise in console — keep summary + path
+    summary = {k: v for k, v in result.items() if k != "pockets"}
+    summary["n_pockets"] = len(result.get("pockets") or [])
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("paper-calibration")
+def paper_calibration_cmd(
+    store_dir: Path = typer.Option(Path("data/external/market_store"), "--store-dir"),
+    out: Path = typer.Option(Path("outputs/demo/paper_reliability.csv"), "--out"),
+    n_bins: int = typer.Option(10, "--n-bins"),
+    verbose: bool = False,
+) -> None:
+    """Reliability diagram / ECE on settled manual paper bets (research audit)."""
+    _setup_logging(verbose)
+    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
+    from src.quant.paper_calibration import write_paper_reliability_csv
+
+    store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
+    result = write_paper_reliability_csv(store, out, n_bins=n_bins)
+    summary = {
+        k: v
+        for k, v in result.items()
+        if k not in {"reliability_table", "chart_points", "perfect_calibration_line"}
+    }
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    app()
+
 
 if __name__ == "__main__":
     app()

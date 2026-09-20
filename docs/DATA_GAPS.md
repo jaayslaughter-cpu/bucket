@@ -147,6 +147,30 @@ player lines.
     observation time that CLV and line movement are measured against~~,
     ~~the settlement README documented a CLI that did not exist~~.
 
+12c. Wave merge, third pass — all four previously-open merge items closed:
+    ~~config/model_comparison.yaml was stale~~ (merged and WIRED, since
+    config nothing reads states a value the system is not using);
+    ~~scoring_efficiency.py was referenced and absent~~ (written with the
+    real True Shooting formula, and FGA/FTA/OREB/DREB added to both
+    ingesters so it has genuine inputs); ~~PACE_MULTIPLIER was a
+    fabricated 1.0~~ (now measured from box scores via the standard
+    possessions estimate, null where it cannot be measured);
+    ~~prob_calibration lacked ECE~~ (ported, with the sparse-bin coverage
+    gate that stops a two-bin reliability diagram winning selection).
+
+    Deliberately NOT merged, with reasons:
+
+    - `_soft_fill` (compare.py). This is the silent feature fabrication
+      removed as item 2 above. Taking the wave version back would reverse
+      a documented fix.
+    - `zip.zero_infl` / `combo.var_fudge` (config). Both are now fitted;
+      setting them would reintroduce the hardcoded dispersion of item 4.
+    - `propiq_analyst.py`. A Streamlit dashboard, which is out of scope by
+      instruction, and it imports four modules (`propiq_logic_v2`,
+      `matchup_overlay`, `ml_learner`, `vault_store`) that exist in no
+      pack and in no version of this repository. Merging it would add a
+      file that cannot run and re-add a dependency deliberately dropped.
+
 **Still open**
 
 13. **The classifiers can now be made line-aware.** `over_hit` is

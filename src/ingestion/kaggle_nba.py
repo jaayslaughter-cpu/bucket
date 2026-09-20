@@ -40,6 +40,7 @@ PANEL_COLS = (
     "PLAYER_ID", "PLAYER_NAME", "GAME_ID", "GAME_DATE", "SEASON",
     "TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "IS_HOME",
     "MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV",
+    "FGM", "FGA", "FTM", "FTA", "OREB", "DREB",
 )
 
 # Candidate source spellings per target column, lowercased and stripped of
@@ -78,6 +79,14 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "STL": ("steals", "stl"),
     "BLK": ("blocks", "blk"),
     "TOV": ("turnovers", "tov", "to", "numturnovers"),
+    # Shooting volume — see scoring_efficiency. Optional: absent columns
+    # simply mean the efficiency layer abstains.
+    "FGM": ("fieldgoalsmade", "fgm"),
+    "FGA": ("fieldgoalsattempted", "fga"),
+    "FTM": ("freethrowsmade", "ftm"),
+    "FTA": ("freethrowsattempted", "fta"),
+    "OREB": ("reboundsoffensive", "oreb", "orb", "offensiverebounds"),
+    "DREB": ("reboundsdefensive", "dreb", "drb", "defensiverebounds"),
 }
 
 # A frame carrying any of these is not an NBA player panel.
@@ -232,7 +241,8 @@ def normalize_player_box_scores(
     if out.empty:
         raise KaggleNbaError("DATA_NOT_AVAILABLE: no rows survived date parsing")
 
-    for numeric in ("MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"):
+    for numeric in ("MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV",
+                    "FGM", "FGA", "FTM", "FTA", "OREB", "DREB"):
         if numeric in out.columns:
             out[numeric] = pd.to_numeric(out[numeric], errors="coerce")
 

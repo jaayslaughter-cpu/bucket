@@ -38,10 +38,28 @@ def test_usage_proxy_shift_safe_when_box_present():
 
 
 def test_usage_proxy_missing_box_is_dna():
+    """Usage cannot be estimated without shot-volume columns.
+
+    This previously relied on the demo panel happening to lack FGA/FTA/TOV.
+    The demo panel now carries them (so the efficiency and pace layers are
+    exercisable), so the columns are dropped explicitly here — the
+    behaviour under test is the abstention, not the fixture's gaps.
+    """
     raw = make_demo_panel(n_players=1, n_games=5)
-    out = attach_usage_proxy(raw)
+    without_box = raw.drop(
+        columns=[c for c in ("FGA", "FTA", "TOV", "FGM", "FTM") if c in raw.columns]
+    )
+    out = attach_usage_proxy(without_box)
     assert out.attrs.get("usage_proxy_status") == "DATA_NOT_AVAILABLE"
     assert out["USAGE_PROXY"].isna().all()
+
+
+def test_usage_proxy_computes_when_the_box_score_is_present():
+    """The other half of the contract: with the columns, it must work."""
+    raw = make_demo_panel(n_players=2, n_games=10)
+    out = attach_usage_proxy(raw)
+    assert out.attrs.get("usage_proxy_status") == "OK"
+    assert out["USAGE_PROXY"].notna().any()
 
 
 def test_streaks_and_opp_allowed_in_builder():

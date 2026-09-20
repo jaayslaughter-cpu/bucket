@@ -54,3 +54,97 @@ calibration:
 outputs_dir: outputs
 demo_outputs_dir: outputs/demo
 artifacts_dir: data/external/model_runs/comparison
+
+# ---------------------------------------------------------------------------
+# Wave 1: calibration-quality gates
+# ---------------------------------------------------------------------------
+# A reliability diagram built from a handful of populated bins looks
+# excellent for the wrong reason. Require most bins to carry data before a
+# calibration result is allowed to decide anything.
+ece:
+  n_bins: 10
+  min_bin_coverage: 0.8
+
+# Covariate drift is REPORTED, never auto-actioned. A feature whose
+# distribution shifted may be broken or may simply reflect a changed
+# league; dropping it automatically would hide which.
+drift:
+  ks_p_threshold: 0.01
+
+# Cold-start abstention. A player without enough prior games has no
+# rolling history worth projecting from.
+eligibility:
+  min_prior_games: 10
+  min_minutes_l5: 12.0
+
+# ---------------------------------------------------------------------------
+# Wave 2: additive feature layers
+# ---------------------------------------------------------------------------
+# Recency half-life and empirical-Bayes shrink. These ADD columns; the
+# L5/L10/SEASON/BASELINE set is untouched.
+halflife:
+  games: 10.0
+  shrink_k: 8.0
+
+# ---------------------------------------------------------------------------
+# Wave 4: arbitration and line comparison
+# ---------------------------------------------------------------------------
+arbitration:
+  agreement_high: 0.75
+  agreement_mod: 0.60
+  edge_high: 0.08
+  edge_mod: 0.04
+
+line_diff:
+  pts_per_prob: 0.03
+
+# ---------------------------------------------------------------------------
+# Wave 4b: hot-hand research flags
+# ---------------------------------------------------------------------------
+hot_hand:
+  z_threshold: 1.0
+  minutes_stable_ratio: 0.15
+
+# ---------------------------------------------------------------------------
+# Dispersion: DELIBERATELY NOT CONFIGURED HERE
+# ---------------------------------------------------------------------------
+# The wave configs carried `zip.zero_infl: 0.12` and `combo.var_fudge: 1.1`.
+# Both are now FITTED rather than asserted, so setting them here would
+# reintroduce exactly the hardcoded dispersion this project removed:
+#
+#   zero-inflation  -> fit_count_dispersion() estimates it per market and
+#                      selects ZIP against poisson/negbin/normal by
+#                      held-out log-likelihood.
+#   combo inflation -> fit_combo_variance_inflation() measures
+#                      Var(A+B+C) / (Var(A)+Var(B)+Var(C)) directly.
+#
+# On the demo panel the measured combo inflation is 1.29, not the 1.10
+# the config asserted. Leaving these unset is not an oversight.
+
+# ---------------------------------------------------------------------------
+# Wave 3 / 5a: manual paper research. MANUAL_ONLY is not a default to relax.
+# ---------------------------------------------------------------------------
+paper_research:
+  placement_mode: MANUAL_ONLY
+  store_dir: data/external/market_store
+  # A user-supplied unit only. Never a Kelly fraction derived from the
+  # model — this project does not size stakes.
+  default_unit_stake: 1.0
+
+pocket_roi:
+  placement_mode: MANUAL_ONLY
+
+sports_ev:
+  usage_enabled: true
+  streak_stats: [PTS, REB, AST, FG3M]
+  opp_allowed_l10: true
+
+# ---------------------------------------------------------------------------
+# Recency weighting of TRAINING rows (not features)
+# ---------------------------------------------------------------------------
+# Half-life in days, so the value says what it means. null disables
+# weighting entirely; fit_half_life_by_holdout() can choose it instead.
+# Check effective_sample_size before trusting an aggressive value.
+recency:
+  half_life_days: 240
+  enabled: false
