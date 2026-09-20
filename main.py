@@ -165,26 +165,29 @@ def ingest_market_lines(xlsx_path: Path, persist: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) -> pd.DataFrame:
+    """
+    Pull posted NBA prop lines from PropLine.
+
+    An absent source is not a pipeline failure — it is the same "no lines
+    available" state the off-season produces, and downstream stages already
+    abstain on it. Crashing here would take out feature building, scoring
+    and persistence for a source that only supplies optional prop lines.
+    """
     try:
-        from src.ingestion.pickem import pull_pickem_boards
+        from src.ingestion.propline import pull_nba_prop_lines
     except ImportError:
-        # No pick'em loader in this repository yet. An absent source is not a
-        # pipeline failure — it is the same "no lines available" state the
-        # off-season produces, and downstream stages already abstain on it.
-        # Crashing here would take out feature building, scoring and
-        # persistence for a source that only supplies optional prop lines.
         logger.warning(
-            "Prop-line ingest skipped: src/ingestion/pickem.py is not present. "
+            "Prop-line ingest skipped: src/ingestion/propline.py is not present. "
             "Downstream stages will abstain on prop lines; see docs/DATA_GAPS.md."
         )
         return pd.DataFrame()
 
-    sources = None
+    books = None
     if guideline and "approved_prop_sources" in guideline:
-        sources = tuple(guideline["approved_prop_sources"])
-        logger.info("Prop sources from master guideline: %s", sources)
+        books = list(guideline["approved_prop_sources"])
+        logger.info("Prop books from master guideline: %s", books)
 
-    snapshots = pull_pickem_boards(sources)
+    snapshots = pull_nba_prop_lines(bookmakers=books)
     rows: list[dict[str, Any]] = []
     for snap in snapshots:
         if snap.status != "VALID":
@@ -192,18 +195,26 @@ def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) ->
             continue
         for line in snap.lines:
             rows.append({
-                "source": snap.source,
-                "is_pickem": True,
-                "captured_at_utc": snap.captured_at_utc,
-                "player_name": getattr(line, "player_name", None),
-                "market": getattr(line, "market", None),
-                "line": getattr(line, "line", None),
-                # Pick'em boards give a payout multiplier, not two-way
-                # American odds. Leaving these None is what keeps
-                # market_ev_gate correctly abstaining downstream.
-                "over_odds_american": getattr(line, "over_odds_american", None),
-                "under_odds_american": getattr(line, "under_odds_american", None),
-                "status": "VALID",
+                "source": line.source,
+                # Per ROW, never hardcoded. This used to be a literal True,
+                # which made market_ev_gate abstain on every prop including
+                # genuine two-way sportsbook prices — the gate would have
+                # refused the very data it exists to evaluate.
+                "is_pickem": line.is_pickem,
+                # The source's own observation time, or NULL when it did not
+                # report one. Never now(): see PropLineSnapshot.captured_at_utc.
+                "captured_at_utc": line.captured_at_utc,
+                "player_name": line.player_name,
+                "nba_player_id": line.nba_player_id,
+                "market": line.market,
+                "line": line.line,
+                "over_odds_american": line.over_odds_american,
+                "under_odds_american": line.under_odds_american,
+                "payout_multiplier": line.payout_multiplier,
+                "game_date": line.game_date,
+                "nba_game_id": line.nba_game_id,
+                "status": line.status,
+                "raw_json": line.raw,
             })
 
     df = pd.DataFrame(rows)
