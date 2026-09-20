@@ -219,6 +219,43 @@ def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) ->
 # [5][6] features + FATIGUE VERIFICATION (not re-application)
 # ---------------------------------------------------------------------------
 
+def _filter_to_slate(features: pd.DataFrame, slate: str) -> tuple[pd.DataFrame, int]:
+    """
+    Keep only the rows whose game falls on the requested Pacific slate date.
+
+    Called AFTER feature-building, never before: the shifted rolling windows
+    need the surrounding history to read, but that history must not be
+    projected or persisted as though it were today's work.
+
+    A missing GAME_DATE column is treated as unfilterable rather than as an
+    empty slate — dropping every row on a schema surprise would look exactly
+    like a quiet night.
+    """
+    if "GAME_DATE" not in features.columns:
+        logger.warning(
+            "No GAME_DATE column — cannot filter to slate %s, so every panel row "
+            "would be scored. Refusing to guess; returning the frame unfiltered "
+            "for the caller to reject.",
+            slate,
+        )
+        return features, len(features)
+
+    try:
+        target = pd.Timestamp(slate).normalize()
+    except (TypeError, ValueError):
+        logger.warning("Unparseable slate date %r — not filtering", slate)
+        return features, len(features)
+
+    dates = pd.to_datetime(features["GAME_DATE"], errors="coerce").dt.normalize()
+    on_slate = features.loc[dates == target]
+    logger.info(
+        "Slate filter: %d of %d panel rows fall on %s; the rest are history "
+        "feeding the rolling features.",
+        len(on_slate), len(features), slate,
+    )
+    return on_slate, len(on_slate)
+
+
 def build_features_and_verify_fatigue(player_panel: pd.DataFrame) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix and VERIFY fatigue was applied.
@@ -619,6 +656,37 @@ def main() -> int:
             return 0
 
         features = build_features_and_verify_fatigue(panel)
+
+        # The panel deliberately carries ~400 days so the shift-1 rolling
+        # features have history to read. Those historical rows are INPUT,
+        # not output: projecting and persisting them turns a request for one
+        # slate into a retrospective projection of the whole lookback. Filter
+        # after feature-building so the history is used but not scored.
+        slate = args.date or str(pacific_calendar_date())
+        features, slate_rows = _filter_to_slate(features, slate)
+        stage_summary["slate_filter"] = {
+            "slate_pt": slate,
+            "panel_rows": len(panel),
+            "slate_rows": slate_rows,
+        }
+        if features.empty:
+            # Not the same condition as an empty panel, and the distinction
+            # matters: the panel holds COMPLETED games, so a future slate is
+            # legitimately absent from it and needs a schedule source, not
+            # more box scores.
+            logger.warning(
+                "No rows for slate %s (%s) in a panel of %d rows. The player "
+                "game log holds completed games, so a future slate will not "
+                "appear here until those games are played and ingested.",
+                slate, DISPLAY_TZ_NAME, len(panel),
+            )
+            stage_summary["projections"] = {"rows": 0, "reason": "no rows on the requested slate"}
+            if persist:
+                from src.db.repository import record_run
+
+                record_run(run_id, status="success_no_data", stage_summary=stage_summary)
+            return 0
+
         prob_over = score_prob_over(features, prop_df, Path(args.model))
         ev_verdict = evaluate_ev_gate(prop_df, market_df)
         stage_summary["ev_gate"] = ev_verdict

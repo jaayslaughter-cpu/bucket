@@ -719,6 +719,78 @@ def test_elo_rates_a_well_formed_game():
     assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
 
 
+def test_neutral_site_games_are_not_relabelled_as_home_games():
+    """IS_HOME was rewritten to True for neutral rows to suppress the altitude tax.
+
+    It worked, but IS_HOME is an active model feature and a reporting field,
+    so every neutral game trained and reported as a home game. The exclusion
+    belongs in the altitude rule, not in the home flag.
+    """
+    from src.features.fatigue_logic import ALTITUDE_PENALTY, attach_fatigue_column
+
+    base = {
+        "PLAYER_ID": "p1", "SEASON": "2024-25",
+        "GAME_DATE": pd.Timestamp("2025-01-15"),
+    }
+    frame = pd.DataFrame([
+        # Genuinely away at Denver — taxed.
+        {**base, "OPPONENT_ABBREVIATION": "DEN", "IS_HOME": False, "IS_NEUTRAL_SITE": False},
+        # Neutral-site game against Denver — nobody travels to altitude.
+        {**base, "OPPONENT_ABBREVIATION": "DEN", "IS_HOME": False, "IS_NEUTRAL_SITE": True},
+        # Away against a sea-level team — untaxed.
+        {**base, "OPPONENT_ABBREVIATION": "BOS", "IS_HOME": False, "IS_NEUTRAL_SITE": False},
+    ])
+
+    out = attach_fatigue_column(frame)
+    mult = out["fatigue_multiplier"]
+
+    assert mult.iloc[0] == pytest.approx(mult.iloc[2] * ALTITUDE_PENALTY)
+    assert mult.iloc[1] == pytest.approx(mult.iloc[2]), "neutral-site row was taxed"
+
+    # And the home flag itself must survive untouched.
+    assert out["IS_HOME"].tolist() == [False, False, False]
+
+
+def test_a_slate_run_scores_only_the_slate_not_the_whole_lookback():
+    """A `--date` run projected and persisted ~400 days of historical games.
+
+    The panel's history is INPUT — the shift-1 rolling windows need it — but
+    scoring it turns a request for one slate into a retrospective projection
+    of the entire lookback, written to the projections table as though it
+    were today's work.
+    """
+    from main import _filter_to_slate
+
+    features = pd.DataFrame({
+        "GAME_DATE": pd.to_datetime(
+            ["2025-01-28", "2025-01-29", "2025-01-30", "2025-01-30", "2025-01-31"]
+        ),
+        "PLAYER_ID": ["p1", "p1", "p1", "p2", "p1"],
+    })
+
+    on_slate, n = _filter_to_slate(features, "2025-01-30")
+    assert n == 2
+    assert len(on_slate) == 2
+    assert set(on_slate["PLAYER_ID"]) == {"p1", "p2"}
+
+    # A slate with no games is empty, not an error.
+    empty, n_empty = _filter_to_slate(features, "2025-02-05")
+    assert empty.empty and n_empty == 0
+
+
+def test_slate_filter_does_not_silently_empty_the_frame_on_a_schema_surprise():
+    """Dropping every row when GAME_DATE is absent would look like a quiet night."""
+    from main import _filter_to_slate
+
+    features = pd.DataFrame({"PLAYER_ID": ["p1", "p2"]})
+    out, n = _filter_to_slate(features, "2025-01-30")
+    assert len(out) == 2 and n == 2
+
+    dated = pd.DataFrame({"GAME_DATE": pd.to_datetime(["2025-01-30"]), "PLAYER_ID": ["p1"]})
+    out2, n2 = _filter_to_slate(dated, "not-a-date")
+    assert len(out2) == 1 and n2 == 1
+
+
 def test_the_documented_settlement_commands_exist_and_dispatch():
     """The README documented a CLI module that was never written.
 

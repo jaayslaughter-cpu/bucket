@@ -151,16 +151,13 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             "SEASON": r.season,
             "TEAM_ABBREVIATION": r.team_abbr,
             "OPPONENT_ABBREVIATION": r.opponent_abbr,
-            # NEUTRAL-SITE HANDLING: fatigue_logic.attach_fatigue_column
-            # applies the altitude tax when IS_HOME == False AND the
-            # opponent plays at altitude (DEN/UTA). At a neutral-site game
-            # neither team is home, so a naive IS_HOME=False for both would
-            # tax a team that isn't actually travelling to altitude.
-            # Setting IS_HOME=True for neutral rows suppresses the tax
-            # (the correct behaviour — nobody is the visitor), while
-            # IS_NEUTRAL_SITE is carried through so downstream home-court
-            # features can distinguish it from a genuine home game.
-            "IS_HOME": True if r.is_neutral_site else r.is_home,
+            # IS_HOME is reported as the source recorded it. It used to be
+            # rewritten to True for neutral-site rows in order to suppress
+            # the altitude tax, but IS_HOME is an active model feature and a
+            # reporting field: that made every neutral game train and report
+            # as a home game. The altitude tax now excludes neutral sites
+            # itself, via IS_NEUTRAL_SITE, which is where that rule belongs.
+            "IS_HOME": r.is_home,
             "IS_NEUTRAL_SITE": r.is_neutral_site,
             "MIN": r.minutes,
             "PTS": r.pts,
@@ -175,7 +172,8 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
     ])
     n_neutral = int(df["IS_NEUTRAL_SITE"].sum()) if "IS_NEUTRAL_SITE" in df else 0
     logger.info(
-        "Loaded player panel: %d rows, %d players (%d neutral-site rows — altitude tax suppressed)",
+        "Loaded player panel: %d rows, %d players (%d neutral-site rows — IS_HOME "
+        "kept as recorded; the altitude tax excludes them downstream)",
         len(df), df["PLAYER_ID"].nunique(), n_neutral,
     )
     return df
