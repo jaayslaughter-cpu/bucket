@@ -37,9 +37,6 @@ stats = [
     "nba_api>=1.4",
     "pyarrow>=14.0",
 ]
-ui = [
-    "streamlit>=1.28",
-]
 edge = [
     "nba-edge>=0.1.0",
 ]

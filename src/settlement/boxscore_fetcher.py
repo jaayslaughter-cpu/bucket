@@ -1,8 +1,7 @@
 """
 src/settlement/boxscore_fetcher.py — real NBA post-game box scores.
 
-SCOPE: NBA only. NCAA/CBB has no infrastructure in this tree; see
-EXTENDING TO NCAA at the bottom of this docstring.
+SCOPE: NBA only.
 
 DATA SOURCE (real, unauthenticated, no mock mode)
 -------------------------------------------------
@@ -22,14 +21,6 @@ STATUS GATE
 `gameStatus` 3 == Final. Box scores for in-progress games are live and
 will change, so `fetch_final_boxscore` refuses to return a non-final
 game rather than letting the settlement engine grade a partial line.
-
-EXTENDING TO NCAA
------------------
-Not implemented. NCAA would need a different provider entirely (ESPN's
-college endpoints or an approved licensed feed), a separate id scheme,
-and its own roster/name crosswalk. Add it as
-`src/settlement/ncaa_boxscore_fetcher.py` implementing the same
-`extract_player_stats()` contract; do not widen this module.
 """
 
 from __future__ import annotations

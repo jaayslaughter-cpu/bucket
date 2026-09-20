@@ -17,10 +17,16 @@ import pytest
 
 from src.ingestion.bigdataball import load_bigdataball_workbook, load_team_map
 
-WORKBOOK = Path(__file__).parent.parent / "data" / "external" / "bigdataball" / "2025-2026_NBA_Box_Score_Team-Stats__1_.xlsx"
+def _find_workbook() -> Path | None:
+    """The download's filename suffix varies ('_1', '__1_', none), so glob."""
+    root = Path(__file__).parent.parent / "data" / "external" / "bigdataball"
+    return next(iter(sorted(root.glob("*NBA_Box_Score_Team-Stats*.xlsx"))), None)
+
+
+WORKBOOK = _find_workbook()
 
 pytestmark = pytest.mark.skipif(
-    not WORKBOOK.exists(),
+    WORKBOOK is None,
     reason="Licensed BigDataBall workbook not present (not committed to git).",
 )
 
