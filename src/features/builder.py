@@ -32,7 +32,7 @@ from src.features.team_strength import attach_elo_features, compute_team_elo
 logger = logging.getLogger(__name__)
 
 # Counting stats that get the full rolling treatment.
-ROLLING_STATS = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "MIN")
+ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN")
 
 # Layer-1 blend. Recent form dominates, season average stabilises a short
 # sample. Unfitted starting weights, not estimated parameters.
@@ -95,6 +95,18 @@ def build_feature_matrix(
     df = player_panel.copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df = df.sort_values(["PLAYER_ID", "GAME_DATE"]).reset_index(drop=True)
+
+    # PRA is the exact sum of three real columns, not an estimate, so it is
+    # derived here rather than listed as a supported market that cannot in
+    # fact be labelled. Deriving it before the rolling loop gives it the same
+    # shift-1 treatment as every other stat. A NaN in any component
+    # propagates deliberately: a partial sum would read as a real total.
+    if {"PTS", "REB", "AST"}.issubset(df.columns) and "PRA" not in df.columns:
+        df["PRA"] = (
+            pd.to_numeric(df["PTS"], errors="coerce")
+            + pd.to_numeric(df["REB"], errors="coerce")
+            + pd.to_numeric(df["AST"], errors="coerce")
+        )
 
     by_player = df.groupby("PLAYER_ID", sort=False)
 

@@ -5,8 +5,14 @@
 ```bash
 psql "$DATABASE_URL" -f migrations/002_prop_results.sql   # once
 python -m src.settlement.cli settle                        # grade PENDING props
+python -m src.settlement.cli settle --dry-run              # grade, write nothing
 python -m src.settlement.cli summary --days 30             # W-L-P / strike rate / ROI / CLV
+python -m src.settlement.cli summary --days 30 --by-market # per-market breakdown
 ```
+
+Exit codes: `0` completed, `1` failed, `2` bad arguments. A settle run
+that grades nothing exits `0` — an empty slate and a broken pipeline must
+not look alike to a scheduler.
 
 ## Three things that are easy to get wrong, and how these handle them
 

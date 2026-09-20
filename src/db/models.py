@@ -168,7 +168,16 @@ class GameMarketLine(Base):
     source: Mapped[str] = mapped_column(String(32), default="bigdataball")
     status: Mapped[str] = mapped_column(String(32), default="VALID")
     raw_json: Mapped[dict | None] = mapped_column(JSONB)
-    captured_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Same split as prop_line_snapshots: observation time is the source's to
+    # report, ingest time is ours. A workbook loaded months later must not
+    # claim its lines were seen today.
+    captured_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ingested_at_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class PlayerGameLog(Base):
@@ -221,7 +230,20 @@ class PropLineSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(32), index=True)
     is_pickem: Mapped[bool] = mapped_column(Boolean, default=True)
-    captured_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, default=utcnow)
+
+    # When the line was OBSERVED AT THE SOURCE. Nullable with no default on
+    # purpose: defaulting it to now() stamped every backfilled row with its
+    # ingest time and called that an observation time. Line movement and CLV
+    # are both measured against this field, so a fabricated value would not
+    # look like missing data — it would look like a line that never moved.
+    # NULL means the source did not report it.
+    captured_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
+    # When THIS ROW was written. Always known, never a claim about the book.
+    ingested_at_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, default=utcnow
+    )
 
     player_name: Mapped[str] = mapped_column(String(128), index=True)
     nba_player_id: Mapped[str | None] = mapped_column(String(32), index=True)

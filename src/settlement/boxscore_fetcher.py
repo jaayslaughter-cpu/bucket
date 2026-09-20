@@ -117,6 +117,19 @@ def fetch_final_boxscore(game_id: str | int, session: requests.Session | None = 
     return payload
 
 
+def _positive(value: Any) -> bool:
+    """True only for a numeric value above zero.
+
+    Used to decide whether a player with unreadable minutes actually
+    appeared, so a non-numeric or absent field must read as 'no evidence',
+    never as evidence of play.
+    """
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _parse_minutes(value: Any) -> float | None:
     """
     CDN reports minutes as an ISO-8601 duration: 'PT36M14.00S'.
@@ -174,11 +187,41 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             dnp_reason = player.get("notPlayingReason")
             minutes = _parse_minutes(stats.get("minutes"))
 
-            did_not_play = (
-                status == "INACTIVE"
-                or bool(dnp_reason)
-                or minutes in (None, 0.0)
+            # A failed minutes parse is not a DNP. Folding None into this
+            # test voided every player whose minutes string the CDN changed
+            # the format of — with the note "player did not play", against a
+            # box score showing they had played. Those rows left W-L and ROI
+            # entirely, so a parser break would have read as a quiet sample
+            # shrink rather than an error.
+            played_signal = any(
+                _positive(stats.get(field))
+                for field in (
+                    "points", "reboundsTotal", "assists",
+                    "threePointersMade", "steals", "blocks", "turnovers",
+                )
             )
+            if status == "INACTIVE" or dnp_reason:
+                did_not_play = True          # the feed says so outright
+                minutes_status = "DNP_DECLARED"
+            elif minutes == 0.0:
+                did_not_play = True          # parsed, and genuinely zero
+                minutes_status = "PARSED"
+            elif minutes is None:
+                # Unknowable from minutes alone. Recorded stats settle it;
+                # with none, DNP is both the likelier reading and the safe
+                # one, since VOID invents no win or loss.
+                did_not_play = not played_signal
+                minutes_status = "UNAVAILABLE"
+            else:
+                did_not_play = False
+                minutes_status = "PARSED"
+
+            if minutes_status == "UNAVAILABLE" and played_signal:
+                logger.warning(
+                    "Could not parse minutes for %r (raw %r) but the box score "
+                    "records stats — grading from the stat line, not voiding.",
+                    name, stats.get("minutes"),
+                )
 
             # Two players in one game can share a full name. Silently keeping
             # the last would let settlement grade one player's prop against
@@ -200,6 +243,7 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "team_tricode": team_tricode,
                 "is_home": side == "homeTeam",
                 "minutes_played": minutes,
+                "minutes_status": minutes_status,
                 "did_not_play": did_not_play,
                 "not_playing_reason": dnp_reason,
                 # CDN field names, verbatim

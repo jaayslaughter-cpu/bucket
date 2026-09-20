@@ -7,6 +7,7 @@ like a slightly different metric rather than an error.
 
 from __future__ import annotations
 
+import argparse
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -401,11 +402,89 @@ def test_duplicate_player_names_are_marked_ambiguous_not_overwritten():
         assert stats["Chris Johnson"]["ambiguous_name"] is True
 
 
+def test_unparseable_minutes_does_not_become_a_did_not_play():
+    """A parser break voided players the box score shows played.
+
+    `minutes in (None, 0.0)` treated a failed parse as a DNP, so the prop
+    was voided with the note "player did not play" and dropped out of W-L
+    and ROI. A CDN format change would have read as a shrinking sample
+    rather than an error.
+    """
+    from src.settlement.boxscore_fetcher import extract_player_stats
+
+    def _player(pid, name, minutes, points, **extra):
+        return {
+            "personId": pid, "nameI": name, "firstName": name.split()[0],
+            "familyName": name.split()[-1], "status": "ACTIVE",
+            "statistics": {"minutes": minutes, "points": points},
+            **extra,
+        }
+
+    payload = {"game": {"gameId": "0022500002", "homeTeam": {
+        "teamTricode": "LAL", "players": [
+            # Minutes in a format the parser does not know, but 30 real points.
+            _player("1", "Played Anyway", "36:14", 30),
+            # No minutes and no stats — DNP is both likelier and safe (VOID
+            # invents no result).
+            _player("2", "Truly Out", None, 0),
+            # The feed states it outright.
+            _player("3", "Declared Out", None, 0, notPlayingReason="INJURY"),
+            # Parsed, and genuinely zero.
+            _player("4", "Zero Minutes", "PT00M00.00S", 0),
+        ]}, "awayTeam": {"teamTricode": "BOS", "players": []}}}
+
+    stats = extract_player_stats(payload)
+
+    assert stats["Played Anyway"]["did_not_play"] is False
+    assert stats["Played Anyway"]["minutes_status"] == "UNAVAILABLE"
+    assert stats["Played Anyway"]["points"] == 30
+
+    assert stats["Truly Out"]["did_not_play"] is True
+    assert stats["Declared Out"]["did_not_play"] is True
+    assert stats["Declared Out"]["minutes_status"] == "DNP_DECLARED"
+    assert stats["Zero Minutes"]["did_not_play"] is True
+    assert stats["Zero Minutes"]["minutes_status"] == "PARSED"
+
+
+def test_a_player_with_unreadable_minutes_is_graded_from_the_stat_line():
+    """Minutes are only needed to detect a zero-minute void, not to grade."""
+    from src.settlement.evaluator import Outcome, settle_prop
+
+    result = settle_prop(
+        market="PTS", predicted_line=Decimal("25.5"), predicted_side="OVER",
+        player_stats={"points": 30}, odds=-110,
+        did_not_play=False, minutes_played=None,   # unreadable, not absent-from-game
+    )
+    assert result.outcome is Outcome.WIN
+
+
 def test_settlement_refuses_an_ambiguous_name():
     from src.settlement.runner import _match_player
 
     stats = {"Chris Johnson": {"player_name": "Chris Johnson", "ambiguous_name": True}}
     assert _match_player(stats, "Chris Johnson") is None
+
+
+def test_capture_time_is_not_defaulted_to_the_ingest_time():
+    """`captured_at_utc` defaulting to now() fabricated an observation time.
+
+    Line movement and CLV are measured against this field, so a backfilled
+    season would not have looked like missing data — it would have looked
+    like a line that never moved.
+    """
+    from src.db.models import GameMarketLine, PropLineSnapshot
+
+    for model in (PropLineSnapshot, GameMarketLine):
+        captured = model.__table__.columns["captured_at_utc"]
+        ingested = model.__table__.columns["ingested_at_utc"]
+
+        assert captured.nullable, f"{model.__name__}.captured_at_utc must allow NULL"
+        assert captured.default is None, (
+            f"{model.__name__}.captured_at_utc has a default — it would stamp "
+            "every backfilled row with an invented observation time"
+        )
+        assert not ingested.nullable
+        assert ingested.default is not None, "ingest time is always knowable"
 
 
 def test_projection_uniqueness_excludes_run_id():
@@ -419,6 +498,30 @@ def test_projection_uniqueness_excludes_run_id():
     columns = {c.name for c in uq.columns}
     assert "run_id" not in columns
     assert columns == {"nba_game_id", "player_name", "market"}
+
+
+def test_pra_is_a_real_sum_and_is_actually_labellable():
+    """PRA was advertised as a market but had no column, so labelling raised.
+
+    It is the exact sum of three real columns, so deriving it is not an
+    estimate. A NaN component must propagate: a partial sum would read as
+    a real total, which is the fabrication this project forbids.
+    """
+    from src.models.labels import POST_LAUNCH_MARKETS
+
+    panel = build_feature_matrix(make_demo_panel(n_players=4, n_games=20))
+    row = panel.iloc[50]
+    assert row["PRA"] == row["PTS"] + row["REB"] + row["AST"]
+    for col in ("PRA_L2", "PRA_L5", "PRA_L10", "PRA_SEASON"):
+        assert col in panel.columns
+
+    assert "PRA" in POST_LAUNCH_MARKETS
+    labelled = attach_research_over_labels(panel, stat="PRA")
+    assert labelled["over_hit"].notna().sum() > 0
+
+    partial = make_demo_panel(n_players=4, n_games=20)
+    partial.loc[partial.index[:5], "REB"] = np.nan
+    assert build_feature_matrix(partial)["PRA"].isna().sum() >= 5
 
 
 def test_stake_of_zero_is_not_promoted_to_one_unit():
@@ -547,6 +650,45 @@ def test_elo_rates_a_well_formed_game():
     assert len(out) == 2
     assert set(out["team"]) == {"LAL", "BOS"}
     assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
+
+
+def test_the_documented_settlement_commands_exist_and_dispatch():
+    """The README documented a CLI module that was never written.
+
+    `settle` and `summary` both existed as functions with no entry point,
+    so the documented command failed with ModuleNotFoundError.
+    """
+    from unittest import mock
+
+    from src.settlement import cli
+
+    documented = {"settle", "summary"}
+    subparsers = [
+        action for action in cli.build_parser()._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    assert subparsers, "no subcommands registered"
+    assert documented.issubset(set(subparsers[0].choices))
+
+    with mock.patch.object(cli, "settle_pending_props") as settle:
+        settle.return_value = mock.Mock(as_dict=lambda: {"props_graded": 0})
+        assert cli.main(["settle", "--dry-run"]) == 0
+    assert settle.call_args.kwargs["dry_run"] is True
+
+
+def test_settlement_cli_reports_failure_with_a_nonzero_exit():
+    """An empty slate and a broken pipeline must not return the same code."""
+    from unittest import mock
+
+    from src.settlement import cli
+
+    with mock.patch.object(cli, "settle_pending_props", side_effect=RuntimeError("db down")):
+        assert cli.main(["settle"]) == 1
+
+    # Nothing to grade is a completed run, not a failure.
+    with mock.patch.object(cli, "settle_pending_props") as settle:
+        settle.return_value = mock.Mock(as_dict=lambda: {"props_graded": 0})
+        assert cli.main(["settle"]) == 0
 
 
 def test_roi_aggregates_are_scoped_to_settled_rows():

@@ -132,6 +132,21 @@ player lines.
     into every market~~, ~~the ensemble's two probability APIs disagreed on
     whole-number lines~~.
 
+12b. Second review pass, all fixed and regression-tested (each test was
+    verified to fail against the unfixed code): ~~a date-only cutoff
+    rendered a day early in `data_cutoff_pt`~~, ~~Elo rated a team against
+    itself when two rows shared an abbreviation~~, ~~blank market rows were
+    marked VALID because NaN is not None~~, ~~audit row counts could exceed
+    the row total~~, ~~`is_valid_probability` accepted out-of-range
+    components that happened to sum to 1~~, ~~a zero stake was silently
+    re-staked at one unit~~, ~~the XGBoost adapter saved only its
+    classifier, so a reloaded model returned null projections and
+    different probabilities~~, ~~an unparseable minutes string was graded
+    as a DNP and voided~~, ~~PRA was advertised as a market but had no
+    column~~, ~~`captured_at_utc` defaulted to now(), fabricating an
+    observation time that CLV and line movement are measured against~~,
+    ~~the settlement README documented a CLI that did not exist~~.
+
 **Still open**
 
 13. **The classifiers ignore the line they are scored at.** `CatBoost`,
@@ -144,13 +159,13 @@ player lines.
     treat classifier probabilities as valid only at the line they were
     labelled against.
 
-14. **Orchestrator and database paths carry known defects** that cannot be
-    verified until player data lands: `main.py` scores the whole lookback
-    panel rather than the requested slate, `prop_results` migrations allow
-    duplicate and mis-aggregated rows, `session.py` does not percent-encode
-    credentials in a built URL, the projections upsert keys on a
-    per-execution UUID so re-runs accumulate, and box-score matching by
-    name collides when two players share one.
+14. **Orchestrator paths carry known defects** that cannot be verified
+    until player data lands: `main.py` scores the whole lookback panel
+    rather than the requested slate, and `predict-slate` does not actually
+    score. The database defects previously listed here are fixed and
+    regression-tested — credential percent-encoding, the projections
+    upsert keying on a per-execution UUID, the ROI aggregates counting
+    unsettled rows, and box-score name collisions.
 
 7. **The evaluation target is self-referential.** `over_hit` is defined
    against `RESEARCH_LINE = {stat}_L10` while the projection derives from
@@ -164,9 +179,15 @@ player lines.
    method on a clean 70/30 chronological split, then refits the deployed
    calibrator on all rows including the 30% used to select it.
 
-10. **PRA and combo props are not implemented.** They need joint
-    simulation of correlated components; adding independent marginals
-    would understate variance. Blocked on player data.
+10. **PRA is implemented; the other combos are not.** PRA is derived as
+    the exact sum of `PTS + REB + AST` before the rolling step, so it gets
+    the same shift-1 features as any other stat and its dispersion is
+    fitted on *realised* PRA residuals. Modelling the realised total
+    directly sidesteps the correlation problem rather than solving it —
+    no joint simulation is needed, because the components are never
+    combined as independent marginals. PR, PA and RA are not derived; they
+    would follow the same pattern. A NaN in any component propagates, so a
+    partial sum is never presented as a total.
 
 11. **No no-vig market comparison, CLV, or ROI** in the comparison path.
     Blocked on two-way odds with capture timestamps.
