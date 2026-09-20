@@ -1,0 +1,79 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Data — track only .gitkeep + small READMEs (CSVs stay local)
+data/**
+!data/.gitkeep
+!data/external/
+!data/external/databallr/
+!data/external/databallr/README.md
+!data/external/basketball_index/
+!data/external/basketball_index/.gitkeep
+!data/external/basketball_index/README.md
+!data/external/bigdataball/
+!data/external/bigdataball/.gitkeep
+data/external/bigdataball/*.xlsx
+data/cache/
+
+# Model comparison exports (keep README + gitkeep only)
+outputs/**
+!outputs/.gitkeep
+!outputs/README.md
+
+# CatBoost writes training logs beside the working directory
+catboost_info/
+
+# Cached player game logs (re-fetchable; keep the directory)
+data/external/player_logs/
+
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Local research dumps (keep out of git)
+*.html
+*_files/
+nba-data-*.json
+shotquality_*.csv
+*.zip
+*.docx
+_refs/
+
+# Local images / misc
+*.jpg
+*.jpeg
+*.png
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

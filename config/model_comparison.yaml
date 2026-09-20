@@ -1,0 +1,56 @@
+# PropIQ model comparison — RESEARCH_ONLY. No wagering.
+# Weights below are starting defaults, not claimed optima.
+
+random_seed: 42
+feature_schema_version: "fs_v1_shift1_l2"
+
+markets_launch:
+  - PTS
+  - REB
+  - AST
+
+markets_post_launch:
+  - FG3M
+  - STL
+  - BLK
+  - PRA
+
+ensemble_weights:
+  catboost: 0.50
+  xgboost: 0.30
+  distribution: 0.20
+
+catboost:
+  task_type: CPU          # GPU optional only — never default
+  iterations: 400
+  depth: 6
+  learning_rate: 0.05
+  early_stopping_rounds: 40
+  l2_leaf_reg: 3.0
+  loss_function: Logloss
+  eval_metric: Logloss
+  categorical_features:
+    - TEAM_ABBREVIATION
+    - OPPONENT_ABBREVIATION
+    - SEASON
+
+minutes_model:
+  iterations: 300
+  depth: 6
+  learning_rate: 0.05
+  early_stopping_rounds: 30
+  loss_function: RMSE
+  quantiles: [0.1, 0.5, 0.9]
+
+walk_forward:
+  min_train_rows: 500
+  validation_days: 30
+  step_days: 14
+
+calibration:
+  methods: [isotonic, sigmoid]
+  min_oof_rows: 200
+
+outputs_dir: outputs
+demo_outputs_dir: outputs/demo
+artifacts_dir: data/external/model_runs/comparison
