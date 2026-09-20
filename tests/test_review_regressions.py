@@ -719,6 +719,60 @@ def test_elo_rates_a_well_formed_game():
     assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
 
 
+def test_player_logs_have_a_writer_and_it_maps_the_panel_to_the_table():
+    """Nothing ever wrote `player_game_logs`, so the orchestrator's panel
+    was permanently empty and every run reported `success_no_data` — a
+    pipeline that looked healthy while doing nothing.
+    """
+    from unittest import mock
+
+    from src.db import repository
+
+    panel = pd.DataFrame({
+        "PLAYER_ID": [201939, 201939],
+        "PLAYER_NAME": ["Demo Player", "Demo Player"],
+        "GAME_ID": ["0022400001", "0022400002"],
+        "GAME_DATE": pd.to_datetime(["2025-01-10", "2025-01-12"]),
+        "SEASON": ["2024-25", "2024-25"],
+        "TEAM_ABBREVIATION": ["GSW", "GSW"],
+        "OPPONENT_ABBREVIATION": ["DEN", "LAL"],
+        "IS_HOME": [False, True],
+        "MIN": [32.5, 28.0],
+        "PTS": [30, 22], "REB": [5, 6], "AST": [7, 9],
+        "FG3M": [6, 3], "STL": [1, 2], "BLK": [0, 1], "TOV": [3, 2],
+    })
+
+    captured = {}
+
+    class _Session:
+        def execute(self, stmt):
+            captured["stmt"] = stmt
+
+    with mock.patch.object(repository, "session_scope") as scope, \
+         mock.patch.object(repository, "_lookup_neutral_site") as neutral:
+        scope.return_value.__enter__ = lambda self: _Session()
+        scope.return_value.__exit__ = lambda self, *a: False
+        neutral.side_effect = lambda work: pd.Series(False, index=work.index, dtype=bool)
+        written = repository.upsert_player_game_logs(panel)
+
+    assert written == 2
+    values = captured["stmt"].compile().params
+    # Ids are strings in the schema; a stringified int must not carry a ".0".
+    assert all("." not in str(v) for k, v in values.items() if "nba_player_id" in k)
+    assert captured["stmt"]._post_values_clause is not None, "not an upsert"
+
+
+def test_player_log_writer_refuses_an_incomplete_panel():
+    """A missing key column must raise, not write partial rows."""
+    from src.db import repository
+
+    with pytest.raises(ValueError, match="DATA_NOT_AVAILABLE"):
+        repository.upsert_player_game_logs(pd.DataFrame({"PLAYER_ID": [1], "GAME_ID": ["g"]}))
+
+    # An empty frame is not an error, but it is not a successful ingest either.
+    assert repository.upsert_player_game_logs(pd.DataFrame()) == 0
+
+
 def test_neutral_site_games_are_not_relabelled_as_home_games():
     """IS_HOME was rewritten to True for neutral rows to suppress the altitude tax.
 

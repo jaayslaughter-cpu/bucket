@@ -195,10 +195,10 @@ class PlayerGameLog(Base):
     team_abbr: Mapped[str | None] = mapped_column(String(8), index=True)
     opponent_abbr: Mapped[str | None] = mapped_column(String(8), index=True)
     is_home: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Must be propagated from team_game_stats: fatigue_logic applies the
-    # altitude tax on `IS_HOME == False`, which would wrongly tax BOTH
-    # teams at a neutral-site game in Denver/Utah. See
-    # repository.load_player_panel, which neutralises IS_HOME for these.
+    # Propagated from team_game_stats: fatigue_logic applies the altitude
+    # tax on `IS_HOME == False`, which would wrongly tax BOTH teams at a
+    # neutral-site game in Denver/Utah. The tax reads THIS column to exclude
+    # them; is_home stays as recorded, because it is a model feature.
     is_neutral_site: Mapped[bool] = mapped_column(Boolean, default=False)
 
     minutes: Mapped[float | None] = mapped_column(Float)

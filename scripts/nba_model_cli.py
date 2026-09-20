@@ -84,12 +84,20 @@ def ingest_logs(
     seasons: str = typer.Option("2025-26", "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
     season_type: str = typer.Option("Regular Season", "--season-type"),
     refresh: bool = typer.Option(False, "--refresh", help="Ignore the cache and re-fetch"),
+    persist: bool = typer.Option(
+        False, "--persist",
+        help="Also write the logs to Postgres, which is what main.py reads",
+    ),
     verbose: bool = False,
 ) -> None:
     """Pull player game logs from the NBA stats API and cache them locally.
 
     Needs network access to stats.nba.com. Run this before any training —
     the BigDataBall workbook is team-level and cannot supply player lines.
+
+    The local cache feeds this CLI's own commands. ``main.py`` reads the
+    database instead, so a run without ``--persist`` leaves the orchestrator
+    with an empty panel no matter how many rows land in the cache.
     """
     _setup_logging(verbose)
     from src.ingestion.boxscores import BoxScoreFetchError, BoxScoreLoadConfig, load_player_game_logs
@@ -105,19 +113,31 @@ def ingest_logs(
         typer.echo(f"Ingest failed: {exc}", err=True)
         raise SystemExit(2) from exc
 
-    typer.echo(
-        json.dumps(
-            {
-                "rows": int(len(panel)),
-                "players": int(panel["PLAYER_ID"].nunique()),
-                "games": int(panel["GAME_ID"].nunique()),
-                "first_game_date": str(panel["GAME_DATE"].min().date()),
-                "last_game_date": str(panel["GAME_DATE"].max().date()),
-                "cache_dir": str(config.cache_dir),
-            },
-            indent=2,
+    summary: dict[str, object] = {
+        "rows": int(len(panel)),
+        "players": int(panel["PLAYER_ID"].nunique()),
+        "games": int(panel["GAME_ID"].nunique()),
+        "first_game_date": str(panel["GAME_DATE"].min().date()),
+        "last_game_date": str(panel["GAME_DATE"].max().date()),
+        "cache_dir": str(config.cache_dir),
+    }
+
+    if persist:
+        from src.db.repository import upsert_player_game_logs
+
+        try:
+            summary["rows_written_to_db"] = upsert_player_game_logs(panel)
+        except Exception as exc:  # noqa: BLE001 — report, do not claim success
+            typer.echo(f"Cached to disk, but the database write failed: {exc}", err=True)
+            raise SystemExit(3) from exc
+    else:
+        summary["rows_written_to_db"] = 0
+        summary["note"] = (
+            "Cached locally only. main.py reads Postgres, so re-run with "
+            "--persist before the orchestrator will see these rows."
         )
-    )
+
+    typer.echo(json.dumps(summary, indent=2))
 
 
 @app.command("audit-data")

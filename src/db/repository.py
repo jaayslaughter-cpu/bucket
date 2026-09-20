@@ -63,6 +63,125 @@ def upsert_team_game_stats(df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def upsert_player_game_logs(df: pd.DataFrame) -> int:
+    """
+    Write the player panel to Postgres, keyed on (game, player).
+
+    WHY THIS EXISTS: ``load_player_panel`` reads ``player_game_logs``, but
+    nothing wrote to it. ``ingest-logs`` cached to Parquet and stopped, so
+    the orchestrator's panel was permanently empty and every run reported
+    ``success_no_data`` — a pipeline that looked healthy while doing
+    nothing.
+
+    Idempotent, so re-ingesting a season corrects rows rather than
+    duplicating them. Neutral-site status is not in the NBA stats payload;
+    it is filled from ``team_game_stats`` where that row exists and left
+    False otherwise, with a count logged, because the altitude rule reads
+    it and a wrong value there is a silently wrong feature.
+    """
+    if df.empty:
+        logger.warning("No player game logs to write — refusing to report a successful ingest")
+        return 0
+
+    required = {"PLAYER_ID", "GAME_ID", "GAME_DATE", "PLAYER_NAME", "SEASON"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"DATA_NOT_AVAILABLE: player logs missing {sorted(missing)}")
+
+    work = pd.DataFrame({
+        "nba_game_id": df["GAME_ID"].astype(str),
+        "nba_player_id": df["PLAYER_ID"].astype(str),
+        "player_name": df["PLAYER_NAME"].astype(str),
+        "game_date": pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.date,
+        "season": df["SEASON"].astype(str),
+        "team_abbr": df.get("TEAM_ABBREVIATION"),
+        "opponent_abbr": df.get("OPPONENT_ABBREVIATION"),
+        "is_home": df.get("IS_HOME", False),
+        "minutes": pd.to_numeric(df.get("MIN"), errors="coerce"),
+        "pts": pd.to_numeric(df.get("PTS"), errors="coerce"),
+        "reb": pd.to_numeric(df.get("REB"), errors="coerce"),
+        "ast": pd.to_numeric(df.get("AST"), errors="coerce"),
+        "fg3m": pd.to_numeric(df.get("FG3M"), errors="coerce"),
+        "stl": pd.to_numeric(df.get("STL"), errors="coerce"),
+        "blk": pd.to_numeric(df.get("BLK"), errors="coerce"),
+        "tov": pd.to_numeric(df.get("TOV"), errors="coerce"),
+        "source": "nba_stats_leaguegamelog",
+    })
+
+    undated = int(work["game_date"].isna().sum())
+    if undated:
+        logger.warning("Dropping %d player-log rows with an unparseable GAME_DATE", undated)
+        work = work.loc[work["game_date"].notna()]
+    if work.empty:
+        raise ValueError("DATA_NOT_AVAILABLE: no player-log rows survived date parsing")
+
+    # Integer columns in the model; a float like 30.0 would be rejected.
+    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov"):
+        work[col] = work[col].astype("Int64")
+
+    work["is_neutral_site"] = _lookup_neutral_site(work)
+
+    rows = _records(work)
+    with session_scope() as session:
+        stmt = pg_insert(PlayerGameLog).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["nba_game_id", "nba_player_id"],
+            set_={
+                c: stmt.excluded[c]
+                for c in (
+                    "player_name", "game_date", "season", "team_abbr",
+                    "opponent_abbr", "is_home", "is_neutral_site", "minutes",
+                    "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "source",
+                )
+            },
+        )
+        session.execute(stmt)
+    logger.info("Upserted %d player game-log rows", len(rows))
+    return len(rows)
+
+
+def _lookup_neutral_site(work: pd.DataFrame) -> pd.Series:
+    """Fill is_neutral_site from team_game_stats; False where unknown.
+
+    The NBA stats player endpoint does not report it. Defaulting to False
+    is the safe direction — it means the altitude tax still applies to a
+    genuine road trip — but the count is logged, because an unflagged
+    neutral game is a wrong feature, not a missing one.
+    """
+    default = pd.Series(False, index=work.index, dtype=bool)
+    try:
+        with session_scope() as session:
+            known = session.execute(
+                select(
+                    TeamGameStat.nba_game_id,
+                    TeamGameStat.team_abbr,
+                    TeamGameStat.is_neutral_site,
+                ).where(TeamGameStat.is_neutral_site.is_(True))
+            ).all()
+    except Exception as exc:  # noqa: BLE001 — an optional enrichment, never fatal
+        logger.warning("Could not read neutral-site flags (%s) — defaulting to False", exc)
+        return default
+
+    if not known:
+        logger.info("No neutral-site games recorded in team_game_stats — all rows False")
+        return default
+
+    neutral_keys = {(str(g), str(t)) for g, t, _ in known}
+    flags = pd.Series(
+        [
+            (str(g), str(t)) in neutral_keys
+            for g, t in zip(work["nba_game_id"], work["team_abbr"].astype(str))
+        ],
+        index=work.index,
+        dtype=bool,
+    )
+    logger.info(
+        "Marked %d of %d player-log rows as neutral-site from team_game_stats",
+        int(flags.sum()), len(flags),
+    )
+    return flags
+
+
 def upsert_market_lines(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
