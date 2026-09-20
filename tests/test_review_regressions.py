@@ -244,3 +244,35 @@ def test_records_converts_numeric_nan_to_none():
     records = _records(frame)
     assert records[1]["pts"] is None
     assert records[1]["name"] is None
+
+
+def test_ensemble_apis_agree_on_a_whole_number_line():
+    """Blending raw probabilities skipped push handling, so the two APIs
+    disagreed on exactly the lines where push mass is non-zero."""
+    pytest.importorskip("catboost")
+    from src.models.compare import build_components, load_comparison_config
+    from src.models.ensemble import EnsemblePropModel
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    cols = ["PTS_L5", "PTS_L10", "MIN_L5"]
+    components = build_components("PTS", cols, load_comparison_config(), xgb_feature_cols=cols)
+    fitted = {}
+    for name, model in components.items():
+        try:
+            model.fit(panel)
+            fitted[name] = model
+        except Exception:  # noqa: BLE001 — component availability varies
+            pass
+    if len(fitted) < 2:
+        pytest.skip("need two fitted components")
+
+    ensemble = EnsemblePropModel(fitted, weights={k: 1.0 for k in fitted}, target_market="PTS")
+    scoring = panel.head(20).copy()
+    scoring["WHOLE_LINE"] = scoring["PTS_L10"].round()  # whole numbers can push
+
+    via_series = ensemble.predict_probability_over(scoring, scoring["WHOLE_LINE"]).to_numpy()
+    via_rows = np.array(
+        [r.probability_over for r in ensemble.predict_rows(scoring, line_col="WHOLE_LINE")],
+        dtype=float,
+    )
+    np.testing.assert_allclose(via_series, via_rows, rtol=1e-9)

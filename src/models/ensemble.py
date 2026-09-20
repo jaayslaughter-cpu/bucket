@@ -99,17 +99,25 @@ class EnsemblePropModel:
         features: pd.DataFrame,
         line: float | pd.Series,
     ) -> pd.Series:
-        available: dict[str, pd.Series] = {}
-        for name, model in self.components.items():
-            try:
-                available[name] = model.predict_probability_over(features, line)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("ensemble skip %s: %s", name, exc)
-        weights, _ = renormalize_weights(self.weights, set(available))
-        blended = pd.Series(0.0, index=features.index, dtype=float)
-        for name, w in weights.items():
-            blended = blended + w * available[name].astype(float)
-        return blended
+        """P(over), consistent with ``predict_rows``.
+
+        Delegates to ``predict_rows`` rather than blending the components'
+        raw probabilities. Blending directly skips the push handling that
+        ``predict_rows`` applies, so the two APIs disagreed on exactly the
+        whole-number lines where push mass is non-zero — and which one a
+        caller happened to use decided the answer.
+        """
+        work = features
+        line_col = "_ENSEMBLE_LINE"
+        if isinstance(line, pd.Series):
+            work = features.assign(**{line_col: line})
+        else:
+            work = features.assign(**{line_col: float(line)})
+
+        rows = self.predict_rows(work, line_col=line_col)
+        return pd.Series(
+            [r.probability_over for r in rows], index=features.index, dtype="float64"
+        )
 
     def predict_rows(
         self,

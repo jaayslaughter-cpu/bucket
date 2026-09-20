@@ -305,7 +305,16 @@ def score_prob_over(
             )
             return null
 
-        feature_cols = json.loads(meta_path.read_text())["feature_cols"]
+        meta = json.loads(meta_path.read_text())
+        feature_cols = meta["feature_cols"]
+        scored_market = meta.get("target_market")
+        if not scored_market:
+            logger.warning(
+                "P(Over) skipped: %s has no target_market, so there is no way to tell "
+                "which market these probabilities belong to.",
+                meta_path,
+            )
+            return null
         missing = [c for c in feature_cols if c not in features.columns]
         if missing:
             logger.warning("P(Over) skipped: feature matrix missing trained columns: %s", missing[:10])
@@ -317,8 +326,13 @@ def score_prob_over(
         pipeline.model = booster
 
         probs = pipeline.predict_proba_over(features)
-        logger.info("P(Over) scored for %d rows (mean %.4f)", len(probs), float(pd.Series(probs).mean()))
-        return pd.Series(probs, index=features.index)
+        logger.info(
+            "P(Over) scored for %d rows (mean %.4f) for market %s",
+            len(probs), float(pd.Series(probs).mean()), scored_market,
+        )
+        scored = pd.Series(probs, index=features.index)
+        scored.attrs["target_market"] = scored_market
+        return scored
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("P(Over) skipped: %s", exc)
@@ -428,7 +442,19 @@ def assemble_projections(
     mis-joining one player's line onto another's projection. Unmatched
     rows keep LINE = None, which is honest — no line was verified for
     that projection.
+
+    PROB_OVER is written ONLY for the market the scoring model was trained
+    for, taken from its artifact metadata. Copying one model's probability
+    into every market frame published a points model's P(Over) as the
+    rebound, assist and threes probability too.
     """
+    scored_market = prob_over.attrs.get("target_market") if hasattr(prob_over, "attrs") else None
+    if scored_market is None and prob_over.notna().any():
+        logger.warning(
+            "P(Over) has no target market attached — leaving PROB_OVER null rather "
+            "than attributing one market's probabilities to all of them."
+        )
+
     frames = []
     for stat in stats:
         base_col, l2_col = f"{stat}_BASELINE", f"{stat}_L2"
@@ -445,7 +471,11 @@ def assemble_projections(
             "FINAL_PROJECTION": features[l2_col],   # already fatigue-adjusted
             "FATIGUE_MULTIPLIER": features[FATIGUE_COL],
             "FATIGUE_NOTES": _fatigue_notes(features),
-            "PROB_OVER": prob_over.values,
+            "PROB_OVER": (
+                prob_over.values
+                if scored_market == stat
+                else [None] * len(features)
+            ),
             "MARKET_STATUS": ev_verdict["status"],
         }))
 
