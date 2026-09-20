@@ -1,0 +1,31 @@
+# PLACEHOLDER — replace with your real master guideline file.
+#
+# This file does not exist in the repo yet; main.py's load_master_guideline()
+# looks for config/master_guideline_props.yaml (override via the
+# PROPIQ_MASTER_GUIDELINE env var). When absent, the pipeline logs a
+# warning and falls back to config.json's pickem.approved_sources.
+#
+# The shape below is a GUESS at what a props master guideline might
+# contain — adjust it to match your actual file, then update
+# ingest_prop_lines() in main.py to read whatever keys you really use.
+
+approved_prop_sources:
+  - underdog
+  - prizepicks
+  - sleeper
+
+# Which file/source wins when two sources disagree on the same player+market
+source_precedence:
+  - underdog
+  - prizepicks
+  - sleeper
+
+markets:
+  - PTS
+  - REB
+  - AST
+  - PRA
+  - FG3M
+
+freshness:
+  max_snapshot_age_minutes: 120
