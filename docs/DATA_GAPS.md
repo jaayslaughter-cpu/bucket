@@ -183,8 +183,16 @@ player lines.
    the same rolling history. Brier and log loss measure "is recent form
    above medium-term form", not prop skill. Only real prop lines fix this.
 
-8. **The minutes model is orphaned.** `MinutesModel` is built but never
-   used by `compare.py`, and is the only model with no `save()`/`load()`.
+8. **The minutes model is trained but not consumed.** `MinutesModel` now
+   has `save()`/`load()` (mean head plus every quantile head, refusing a
+   partial artifact rather than silently narrowing the interval), and
+   `train-minutes` writes the artifact instead of discarding it.
+
+   It is still not consumed by `compare.py` or the orchestrator, and that
+   is deliberate rather than pending: feeding projected minutes into the
+   stat projections changes every number the pipeline produces. That is a
+   modelling decision, not a wiring fix, and it wants real player data to
+   evaluate against before it is made.
 
 9. **Calibrator selection leak (minor).** `choose_calibrator()` selects a
    method on a clean 70/30 chronological split, then refits the deployed

@@ -246,6 +246,60 @@ def test_dispersion_round_trip_keeps_full_precision():
     assert CountDispersion.from_dict(None) is None
 
 
+def test_minutes_model_round_trips_every_head(tmp_path):
+    """train-minutes fitted four boosters and discarded all of them.
+
+    MinutesModel was the only model in the project with no save/load, so
+    the command reported success and left nothing behind.
+    """
+    pytest.importorskip("catboost")
+    from src.models.minutes_model import MinutesModel
+
+    panel = build_feature_matrix(make_demo_panel(n_players=6, n_games=30))
+    train = panel.dropna(subset=["MIN_L5", "MIN_L10"])
+    model = MinutesModel(hyperparameters={"iterations": 30})
+    model.fit(train)
+
+    scoring = train.head(10)
+    before_mean = model.predict_mean(scoring).to_numpy()
+    before_q = model.predict_quantiles(scoring)
+
+    model.save(tmp_path / "minutes")
+    reloaded = MinutesModel(hyperparameters={"iterations": 30}).load(tmp_path / "minutes")
+
+    assert sorted(reloaded.quantile_models) == sorted(model.quantile_models)
+    assert reloaded.feature_cols == model.feature_cols
+    assert reloaded.categorical_features == model.categorical_features
+
+    np.testing.assert_allclose(before_mean, reloaded.predict_mean(scoring).to_numpy(), rtol=1e-6)
+    after_q = reloaded.predict_quantiles(scoring)
+    for col in before_q.columns:
+        np.testing.assert_allclose(
+            before_q[col].to_numpy(dtype=float),
+            after_q[col].to_numpy(dtype=float),
+            rtol=1e-6,
+            err_msg=f"quantile {col} changed across the round trip",
+        )
+
+
+def test_minutes_model_refuses_a_partial_artifact(tmp_path):
+    """A missing quantile head would narrow every interval without saying so."""
+    pytest.importorskip("catboost")
+    from src.models.minutes_model import MinutesModel
+
+    panel = build_feature_matrix(make_demo_panel(n_players=6, n_games=30))
+    model = MinutesModel(hyperparameters={"iterations": 20})
+    model.fit(panel.dropna(subset=["MIN_L5", "MIN_L10"]))
+    model.save(tmp_path / "minutes")
+
+    (tmp_path / "minutes.q0.9.cbm").unlink()
+    with pytest.raises(FileNotFoundError, match="quantile head"):
+        MinutesModel(hyperparameters={"iterations": 20}).load(tmp_path / "minutes")
+
+    with pytest.raises(FileNotFoundError):
+        MinutesModel(hyperparameters={"iterations": 20}).load(tmp_path / "nonexistent")
+
+
 def test_distribution_load_refuses_a_missing_artifact():
     from src.models.distribution_adapter import DistributionPropModel
 

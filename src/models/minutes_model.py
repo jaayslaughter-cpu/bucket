@@ -233,6 +233,109 @@ class MinutesModel:
             out.append(w)
         return out
 
+    def save(self, path: Any) -> None:
+        """Persist the mean head, every quantile head, and the feature contract.
+
+        Without this, ``train-minutes`` fitted four boosters and discarded
+        all of them when the process exited — the command reported success
+        and left nothing behind. This was the only model in the project with
+        no save/load.
+        """
+        import json
+        from pathlib import Path
+
+        target = Path(path)
+        target = target.with_suffix("") if target.suffix else target
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.mean_model is None:
+            raise RuntimeError("Cannot save an unfitted MinutesModel")
+
+        self.mean_model.save_model(str(target.with_suffix(".mean.cbm")))
+
+        saved_quantiles = []
+        for q, model in self.quantile_models.items():
+            model.save_model(str(target.with_suffix(f".q{q}.cbm")))
+            saved_quantiles.append(q)
+
+        # Stale heads from a previous fit must not survive into this artifact,
+        # or a reload would mix two models' quantiles.
+        for old in target.parent.glob(f"{target.name}.q*.cbm"):
+            q_text = old.name.rsplit(".q", 1)[-1].removesuffix(".cbm")
+            try:
+                if float(q_text) not in saved_quantiles:
+                    old.unlink()
+            except ValueError:  # not one of ours
+                continue
+
+        target.with_suffix(".meta.json").write_text(
+            json.dumps(
+                {
+                    "model_version": self.model_version,
+                    "feature_cols": self.feature_cols,
+                    "categorical_features": self.categorical_features,
+                    "quantiles": saved_quantiles,
+                    "hyperparameters": self.hyperparameters,
+                    "random_seed": self.random_seed,
+                    "train_row_count": self._meta.get("train_row_count"),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        logger.info("Saved minutes model to %s (%d quantile heads)", target, len(saved_quantiles))
+
+    def load(self, path: Any) -> "MinutesModel":
+        """Reload a saved minutes model. Refuses a missing or partial artifact."""
+        import json
+        from pathlib import Path
+
+        target = Path(path)
+        target = target.with_suffix("") if target.suffix else target
+        meta_path = target.with_suffix(".meta.json")
+        mean_path = target.with_suffix(".mean.cbm")
+
+        if not meta_path.exists() or not mean_path.exists():
+            raise FileNotFoundError(
+                f"No minutes-model artifact at {target} — train and save before "
+                "scoring; this will not substitute an unfitted model."
+            )
+
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.model_version = meta.get("model_version", self.model_version)
+        self.feature_cols = list(meta["feature_cols"])
+        self.categorical_features = list(meta.get("categorical_features") or [])
+        self.hyperparameters = dict(meta.get("hyperparameters") or self.hyperparameters)
+        self.random_seed = meta.get("random_seed", self.random_seed)
+        self._meta = {
+            "train_row_count": meta.get("train_row_count"),
+            "feature_cols": self.feature_cols,
+        }
+
+        self.mean_model = CatBoostRegressor()
+        self.mean_model.load_model(str(mean_path))
+
+        self.quantile_models = {}
+        missing = []
+        for q in meta.get("quantiles") or []:
+            q_path = target.with_suffix(f".q{q}.cbm")
+            if not q_path.exists():
+                missing.append(q)
+                continue
+            head = CatBoostRegressor()
+            head.load_model(str(q_path))
+            self.quantile_models[float(q)] = head
+        if missing:
+            # Silently returning fewer quantiles would narrow every published
+            # interval without saying so.
+            raise FileNotFoundError(
+                f"Minutes artifact at {target} is missing quantile head(s) {missing}. "
+                "Re-save rather than scoring with a narrower interval than was fitted."
+            )
+        self.quantiles = sorted(self.quantile_models)
+        logger.info("Loaded minutes model from %s (%d quantile heads)", target, len(self.quantile_models))
+        return self
+
     def get_model_metadata(self) -> ModelMetadata:
         return ModelMetadata(
             model_name=self.model_name,

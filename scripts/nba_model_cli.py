@@ -199,19 +199,39 @@ def train_minutes(
     season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
-    """Train minutes CatBoost on chronological window."""
+    """Train minutes CatBoost on chronological window and save the artifact."""
     _setup_logging(verbose)
     import pandas as pd
 
+    from src.models.compare import load_comparison_config
     from src.models.minutes_model import MinutesModel
 
-    panel, _ = _load_real_or_demo(demo, seasons, season_type)
+    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
     d = panel.copy()
     d["GAME_DATE"] = pd.to_datetime(d["GAME_DATE"])
     train = d[(d["GAME_DATE"] >= start_date) & (d["GAME_DATE"] <= end_date)]
+    if train.empty:
+        typer.echo(
+            f"No rows between {start_date} and {end_date} — nothing to train on.",
+            err=True,
+        )
+        raise SystemExit(2)
+
     model = MinutesModel()
     model.fit(train)
-    typer.echo(json.dumps(model.get_model_metadata().model_dump(), indent=2, default=str))
+
+    cfg = load_comparison_config()
+    art = Path(cfg.get("artifacts_dir", "data/external/model_runs/comparison"))
+    if is_demo:
+        art = art / "demo"
+    art.mkdir(parents=True, exist_ok=True)
+    # Previously the fitted boosters were reported and then discarded when
+    # the process exited, so the command "succeeded" and left nothing behind.
+    model.save(art / "minutes")
+
+    payload = model.get_model_metadata().model_dump()
+    payload["artifact"] = str(art / "minutes")
+    typer.echo(json.dumps(payload, indent=2, default=str))
 
 
 @app.command("train-stats")
