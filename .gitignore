@@ -43,6 +43,12 @@ outputs/**
 !outputs/.gitkeep
 !outputs/README.md
 
+# CatBoost writes training logs beside the working directory
+catboost_info/
+
+# Cached player game logs (re-fetchable; keep the directory)
+data/external/player_logs/
+
 *.parquet
 *.feather
 *.h5

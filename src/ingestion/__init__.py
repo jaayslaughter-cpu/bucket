@@ -7,8 +7,16 @@ missing module can never be mistaken for a silently empty data source.
 """
 
 from src.ingestion.bigdataball import load_bigdataball_workbook, load_team_map
+from src.ingestion.boxscores import (
+    BoxScoreFetchError,
+    BoxScoreLoadConfig,
+    load_player_game_logs,
+)
 
 __all__ = [
+    "BoxScoreFetchError",
+    "BoxScoreLoadConfig",
     "load_bigdataball_workbook",
+    "load_player_game_logs",
     "load_team_map",
 ]
