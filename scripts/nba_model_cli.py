@@ -168,6 +168,91 @@ def ingest_logs(
     typer.echo(json.dumps(summary, indent=2))
 
 
+@app.command("ingest-kaggle")
+def ingest_kaggle(
+    path: str = typer.Option(
+        None, "--path",
+        help="Local CSV/Parquet export already on disk (no network needed)",
+    ),
+    dataset: str = typer.Option(
+        "eoinamoore/historical-nba-data-and-player-box-scores", "--dataset",
+        help="Kaggle dataset ref, used only when --path is omitted",
+    ),
+    file_path: str = typer.Option(
+        None, "--file",
+        help="Which file inside the Kaggle dataset to load (required for --dataset)",
+    ),
+    describe: bool = typer.Option(
+        False, "--describe",
+        help="Report the discovered column mapping and exit without writing",
+    ),
+    persist: bool = typer.Option(
+        False, "--persist", help="Write the panel to Postgres (what main.py reads)"
+    ),
+    verbose: bool = False,
+) -> None:
+    """Load an NBA player box-score export and optionally persist it.
+
+    A second path to the player panel that does not depend on
+    stats.nba.com being reachable. Run with --describe first on any new
+    export: the column mapping is DISCOVERED, and you should see what was
+    recognised before trusting it.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.kaggle_nba import (
+        KaggleNbaError,
+        describe_schema,
+        load_from_kagglehub,
+        load_local_export,
+        normalize_player_box_scores,
+    )
+
+    try:
+        raw = (
+            load_local_export(path) if path
+            else load_from_kagglehub(dataset, file_path or "")
+        )
+    except KaggleNbaError as exc:
+        typer.echo(f"Ingest failed: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    report = describe_schema(raw)
+    if describe:
+        typer.echo(json.dumps(report.as_dict(), indent=2, default=str))
+        # An unusable export is a failure even in describe mode, so a
+        # scripted check cannot read "column not recognised" as success.
+        raise SystemExit(0 if report.usable else 3)
+
+    try:
+        panel = normalize_player_box_scores(raw, report)
+    except KaggleNbaError as exc:
+        typer.echo(f"Ingest failed: {exc}", err=True)
+        raise SystemExit(3) from exc
+
+    summary: dict[str, object] = {
+        "rows": int(len(panel)),
+        "players": int(panel["PLAYER_NAME"].nunique()),
+        "first_game_date": str(panel["GAME_DATE"].min().date()),
+        "last_game_date": str(panel["GAME_DATE"].max().date()),
+        "mapped_columns": report.mapped,
+        "missing_optional": report.missing_optional,
+    }
+
+    if persist:
+        from src.db.repository import upsert_player_game_logs
+
+        try:
+            summary["rows_written_to_db"] = upsert_player_game_logs(panel)
+        except Exception as exc:  # noqa: BLE001 — report, never claim success
+            typer.echo(f"Parsed the export, but the database write failed: {exc}", err=True)
+            raise SystemExit(4) from exc
+    else:
+        summary["rows_written_to_db"] = 0
+        summary["note"] = "Parsed only. Re-run with --persist to write to Postgres."
+
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
 @app.command("audit-data")
 def audit_data(
     demo: bool = typer.Option(False, help="Audit a DEMO panel only"),
