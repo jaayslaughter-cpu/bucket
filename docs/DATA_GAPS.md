@@ -6,18 +6,32 @@ what has to arrive before a model comparison means anything.
 Nothing in this file is a guess about your data. Every "MISSING" was
 verified by reading the code and opening the workbook.
 
-## 1. Missing modules
+## 1. Modules written to fill the gaps — read the provenance note
 
-These are imported by code in this repository but do not exist here. Until
-they land, `compare-models` and the `main.py` orchestrator cannot run.
+Five modules were imported by the packs but did not exist. They have now
+been **written fresh for this repository**. They are not recovered
+originals.
 
-| Module | Imported by | What its absence blocks |
-|---|---|---|
-| `src/features/builder.py` | `scripts/nba_model_cli.py`, `main.py`, tests | **Everything.** Provides `build_feature_matrix`, `assert_no_lookahead`, `attach_fatigue_column`, and the `{stat}_L2` / `{stat}_BASELINE` / `fatigue_multiplier` columns every model reads |
-| `src/models/labels.py` | `src/models/compare.py`, CLI | `attach_research_over_labels` and `default_feature_cols` — without them there is no `over_hit` target and no feature list |
-| `src/models/xgboost_pipeline.py` | `src/models/xgb_adapter.py`, `main.py` | The XGBoost baseline itself. **Do not let anyone regenerate this from scratch** — it is the thing the challenger is being compared against, and a reinvented copy would not be a fair baseline |
-| `src/quant/contracts.py` | `main.py` | `MarketContext` and `market_ev_gate`, the abstention gate that stops EV being computed without two-way odds |
-| `src/ingestion/boxscores.py` | `scripts/nba_model_cli.py` | `load_player_game_logs` — the real (non-demo) data path |
+| Module | Status |
+|---|---|
+| `src/features/builder.py` | New. Pregame-only rolling features, shift-1 discipline, `assert_no_lookahead` |
+| `src/features/fatigue_logic.py` | New. Schedule density + altitude. **Multipliers are unfitted heuristics** |
+| `src/models/labels.py` | New. `RESEARCH_LINE` / `over_hit`, pushes dropped not graded |
+| `src/models/xgboost_pipeline.py` | New. **Not your prior baseline** — see below |
+| `src/quant/contracts.py` | New. `MarketContext`, `market_ev_gate`, two-way de-vig |
+| `src/ingestion/boxscores.py` | New. Player game logs from the NBA stats API |
+
+**The XGBoost baseline is new code.** No earlier PropIQ baseline was
+available, so `xgboost_pipeline.py` was written from scratch. A comparison
+against it tells you which of two models written at the same time scored
+better on the same split. It says nothing about beating an incumbent
+production model, because there is no incumbent here. The file carries
+this warning in its own docstring.
+
+**The fatigue multipliers are guesses.** 0.97 for a back-to-back, 0.96 for
+a 3-in-4, 0.94 for a 4-in-5, 0.98 for away-at-altitude. They are
+conservative and documented, but nobody fitted them. Fitting them against
+real player logs is open work.
 
 ## 2. Missing data
 
@@ -46,45 +60,57 @@ player lines.
 | sportsbook prop line / odds / timestamp | **MISSING** | `prop_line_snapshots` is well-designed and empty. No two-way odds source is wired |
 | historical settlement | NEEDS VALIDATION | `src/settlement/` implements it correctly, but it needs player box scores first |
 
-## 3. Known defects in the merged code
+## 3. Defects found by inspection — status
 
-Found by inspection, not yet fixed. Listed so they are not mistaken for
-working behaviour.
+**Fixed**
 
-1. **All three models return the same prediction mean.** `XGBoostAdapter`,
-   `CatBoostPropPipeline`, and `DistributionPropModel` each return
-   `{market}_L2` from `predict_mean()`. MAE, RMSE, and mean bias are
-   therefore identical across models and cannot pick a winner. Neither
-   boosted model actually predicts a mean — both are pure classifiers.
+1. ~~All three models return the same prediction mean.~~ CatBoost and
+   XGBoost now each fit a **regression head** alongside the classifier.
+   MAE, RMSE and mean bias differ per model and can discriminate. Verified:
+   before the fix all four models reported byte-identical MAE.
 
-2. **The evaluation target is self-referential.** `over_hit` is defined
-   against `RESEARCH_LINE = {stat}_L10`, and the projection is
-   `{stat}_L2` — both derived from the same rolling history. Brier and log
-   loss currently measure "is his 2-game average above his 10-game
-   average", not prop skill. The code labels this honestly; it still means
-   no current metric is a real benchmark.
+2. ~~Silent feature fabrication.~~ `_soft_fill` is gone. Missing features
+   are dropped and logged; missing targets drop the row. Nothing is
+   zero-filled.
 
-3. **Silent feature fabrication.** `compare.py::_soft_fill()` creates any
-   missing feature column and fills it with `0.0`. A model can train on a
-   wholly invented column with no error raised.
+3. ~~Calibration is never called.~~ Wired in. Each model/market gets a
+   calibrator fitted on a **strictly earlier** window, chosen between
+   isotonic and sigmoid by held-out Brier.
 
-4. **Calibration is never called.** `src/models/prob_calibration.py` is
-   complete but nothing invokes it, so `probability_over_calibrated` is
-   always null in the exports.
+4. ~~Hardcoded dispersion.~~ The 1.35 variance multiplier is gone.
+   Dispersion is fitted from **out-of-fold** residuals and the family
+   (Poisson vs Negative Binomial) is selected by held-out log-likelihood.
+   In-sample residuals were tried first and were visibly too tight — every
+   boosted model collapsed to Poisson φ=1.0. Out-of-fold gives φ≈1.3–2.1.
 
-5. **The minutes model is orphaned.** `MinutesModel` is built but never
-   used by `compare.py`, and it is the only model with no `save()`/`load()`.
+5. ~~Cross-player rolling leakage.~~ Found by a test written for this
+   repo: applying `.rolling()` to a groupby-shifted Series rolls across
+   player boundaries, so a player's debut inherited the previous player's
+   last game. Both shift and window now happen inside one per-group call.
 
-6. **`MIN_SEASON` may leak.** If it is a full-season average it leaks the
-   future into every early-season row. Unverifiable until
-   `src/features/builder.py` arrives.
+6. ~~Duplicate push math.~~ `line_probs.py` is removed; its rule lived in
+   two places and would have drifted.
 
-7. **CatBoost train/serve skew.** `fit()` drops rows with NaN features;
-   `predict_probability_over()` fills them with `0.0`.
+**Still open**
 
-8. **Calibrator selection leak (minor).** `choose_calibrator()` selects a
+7. **The evaluation target is self-referential.** `over_hit` is defined
+   against `RESEARCH_LINE = {stat}_L10` while the projection derives from
+   the same rolling history. Brier and log loss measure "is recent form
+   above medium-term form", not prop skill. Only real prop lines fix this.
+
+8. **The minutes model is orphaned.** `MinutesModel` is built but never
+   used by `compare.py`, and is the only model with no `save()`/`load()`.
+
+9. **Calibrator selection leak (minor).** `choose_calibrator()` selects a
    method on a clean 70/30 chronological split, then refits the deployed
    calibrator on all rows including the 30% used to select it.
+
+10. **PRA and combo props are not implemented.** They need joint
+    simulation of correlated components; adding independent marginals
+    would understate variance. Blocked on player data.
+
+11. **No no-vig market comparison, CLV, or ROI** in the comparison path.
+    Blocked on two-way odds with capture timestamps.
 
 ## 4. Leakage traps to avoid when the data arrives
 
@@ -97,14 +123,16 @@ working behaviour.
 
 ## 5. What unblocks the most, fastest
 
-1. **Player game logs** for the 2025-26 season. This single item unblocks
-   every model. The workbook cannot provide it.
-2. **`src/features/builder.py` and `src/models/labels.py`**, so the
-   feature and target contracts are the real ones rather than reinvented.
-3. **`src/models/xgboost_pipeline.py`**, so the baseline is genuinely your
-   baseline.
-4. **Real prop lines with capture timestamps**, which is what turns
-   `RESEARCH_LINE` from a labeled proxy into an actual benchmark.
+1. **Player game logs.** Run `nba-model ingest-logs` (or
+   `load_player_game_logs()`) on a machine with network access to
+   `stats.nba.com`. One call per season. This single item unblocks every
+   model, and nothing else can substitute for it — the workbook is
+   team-level.
+2. **Real prop lines with capture timestamps.** This is what turns
+   `RESEARCH_LINE` from a labelled proxy into an actual benchmark, and is
+   a hard prerequisite for any claim about edge, CLV, or ROI.
+3. **Fitted fatigue multipliers**, replacing the heuristics in
+   `fatigue_logic.py`, once item 1 gives something to fit against.
 
-Items 1–3 are prerequisites for any honest comparison. Item 4 is a
-prerequisite for any claim about market edge, CLV, or ROI.
+Until item 1 lands, every number this repository produces comes from the
+synthetic demo panel and means nothing about real NBA performance.

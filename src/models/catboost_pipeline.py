@@ -11,20 +11,35 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.models.line_probs import classifier_over_under
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
+from src.models.residuals import (
+    CountDispersion,
+    fit_dispersion_out_of_fold,
+    over_under_push_from_dispersion,
+)
 
 logger = logging.getLogger(__name__)
 
 try:
-    from catboost import CatBoostClassifier, Pool
+    from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 except ImportError:  # pragma: no cover
     CatBoostClassifier = None  # type: ignore[misc, assignment]
+    CatBoostRegressor = None  # type: ignore[misc, assignment]
     Pool = None  # type: ignore[misc, assignment]
 
 
 class CatBoostPropPipeline:
-    """Binary P(Over) challenger. Does not replace XGBoost."""
+    """CatBoost challenger. Does not replace XGBoost.
+
+    Fits two heads on the same features:
+
+    - a **regressor** for the expected stat value, which is what MAE and
+      RMSE score, and what the count distribution is centred on;
+    - a **classifier** for P(over) at the labelled line.
+
+    Both are needed. Without the regressor the model has no opinion about
+    the stat itself and can only be compared on probability metrics.
+    """
 
     model_name = "catboost"
 
@@ -71,6 +86,8 @@ class CatBoostPropPipeline:
         self.hyperparameters = defaults
         self.random_seed = random_seed
         self.model: Any | None = None
+        self.mean_model: Any | None = None
+        self.dispersion: CountDispersion | None = None
         self._meta_extra: dict[str, Any] = {}
 
     def _prepare(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -118,11 +135,15 @@ class CatBoostPropPipeline:
             fit_kwargs["early_stopping_rounds"] = early
         self.model.fit(train_pool, **fit_kwargs)
 
+        self._fit_mean_head(train, validation_data)
+
         self._meta_extra = {
             "train_row_count": len(train),
             "validation_row_count": val_rows,
             "data_cutoff_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
+        if self.dispersion is not None:
+            self._meta_extra.update(self.dispersion.as_metadata())
         if "GAME_DATE" in train.columns:
             d = pd.to_datetime(train["GAME_DATE"])
             self._meta_extra["train_start_date"] = str(d.min().date())
@@ -136,18 +157,80 @@ class CatBoostPropPipeline:
         )
         return self
 
+    def _fit_mean_head(
+        self,
+        train: pd.DataFrame,
+        validation_data: pd.DataFrame | None,
+    ) -> None:
+        """Fit the regressor and estimate dispersion from its training residuals."""
+        target = self.target_market
+        if target not in train.columns:
+            logger.warning(
+                "catboost: realised %s column absent — no mean head, so MAE/RMSE "
+                "and the count distribution are unavailable for this market.",
+                target,
+            )
+            return
+
+        y = pd.to_numeric(train[target], errors="coerce")
+        fit_rows = train.loc[y.notna()]
+        y = y.loc[fit_rows.index]
+        if fit_rows.empty:
+            logger.warning("catboost: no labelled %s rows for the mean head", target)
+            return
+
+        params = {
+            k: v
+            for k, v in self.hyperparameters.items()
+            if k not in {"early_stopping_rounds", "loss_function", "eval_metric"}
+        }
+        params["loss_function"] = "RMSE"
+        cats = self.categorical_features or None
+        X = fit_rows[self.feature_cols]
+
+        def _train_predict(X_tr, y_tr, X_va):
+            fold = CatBoostRegressor(**params)
+            fold.fit(Pool(X_tr, y_tr, cat_features=cats))
+            return np.clip(fold.predict(X_va), 0, None)
+
+        # Dispersion comes from out-of-fold residuals on TRAINING rows only.
+        self.dispersion = fit_dispersion_out_of_fold(
+            _train_predict, X, y.to_numpy(), market=target
+        )
+
+        self.mean_model = CatBoostRegressor(**params)
+        self.mean_model.fit(Pool(X, y, cat_features=cats))
+
     def predict_mean(self, features: pd.DataFrame) -> pd.Series:
-        col = f"{self.target_market}_L2"
-        if col in features.columns:
-            return pd.to_numeric(features[col], errors="coerce")
-        return pd.Series([None] * len(features), index=features.index, dtype="object")
+        if self.mean_model is None:
+            logger.warning("catboost: mean head unfitted — returning nulls, not a fallback column")
+            return pd.Series([None] * len(features), index=features.index, dtype="object")
+        work = self._prepare(features)
+        for c in self.feature_cols:
+            if c not in self.categorical_features:
+                work[c] = work[c].fillna(0.0)
+        preds = np.clip(self.mean_model.predict(work[self.feature_cols]), 0, None)
+        return pd.Series(preds, index=features.index, dtype=float)
 
     def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
+        means = self.predict_mean(features)
+        if self.dispersion is None:
+            return pd.DataFrame(
+                {
+                    "prediction_mean": means,
+                    "prediction_std_or_dispersion": None,
+                    "method": "no_dispersion_fitted",
+                },
+                index=features.index,
+            )
+        std = means.apply(
+            lambda m: float(np.sqrt(self.dispersion.variance_for(m))) if pd.notna(m) else None
+        )
         return pd.DataFrame(
             {
-                "prediction_mean": self.predict_mean(features),
-                "prediction_std_or_dispersion": None,
-                "method": "classifier_no_count_distribution",
+                "prediction_mean": means,
+                "prediction_std_or_dispersion": std,
+                "method": self.dispersion.family,
             },
             index=features.index,
         )
@@ -174,11 +257,47 @@ class CatBoostPropPipeline:
         line_col: str = "RESEARCH_LINE",
     ) -> list[ModelPrediction]:
         probs = self.predict_probability_over(features, features[line_col])
-        means = self.predict_mean(features)
+        dist = self.predict_distribution(features)
+        means = dist["prediction_mean"]
+        stds = dist["prediction_std_or_dispersion"]
+
         out: list[ModelPrediction] = []
         for i, (_, row) in enumerate(features.iterrows()):
             line = row.get(line_col)
-            cu = classifier_over_under(float(probs.iloc[i]), float(line) if pd.notna(line) else float("nan"))
+            mean_val = means.iloc[i]
+            warnings: list[str] = []
+            extras: dict[str, Any] = {}
+
+            p_over = float(np.clip(probs.iloc[i], 1e-6, 1 - 1e-6))
+            p_push: float | None = None
+
+            # The classifier cannot represent a push. The fitted count
+            # distribution can, so take push mass from it and let the
+            # classifier split only the remaining probability.
+            if self.dispersion is not None and pd.notna(line) and pd.notna(mean_val):
+                d = over_under_push_from_dispersion(float(mean_val), float(line), self.dispersion)
+                extras["distribution_probabilities"] = {
+                    "probability_over": d.get("probability_over"),
+                    "probability_under": d.get("probability_under"),
+                    "probability_push": d.get("probability_push"),
+                    "distribution": d.get("distribution"),
+                }
+                if d.get("status") == "OK":
+                    p_push = float(d["probability_push"])
+            elif self.dispersion is None:
+                warnings.append("No fitted dispersion — push mass not modelled")
+
+            if p_push is None:
+                p_under = 1.0 - p_over
+                if pd.notna(line) and float(line) == int(float(line)):
+                    warnings.append(
+                        "Whole-number line with no push model; P(under) is 1 - P(over)"
+                    )
+            else:
+                remaining = 1.0 - p_push
+                p_under = remaining * (1.0 - p_over)
+                p_over = remaining * p_over
+
             out.append(
                 ModelPrediction(
                     model_name=self.model_name,
@@ -187,13 +306,15 @@ class CatBoostPropPipeline:
                     event_id=str(row.get("GAME_ID", "")),
                     player_id=str(row.get("PLAYER_ID", "")),
                     player_name=row.get("PLAYER_NAME"),
-                    prediction_mean=float(means.iloc[i]) if pd.notna(means.iloc[i]) else None,
+                    prediction_mean=float(mean_val) if pd.notna(mean_val) else None,
+                    prediction_std_or_dispersion=float(stds.iloc[i]) if pd.notna(stds.iloc[i]) else None,
                     prop_line=float(line) if pd.notna(line) else None,
-                    probability_over=cu.get("probability_over"),
-                    probability_under=cu.get("probability_under"),
-                    probability_push=cu.get("probability_push"),
+                    probability_over=round(p_over, 6),
+                    probability_under=round(p_under, 6),
+                    probability_push=None if p_push is None else round(p_push, 6),
                     feature_schema_version=self.feature_schema_version,
-                    warnings=list(cu.get("warnings") or []),
+                    warnings=warnings,
+                    extras=extras,
                 )
             )
         return out
@@ -205,6 +326,8 @@ class CatBoostPropPipeline:
             raise RuntimeError("Cannot save unfitted CatBoost model")
         model_path = path if path.suffix else path.with_suffix(".cbm")
         self.model.save_model(str(model_path))
+        if self.mean_model is not None:
+            self.mean_model.save_model(str(model_path.with_name(model_path.stem + ".mean.cbm")))
         meta = {
             "feature_cols": self.feature_cols,
             "categorical_features": self.categorical_features,
@@ -234,6 +357,26 @@ class CatBoostPropPipeline:
         self.hyperparameters = meta.get("hyperparameters", self.hyperparameters)
         self.model = CatBoostClassifier()
         self.model.load_model(str(model_path))
+
+        mean_path = model_path.with_name(model_path.stem + ".mean.cbm")
+        if mean_path.exists():
+            self.mean_model = CatBoostRegressor()
+            self.mean_model.load_model(str(mean_path))
+            if meta.get("dispersion_family"):
+                self.dispersion = CountDispersion(
+                    family=meta["dispersion_family"],
+                    phi=float(meta.get("dispersion_phi", 1.0)),
+                    n_train_rows=int(meta.get("dispersion_train_rows", 0)),
+                    selection_scores=meta.get("dispersion_selection") or {},
+                    fallback_reason=meta.get("dispersion_fallback_reason"),
+                )
+        else:
+            logger.warning(
+                "No mean head at %s — loaded classifier only, so this model has no "
+                "stat projection and no count distribution.",
+                mean_path,
+            )
+
         self._meta_extra = {k: v for k, v in meta.items() if k not in {"feature_cols", "hyperparameters"}}
         return self
 
@@ -251,7 +394,16 @@ class CatBoostPropPipeline:
             train_end_date=self._meta_extra.get("train_end_date"),
             feature_schema_version=self.feature_schema_version,
             random_seed=self.random_seed,
-            notes=["CatBoost challenger — CPU default; early stopping on chrono validation"],
+            notes=[
+                "CatBoost challenger — CPU default; early stopping on chrono validation",
+                "Two heads: RMSE regressor for the mean, Logloss classifier for P(over)",
+                (
+                    f"Dispersion {self.dispersion.family} phi={self.dispersion.phi:.3f} "
+                    f"fitted on {self.dispersion.n_train_rows} training rows"
+                    if self.dispersion
+                    else "No dispersion fitted"
+                ),
+            ],
         )
 
     def feature_importance_frame(self) -> pd.DataFrame:

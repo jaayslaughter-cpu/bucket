@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
 import requests
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from src.db.models import PropResult
 from src.db.session import session_scope
@@ -36,6 +36,7 @@ from src.settlement.evaluator import (
     compute_clv,
     settle_prop,
 )
+from src.utils.timezones import pacific_calendar_date
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,10 @@ def settle_pending_props(
     (e.g. a game id that never posts) doesn't get retried forever.
     """
     report = SettlementReport()
-    cutoff = date.today() - timedelta(days=max_game_age_days)
+    # Pacific calendar day, not the host's local date: an NBA slate that
+    # runs past midnight UTC is still the same Pacific game day, and a
+    # UTC-dated cutoff would drop the most recent night's props.
+    cutoff = pacific_calendar_date() - timedelta(days=max_game_age_days)
     http = session_http or requests.Session()
 
     with session_scope() as db:

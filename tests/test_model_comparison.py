@@ -2,36 +2,27 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from src.models.ensemble import renormalize_weights
 from src.models.exports import DETAIL_COLS, SUMMARY_COLS, write_comparison_exports
-from src.models.line_probs import classifier_over_under, discrete_over_under_push, is_whole_number_line
-from src.models.walk_forward import expanding_window_splits, fixed_cutoff_split, sort_by_game_date
+from src.models.residuals import CountDispersion, over_under_push_from_dispersion
+from src.models.walk_forward import expanding_window_splits, fixed_cutoff_split
+
+POISSON = CountDispersion(family="poisson", phi=1.0, n_train_rows=500, selection_scores={})
 
 
 def test_whole_number_push_and_half_line():
-    assert is_whole_number_line(25.0)
-    assert not is_whole_number_line(25.5)
-
-    whole = discrete_over_under_push(25.0, 25.0, family="poisson")
+    whole = over_under_push_from_dispersion(25.0, 25.0, POISSON)
     assert whole["status"] == "OK"
     assert whole["probability_push"] is not None and whole["probability_push"] > 0
     total = whole["probability_over"] + whole["probability_under"] + whole["probability_push"]
     assert total == pytest.approx(1.0, abs=1e-5)
 
-    half = discrete_over_under_push(25.0, 25.5, family="poisson")
+    half = over_under_push_from_dispersion(25.0, 25.5, POISSON)
     assert half["probability_push"] == 0.0
     assert half["probability_over"] + half["probability_under"] == pytest.approx(1.0, abs=1e-5)
-
-
-def test_classifier_under_complements_over():
-    res = classifier_over_under(0.62, 24.5)
-    assert res["probability_over"] == pytest.approx(0.62)
-    assert res["probability_under"] == pytest.approx(0.38)
-    assert res["probability_push"] is None
 
 
 def test_chronological_split_no_leakage():

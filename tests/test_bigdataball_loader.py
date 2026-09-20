@@ -17,6 +17,7 @@ import pytest
 
 from src.ingestion.bigdataball import load_bigdataball_workbook, load_team_map
 
+
 def _find_workbook() -> Path | None:
     """The download's filename suffix varies ('_1', '__1_', none), so glob."""
     root = Path(__file__).parent.parent / "data" / "external" / "bigdataball"

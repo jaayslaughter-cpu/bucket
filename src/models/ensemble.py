@@ -63,11 +63,31 @@ class EnsemblePropModel:
         return self
 
     def predict_mean(self, features: pd.DataFrame) -> pd.Series:
-        # Prefer CatBoost/XGB L2 mean via first available component
-        for name in ("catboost", "xgboost", "distribution"):
-            if name in self.components:
-                return self.components[name].predict_mean(features)
-        return pd.Series([None] * len(features), index=features.index, dtype="object")
+        """Weighted blend of component means, using the same weights as the
+        probabilities. Taking one component's mean would report a blended
+        probability next to an unblended projection."""
+        means: dict[str, pd.Series] = {}
+        for name, model in self.components.items():
+            try:
+                series = pd.to_numeric(model.predict_mean(features), errors="coerce")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ensemble mean skip %s: %s", name, exc)
+                continue
+            if series.notna().any():
+                means[name] = series
+
+        if not means:
+            return pd.Series([None] * len(features), index=features.index, dtype="object")
+
+        weights, _ = renormalize_weights(self.weights, set(means))
+        blended = pd.Series(0.0, index=features.index, dtype=float)
+        weight_used = pd.Series(0.0, index=features.index, dtype=float)
+        for name, w in weights.items():
+            valid = means[name].notna()
+            blended = blended.add((means[name] * w).where(valid, 0.0), fill_value=0.0)
+            weight_used = weight_used.add(pd.Series(w, index=features.index).where(valid, 0.0))
+        # Renormalize per row so rows where a component was null are not diluted.
+        return (blended / weight_used.replace(0.0, pd.NA)).astype(float)
 
     def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
         if "distribution" in self.components:
@@ -105,6 +125,7 @@ class EnsemblePropModel:
                 logger.warning("ensemble rows skip %s: %s", name, exc)
 
         weights, base_warnings = renormalize_weights(self.weights, set(component_rows))
+        blended_means = self.predict_mean(features)
         out: list[ModelPrediction] = []
         n = len(features)
         for i in range(n):
@@ -115,7 +136,8 @@ class EnsemblePropModel:
             push_known = True
             extras: dict[str, Any] = {"component_weights": weights, "component_probabilities": {}}
             warnings = list(base_warnings)
-            mean_val = None
+            raw_mean = blended_means.iloc[i]
+            mean_val = float(raw_mean) if pd.notna(raw_mean) else None
             for name, w in weights.items():
                 pred = component_rows[name][i]
                 extras["component_probabilities"][name] = {
@@ -133,8 +155,6 @@ class EnsemblePropModel:
                     push_known = False
                 else:
                     p_push += w * float(pred.probability_push)
-                if mean_val is None and pred.prediction_mean is not None:
-                    mean_val = pred.prediction_mean
                 warnings.extend(pred.warnings)
             if not push_known:
                 p_push_out = None

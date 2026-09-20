@@ -18,7 +18,6 @@ Design notes:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -36,7 +35,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def utcnow() -> datetime:

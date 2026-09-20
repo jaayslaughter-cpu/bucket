@@ -28,14 +28,24 @@ def load_comparison_config(path: Path | str = "config/model_comparison.yaml") ->
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
-def _soft_fill(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        if c not in out.columns:
-            out[c] = 0.0 if c != "RESEARCH_LINE" else np.nan
-        elif c in {"BBS_OUT_FLAG", "OPP_DEF_RATING_PROXY"} or c.startswith("OPP_"):
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    return out
+def resolve_feature_cols(df: pd.DataFrame, cols: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Keep only features the panel actually has.
+
+    An earlier version created any missing column and filled it with 0.0,
+    which let a model train on a wholly invented feature without raising.
+    A missing column is now dropped and reported, so the run is narrower
+    but honest.
+    """
+    present = [c for c in cols if c in df.columns]
+    absent = [c for c in cols if c not in df.columns]
+    if absent:
+        logger.warning(
+            "Dropping %d feature(s) not present in the panel: %s. They are NOT "
+            "zero-filled — a fabricated column would silently corrupt training.",
+            len(absent), absent,
+        )
+    return present, absent
 
 
 def prepare_market_panel(panel: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -122,6 +132,98 @@ def build_components(
     return components
 
 
+def fit_calibrator_from_earlier_data(
+    name: str,
+    market: str,
+    feature_cols: list[str],
+    xgb_cols: list[str],
+    cfg: dict[str, Any],
+    train: pd.DataFrame,
+    *,
+    calib_fraction: float = 0.3,
+) -> tuple[Any | None, dict[str, Any]]:
+    """
+    Fit a probability calibrator using only data earlier than the evaluation.
+
+    A calibrator fitted on the predictions it later corrects is worthless —
+    it learns the noise it is supposed to smooth. So the training period is
+    split chronologically: a fresh copy of the model is fitted on the
+    earlier part, asked to predict the later part, and the calibrator is
+    fitted on those genuinely out-of-sample probabilities. Validation rows
+    are never touched here.
+
+    Returns (calibrator_or_None, info) — info always explains a None.
+    """
+    from src.models.prob_calibration import choose_calibrator
+
+    min_rows = int((cfg.get("calibration") or {}).get("min_oof_rows", 200))
+    if len(train) < min_rows:
+        return None, {"reason": f"only {len(train)} training rows, need {min_rows}"}
+
+    ordered = train.sort_values("GAME_DATE") if "GAME_DATE" in train.columns else train
+    cut = int(len(ordered) * (1 - calib_fraction))
+    earlier, later = ordered.iloc[:cut], ordered.iloc[cut:]
+    if earlier.empty or later.empty:
+        return None, {"reason": "chronological calibration split produced an empty side"}
+
+    try:
+        components = build_components(market, feature_cols, cfg, xgb_feature_cols=xgb_cols)
+        if name == "ensemble":
+            # Rebuild the blend from components fitted on the earlier window
+            # only, so the calibrator never sees its own evaluation rows.
+            refit = {}
+            for comp_name, comp in components.items():
+                try:
+                    comp.fit(earlier, later)
+                    refit[comp_name] = comp
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("calibration re-fit skipped %s: %s", comp_name, exc)
+            if len(refit) < 2:
+                return None, {"reason": "fewer than two components re-fitted for the ensemble"}
+            ens_weights = cfg.get("ensemble_weights") or {}
+            fresh = EnsemblePropModel(
+                refit,
+                weights={k: ens_weights.get(k, 0.0) for k in refit},
+                target_market=market,
+            )
+        else:
+            fresh = components.get(name)
+            if fresh is None:
+                return None, {"reason": f"no component named {name} to re-fit"}
+            fresh.fit(earlier, later)
+        preds = fresh.predict_rows(later, line_col="RESEARCH_LINE")
+    except Exception as exc:  # noqa: BLE001
+        return None, {"reason": f"calibration re-fit failed: {exc}"}
+
+    p = np.array([x.probability_over if x.probability_over is not None else np.nan for x in preds])
+    y = later["over_hit"].astype(float).to_numpy()
+    ok = np.isfinite(p) & np.isfinite(y)
+    if int(ok.sum()) < 60:
+        return None, {"reason": f"only {int(ok.sum())} usable out-of-sample rows"}
+
+    try:
+        calibrator, scores = choose_calibrator(y[ok], p[ok])
+    except ValueError as exc:
+        return None, {"reason": str(exc)}
+
+    info = {
+        "method": calibrator.method,
+        "n_rows": int(ok.sum()),
+        "scores": scores,
+        "fit_start_date": str(pd.to_datetime(later["GAME_DATE"]).min().date())
+        if "GAME_DATE" in later.columns
+        else None,
+        "fit_end_date": str(pd.to_datetime(later["GAME_DATE"]).max().date())
+        if "GAME_DATE" in later.columns
+        else None,
+    }
+    logger.info(
+        "calibrator %s/%s: method=%s rows=%d window=%s..%s",
+        market, name, info["method"], info["n_rows"], info["fit_start_date"], info["fit_end_date"],
+    )
+    return calibrator, info
+
+
 def compare_models_on_panel(
     panel: pd.DataFrame,
     *,
@@ -141,17 +243,27 @@ def compare_models_on_panel(
     detail_rows: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
     calib_rows: list[dict[str, Any]] = []
+    calibration_meta: dict[tuple[str, str], dict[str, Any]] = {}
     winners: dict[str, dict[str, Any]] = {}
 
     for market in markets:
         work = prepare_market_panel(panel, market)
-        xgb_cols = list(default_feature_cols(market))  # type: ignore[arg-type]
+        xgb_cols, dropped = resolve_feature_cols(work, list(default_feature_cols(market)))  # type: ignore[arg-type]
+        if not xgb_cols:
+            logger.error("Market %s has none of its expected features — skipping.", market)
+            continue
         feature_cols = list(xgb_cols)
         # Add categoricals for CatBoost only (XGBoost stays numeric-only)
         for c in ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"):
             if c in work.columns and c not in feature_cols:
                 feature_cols = list(feature_cols) + [c]
-        work = _soft_fill(work, feature_cols)
+        # Drop rows with no usable label — never fill a target. The index is
+        # reset because fixed_cutoff_split sorts and resets internally, then
+        # returns positional labels that must line up with this frame.
+        work = work.loc[work["over_hit"].notna()].reset_index(drop=True)
+        if work.empty:
+            logger.error("Market %s has no labelled rows — skipping.", market)
+            continue
         split = fixed_cutoff_split(work, train_end=train_end, validation_end=validation_end)
         train = work.loc[split.train_idx]
         val = work.loc[split.validation_idx]
@@ -185,6 +297,31 @@ def compare_models_on_panel(
                 continue
             p_over = np.array([p.probability_over if p.probability_over is not None else np.nan for p in preds], dtype=float)
             means = np.array([p.prediction_mean if p.prediction_mean is not None else np.nan for p in preds], dtype=float)
+
+            # Calibrate using only data earlier than this evaluation window.
+            calibrator, calib_info = fit_calibrator_from_earlier_data(
+                name, market, feature_cols, xgb_cols, cfg, train
+            )
+            p_cal = np.full_like(p_over, np.nan)
+            if calibrator is not None:
+                usable = np.isfinite(p_over)
+                if usable.any():
+                    p_cal[usable] = calibrator.transform(p_over[usable])
+                for pred, value in zip(preds, p_cal):
+                    if np.isfinite(value):
+                        pred.probability_over_calibrated = round(float(value), 6)
+                        pred.probability_under_calibrated = round(
+                            float(1.0 - value - (pred.probability_push or 0.0)), 6
+                        )
+                calibration_meta[(market, name)] = calib_info
+            else:
+                logger.info(
+                    "calibration skipped market=%s model=%s: %s",
+                    market, name, calib_info.get("reason"),
+                )
+                for pred in preds:
+                    pred.warnings.append(f"Uncalibrated: {calib_info.get('reason')}")
+
             bin_s = score_binary(y_true, p_over)
             mean_s = score_mean(actual, means)
             row = {
@@ -287,5 +424,6 @@ def compare_models_on_panel(
         "predictions": detail_rows,
         "feature_importance": importance_rows,
         "calibration": calib_rows,
+        "calibration_meta": {f"{m}|{n}": v for (m, n), v in calibration_meta.items()},
         "winners": winners,
     }

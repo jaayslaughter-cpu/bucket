@@ -70,11 +70,19 @@ def audit_player_panel(df: pd.DataFrame, *, dataset_name: str = "player_panel") 
     }
 
 
-def make_demo_panel(n_players: int = 8, n_games: int = 40, seed: int = 42) -> pd.DataFrame:
+def make_demo_panel(n_players: int = 24, n_games: int = 70, seed: int = 42) -> pd.DataFrame:
     """
     DEMO ONLY synthetic panel for wiring tests.
 
-    Clearly tagged; must never be mixed into real ``outputs/`` without demo flag.
+    Clearly tagged; must never be mixed into real ``outputs/`` without the
+    demo flag. Sized so a month-long validation window holds enough rows to
+    exercise calibration binning — a panel too small to calibrate would
+    leave that code path unverified.
+
+    The generator draws each stat independently from a Poisson whose mean
+    scales with minutes. Real NBA stats are correlated and overdispersed,
+    so demo metrics say nothing about real performance. They only prove the
+    wiring runs.
     """
     import numpy as np
 

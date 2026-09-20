@@ -1,4 +1,13 @@
-"""Distribution-based P(Over) using QuantEngine families + explicit push handling."""
+"""Distribution baseline: rolling-average mean, data-fitted count spread.
+
+The deliberately simple reference model. It learns no feature weights —
+its mean is the player's own recent form (``{stat}_L2``) — so it shows
+what the boosted models have to beat to justify themselves.
+
+What it DOES fit is the spread. Dispersion comes from training residuals
+and the family (Poisson vs Negative Binomial) is chosen by held-out score,
+rather than being asserted per stat.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +16,18 @@ from typing import Any
 
 import pandas as pd
 
-from src.models.line_probs import discrete_over_under_push
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
+from src.models.residuals import (
+    CountDispersion,
+    fit_count_dispersion,
+    over_under_push_from_dispersion,
+)
 
 logger = logging.getLogger(__name__)
 
-_NB_STATS = {"FG3M", "3PM", "STL", "BLK"}
-
 
 class DistributionPropModel:
-    """Mean from ``{stat}_L2``; probabilities from Poisson / NegBin with push."""
+    """Mean from ``{stat}_L2``; spread fitted from training residuals."""
 
     model_name = "distribution"
 
@@ -30,14 +41,48 @@ class DistributionPropModel:
         self.target_market = target_market
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
-        self._fitted = True
+        self.dispersion: CountDispersion | None = None
+        self._fitted = False
 
     def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "DistributionPropModel":
+        """Estimate dispersion from training rows only. No feature weights are learned."""
+        stat = self.target_market
+        mean_col = self._mean_col()
+
+        if stat not in train_data.columns or mean_col not in train_data.columns:
+            logger.warning(
+                "distribution: need both %s and %s to fit dispersion — falling back to Poisson",
+                stat, mean_col,
+            )
+            self._fitted = True
+            return self
+
+        work = train_data
+        if "GAME_DATE" in work.columns:
+            work = work.sort_values("GAME_DATE")
+        actual = pd.to_numeric(work[stat], errors="coerce")
+        projected = pd.to_numeric(work[mean_col], errors="coerce")
+        self.dispersion = fit_count_dispersion(
+            actual.to_numpy(), projected.to_numpy(), market=stat
+        )
+        self._fitted = True
         logger.info(
-            "distribution model: no parameter fit (uses {stat}_L2 + discrete family); train_rows=%d",
-            len(train_data),
+            "distribution fitted %s: family=%s phi=%.3f on %d rows",
+            stat, self.dispersion.family, self.dispersion.phi, self.dispersion.n_train_rows,
         )
         return self
+
+    def _effective_dispersion(self) -> CountDispersion:
+        """Poisson is the honest default when nothing was fitted."""
+        if self.dispersion is not None:
+            return self.dispersion
+        return CountDispersion(
+            family="poisson",
+            phi=1.0,
+            n_train_rows=0,
+            selection_scores={},
+            fallback_reason="fit() was never called or lacked the columns to fit",
+        )
 
     def _mean_col(self) -> str:
         return f"{self.target_market}_L2"
@@ -50,16 +95,14 @@ class DistributionPropModel:
 
     def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
         means = self.predict_mean(features)
-        family = "negbin" if self.target_market in _NB_STATS else "poisson"
+        dispersion = self._effective_dispersion()
         return pd.DataFrame(
             {
                 "prediction_mean": means,
                 "prediction_std_or_dispersion": means.apply(
-                    lambda m: (float(m) * 1.35) ** 0.5
-                    if pd.notna(m) and family == "negbin"
-                    else (float(m) ** 0.5 if pd.notna(m) else None)
+                    lambda m: float(dispersion.variance_for(m)) ** 0.5 if pd.notna(m) else None
                 ),
-                "method": family,
+                "method": dispersion.family,
             },
             index=features.index,
         )
@@ -71,13 +114,13 @@ class DistributionPropModel:
     ) -> pd.Series:
         means = self.predict_mean(features)
         lines = line if isinstance(line, pd.Series) else pd.Series([line] * len(features), index=features.index)
-        family = "negbin" if self.target_market in _NB_STATS else "poisson"
+        dispersion = self._effective_dispersion()
         vals = []
         for m, ln in zip(means, lines):
-            res = discrete_over_under_push(
+            res = over_under_push_from_dispersion(
                 float(m) if pd.notna(m) else float("nan"),
                 float(ln) if pd.notna(ln) else float("nan"),
-                family=family,
+                dispersion,
             )
             vals.append(res.get("probability_over"))
         return pd.Series(vals, index=features.index)
@@ -89,19 +132,21 @@ class DistributionPropModel:
         line_col: str = "RESEARCH_LINE",
     ) -> list[ModelPrediction]:
         means = self.predict_mean(features)
-        family = "negbin" if self.target_market in _NB_STATS else "poisson"
+        dispersion = self._effective_dispersion()
         out: list[ModelPrediction] = []
         for i, (_, row) in enumerate(features.iterrows()):
             line = row.get(line_col)
             m = means.iloc[i]
-            res = discrete_over_under_push(
+            res = over_under_push_from_dispersion(
                 float(m) if pd.notna(m) else float("nan"),
                 float(line) if pd.notna(line) else float("nan"),
-                family=family,
+                dispersion,
             )
             warnings: list[str] = []
             if res.get("status") != "OK":
                 warnings.append(str(res.get("reason") or "distribution unavailable"))
+            if dispersion.fallback_reason:
+                warnings.append(f"Dispersion not fitted: {dispersion.fallback_reason}")
             out.append(
                 ModelPrediction(
                     model_name=self.model_name,
@@ -111,6 +156,7 @@ class DistributionPropModel:
                     player_id=str(row.get("PLAYER_ID", "")),
                     player_name=row.get("PLAYER_NAME"),
                     prediction_mean=float(m) if pd.notna(m) else None,
+                    prediction_std_or_dispersion=res.get("standard_deviation"),
                     prop_line=float(line) if pd.notna(line) else None,
                     probability_over=res.get("probability_over"),
                     probability_under=res.get("probability_under"),
@@ -136,8 +182,13 @@ class DistributionPropModel:
             feature_cols=[self._mean_col()],
             feature_schema_version=self.feature_schema_version,
             notes=[
-                "Uses leakage-safe {stat}_L2 mean",
-                "Poisson for PTS/REB/AST; NegBin for FG3M/STL/BLK",
-                "Push mass modeled on whole-number lines",
+                "Uses leakage-safe {stat}_L2 mean; learns no feature weights",
+                (
+                    f"Dispersion {self.dispersion.family} phi={self.dispersion.phi:.3f} "
+                    f"fitted on {self.dispersion.n_train_rows} training rows"
+                    if self.dispersion
+                    else "Dispersion not fitted — Poisson fallback"
+                ),
+                "Push mass modelled on whole-number lines",
             ],
         )

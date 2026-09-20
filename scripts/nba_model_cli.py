@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 
@@ -52,6 +50,47 @@ def _load_real_or_demo(demo: bool):
         raise SystemExit(2) from exc
 
 
+@app.command("ingest-logs")
+def ingest_logs(
+    seasons: str = typer.Option("2025-26", "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
+    season_type: str = typer.Option("Regular Season", "--season-type"),
+    refresh: bool = typer.Option(False, "--refresh", help="Ignore the cache and re-fetch"),
+    verbose: bool = False,
+) -> None:
+    """Pull player game logs from the NBA stats API and cache them locally.
+
+    Needs network access to stats.nba.com. Run this before any training —
+    the BigDataBall workbook is team-level and cannot supply player lines.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.boxscores import BoxScoreFetchError, BoxScoreLoadConfig, load_player_game_logs
+
+    config = BoxScoreLoadConfig(
+        seasons=tuple(s.strip() for s in seasons.split(",") if s.strip()),
+        season_type=season_type,
+        use_cache=not refresh,
+    )
+    try:
+        panel = load_player_game_logs(config)
+    except BoxScoreFetchError as exc:
+        typer.echo(f"Ingest failed: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    typer.echo(
+        json.dumps(
+            {
+                "rows": int(len(panel)),
+                "players": int(panel["PLAYER_ID"].nunique()),
+                "games": int(panel["GAME_ID"].nunique()),
+                "first_game_date": str(panel["GAME_DATE"].min().date()),
+                "last_game_date": str(panel["GAME_DATE"].max().date()),
+                "cache_dir": str(config.cache_dir),
+            },
+            indent=2,
+        )
+    )
+
+
 @app.command("audit-data")
 def audit_data(
     demo: bool = typer.Option(False, help="Audit a DEMO panel only"),
@@ -75,14 +114,13 @@ def train_minutes(
 ) -> None:
     """Train minutes CatBoost on chronological window."""
     _setup_logging(verbose)
+    import pandas as pd
+
     from src.models.minutes_model import MinutesModel
-    from src.models.walk_forward import fixed_cutoff_split
 
     panel, _ = _load_real_or_demo(demo)
-    split = fixed_cutoff_split(panel, train_end=end_date, validation_end=end_date)
-    # use start_date filter
     d = panel.copy()
-    d["GAME_DATE"] = __import__("pandas").to_datetime(d["GAME_DATE"])
+    d["GAME_DATE"] = pd.to_datetime(d["GAME_DATE"])
     train = d[(d["GAME_DATE"] >= start_date) & (d["GAME_DATE"] <= end_date)]
     model = MinutesModel()
     model.fit(train)
@@ -99,7 +137,12 @@ def train_stats(
 ) -> None:
     """Fit XGBoost + CatBoost adapters for one market (artifacts under model_runs)."""
     _setup_logging(verbose)
-    from src.models.compare import build_components, load_comparison_config, prepare_market_panel, _soft_fill
+    from src.models.compare import (
+        build_components,
+        load_comparison_config,
+        prepare_market_panel,
+        resolve_feature_cols,
+    )
     from src.models.labels import default_feature_cols
 
     market = market.upper()
@@ -109,11 +152,13 @@ def train_stats(
     panel, is_demo = _load_real_or_demo(demo)
     work = prepare_market_panel(panel, market)
     work = work[(work["GAME_DATE"] >= start_date) & (work["GAME_DATE"] <= end_date)]
-    cols = default_feature_cols(market)  # type: ignore[arg-type]
+    cols, _dropped = resolve_feature_cols(work, list(default_feature_cols(market)))  # type: ignore[arg-type]
+    if not cols:
+        typer.echo(f"No usable features for {market} in this panel", err=True)
+        raise SystemExit(2)
     for c in ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"):
         if c in work.columns and c not in cols:
             cols = list(cols) + [c]
-    work = _soft_fill(work, cols)
     cfg = load_comparison_config()
     comps = build_components(market, cols, cfg)
     art = Path(cfg.get("artifacts_dir", "data/external/model_runs/comparison"))
