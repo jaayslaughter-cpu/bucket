@@ -41,6 +41,38 @@ BASELINE_WEIGHTS = {"L5": 0.5, "L10": 0.3, "SEASON": 0.2}
 FEATURE_SCHEMA_VERSION = "fs_v1_shift1_l2"
 
 
+def _additive_feature_layers() -> list[tuple[str, object]]:
+    """
+    Optional feature layers, resolved at import time.
+
+    Imported lazily and individually so a module that is absent from this
+    repository simply does not contribute a layer. `scoring_efficiency`
+    is referenced by the wave-5a builder but was never delivered in any
+    pack, so it is expected to be missing here.
+    """
+    layers: list[tuple[str, object]] = []
+    for module_path, func_name in (
+        ("src.features.halflife", "attach_halflife_shrink_features"),
+        ("src.features.halflife", "attach_pra_component_rollups"),
+        ("src.features.hot_hand", "attach_hot_hand_features"),
+        ("src.features.teammate_cascade", "attach_teammate_cascade_stub"),
+        ("src.features.sports_ev_features", "attach_sports_ev_features"),
+        ("src.features.scoring_efficiency", "attach_box_ts_features"),
+    ):
+        try:
+            module = __import__(module_path, fromlist=[func_name])
+            layers.append((f"{module_path}.{func_name}", getattr(module, func_name)))
+        except (ImportError, AttributeError):
+            logger.info(
+                "Feature layer %s.%s not present in this repository — skipped.",
+                module_path, func_name,
+            )
+    return layers
+
+
+_ADDITIVE_FEATURE_LAYERS = _additive_feature_layers()
+
+
 class LookaheadError(AssertionError):
     """Raised when a feature row could see its own game or a later one."""
 
@@ -174,6 +206,25 @@ def build_feature_matrix(
         df[f"{stat}_L2"] = (
             df[f"{stat}_BASELINE"] * df["fatigue_multiplier"] * pace_adjustment
         )
+
+    # --- additive feature layers (waves 2, 4b, 5a) ------------------------
+    # Each of these ONLY adds columns; none rewrites the core L2/L5/L10/
+    # BASELINE set above. They run here, after the season baselines exist,
+    # because hot_hand measures recent form against {stat}_SEASON and would
+    # otherwise have nothing to compare to.
+    #
+    # A layer that fails is logged and skipped rather than taking the whole
+    # matrix down: these are enrichments, and losing one should narrow the
+    # feature set, not stop the pipeline. assert_no_lookahead still runs
+    # over whatever they produced.
+    for layer_name, attach in _ADDITIVE_FEATURE_LAYERS:
+        try:
+            df = attach(df)
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Feature layer %s skipped (%s) — its columns are absent, not "
+                "filled with a placeholder.", layer_name, exc,
+            )
 
     df["FEATURE_SCHEMA_VERSION"] = FEATURE_SCHEMA_VERSION
 
