@@ -26,13 +26,42 @@ def _setup_logging(verbose: bool = False) -> None:
     )
 
 
+def _load_team_games():
+    """Team-level results for Elo, from the licensed workbook when configured.
+
+    Returns None when unavailable — the builder then skips team-strength
+    features and says so, rather than inventing ratings.
+    """
+    import os
+
+    path = os.environ.get("BIGDATABALL_XLSX")
+    if not path or not Path(path).exists():
+        logger.info(
+            "BIGDATABALL_XLSX unset or missing — no team Elo features this run. "
+            "Point it at the licensed workbook to enable them."
+        )
+        return None
+    try:
+        from src.ingestion.bigdataball import load_bigdataball_workbook
+
+        team_games, _market = load_bigdataball_workbook(path)
+        logger.info("Loaded %d team-game rows for Elo from %s", len(team_games), path)
+        return team_games
+    except Exception as exc:  # noqa: BLE001 — degrade with a reason, never fake it
+        logger.warning("Could not load team games (%s) — proceeding without Elo", exc)
+        return None
+
+
 def _load_real_or_demo(demo: bool):
     from src.features.builder import build_feature_matrix
     from src.models.data_audit import make_demo_panel
 
+    team_games = _load_team_games()
+
     if demo:
         logger.warning("DEMO MODE — synthetic panel; do not treat metrics as real")
         raw = make_demo_panel()
+        # Real team ratings must never be joined onto synthetic players.
         return build_feature_matrix(raw), True
     try:
         from src.ingestion.boxscores import load_player_game_logs
@@ -40,7 +69,7 @@ def _load_real_or_demo(demo: bool):
         raw = load_player_game_logs()
         if raw is None or raw.empty:
             raise RuntimeError("empty player logs")
-        return build_feature_matrix(raw), False
+        return build_feature_matrix(raw, team_games=team_games), False
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Real panel unavailable (%s). Re-run with --demo for wiring tests, "

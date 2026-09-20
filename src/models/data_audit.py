@@ -96,6 +96,8 @@ def make_demo_panel(n_players: int = 24, n_games: int = 70, seed: int = 42) -> p
         for g in range(n_games):
             day = start + pd.Timedelta(days=g * 2 + (p % 2))
             opp = teams[(p + 3 + g) % len(teams)]
+            if opp == team:  # a team never plays itself
+                opp = teams[(p + 4 + g) % len(teams)]
             mins = float(rng.uniform(18, 36))
             pts = float(rng.poisson(mins * 0.45))
             reb = float(rng.poisson(mins * 0.15))

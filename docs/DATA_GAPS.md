@@ -16,6 +16,8 @@ originals.
 |---|---|
 | `src/features/builder.py` | New. Pregame-only rolling features, shift-1 discipline, `assert_no_lookahead` |
 | `src/features/fatigue_logic.py` | New. Schedule density + altitude. **Multipliers are unfitted heuristics** |
+| `src/features/schedule.py` | New. Team rest, travel miles, rest advantage, arena relocation history |
+| `src/features/team_strength.py` | New. Elo with margin-of-victory damping and offseason regression |
 | `src/models/labels.py` | New. `RESEARCH_LINE` / `over_hit`, pushes dropped not graded |
 | `src/models/xgboost_pipeline.py` | New. **Not your prior baseline** — see below |
 | `src/quant/contracts.py` | New. `MarketContext`, `market_ev_gate`, two-way de-vig |
@@ -90,6 +92,16 @@ player lines.
 
 6. ~~Duplicate push math.~~ `line_probs.py` is removed; its rule lived in
    two places and would have drifted.
+
+7. ~~No opponent-strength feature.~~ `team_strength.py` adds pre-game Elo.
+   Validated against the real 2025-26 workbook: Brier 0.212 and log loss
+   0.613 against 0.25 / 0.693 baselines, 67.2% accuracy on 2,116
+   team-games. Only `elo_pre` is exposed; `elo_post` never reaches the
+   feature matrix.
+
+8. ~~Rest computed across season boundaries.~~ `fatigue_logic` grouped by
+   player alone, so a player's first game of a season read as roughly 150
+   days of rest. Now partitioned by season.
 
 **Still open**
 

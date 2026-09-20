@@ -43,6 +43,7 @@ def default_feature_cols(market: str) -> list[str]:
     """
     market = market.upper()
     return [
+        # Own production history
         f"{market}_L2",
         f"{market}_L5",
         f"{market}_L10",
@@ -51,9 +52,22 @@ def default_feature_cols(market: str) -> list[str]:
         "MIN_L5",
         "MIN_L10",
         "MIN_SEASON",
+        # Player-level fatigue
         "fatigue_multiplier",
-        "PACE_MULTIPLIER",
         "days_rest",
+        # Team schedule context
+        "TEAM_DAYS_REST_CAPPED",
+        "REST_ADVANTAGE",
+        "IS_B2B_SECOND",
+        "IS_B2B_FIRST",
+        "TRAVEL_MILES",
+        # Opponent strength
+        "TEAM_ELO_PRE",
+        "OPP_ELO_PRE",
+        "ELO_DIFF",
+        "ELO_WIN_PROB",
+        # Situation
+        "PACE_MULTIPLIER",
         "IS_HOME",
         "CAREER_GAMES_PRIOR",
     ]

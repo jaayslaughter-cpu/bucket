@@ -26,6 +26,8 @@ import logging
 import pandas as pd
 
 from src.features.fatigue_logic import attach_fatigue_column
+from src.features.schedule import attach_team_schedule_features
+from src.features.team_strength import attach_elo_features, compute_team_elo
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +66,22 @@ def _expanding_prior_mean(series: pd.Series) -> pd.Series:
     return series.shift(1).expanding().mean()
 
 
-def build_feature_matrix(player_panel: pd.DataFrame) -> pd.DataFrame:
+def build_feature_matrix(
+    player_panel: pd.DataFrame,
+    *,
+    team_games: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix from a raw player game-log panel.
 
     Expects at minimum PLAYER_ID, GAME_DATE, and one or more of
     ``ROLLING_STATS``. Missing stats are skipped rather than invented.
+
+    ``team_games`` is an optional team-level frame carrying final scores
+    (the BigDataBall ``team_game_stats`` output, or anything with game id,
+    date, team and points). When supplied, pre-game Elo ratings are joined
+    on; when absent, the team-strength columns are simply not created and
+    the run is narrower rather than silently filled.
     """
     if player_panel.empty:
         logger.warning("Empty player panel — returning it unchanged.")
@@ -107,6 +119,21 @@ def build_feature_matrix(player_panel: pd.DataFrame) -> pd.DataFrame:
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
 
     df = attach_fatigue_column(df)
+
+    if {"TEAM_ABBREVIATION", "GAME_ID"}.issubset(df.columns):
+        df = attach_team_schedule_features(df)
+    else:
+        logger.info("Team schedule features skipped: needs TEAM_ABBREVIATION and GAME_ID.")
+
+    if team_games is not None and not team_games.empty:
+        # Elo is computed over the full team history in date order, then
+        # joined by pre-game value only. elo_post never reaches the panel.
+        df = attach_elo_features(df, compute_team_elo(team_games))
+    else:
+        logger.info(
+            "Team Elo skipped: no team_games frame supplied, so no opponent-strength "
+            "features. Pass the BigDataBall team_game_stats frame to enable them."
+        )
 
     if "PACE_MULTIPLIER" not in df.columns:
         # No opponent pace joined yet. 1.0 is a neutral no-op, not an

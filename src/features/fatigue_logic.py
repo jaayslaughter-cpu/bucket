@@ -42,7 +42,18 @@ def assess_schedule_density(df: pd.DataFrame) -> pd.DataFrame:
     work["GAME_DATE"] = pd.to_datetime(work["GAME_DATE"])
     work = work.sort_values(["PLAYER_ID", "GAME_DATE"])
 
-    grouped = work.groupby("PLAYER_ID", sort=False)["GAME_DATE"]
+    # Partition by season. Grouping on player alone makes the first game
+    # after an offseason read as ~150 days of rest — true, but useless: it
+    # tells the model nothing about fatigue while swamping the within-season
+    # variation the feature exists to capture.
+    group_cols = ["PLAYER_ID", "SEASON"] if "SEASON" in work.columns else ["PLAYER_ID"]
+    if "SEASON" not in work.columns:
+        logger.warning(
+            "No SEASON column — rest is computed across season boundaries, so each "
+            "player's first game of a season will show an offseason-length gap."
+        )
+
+    grouped = work.groupby(group_cols, sort=False)["GAME_DATE"]
     prev_date = grouped.shift(1)
     work["days_rest"] = (work["GAME_DATE"] - prev_date).dt.days
 
