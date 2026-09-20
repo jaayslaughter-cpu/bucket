@@ -134,8 +134,25 @@ def test_ev_gate_requires_two_way_american_odds():
 
 
 def test_main_calls_the_ev_gate():
-    """v1 listed an EV stage it never actually invoked."""
+    """v1 listed an EV stage it never actually invoked.
+
+    Asserts on a real Call node, not on the substring. main.py's module
+    docstring mentions `market_ev_gate` twice while documenting this very
+    correction, so a substring check passes even with the executable call
+    deleted — the exact regression this test exists to catch would go
+    unnoticed. The sibling docstring-filtering test below makes the same
+    distinction.
+    """
+    import ast
+
     import main
 
-    source = inspect.getsource(main)
-    assert "market_ev_gate" in source, "main.py must actually call the EV gate"
+    tree = ast.parse(inspect.getsource(main))
+    called = {
+        node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert "market_ev_gate" in called, (
+        "main.py must actually CALL market_ev_gate, not merely mention it"
+    )

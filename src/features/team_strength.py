@@ -139,7 +139,10 @@ def compute_team_elo(
     for (_date, game_id), pair in work.sort_values(["game_date", "game_id"]).groupby(
         ["game_date", "game_id"], sort=True
     ):
-        if len(pair) != 2:
+        # Two rows is not enough: two rows carrying the SAME abbreviation
+        # would update one team against itself, moving its rating twice and
+        # emitting a self-opponent into the feature join.
+        if len(pair) != 2 or pair["team"].nunique() != 2:
             skipped += 1
             continue
 

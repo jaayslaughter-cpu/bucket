@@ -83,9 +83,20 @@ class XGBoostPropPipeline:
         missing = [c for c in self.feature_cols if c not in df.columns]
         if missing:
             raise ValueError(f"DATA_NOT_AVAILABLE: missing feature columns {missing}")
-        out = df[self.feature_cols].apply(pd.to_numeric, errors="coerce")
-        # XGBoost handles NaN natively via its default split direction, so
-        # leave them rather than imputing a value nobody chose.
+        raw = df[self.feature_cols]
+        out = raw.apply(pd.to_numeric, errors="coerce")
+        # A value that was present but failed to parse is a data fault, not a
+        # missing observation. Coercing it to NaN lets XGBoost score the row
+        # anyway and returns a confident probability built on a silently
+        # discarded value.
+        unparseable = raw.notna() & out.isna()
+        if unparseable.any().any():
+            bad = list(raw.columns[unparseable.any(axis=0)])
+            raise ValueError(
+                f"DATA_NOT_AVAILABLE: non-numeric values in feature column(s) {bad}"
+            )
+        # Genuine NaNs are left alone: XGBoost handles them natively via its
+        # default split direction, which beats imputing a value nobody chose.
         return out
 
     def fit(self, train_data: pd.DataFrame, target_col: str = "over_hit") -> "XGBoostPropPipeline":
@@ -109,6 +120,14 @@ class XGBoostPropPipeline:
             raise ValueError("DATA_NOT_AVAILABLE: no labelled rows to train on")
 
         X = self._matrix(work)
+        # astype(int) truncates rather than rejecting: a 0.5 becomes 0 and a
+        # probability-valued target would train as a silently altered label.
+        invalid = ~y_full.isin((0, 1))
+        if invalid.any():
+            raise ValueError(
+                f"DATA_NOT_AVAILABLE: target {target_col!r} must contain only 0 and 1, "
+                f"found {sorted(set(y_full[invalid].unique()))[:5]}"
+            )
         y = y_full.astype(int)
 
         if y.nunique() < 2:

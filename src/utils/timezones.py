@@ -23,12 +23,30 @@ def now_pacific() -> datetime:
     return datetime.now(DISPLAY_TZ)
 
 
-def to_utc(dt: datetime) -> datetime:
-    """Normalize any aware/naive datetime to timezone-aware UTC."""
+def to_utc(dt: datetime, *, assume: str = "utc") -> datetime:
+    """Normalize any aware/naive datetime to timezone-aware UTC.
+
+    ``assume`` decides what a NAIVE input means, and the caller must choose,
+    because the two readings differ by a calendar day at the boundary:
+    a date-only cutoff of 2025-02-01 read as UTC displays as
+    2025-01-31T16:00 Pacific — the previous day, which is what a reader
+    sees in `data_cutoff_pt`. Pass ``assume="pacific"`` for a value that
+    was a Pacific calendar date to begin with.
+    """
     if dt.tzinfo is None:
-        # Naive values are treated as already-UTC storage clocks.
+        if assume == "pacific":
+            return dt.replace(tzinfo=DISPLAY_TZ).astimezone(UTC)
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def pacific_midnight_utc(day: date) -> datetime:
+    """Start of a Pacific calendar day, as an aware UTC datetime.
+
+    Use this for slate dates and data cutoffs — anything that was a
+    calendar date rather than an instant.
+    """
+    return datetime(day.year, day.month, day.day, tzinfo=DISPLAY_TZ).astimezone(UTC)
 
 
 def to_pacific(dt: datetime) -> datetime:

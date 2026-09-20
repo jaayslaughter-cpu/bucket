@@ -135,11 +135,20 @@ def build_feature_matrix(
             "features. Pass the BigDataBall team_game_stats frame to enable them."
         )
 
-    if "PACE_MULTIPLIER" not in df.columns:
-        # No opponent pace joined yet. 1.0 is a neutral no-op, not an
-        # estimate — see docs/DATA_GAPS.md for what would populate it.
-        df["PACE_MULTIPLIER"] = 1.0
-        logger.info("PACE_MULTIPLIER absent — defaulting to neutral 1.0 (no pace effect).")
+    # PACE_MULTIPLIER is NOT materialized when absent. Writing 1.0 into the
+    # frame creates a column that looks measured, enters default_feature_cols,
+    # and gets trained on as though neutral pace had been observed — the same
+    # fabrication the zero-fill in compare.py was removed for. When no pace
+    # source is joined the column simply does not exist, resolve_feature_cols
+    # drops it with a warning, and the layer-2 adjustment below uses a scalar
+    # 1.0 that never reaches the feature matrix.
+    has_pace = "PACE_MULTIPLIER" in df.columns
+    pace_adjustment = df["PACE_MULTIPLIER"] if has_pace else 1.0
+    if not has_pace:
+        logger.info(
+            "PACE_MULTIPLIER absent — layer 2 applies no pace adjustment and the "
+            "column is left out of the feature matrix rather than filled."
+        )
 
     for stat in present:
         blended = (
@@ -151,7 +160,7 @@ def build_feature_matrix(
         # rather than dropping the row or inventing a value.
         df[f"{stat}_BASELINE"] = blended.fillna(df[f"{stat}_L5"]).fillna(df[f"{stat}_L10"])
         df[f"{stat}_L2"] = (
-            df[f"{stat}_BASELINE"] * df["fatigue_multiplier"] * df["PACE_MULTIPLIER"]
+            df[f"{stat}_BASELINE"] * df["fatigue_multiplier"] * pace_adjustment
         )
 
     df["FEATURE_SCHEMA_VERSION"] = FEATURE_SCHEMA_VERSION

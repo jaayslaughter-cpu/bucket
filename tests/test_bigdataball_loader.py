@@ -123,6 +123,25 @@ def test_market_status_reflects_real_data(frames):
         assert row["closing_spread"] is None and row["closing_total"] is None
 
 
+def test_blank_market_row_is_not_marked_valid():
+    """NaN is not None, so `is not None` marked every empty row VALID.
+
+    The shipped workbook happens to have a closing line on every row, so
+    the fixture-based test above never reaches this branch — the bug could
+    only surface on a feed with gaps, where blank lines would have been
+    published as real market data.
+    """
+    import numpy as np
+
+    from src.ingestion.bigdataball import market_row_status
+
+    assert market_row_status(np.nan, np.nan) == "DATA_NOT_AVAILABLE"
+    assert market_row_status(None, None) == "DATA_NOT_AVAILABLE"
+    assert market_row_status(np.nan, 221.5) == "VALID"   # total alone is usable
+    assert market_row_status(-4.5, np.nan) == "VALID"    # so is a spread alone
+    assert market_row_status(0.0, np.nan) == "VALID"     # a pick'em is a real line
+
+
 def test_spreads_are_symmetric_within_a_game(frames):
     """Home and away closing spreads should be opposite signs."""
     _, market = frames

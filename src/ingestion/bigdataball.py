@@ -114,6 +114,18 @@ def _to_int(value: Any) -> int | None:
     return int(f) if f is not None else None
 
 
+def market_row_status(closing_spread: Any, closing_total: Any) -> str:
+    """VALID only when the row carries a usable closing number.
+
+    Uses ``pd.notna``, not ``is not None``: a missing numeric arrives as
+    NaN, which *is not* None, so the identity form marked every empty row
+    VALID and fed blank market data downstream as though it were real.
+    Missing market data stays DATA_NOT_AVAILABLE — never filled with a
+    league-average or invented line.
+    """
+    return "VALID" if (pd.notna(closing_spread) or pd.notna(closing_total)) else "DATA_NOT_AVAILABLE"
+
+
 def load_bigdataball_workbook(
     xlsx_path: str | Path,
     sheet_name: str = DEFAULT_SHEET,
@@ -238,11 +250,8 @@ def load_bigdataball_workbook(
         "source": SOURCE_NAME,
     })
 
-    # A row is only VALID if it actually carries a usable closing number.
-    # Missing market data stays DATA_NOT_AVAILABLE — never filled with a
-    # league-average or invented line.
     market["status"] = [
-        "VALID" if (cs is not None or ct is not None) else "DATA_NOT_AVAILABLE"
+        market_row_status(cs, ct)
         for cs, ct in zip(market["closing_spread"], market["closing_total"])
     ]
 

@@ -19,13 +19,17 @@ except ImportError:  # pragma: no cover
     Pool = None  # type: ignore[misc, assignment]
 
 # Pregame-only numeric features — never same-game MIN / box stats
+# PACE_MULTIPLIER is deliberately absent: no ingestion path produces a
+# pregame pace figure, and the feature builder no longer fabricates a
+# neutral 1.0 for it. Add it back here once a verified pace source is
+# joined — listing it now would make the default configuration refuse to
+# train on every real panel.
 DEFAULT_MINUTES_FEATURES = [
     "MIN_L5",
     "MIN_L10",
     "MIN_SEASON",
     "fatigue_multiplier",
     "IS_HOME",
-    "PACE_MULTIPLIER",
 ]
 
 DEFAULT_MINUTES_CATS = ["TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"]
@@ -72,10 +76,25 @@ class MinutesModel:
         self._meta: dict[str, Any] = {}
 
     def _usable_cols(self, df: pd.DataFrame) -> tuple[list[str], list[str]]:
-        feats = [c for c in self.feature_cols if c in df.columns]
+        """Resolve the configured columns, refusing to quietly train a
+        narrower model than was asked for.
+
+        Silently dropping an absent feature produces a model that reports
+        success while having been fitted on something other than its
+        configuration — indistinguishable afterwards from the intended one.
+        """
+        missing = [c for c in self.feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"DATA_NOT_AVAILABLE: minutes features {missing} absent from the "
+                f"training frame. Pass an explicit feature_cols list if a narrower "
+                f"model is intended."
+            )
         cats = [c for c in self.categorical_features if c in df.columns]
-        # Include cats in feature matrix
-        all_feats = list(dict.fromkeys(feats + cats))
+        absent_cats = [c for c in self.categorical_features if c not in df.columns]
+        if absent_cats:
+            logger.info("minutes model: categorical(s) %s absent — omitted", absent_cats)
+        all_feats = list(dict.fromkeys(list(self.feature_cols) + cats))
         return all_feats, cats
 
     def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "MinutesModel":

@@ -16,10 +16,17 @@ def audit_player_panel(df: pd.DataFrame, *, dataset_name: str = "player_panel") 
         dup = int(df.duplicated(subset=["PLAYER_ID", "GAME_ID"]).sum())
     missing_player = int(df["PLAYER_ID"].isna().sum()) if "PLAYER_ID" in df.columns else total
     missing_event = int(df["GAME_ID"].isna().sum()) if "GAME_ID" in df.columns else total
-    missing_target = 0
-    for c in ("PTS", "REB", "AST"):
-        if c in df.columns:
-            missing_target += int(pd.to_numeric(df[c], errors="coerce").isna().sum())
+    # Count ROWS with any missing target, not cells. Summing per column made
+    # one row missing all three targets read as three rejected rows, so the
+    # figure could exceed total_rows and was never a row count at all.
+    target_cols = [c for c in ("PTS", "REB", "AST") if c in df.columns]
+    if target_cols and total:
+        any_target_missing = pd.concat(
+            [pd.to_numeric(df[c], errors="coerce").isna() for c in target_cols], axis=1
+        ).any(axis=1)
+        missing_target = int(any_target_missing.sum())
+    else:
+        missing_target = total if not target_cols else 0
     missing_pregame_ts = total  # tipoff UTC not on default box panel
     leakage = 0
     if {"GAME_DATE", "LAST_INCLUDED_GAME_DATE"}.issubset(df.columns):
@@ -27,7 +34,20 @@ def audit_player_panel(df: pd.DataFrame, *, dataset_name: str = "player_panel") 
         last = pd.to_datetime(df["LAST_INCLUDED_GAME_DATE"], errors="coerce")
         leakage = int((last.notna() & (last >= g)).sum())
 
-    rejected = missing_player + missing_event
+    # Union of the missing-key masks, not a sum: a row lacking BOTH keys was
+    # counted twice, letting rejected_rows exceed total_rows.
+    if total:
+        player_missing = (
+            df["PLAYER_ID"].isna() if "PLAYER_ID" in df.columns
+            else pd.Series(True, index=df.index)
+        )
+        event_missing = (
+            df["GAME_ID"].isna() if "GAME_ID" in df.columns
+            else pd.Series(True, index=df.index)
+        )
+        rejected = int((player_missing | event_missing).sum())
+    else:
+        rejected = 0
     valid = max(0, total - rejected)
     field_status = {
         "game_date": "AVAILABLE_AND_VERIFIED" if "GAME_DATE" in df.columns else "MISSING",

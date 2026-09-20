@@ -346,6 +346,134 @@ def test_projection_uniqueness_excludes_run_id():
     assert columns == {"nba_game_id", "player_name", "market"}
 
 
+def test_stake_of_zero_is_not_promoted_to_one_unit():
+    """`stake or Decimal(1)` graded a zero-stake row as a one-unit bet.
+
+    Decimal("0") is falsey, so the row was silently restaked and its
+    profit_units entered the ROI sums as though a wager had been placed.
+    """
+    from src.settlement.runner import stake_or_default
+
+    assert stake_or_default(None) == Decimal(1)
+    assert stake_or_default(Decimal("0")) == Decimal("0")
+    assert stake_or_default(Decimal("2.5")) == Decimal("2.5")
+
+
+# --------------------------------------------------------------------------
+# A calendar date is not an instant
+# --------------------------------------------------------------------------
+
+def test_date_only_cutoff_displays_on_the_same_calendar_day():
+    """A cutoff of 2025-02-01 read as UTC midnight displays as Jan 31 PT.
+
+    `data_cutoff_pt` is how a reader checks that no future data entered a
+    fold, so an off-by-one-day render is a leakage report that lies.
+    """
+    from datetime import date
+
+    from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
+
+    rendered = format_pacific_iso(pacific_midnight_utc(date(2025, 2, 1)))
+    assert rendered.startswith("2025-02-01T00:00:00")
+
+
+def test_naive_pacific_datetime_is_not_read_as_utc():
+    from datetime import datetime
+
+    from src.utils.timezones import to_utc
+
+    # noqa DTZ001: a naive datetime is exactly what this test is about —
+    # supplying tzinfo here would remove the ambiguity being tested.
+    naive = datetime(2025, 2, 1, 0, 0, 0)  # noqa: DTZ001
+    assert to_utc(naive).hour == 0                      # assumed UTC
+    assert to_utc(naive, assume="pacific").hour == 8    # PST is UTC-8
+
+
+# --------------------------------------------------------------------------
+# Counts that describe rows must stay within the row count
+# --------------------------------------------------------------------------
+
+def test_audit_counts_never_exceed_the_row_count():
+    """Summing per-column misses counted one bad row three times.
+
+    missing_target_rows and rejected_rows are reported as row counts, so a
+    figure above total_rows is not a near-miss — it is a different quantity.
+    """
+    from src.models.data_audit import audit_player_panel
+
+    frame = pd.DataFrame({
+        "PLAYER_ID": [None, "p2", "p3"],
+        "GAME_ID": [None, "g2", "g3"],          # row 0 is missing BOTH keys
+        "PTS": [np.nan, 10.0, 12.0],
+        "REB": [np.nan, 4.0, 5.0],              # row 0 is missing ALL targets
+        "AST": [np.nan, 2.0, 3.0],
+    })
+    report = audit_player_panel(frame)
+
+    assert report["missing_target_rows"] == 1
+    assert report["rejected_rows"] == 1
+    assert report["valid_rows"] == 2
+    assert report["rejected_rows"] <= report["total_rows"]
+
+
+# --------------------------------------------------------------------------
+# Probabilities must be probabilities, not just balanced
+# --------------------------------------------------------------------------
+
+def test_out_of_range_components_are_rejected_even_when_they_sum_to_one():
+    """1.4 over against -0.4 under totals exactly 1.0 but means nothing."""
+    from src.models.prediction_schema import ModelPrediction
+
+    def _prediction(**kwargs) -> ModelPrediction:
+        return ModelPrediction(
+            model_name="m", model_version="v", target_market="PTS",
+            event_id="g1", player_id="p1", **kwargs,
+        )
+
+    assert not _prediction(probability_over=1.4, probability_under=-0.4).is_valid_probability()
+    assert not _prediction(
+        probability_over=float("nan"), probability_under=float("nan")
+    ).is_valid_probability()
+    assert _prediction(probability_over=0.6, probability_under=0.4).is_valid_probability()
+
+
+# --------------------------------------------------------------------------
+# One rating, one team
+# --------------------------------------------------------------------------
+
+def test_elo_skips_a_game_whose_two_rows_are_the_same_team():
+    """A duplicated row passed the len()==2 check and rated a team against itself.
+
+    The update moves that team's rating twice and emits a self-opponent into
+    the feature join, so every later game inherits a corrupted rating.
+    """
+    from src.features.team_strength import compute_team_elo
+
+    duplicated = pd.DataFrame([
+        {"game_id": "001", "game_date": "2025-01-01", "team": "LAL",
+         "opponent": "BOS", "points": 110, "is_home": True, "season": "2024-25"},
+        {"game_id": "001", "game_date": "2025-01-01", "team": "LAL",
+         "opponent": "BOS", "points": 104, "is_home": False, "season": "2024-25"},
+    ])
+    assert compute_team_elo(duplicated).empty
+
+
+def test_elo_rates_a_well_formed_game():
+    """The same-team guard must not reject legitimate two-sided games."""
+    from src.features.team_strength import compute_team_elo
+
+    frame = pd.DataFrame([
+        {"game_id": "001", "game_date": "2025-01-01", "team": "LAL",
+         "opponent": "BOS", "points": 110, "is_home": True, "season": "2024-25"},
+        {"game_id": "001", "game_date": "2025-01-01", "team": "BOS",
+         "opponent": "LAL", "points": 104, "is_home": False, "season": "2024-25"},
+    ])
+    out = compute_team_elo(frame)
+    assert len(out) == 2
+    assert set(out["team"]) == {"LAL", "BOS"}
+    assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
+
+
 def test_roi_aggregates_are_scoped_to_settled_rows():
     """A PENDING or VOID row carrying a stake must not enter the ROI sums."""
     from pathlib import Path

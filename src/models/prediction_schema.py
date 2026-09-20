@@ -55,11 +55,26 @@ class ModelPrediction(BaseModel):
         return format_pacific_iso(to_pacific(self.data_cutoff_timestamp_utc))
 
     def is_valid_probability(self) -> bool:
-        if self.probability_over is None or self.probability_under is None:
-            return False
-        push = self.probability_push or 0.0
-        total = float(self.probability_over) + float(self.probability_under) + float(push)
-        return abs(total - 1.0) < 1e-2
+        """Every component in [0, 1] AND summing to one.
+
+        Checking only the sum accepts nonsense that happens to balance —
+        1.4 over against -0.4 under totals exactly 1.0 — so the range check
+        has to come first.
+        """
+        import math
+
+        values = [self.probability_over, self.probability_under]
+        if self.probability_push is not None:
+            values.append(self.probability_push)
+
+        for value in values:
+            if value is None:
+                return False
+            number = float(value)
+            if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                return False
+
+        return abs(sum(float(v) for v in values) - 1.0) < 1e-2
 
 
 class ModelMetadata(BaseModel):

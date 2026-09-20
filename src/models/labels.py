@@ -66,8 +66,9 @@ def default_feature_cols(market: str) -> list[str]:
         "OPP_ELO_PRE",
         "ELO_DIFF",
         "ELO_WIN_PROB",
-        # Situation
-        "PACE_MULTIPLIER",
+        # Situation. PACE_MULTIPLIER is omitted until a pregame pace source
+        # exists; resolve_feature_cols would drop it anyway, with a warning
+        # on every market of every run.
         "IS_HOME",
         "CAREER_GAMES_PRIOR",
     ]

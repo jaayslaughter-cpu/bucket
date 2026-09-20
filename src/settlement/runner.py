@@ -108,6 +108,16 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
     return None
 
 
+def stake_or_default(stake: Decimal | None) -> Decimal:
+    """Default a NULL stake to one unit — and only a NULL one.
+
+    Written as an explicit None check because ``stake or Decimal(1)`` treats
+    Decimal("0") as falsey: a row deliberately staked at zero would be
+    re-staked at one unit and booked into profit_units as a real bet.
+    """
+    return Decimal(1) if stake is None else stake
+
+
 def settle_pending_props(
     max_game_age_days: int = 14,
     session_http: requests.Session | None = None,
@@ -179,7 +189,7 @@ def settle_pending_props(
                         odds=prop.odds,
                         did_not_play=player_stats.get("did_not_play", False),
                         minutes_played=player_stats.get("minutes_played"),
-                        stake_units=prop.stake_units or Decimal(1),
+                        stake_units=stake_or_default(prop.stake_units),
                     )
                 except SettlementError as exc:
                     report.errors.append(f"{game_id}/{prop.player_name}/{prop.market}: {exc}")

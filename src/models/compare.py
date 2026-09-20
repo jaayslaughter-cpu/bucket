@@ -16,7 +16,7 @@ from src.models.ensemble import EnsemblePropModel
 from src.models.labels import attach_research_over_labels, default_feature_cols
 from src.models.prob_calibration import reliability_table
 from src.models.walk_forward import fixed_cutoff_split, sort_by_game_date
-from src.utils.timezones import format_pacific_iso, to_pacific
+from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +399,12 @@ def compare_models_on_panel(
                         "model_version": pred.model_version,
                         "ensemble_weight": (pred.extras or {}).get("component_weights"),
                         "feature_schema_version": pred.feature_schema_version,
-                        "data_cutoff_pt": format_pacific_iso(to_pacific(pd.Timestamp(split.train_end).to_pydatetime())),
+                        # The cutoff is a Pacific CALENDAR DATE, not an instant.
+                        # Reading its naive midnight as UTC shifted the display
+                        # back a day: 2025-02-01 rendered as 2025-01-31T16:00.
+                        "data_cutoff_pt": format_pacific_iso(
+                            pacific_midnight_utc(pd.Timestamp(split.train_end).date())
+                        ),
                         "prediction_timestamp_pt": format_pacific_iso(pred.prediction_timestamp_utc),
                         "actual_stat_value": float(actual[i]) if np.isfinite(actual[i]) else None,
                         "settlement": None,
