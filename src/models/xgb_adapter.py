@@ -246,12 +246,26 @@ class XGBoostAdapter:
             raise RuntimeError("Cannot save unfitted XGBoost model")
         model_path = path.with_suffix(".json") if path.suffix == "" else path
         self._pipe.model.save_model(str(model_path))
+
+        # The classifier alone is not the model. The mean head supplies every
+        # MAE/RMSE figure and the dispersion supplies push mass on whole-number
+        # lines, so saving only the booster made a reloaded model return null
+        # projections and different probabilities than the one just evaluated.
+        mean_path = model_path.with_suffix(".mean.json")
+        if self.mean_model is not None:
+            self.mean_model.save_model(str(mean_path))
+        elif mean_path.exists():
+            # A stale head from an earlier fit would be reloaded as current.
+            mean_path.unlink()
+
         meta = {
             "feature_cols": self.feature_cols,
             "target_market": self.target_market,
             "model_version": self.model_version,
             "feature_schema_version": self.feature_schema_version,
             "model_params": self._pipe.model_params,
+            "dispersion": None if self.dispersion is None else self.dispersion.to_dict(),
+            "has_mean_head": self.mean_model is not None,
             **self._meta_extra,
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -280,8 +294,27 @@ class XGBoostAdapter:
         booster = xgb.XGBClassifier()
         booster.load_model(str(model_path))
         self._pipe.model = booster
+
+        self.dispersion = CountDispersion.from_dict(meta.get("dispersion"))
+        mean_path = model_path.with_suffix(".mean.json")
+        if mean_path.exists():
+            regressor = xgb.XGBRegressor()
+            regressor.load_model(str(mean_path))
+            self.mean_model = regressor
+        else:
+            self.mean_model = None
+            if meta.get("has_mean_head"):
+                logger.warning(
+                    "Mean head recorded in %s but %s is absent — projections will be "
+                    "null. The artifact is incomplete; re-save rather than scoring.",
+                    meta_path.name, mean_path.name,
+                )
+
         self._fitted = True
-        self._meta_extra = {k: v for k, v in meta.items() if k not in {"feature_cols", "model_params"}}
+        self._meta_extra = {
+            k: v for k, v in meta.items()
+            if k not in {"feature_cols", "model_params", "dispersion", "has_mean_head"}
+        }
         return self
 
     def get_model_metadata(self) -> ModelMetadata:

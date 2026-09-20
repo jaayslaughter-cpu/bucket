@@ -169,6 +169,81 @@ def test_distribution_model_round_trips_its_dispersion(tmp_path):
     assert reloaded.dispersion.phi == pytest.approx(1.87)
 
 
+def test_xgboost_adapter_round_trips_its_mean_head_and_dispersion(tmp_path):
+    """Saving only the classifier changed what a reloaded model predicts.
+
+    The mean head supplies every MAE/RMSE figure and the dispersion supplies
+    push mass on whole-number lines, so a reload returned null projections
+    and different probabilities than the model that was just evaluated —
+    the deployed artifact was not the one the comparison report described.
+    """
+    pytest.importorskip("xgboost")
+    from src.models.xgb_adapter import XGBoostAdapter
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    cols = ["PTS_L5", "PTS_L10", "MIN_L5"]
+    model = XGBoostAdapter(cols, target_market="PTS", model_params={"n_estimators": 30})
+    model.fit(panel)
+    assert model.mean_model is not None, "fixture failed to fit a mean head"
+    assert model.dispersion is not None, "fixture failed to fit a dispersion"
+
+    scoring = panel.head(15).copy()
+    scoring["WHOLE_LINE"] = scoring["PTS_L10"].round()  # whole lines carry push mass
+    before_mean = model.predict_mean(scoring).to_numpy()
+    before_probs = np.array(
+        [r.probability_over for r in model.predict_rows(scoring, line_col="WHOLE_LINE")],
+        dtype=float,
+    )
+
+    model.save(tmp_path / "xgb_PTS")
+    reloaded = XGBoostAdapter(cols, target_market="PTS").load(tmp_path / "xgb_PTS")
+
+    assert reloaded.dispersion is not None
+    assert reloaded.dispersion.family == model.dispersion.family
+    assert reloaded.dispersion.phi == pytest.approx(model.dispersion.phi)
+
+    after_mean = reloaded.predict_mean(scoring).to_numpy()
+    assert not np.isnan(after_mean).all(), "mean head was lost — projections are null"
+    np.testing.assert_allclose(before_mean, after_mean, rtol=1e-6)
+
+    after_probs = np.array(
+        [r.probability_over for r in reloaded.predict_rows(scoring, line_col="WHOLE_LINE")],
+        dtype=float,
+    )
+    np.testing.assert_allclose(before_probs, after_probs, rtol=1e-6)
+
+
+def test_xgboost_adapter_drops_a_stale_mean_head_on_save(tmp_path):
+    """A leftover sidecar would reload as the current projection."""
+    pytest.importorskip("xgboost")
+    from src.models.xgb_adapter import XGBoostAdapter
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    cols = ["PTS_L5", "PTS_L10"]
+    model = XGBoostAdapter(cols, target_market="PTS", model_params={"n_estimators": 20})
+    model.fit(panel)
+    model.save(tmp_path / "xgb_PTS")
+    assert (tmp_path / "xgb_PTS.mean.json").exists()
+
+    model.mean_model = None
+    model.save(tmp_path / "xgb_PTS")
+    assert not (tmp_path / "xgb_PTS.mean.json").exists()
+
+
+def test_dispersion_round_trip_keeps_full_precision():
+    """`as_metadata` rounds phi; reloading from it changes the distribution."""
+    from src.models.residuals import CountDispersion
+
+    original = CountDispersion(
+        family="negbin", phi=1.8712345, n_train_rows=500,
+        selection_scores={"poisson": -2.5, "negbin": -2.1}, fallback_reason=None,
+    )
+    restored = CountDispersion.from_dict(original.to_dict())
+    assert restored == original
+    assert restored.phi == original.phi  # not rounded to 4dp
+    assert CountDispersion.from_dict(None) is None
+
+
 def test_distribution_load_refuses_a_missing_artifact():
     from src.models.distribution_adapter import DistributionPropModel
 

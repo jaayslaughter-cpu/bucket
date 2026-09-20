@@ -64,6 +64,32 @@ class CountDispersion:
         r = (mu * mu) / max(variance - mu, 1e-6)
         return r, p
 
+    def to_dict(self) -> dict[str, object]:
+        """Round-trippable form. Unlike ``as_metadata`` this keeps full
+        precision — a rounded phi reloads as a different distribution."""
+        return {
+            "family": self.family,
+            "phi": self.phi,
+            "n_train_rows": self.n_train_rows,
+            "selection_scores": self.selection_scores,
+            "fallback_reason": self.fallback_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict | None) -> "CountDispersion | None":
+        """Rebuild from ``to_dict``. None in, None out — an absent dispersion
+        must stay absent rather than defaulting to Poisson, which would look
+        like a fitted result."""
+        if not payload:
+            return None
+        return cls(
+            family=payload["family"],
+            phi=float(payload["phi"]),
+            n_train_rows=int(payload["n_train_rows"]),
+            selection_scores=dict(payload.get("selection_scores") or {}),
+            fallback_reason=payload.get("fallback_reason"),
+        )
+
     def as_metadata(self) -> dict[str, object]:
         return {
             "dispersion_family": self.family,

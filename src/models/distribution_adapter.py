@@ -186,13 +186,7 @@ class DistributionPropModel:
             "model_version": self.model_version,
             "target_market": self.target_market,
             "feature_schema_version": self.feature_schema_version,
-            "dispersion": None if self.dispersion is None else {
-                "family": self.dispersion.family,
-                "phi": self.dispersion.phi,
-                "n_train_rows": self.dispersion.n_train_rows,
-                "selection_scores": self.dispersion.selection_scores,
-                "fallback_reason": self.dispersion.fallback_reason,
-            },
+            "dispersion": None if self.dispersion is None else self.dispersion.to_dict(),
         }
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         logger.info("Saved distribution dispersion to %s", target)
@@ -211,14 +205,7 @@ class DistributionPropModel:
         payload = json.loads(target.read_text(encoding="utf-8"))
         self.model_version = payload.get("model_version", self.model_version)
         self.target_market = payload.get("target_market", self.target_market)
-        stored = payload.get("dispersion")
-        self.dispersion = None if stored is None else CountDispersion(
-            family=stored["family"],
-            phi=float(stored["phi"]),
-            n_train_rows=int(stored.get("n_train_rows", 0)),
-            selection_scores=stored.get("selection_scores") or {},
-            fallback_reason=stored.get("fallback_reason"),
-        )
+        self.dispersion = CountDispersion.from_dict(payload.get("dispersion"))
         self._fitted = True
         return self
 
