@@ -111,7 +111,46 @@ player lines.
    to clear two standard errors, because with an uninformative model the
    top bucket outscores the bottom about half the time by chance.
 
+**Fixed after code review** (see PR #1 comments for the full list)
+
+10. ~~Early stopping read the scoring set.~~ `compare.py` handed `val` to
+    CatBoost as its `eval_set` and then reported metrics on that same
+    `val`, so the iteration count was chosen from the labels being scored.
+    Early stopping now carves its holdout from the tail of `train`. On the
+    demo panel this moved CatBoost PTS Brier 0.2380 → 0.2451 while leaving
+    the distribution and XGBoost models untouched, since neither used an
+    `eval_set` — that unchanged control is what shows the fix is surgical.
+
+11. ~~Ensemble published invented certainty.~~ Probabilities accumulated
+    from `0.0`, so a row no component could score came out as "certainly
+    under". Now null with a warning.
+
+12. ~~Calibrated under could go negative~~, ~~`MinutesModel` zero-filled
+    absent features~~, ~~the EV gate accepted pick'em rows carrying odds~~,
+    ~~`ModelMetadata` dropped `feature_schema_version`~~, ~~the distribution
+    model lost its dispersion on reload~~, ~~one model's P(Over) was written
+    into every market~~, ~~the ensemble's two probability APIs disagreed on
+    whole-number lines~~.
+
 **Still open**
+
+13. **The classifiers ignore the line they are scored at.** `CatBoost`,
+    `XGBoostAdapter` and `XGBoostPropPipeline` are binary classifiers
+    trained against one line definition, so asking for a probability at a
+    different line returns the same number. The distribution path handles
+    arbitrary lines correctly because it derives them from a fitted count
+    distribution. Making the classifiers line-aware means retraining with
+    the line as a feature — a modelling change, not a patch. Until then,
+    treat classifier probabilities as valid only at the line they were
+    labelled against.
+
+14. **Orchestrator and database paths carry known defects** that cannot be
+    verified until player data lands: `main.py` scores the whole lookback
+    panel rather than the requested slate, `prop_results` migrations allow
+    duplicate and mis-aggregated rows, `session.py` does not percent-encode
+    credentials in a built URL, the projections upsert keys on a
+    per-execution UUID so re-runs accumulate, and box-score matching by
+    name collides when two players share one.
 
 7. **The evaluation target is self-referential.** `over_hit` is defined
    against `RESEARCH_LINE = {stat}_L10` while the projection derives from
