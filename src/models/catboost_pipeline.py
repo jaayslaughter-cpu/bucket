@@ -88,6 +88,9 @@ class CatBoostPropPipeline:
         self.random_seed = random_seed
         self.model: Any | None = None
         self.mean_model: Any | None = None
+        # See XGBoostAdapter.line_aware — masking is only correct while
+        # the line is absent from the fitted features.
+        self.line_aware: bool = False
         self.dispersion: CountDispersion | None = None
         self._meta_extra: dict[str, Any] = {}
 
@@ -297,6 +300,8 @@ class CatBoostPropPipeline:
             if c not in self.categorical_features:
                 work[c] = work[c].fillna(0.0)
         proba = self.model.predict_proba(work[self.feature_cols])[:, 1]
+        if self.line_aware:
+            return pd.Series(proba, index=features.index)
         # The line is not a model input, so this probability answers only the
         # line the labels were built from. Asking at any other line abstains
         # rather than returning that number under a different label.

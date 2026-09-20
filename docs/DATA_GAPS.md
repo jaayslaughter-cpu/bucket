@@ -149,26 +149,43 @@ player lines.
 
 **Still open**
 
-13. **The classifiers are not line-aware — they now abstain instead.**
-    `CatBoost` and `XGBoostAdapter` are binary classifiers trained against
-    one line definition, so the line is not one of their inputs and asking
-    at a different line returns the identical number. That number is not
-    wrong about nothing: it is a confident, precise answer to a question
-    nobody asked, and writing it beside a posted sportsbook line presents
-    one line's probability as another's.
+13. **The classifiers can now be made line-aware.** `over_hit` is
+    P(stat > RESEARCH_LINE) and the line was not a model input, so a
+    fitted classifier returned the identical probability at every line.
+    Measured on the demo panel: a line-blind XGBoost returns 0.3879 at
+    8.5, 12.5, 16.5 and 20.5 alike — a range of exactly 0.0000.
 
-    They no longer do that. `mask_probabilities_at_unsupported_lines`
-    compares the scoring line to the labelled `RESEARCH_LINE` per row and
-    returns NaN where they differ, including when there is no
-    `RESEARCH_LINE` to verify against. The ensemble degrades to the
-    distribution model, which derives probabilities from a fitted count
-    distribution and is correct at any line.
+    `src/models/line_aware.py` puts the line into the features and trains
+    against labels built at many lines, so the model learns
+    P(stat > L | features, L). The same measurement on the same panel
+    gives 0.768 → 0.052 across that ladder, monotonically non-increasing.
 
-    **This is containment, not a fix.** The underlying limitation stands:
-    on real prop lines the classifiers will abstain on nearly every row.
-    Making them genuinely line-aware means retraining with the line as a
-    feature and labels built against it — a modelling change, not a patch,
-    and one that wants real lines to train on.
+    Two things make this safe rather than merely impressive:
+
+    - **Candidate lines are generated from pregame quantities only.**
+      Anchor them on the realised stat and the line feature carries the
+      outcome; validation would look superb and a live slate would fail,
+      because at scoring time the book cannot see the result either.
+      `assert_lines_are_pregame` runs before every fit and rejects both
+      an exact leak and a noisy one.
+    - **Augmented copies of one game share one outcome**, so they must
+      never straddle a train/validation split. They share a GAME_DATE, so
+      a chronological split keeps them together;
+      `assert_no_augmented_row_straddles` checks rather than assumes.
+
+    The model abstains outside the standardised line range it was trained
+    on. A boosted tree extrapolates badly there — the raw curve ticked
+    back UP at the top of the ladder, which is impossible for a survival
+    function. That was found by the monotonicity test, not reasoned about
+    in advance.
+
+    **Still to do:** train against genuinely posted lines rather than
+    generated candidates. `augment_lines(keep_real_line_col=...)` already
+    accepts them and marks them `line_source='posted'`; it needs a
+    PropLine archive, which starts accumulating from the first
+    `ingest-props` run. Generated candidates are a bridge, not the
+    destination — they teach the shape of the probability curve, not the
+    market's own view of where the line belongs.
 
 14. **Orchestrator paths carry known defects** that cannot be verified
     until player data lands: `main.py` scores the whole lookback panel
