@@ -103,6 +103,14 @@ player lines.
    player alone, so a player's first game of a season read as roughly 150
    days of rest. Now partitioned by season.
 
+9. ~~No test of the projection against the line.~~ `market_comparison.py`
+   adds `MAE(line) - MAE(projection)` and hit rate bucketed by how strongly
+   the model leaned. Both run against `RESEARCH_LINE` today and become a
+   real market test unchanged once prop lines land; `is_market_line` keeps
+   the two from being confused. The confidence verdict requires the spread
+   to clear two standard errors, because with an uninformative model the
+   top bucket outscores the bottom about half the time by chance.
+
 **Still open**
 
 7. **The evaluation target is self-referential.** `over_hit` is defined

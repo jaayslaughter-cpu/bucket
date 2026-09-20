@@ -51,6 +51,16 @@ QUALITY_COLS = [
     "possible_leakage_rows", "notes",
 ]
 
+MODEL_VS_LINE_COLS = [
+    "target_market", "model_name", "n_predictions", "model_mae", "line_mae",
+    "model_beats_line_by", "model_rmse", "line_rmse", "line_type", "is_market_line",
+]
+
+EDGE_BUCKET_COLS = [
+    "target_market", "model_name", "measure", "bucket", "n_predictions",
+    "n_graded", "n_pushes", "mean_measure", "hit_rate", "below_min_sample",
+]
+
 LIVE_TEMPLATE_COLS = [
     "game_date", "event_id", "game_start_pt", "player_id", "player_name",
     "player_team", "opponent", "target_market", "sportsbook_or_dfs_source",
@@ -112,6 +122,17 @@ def write_comparison_exports(
     files["calibration_report.csv"] = _write_df(
         pd.DataFrame(result.get("calibration") or []), root / "calibration_report.csv", CALIBRATION_COLS
     )
+    files["model_vs_line.csv"] = _write_df(
+        pd.DataFrame(result.get("model_vs_line") or []),
+        root / "model_vs_line.csv",
+        MODEL_VS_LINE_COLS,
+    )
+    files["edge_buckets.csv"] = _write_df(
+        pd.DataFrame(result.get("edge_buckets") or []),
+        root / "edge_buckets.csv",
+        EDGE_BUCKET_COLS,
+    )
+
     qdf = pd.DataFrame([quality_row] if quality_row else [])
     files["data_quality_report.csv"] = _write_df(qdf, root / "data_quality_report.csv", QUALITY_COLS)
 
@@ -120,6 +141,11 @@ def write_comparison_exports(
 
     winners_path = root / "winners_by_market.json"
     winners_path.write_text(json.dumps(result.get("winners") or {}, indent=2), encoding="utf-8")
+
+    if result.get("confidence_verdicts"):
+        (root / "confidence_verdicts.json").write_text(
+            json.dumps(result["confidence_verdicts"], indent=2, default=str), encoding="utf-8"
+        )
 
     manifest = {
         "generated_at_pt": format_pacific_iso(now_pacific()),

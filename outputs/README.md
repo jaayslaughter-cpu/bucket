@@ -16,6 +16,9 @@ python -m scripts.nba_model_cli compare-models --train-end YYYY-MM-DD --validati
 | `predictions_detailed.csv` | Row-level predictions (research lines, not sportsbook unless joined) |
 | `feature_importance_catboost.csv` | CatBoost importances when available |
 | `calibration_report.csv` | Reliability bins |
+| `model_vs_line.csv` | Is the projection closer to the actual result than the line is? `model_beats_line_by` is in stat units; positive means the projection won |
+| `edge_buckets.csv` | Hit rate by how strongly the model leaned. Rows with `below_min_sample` are too small to read |
+| `confidence_verdicts.json` | Whether confidence tracks being right, after ruling out chance |
 | `data_quality_report.csv` | Audit counts / missingness |
 | `live_prediction_template.csv` | Empty template for manual slate capture |
 | `download_manifest.json` | SHA-256 hashes + winners |
@@ -26,6 +29,10 @@ python -m scripts.nba_model_cli compare-models --train-end YYYY-MM-DD --validati
 - RESEARCH_ONLY — no betting automation.
 - **All user-facing timestamps are `America/Los_Angeles` (Pacific).** Columns end in `_pt`. Database storage remains UTC.
 - Default comparison uses `RESEARCH_LINE = {stat}_L10`, **not** a sportsbook line.
+  `model_vs_line.csv` carries `is_market_line` so this is never ambiguous: while
+  it reads `False`, beating the line means beating a recency baseline, not the
+  market. The same file becomes a genuine market test once real timestamped
+  prop lines are joined in — the maths does not change.
 - `outputs/demo/` is for wiring tests only — never treat demo metrics as real.
 - Do not put API keys or passwords in these files.
 

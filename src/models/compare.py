@@ -419,11 +419,38 @@ def compare_models_on_panel(
                 "note": "Lowest Brier on validation window; not a profitability claim",
             }
 
+    detail_frame = pd.DataFrame(detail_rows)
+    market_rows: list[dict[str, Any]] = []
+    bucket_rows: list[dict[str, Any]] = []
+    confidence_rows: list[dict[str, Any]] = []
+    if not detail_frame.empty:
+        from src.models.market_comparison import (
+            confidence_is_informative,
+            edge_bucket_report,
+            model_vs_line_report,
+        )
+
+        market_rows = model_vs_line_report(detail_frame).to_dict(orient="records")
+        bucket_frame = edge_bucket_report(detail_frame)
+        bucket_rows = bucket_frame.to_dict(orient="records")
+        if not bucket_frame.empty:
+            pairs = bucket_frame[["target_market", "model_name"]].drop_duplicates()
+            confidence_rows = [
+                confidence_is_informative(
+                    bucket_frame,
+                    group={"target_market": r.target_market, "model_name": r.model_name},
+                )
+                for r in pairs.itertuples(index=False)
+            ]
+
     return {
         "summary": summary_rows,
         "predictions": detail_rows,
         "feature_importance": importance_rows,
         "calibration": calib_rows,
         "calibration_meta": {f"{m}|{n}": v for (m, n), v in calibration_meta.items()},
+        "model_vs_line": market_rows,
+        "edge_buckets": bucket_rows,
+        "confidence_verdicts": confidence_rows,
         "winners": winners,
     }
