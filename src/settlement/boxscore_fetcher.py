@@ -180,8 +180,22 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 or minutes in (None, 0.0)
             )
 
+            # Two players in one game can share a full name. Silently keeping
+            # the last would let settlement grade one player's prop against
+            # the other's box score, so the collision is recorded and both
+            # entries are marked ambiguous for the matcher to refuse.
+            if name in out:
+                out[name]["ambiguous_name"] = True
+                logger.warning(
+                    "Duplicate player name %r in game %s — marked ambiguous; "
+                    "settle by personId, not name.",
+                    name, payload.get("gameId", "?"),
+                )
+                continue
+
             out[name] = {
                 "player_name": name,
+                "ambiguous_name": False,
                 "nba_player_id": str(player.get("personId")) if player.get("personId") else None,
                 "team_tricode": team_tricode,
                 "is_home": side == "homeTeam",

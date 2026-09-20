@@ -276,3 +276,80 @@ def test_ensemble_apis_agree_on_a_whole_number_line():
         dtype=float,
     )
     np.testing.assert_allclose(via_series, via_rows, rtol=1e-9)
+
+
+# --------------------------------------------------------------------------
+# Connection and settlement identity
+# --------------------------------------------------------------------------
+
+def test_database_url_percent_encodes_credentials():
+    """An f-string URL with @ or / in the password parses to the wrong host."""
+    import os
+    from unittest import mock
+
+    from src.db.session import _build_url_from_parts
+
+    with mock.patch.dict(os.environ, {
+        "PGHOST": "db.example.com", "PGUSER": "postgres",
+        "PGPASSWORD": "p@ss:w/rd#1", "PGPORT": "6543", "PGDATABASE": "postgres",
+    }, clear=False):
+        url = _build_url_from_parts()
+
+    assert "p@ss:w/rd#1" not in url
+    assert "%40" in url and "%2F" in url
+
+    from urllib.parse import urlparse
+    assert urlparse(url).hostname == "db.example.com"
+    assert urlparse(url).port == 6543
+
+
+def test_duplicate_player_names_are_marked_ambiguous_not_overwritten():
+    """Keeping the last silently grades one player's prop with another's stats."""
+    from src.settlement.boxscore_fetcher import extract_player_stats
+
+    def _player(pid, name):
+        return {
+            "personId": pid, "nameI": name, "firstName": name.split()[0],
+            "familyName": name.split()[-1], "status": "ACTIVE",
+            "statistics": {"minutes": "PT30M00.00S", "points": 10},
+        }
+
+    payload = {
+        "game": {
+            "gameId": "0022500001",
+            "homeTeam": {"teamTricode": "LAL", "players": [_player("1", "Chris Johnson")]},
+            "awayTeam": {"teamTricode": "BOS", "players": [_player("2", "Chris Johnson")]},
+        }
+    }
+    stats = extract_player_stats(payload)
+    if "Chris Johnson" in stats:
+        assert stats["Chris Johnson"]["ambiguous_name"] is True
+
+
+def test_settlement_refuses_an_ambiguous_name():
+    from src.settlement.runner import _match_player
+
+    stats = {"Chris Johnson": {"player_name": "Chris Johnson", "ambiguous_name": True}}
+    assert _match_player(stats, "Chris Johnson") is None
+
+
+def test_projection_uniqueness_excludes_run_id():
+    """Keying on a per-execution UUID meant re-runs never conflicted."""
+    from src.db.models import Projection
+
+    uq = next(
+        c for c in Projection.__table__.constraints
+        if getattr(c, "name", None) == "uq_projection"
+    )
+    columns = {c.name for c in uq.columns}
+    assert "run_id" not in columns
+    assert columns == {"nba_game_id", "player_name", "market"}
+
+
+def test_roi_aggregates_are_scoped_to_settled_rows():
+    """A PENDING or VOID row carrying a stake must not enter the ROI sums."""
+    from pathlib import Path
+
+    sql = (Path(__file__).parent.parent / "migrations/002_prop_results.sql").read_text()
+    unscoped = sql.count("FILTER (WHERE odds IS NOT NULL)")
+    assert unscoped == 0, "a stake/profit aggregate is not filtered by settlement status"

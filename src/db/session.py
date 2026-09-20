@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from urllib.parse import urlparse, urlunparse
 
 from sqlalchemy import Engine, create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.db.models import Base
@@ -45,8 +46,19 @@ def _build_url_from_parts() -> str | None:
     password = os.environ.get("PGPASSWORD", "")
     port = os.environ.get("PGPORT", "5432")
     database = os.environ.get("PGDATABASE", "postgres")
-    auth = f"{user}:{password}@" if password else f"{user}@"
-    return f"postgresql+psycopg://{auth}{host}:{port}/{database}"
+
+    # Built with URL.create rather than an f-string: a password containing
+    # @, :, / or # — all common in generated credentials — produces a URL
+    # that parses to the wrong host, and the resulting connection error
+    # names neither the cause nor, thankfully, the password.
+    return URL.create(
+        "postgresql+psycopg",
+        username=user,
+        password=password or None,
+        host=host,
+        port=int(port) if str(port).isdigit() else None,
+        database=database,
+    ).render_as_string(hide_password=False)
 
 
 def _ensure_sslmode(url: str) -> str:

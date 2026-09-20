@@ -99,8 +99,48 @@ CREATE TABLE IF NOT EXISTS prop_results (
         outcome_status <> 'PUSH' OR predicted_line = ROUND(predicted_line)
     ),
 
-    CONSTRAINT uq_prop_result UNIQUE (nba_game_id, player_name, market, predicted_line, predicted_side, source)
+    -- NOTE: uniqueness is enforced by a unique INDEX below, not a table
+    -- constraint. Postgres treats NULLs as distinct in a UNIQUE constraint,
+    -- so a row with source NULL could be inserted repeatedly and each copy
+    -- would be counted again in the settlement metrics. NULLS NOT DISTINCT
+    -- would fix it but needs PG15; this targets PG14, so the index
+    -- normalises a NULL source to '' instead.
+    CONSTRAINT ck_source_present CHECK (source IS NOT NULL)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_prop_result
+    ON prop_results (
+        nba_game_id, player_name, market, predicted_line, predicted_side,
+        COALESCE(source, '')
+    );
+
+-- CREATE TABLE IF NOT EXISTS above is a no-op when the table already exists —
+-- which it does whenever `main.py --init-db` ran Base.metadata.create_all()
+-- first. In that case none of the inline CHECK constraints above are applied,
+-- and the ledger would accept graded rows with no actual_result. Re-assert
+-- them idempotently so the migration converges regardless of which path
+-- created the table.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'ck_settled_has_result'
+    ) THEN
+        ALTER TABLE prop_results ADD CONSTRAINT ck_settled_has_result CHECK (
+            (outcome_status = 'PENDING' AND actual_result IS NULL)
+            OR (outcome_status = 'VOID')
+            OR (outcome_status IN ('WIN','LOSS','PUSH') AND actual_result IS NOT NULL)
+        );
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'ck_push_requires_whole_line'
+    ) THEN
+        ALTER TABLE prop_results ADD CONSTRAINT ck_push_requires_whole_line CHECK (
+            outcome_status <> 'PUSH' OR predicted_line = ROUND(predicted_line)
+        );
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS ix_prop_results_pending
     ON prop_results (outcome_status, game_date)
@@ -157,12 +197,12 @@ SELECT
     -- because ROI is undefined without a payout price.
     COUNT(*) FILTER (WHERE odds IS NOT NULL
                        AND outcome_status IN ('WIN','LOSS','PUSH'))        AS priced_n,
-    ROUND(SUM(stake_units)  FILTER (WHERE odds IS NOT NULL), 4)             AS staked_units,
-    ROUND(SUM(profit_units) FILTER (WHERE odds IS NOT NULL), 4)             AS profit_units,
-    CASE WHEN COALESCE(SUM(stake_units) FILTER (WHERE odds IS NOT NULL), 0) > 0
+    ROUND(SUM(stake_units)  FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')), 4)             AS staked_units,
+    ROUND(SUM(profit_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')), 4)             AS profit_units,
+    CASE WHEN COALESCE(SUM(stake_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')), 0) > 0
          THEN ROUND(
-             SUM(profit_units) FILTER (WHERE odds IS NOT NULL)
-             / SUM(stake_units) FILTER (WHERE odds IS NOT NULL) * 100, 2)
+             SUM(profit_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH'))
+             / SUM(stake_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')) * 100, 2)
     END AS roi_pct,
 
     -- Unpriced (pick'em) rows: counted for W-L-P, excluded from ROI.
@@ -191,10 +231,10 @@ SELECT
              COUNT(*) FILTER (WHERE outcome_status = 'WIN')::NUMERIC
              / COUNT(*) FILTER (WHERE outcome_status IN ('WIN','LOSS')) * 100, 2)
     END AS strike_rate_pct,
-    CASE WHEN COALESCE(SUM(stake_units) FILTER (WHERE odds IS NOT NULL), 0) > 0
+    CASE WHEN COALESCE(SUM(stake_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')), 0) > 0
          THEN ROUND(
-             SUM(profit_units) FILTER (WHERE odds IS NOT NULL)
-             / SUM(stake_units) FILTER (WHERE odds IS NOT NULL) * 100, 2)
+             SUM(profit_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH'))
+             / SUM(stake_units) FILTER (WHERE odds IS NOT NULL AND outcome_status IN ('WIN','LOSS','PUSH')) * 100, 2)
     END AS roi_pct
 FROM prop_results
 GROUP BY market

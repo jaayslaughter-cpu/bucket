@@ -211,9 +211,20 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
 
     with session_scope() as session:
         stmt = pg_insert(Projection).values(rows)
+        # Conflict on the projection's natural identity so re-running a slate
+        # overwrites its own rows. Keying on run_id (a per-execution UUID)
+        # meant the target never matched and every re-run doubled the table.
+        # run_id is refreshed too, recording which run last wrote each row.
         stmt = stmt.on_conflict_do_update(
-            index_elements=["run_id", "nba_player_id", "market", "nba_game_id"],
-            set_={c: stmt.excluded[c] for c in ("final_projection", "prob_over", "market_status")},
+            index_elements=["nba_game_id", "player_name", "market"],
+            set_={
+                c: stmt.excluded[c]
+                for c in (
+                    "run_id", "baseline_projection", "fatigue_multiplier",
+                    "fatigue_notes", "final_projection", "line", "prob_over",
+                    "model_version", "market_status", "ev_per_dollar", "notes",
+                )
+            },
         )
         session.execute(stmt)
     logger.info("Persisted %d projections for run %s", len(rows), run_id)

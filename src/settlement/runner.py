@@ -81,7 +81,15 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
     name variance should be routed through PropIQ's id_crosswalk.
     """
     if player_name in stats_by_name:
-        return stats_by_name[player_name]
+        candidate = stats_by_name[player_name]
+        if candidate.get("ambiguous_name"):
+            logger.warning(
+                "Refusing to settle %r: two players in this game share that name. "
+                "Grading either would be a coin flip on whose line it was.",
+                player_name,
+            )
+            return None
+        return candidate
 
     def norm(s: str) -> str:
         return "".join(ch for ch in s.casefold() if ch.isalnum())
@@ -89,6 +97,13 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
     target = norm(player_name)
     for name, stats in stats_by_name.items():
         if norm(name) == target:
+            if stats.get("ambiguous_name"):
+                logger.warning(
+                    "Refusing to settle %r: normalises to a name shared by two "
+                    "players in this game.",
+                    player_name,
+                )
+                return None
             return stats
     return None
 

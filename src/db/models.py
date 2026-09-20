@@ -241,8 +241,13 @@ class Projection(Base):
     """Model output per player/market/game — the pipeline's deliverable."""
 
     __tablename__ = "projections"
+    # Keyed on the projection's natural identity, NOT on run_id. run_id is a
+    # fresh UUID per execution, so including it meant a re-run of the same
+    # slate never conflicted and simply accumulated a second set of rows.
+    # run_id is still stored, as provenance for which run last wrote each row;
+    # the per-run audit trail lives in pipeline_runs.
     __table_args__ = (
-        UniqueConstraint("run_id", "nba_player_id", "market", "nba_game_id", name="uq_projection"),
+        UniqueConstraint("nba_game_id", "player_name", "market", name="uq_projection"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -317,7 +322,9 @@ class PropResult(Base):
         # accepts graded rows carrying no actual_result, which the metrics
         # views then count as settled.
         CheckConstraint(
-            "outcome_status IN ('PENDING','VOID') OR actual_result IS NOT NULL",
+            "(outcome_status = 'PENDING' AND actual_result IS NULL)"
+            " OR (outcome_status = 'VOID')"
+            " OR (outcome_status IN ('WIN','LOSS','PUSH') AND actual_result IS NOT NULL)",
             name="ck_settled_has_result",
         ),
         CheckConstraint(
