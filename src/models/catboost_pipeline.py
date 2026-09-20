@@ -144,7 +144,12 @@ class CatBoostPropPipeline:
         cut = int(len(train) * (1.0 - holdout_fraction))
         return train.iloc[:cut], train.iloc[cut:]
 
-    def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "CatBoostPropPipeline":
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        validation_data: pd.DataFrame | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> "CatBoostPropPipeline":
         if "over_hit" not in train_data.columns:
             raise ValueError("DATA_NOT_AVAILABLE: missing over_hit")
         train = self._prepare(train_data).dropna(subset=self.feature_cols + ["over_hit"])
@@ -164,10 +169,22 @@ class CatBoostPropPipeline:
                 self._prepare(validation_data).dropna(subset=self.feature_cols + ["over_hit"])
             )
 
+        # Align by index: fit_rows is a filtered, sorted slice of the input.
+        fit_weights = None
+        if sample_weight is not None:
+            fit_weights = pd.Series(sample_weight).reindex(fit_rows.index)
+            if fit_weights.isna().any():
+                raise ValueError(
+                    "DATA_NOT_AVAILABLE: sample_weight does not cover every "
+                    "training row after filtering and sorting."
+                )
+            fit_weights = fit_weights.to_numpy()
+
         train_pool = Pool(
             fit_rows[self.feature_cols],
             fit_rows["over_hit"].astype(int),
             cat_features=self.categorical_features or None,
+            weight=fit_weights,
         )
         eval_set = None
         if stop_rows is not None and not stop_rows.empty:
