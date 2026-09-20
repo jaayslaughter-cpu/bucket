@@ -8,6 +8,7 @@ like a slightly different metric rather than an error.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -717,6 +718,92 @@ def test_elo_rates_a_well_formed_game():
     assert len(out) == 2
     assert set(out["team"]) == {"LAL", "BOS"}
     assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
+
+
+def test_predict_slate_emits_predictions_not_a_row_count(tmp_path, monkeypatch):
+    """`predict-slate` filtered the panel and reported len() as its output.
+
+    Its docstring said "score a slate". A row count is not a score, and the
+    command exited 0 either way, so a slate that was never scored looked
+    exactly like one that was.
+    """
+    pytest.importorskip("catboost")
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    # Nothing trained yet: the command must say so and fail, not report rows.
+    unscored = runner.invoke(
+        app, ["predict-slate", "--date", "2025-01-30", "--markets", "PTS", "--demo"]
+    )
+    assert unscored.exit_code == 4
+    assert "DATA_NOT_AVAILABLE" in unscored.stdout
+
+    trained = runner.invoke(app, [
+        "train-stats", "--market", "PTS",
+        "--start-date", "2024-11-01", "--end-date", "2025-03-01", "--demo",
+    ])
+    assert trained.exit_code == 0
+
+    out_csv = tmp_path / "slate.csv"
+    scored = runner.invoke(app, [
+        "predict-slate", "--date", "2025-01-30", "--markets", "PTS",
+        "--demo", "--out", str(out_csv),
+    ])
+    assert scored.exit_code == 0, scored.stdout
+    payload = json.loads(scored.stdout[scored.stdout.index("{"):])
+    assert payload["by_market"]["PTS"]["status"] == "SCORED"
+    assert payload["predictions"] > 0
+
+    frame = pd.read_csv(out_csv)
+    assert {"projection", "probability_over", "research_line"}.issubset(frame.columns)
+    assert frame["projection"].notna().any()
+    # The line must never be presented as a sportsbook number.
+    assert (frame["line_source"] == "RESEARCH_L10_NOT_A_SPORTSBOOK_LINE").all()
+
+
+def test_train_stats_does_not_hand_categoricals_to_xgboost(tmp_path, monkeypatch):
+    """XGBoost rejects non-numerics, so it silently wrote only 2 of 3 artifacts."""
+    pytest.importorskip("catboost")
+    pytest.importorskip("xgboost")
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, [
+        "train-stats", "--market", "PTS",
+        "--start-date", "2024-11-01", "--end-date", "2025-03-01", "--demo",
+    ])
+    assert result.exit_code == 0
+    for name in ("distribution", "xgboost", "catboost"):
+        assert f"fitted {name} PTS" in result.stdout, f"{name} did not fit"
+
+
+def test_catboost_names_the_offending_column_not_the_labels():
+    """An undeclared string feature emptied the panel via dropna.
+
+    CatBoost then reported "Labels variable is empty", pointing at the
+    target rather than at the string column that actually caused it.
+    """
+    pytest.importorskip("catboost")
+    from src.models.catboost_pipeline import CatBoostPropPipeline
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    # TEAM_ABBREVIATION is a feature here but is NOT declared categorical.
+    model = CatBoostPropPipeline(
+        ["PTS_L5", "TEAM_ABBREVIATION"],
+        target_market="PTS",
+        categorical_features=[],
+        hyperparameters={"iterations": 20},
+    )
+    with pytest.raises(ValueError, match="TEAM_ABBREVIATION"):
+        model.fit(panel)
 
 
 def test_player_logs_have_a_writer_and_it_maps_the_panel_to_the_table():

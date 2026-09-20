@@ -52,7 +52,20 @@ def _load_team_games():
         return None
 
 
-def _load_real_or_demo(demo: bool):
+def _load_real_or_demo(
+    demo: bool,
+    seasons: str | None = None,
+    season_type: str | None = None,
+):
+    """
+    Build the feature matrix from real logs, or a synthetic demo panel.
+
+    ``seasons`` and ``season_type`` are threaded through to the loader.
+    Without them every command fell back to ``BoxScoreLoadConfig``'s
+    default season, so ``ingest-logs --seasons 2024-25`` cached one season
+    and the very next command trained on a different one — quietly, and
+    with no error to notice.
+    """
     from src.features.builder import build_feature_matrix
     from src.models.data_audit import make_demo_panel
 
@@ -64,9 +77,24 @@ def _load_real_or_demo(demo: bool):
         # Real team ratings must never be joined onto synthetic players.
         return build_feature_matrix(raw), True
     try:
-        from src.ingestion.boxscores import load_player_game_logs
+        from src.ingestion.boxscores import BoxScoreLoadConfig, load_player_game_logs
 
-        raw = load_player_game_logs()
+        config = None
+        if seasons or season_type:
+            defaults = BoxScoreLoadConfig()
+            config = BoxScoreLoadConfig(
+                seasons=(
+                    tuple(s.strip() for s in seasons.split(",") if s.strip())
+                    if seasons else defaults.seasons
+                ),
+                season_type=season_type or defaults.season_type,
+            )
+            logger.info(
+                "Loading player logs for seasons=%s season_type=%r",
+                list(config.seasons), config.season_type,
+            )
+
+        raw = load_player_game_logs(config)
         if raw is None or raw.empty:
             raise RuntimeError("empty player logs")
         return build_feature_matrix(raw, team_games=team_games), False
@@ -143,13 +171,18 @@ def ingest_logs(
 @app.command("audit-data")
 def audit_data(
     demo: bool = typer.Option(False, help="Audit a DEMO panel only"),
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
     """Print data readiness field statuses."""
     _setup_logging(verbose)
     from src.models.data_audit import audit_player_panel
 
-    panel, is_demo = _load_real_or_demo(demo)
+    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
     report = audit_player_panel(panel, dataset_name="demo_panel" if is_demo else "player_panel")
     typer.echo(json.dumps(report, indent=2, default=str))
 
@@ -159,6 +192,11 @@ def train_minutes(
     start_date: str = typer.Option(..., "--start-date"),
     end_date: str = typer.Option(..., "--end-date"),
     demo: bool = False,
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
     """Train minutes CatBoost on chronological window."""
@@ -167,7 +205,7 @@ def train_minutes(
 
     from src.models.minutes_model import MinutesModel
 
-    panel, _ = _load_real_or_demo(demo)
+    panel, _ = _load_real_or_demo(demo, seasons, season_type)
     d = panel.copy()
     d["GAME_DATE"] = pd.to_datetime(d["GAME_DATE"])
     train = d[(d["GAME_DATE"] >= start_date) & (d["GAME_DATE"] <= end_date)]
@@ -182,6 +220,11 @@ def train_stats(
     start_date: str = typer.Option(..., "--start-date"),
     end_date: str = typer.Option(..., "--end-date"),
     demo: bool = False,
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
     """Fit XGBoost + CatBoost adapters for one market (artifacts under model_runs)."""
@@ -198,18 +241,24 @@ def train_stats(
     if market not in {"PTS", "REB", "AST"}:
         typer.echo("Launch markets are PTS/REB/AST only", err=True)
         raise SystemExit(1)
-    panel, is_demo = _load_real_or_demo(demo)
+    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
     work = prepare_market_panel(panel, market)
     work = work[(work["GAME_DATE"] >= start_date) & (work["GAME_DATE"] <= end_date)]
     cols, _dropped = resolve_feature_cols(work, list(default_feature_cols(market)))  # type: ignore[arg-type]
     if not cols:
         typer.echo(f"No usable features for {market} in this panel", err=True)
         raise SystemExit(2)
+    # CatBoost handles these natively; XGBoost rejects non-numerics outright,
+    # so it keeps the numeric list. Passing the combined list to both made
+    # every train-stats run fail XGBoost with a DATA_NOT_AVAILABLE and write
+    # only two of the three artifacts — quietly, since the loop logs and
+    # continues.
+    numeric_cols = list(cols)
     for c in ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"):
         if c in work.columns and c not in cols:
             cols = list(cols) + [c]
     cfg = load_comparison_config()
-    comps = build_components(market, cols, cfg)
+    comps = build_components(market, cols, cfg, xgb_feature_cols=numeric_cols)
     art = Path(cfg.get("artifacts_dir", "data/external/model_runs/comparison"))
     if is_demo:
         art = art / "demo"
@@ -232,13 +281,18 @@ def evaluate(
     start_date: str = typer.Option(..., "--start-date"),
     end_date: str = typer.Option(..., "--end-date"),
     demo: bool = False,
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
     """Evaluate models on a validation window (train ends day before start_date)."""
     _setup_logging(verbose)
     from src.models.compare import compare_models_on_panel, load_comparison_config
 
-    panel, is_demo = _load_real_or_demo(demo)
+    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
     # train_end = day before evaluation start
     import pandas as pd
 
@@ -259,6 +313,11 @@ def compare_models(
     train_end: str = typer.Option("2025-01-15", "--train-end"),
     validation_end: str = typer.Option("2025-02-15", "--validation-end"),
     demo: bool = typer.Option(False, help="Use DEMO panel; writes to outputs/demo"),
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
     """Chronological comparison across models; writes outputs/ CSVs."""
@@ -267,7 +326,7 @@ def compare_models(
     from src.models.data_audit import audit_player_panel
     from src.models.exports import write_comparison_exports
 
-    panel, is_demo = _load_real_or_demo(demo or False)
+    panel, is_demo = _load_real_or_demo(demo or False, seasons, season_type)
     demo = demo or is_demo
     mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
     cfg = load_comparison_config()
@@ -312,37 +371,145 @@ def predict_slate(
         help="Slate date YYYY-MM-DD interpreted as America/Los_Angeles calendar day",
     ),
     shadow_mode: bool = typer.Option(True, "--shadow-mode/--no-shadow-mode"),
+    markets: str = typer.Option("PTS,REB,AST", "--markets", help="Comma-separated"),
+    out: str = typer.Option(None, "--out", help="Optional CSV path for the predictions"),
     demo: bool = False,
+    seasons: str = typer.Option(
+        None, "--seasons",
+        help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
+    ),
+    season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
     verbose: bool = False,
 ) -> None:
-    """Score a slate in shadow mode (no betting actions). Dates are Pacific."""
+    """Score a slate in shadow mode (no betting actions). Dates are Pacific.
+
+    Loads the artifacts written by ``train-stats`` and emits one shadow
+    prediction per player-market. The line used is ``RESEARCH_LINE``, a
+    trailing 10-game average — NOT a sportsbook line. No EV, no ranking,
+    no recommendation.
+    """
     _setup_logging(verbose)
+    import pandas as pd
+
+    from src.models.compare import (
+        build_components,
+        load_comparison_config,
+        prepare_market_panel,
+        resolve_feature_cols,
+    )
+    from src.models.labels import default_feature_cols
     from src.utils.timezones import DISPLAY_TZ_NAME, pacific_calendar_date
 
     if not shadow_mode:
         typer.echo("Only shadow-mode is supported in RESEARCH_ONLY", err=True)
         raise SystemExit(1)
-    slate = date or str(pacific_calendar_date())
-    panel, _ = _load_real_or_demo(demo)
-    import pandas as pd
 
-    d = panel.copy()
-    d["GAME_DATE"] = pd.to_datetime(d["GAME_DATE"])
-    # GAME_DATE is a calendar date presented as Pacific slate day (no feed TZ).
-    matched = d[d["GAME_DATE"].dt.strftime("%Y-%m-%d") == slate]
-    typer.echo(
-        json.dumps(
-            {
-                "date": slate,
-                "timezone_display": DISPLAY_TZ_NAME,
-                "shadow_mode": True,
-                "rows": int(len(matched)),
-            },
-            indent=2,
+    slate = date or str(pacific_calendar_date())
+    wanted = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
+
+    cfg = load_comparison_config()
+    art = Path(cfg.get("artifacts_dir", "data/external/model_runs/comparison"))
+    if is_demo:
+        art = art / "demo"
+
+    rows: list[dict[str, object]] = []
+    per_market: dict[str, object] = {}
+
+    for market in wanted:
+        work = prepare_market_panel(panel, market)
+        work["GAME_DATE"] = pd.to_datetime(work["GAME_DATE"])
+        # GAME_DATE is a calendar date presented as Pacific slate day.
+        on_slate = work[work["GAME_DATE"].dt.strftime("%Y-%m-%d") == slate]
+        if on_slate.empty:
+            per_market[market] = {"status": "NO_ROWS", "rows": 0}
+            continue
+
+        cols, _dropped = resolve_feature_cols(on_slate, list(default_feature_cols(market)))
+        for c in ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"):
+            if c in on_slate.columns and c not in cols:
+                cols = list(cols) + [c]
+
+        loaded = {}
+        for name, model in build_components(market, cols, cfg).items():
+            path = art / f"{name}_{market}"
+            if not hasattr(model, "load"):
+                continue
+            try:
+                loaded[name] = model.load(path)
+            except Exception as exc:  # noqa: BLE001 — a missing artifact is expected
+                logger.info("No usable %s artifact for %s (%s)", name, market, exc)
+
+        if not loaded:
+            # Reporting a row count here is what this command used to do, and
+            # it read as a scored slate. Say plainly that nothing scored it.
+            per_market[market] = {
+                "status": "DATA_NOT_AVAILABLE",
+                "rows": int(len(on_slate)),
+                "reason": f"no trained artifacts under {art} — run train-stats first",
+            }
+            continue
+
+        scored_here = 0
+        for name, model in loaded.items():
+            try:
+                predictions = model.predict_rows(on_slate, line_col="RESEARCH_LINE")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("%s could not score %s: %s", name, market, exc)
+                continue
+            for p in predictions:
+                rows.append({
+                    "slate_date_pt": slate,
+                    "market": market,
+                    "model": name,
+                    "player_id": p.player_id,
+                    "player_name": p.player_name,
+                    "event_id": p.event_id,
+                    "research_line": p.prop_line,
+                    "line_source": "RESEARCH_L10_NOT_A_SPORTSBOOK_LINE",
+                    "projection": p.prediction_mean,
+                    "probability_over": p.probability_over,
+                    "probability_under": p.probability_under,
+                    "probability_push": p.probability_push,
+                    "warnings": "; ".join(p.warnings) if p.warnings else None,
+                })
+                scored_here += 1
+        per_market[market] = {
+            "status": "SCORED" if scored_here else "DATA_NOT_AVAILABLE",
+            "rows": int(len(on_slate)),
+            "predictions": scored_here,
+            "models": sorted(loaded),
+        }
+
+    summary: dict[str, object] = {
+        "date": slate,
+        "timezone_display": DISPLAY_TZ_NAME,
+        "shadow_mode": True,
+        "demo": is_demo,
+        "artifacts_dir": str(art),
+        "predictions": len(rows),
+        "by_market": per_market,
+        "line_note": (
+            "RESEARCH_LINE is a trailing 10-game average, not a sportsbook "
+            "line. No EV, no ranking, no recommendation."
+        ),
+    }
+
+    if rows and out:
+        target = Path(out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(target, index=False)
+        summary["csv"] = str(target)
+
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+    if not rows:
+        typer.echo(
+            "Nothing scored. Either no games fall on this Pacific slate date, or "
+            "train-stats has not written artifacts for these markets.",
+            err=True,
         )
-    )
-    if matched.empty:
-        typer.echo("No rows for Pacific slate date (expected off-season or missing logs).")
+        raise SystemExit(4)
 
 if __name__ == "__main__":
     app()

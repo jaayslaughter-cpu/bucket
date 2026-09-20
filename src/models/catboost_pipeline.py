@@ -98,9 +98,24 @@ class CatBoostPropPipeline:
         work = df.copy()
         for c in self.categorical_features:
             work[c] = work[c].astype(str).fillna("MISSING")
+        emptied = []
         for c in self.feature_cols:
             if c not in self.categorical_features:
-                work[c] = pd.to_numeric(work[c], errors="coerce")
+                coerced = pd.to_numeric(work[c], errors="coerce")
+                # A column that was entirely non-numeric becomes entirely NaN,
+                # and the dropna below then removes every row. CatBoost reports
+                # that as "Labels variable is empty", which points at the target
+                # rather than at the string column that is really the problem.
+                if len(work) and coerced.isna().all() and work[c].notna().any():
+                    emptied.append(c)
+                work[c] = coerced
+        if emptied:
+            raise ValueError(
+                f"DATA_NOT_AVAILABLE: feature column(s) {emptied} hold no numeric "
+                "values and are not declared categorical, so coercing them would "
+                "drop every training row. Declare them in catboost."
+                "categorical_features, or remove them from the feature list."
+            )
         return work
 
     def _carve_early_stopping_split(

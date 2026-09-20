@@ -21,6 +21,9 @@ from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_CATEGORICAL_COLS = ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON")
+
+
 def load_comparison_config(path: Path | str = "config/model_comparison.yaml") -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -119,11 +122,27 @@ def build_components(
             from src.models.catboost_pipeline import CatBoostPropPipeline
 
             cb_cfg = cfg.get("catboost") or {}
+            # Fall back to the known-categorical names when the config does
+            # not list them. Without this, a run started outside the repo
+            # root (where config/model_comparison.yaml is not found) treated
+            # TEAM_ABBREVIATION and friends as numeric, coerced every value
+            # to NaN, and dropped the entire training set — surfacing as
+            # CatBoost's "Labels variable is empty", which names the wrong
+            # thing entirely.
+            configured_cats = list(cb_cfg.get("categorical_features") or [])
+            if not configured_cats:
+                configured_cats = [c for c in DEFAULT_CATEGORICAL_COLS if c in feature_cols]
+                if configured_cats:
+                    logger.info(
+                        "No categorical_features configured — treating %s as categorical "
+                        "by name, since coercing them to numeric would empty the panel.",
+                        configured_cats,
+                    )
             components["catboost"] = CatBoostPropPipeline(
                 feature_cols,
                 target_market=market,
                 feature_schema_version=schema,
-                categorical_features=list(cb_cfg.get("categorical_features") or []),
+                categorical_features=configured_cats,
                 hyperparameters={k: v for k, v in cb_cfg.items() if k != "categorical_features"},
                 random_seed=seed,
             )
