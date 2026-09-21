@@ -284,6 +284,47 @@ minutes drive a player's own markets together) and `same_team` /
 draws players independently: it finds the structure that is there and does
 not invent the structure that is not.
 
+## Market context from the licensed workbook
+
+The BigDataBall team workbook is the first real market data in the tree:
+2,644 team-game rows with an opening and a closing spread and total, plus a
+moneyline. Drop it in `data/external/bigdataball/` (gitignored) or set
+`BIGDATABALL_XLSX`, and two things switch on.
+
+**Pregame features.** `build_feature_matrix(..., market_lines=...)` joins
+the market's own forecast: `MKT_OPENING_SPREAD`, `MKT_OPENING_TOTAL`,
+`MKT_IMPLIED_TEAM_TOTAL`, `MKT_IMPLIED_OPP_TOTAL`, `MKT_IS_FAVORITE`. The
+implied team total — `(total − spread) / 2` — is the market's estimate of
+how many points a team will score, priced by people holding injury and
+rotation news no rolling average contains. For a points prop it is the most
+informative pregame number available.
+
+**Only opening lines.** A closing number is known at tip, after every late
+scratch and steam move; joining it to a projection made that morning hands
+the model the market's final answer. `attach_market_context` raises
+`ClosingLineLeakageError` on any closing column rather than dropping it
+quietly, so nothing downstream can reach one by accident.
+
+**CLV on game lines.** Closing values are reachable only through
+`closing_line_value()` — settlement, not features:
+
+```bash
+PYTHONPATH=. python scripts/nba_model_cli.py game-clv
+```
+
+On the 2025-26 workbook: 2,644 team-games priced at both ends, mean move
+**0.000** points, mean absolute move **1.44**, and 1,772 games moved a point
+or more. The zero mean is the check that matters — line moves are zero-sum
+across the two sides of a game, so a non-zero mean would be a parsing error,
+not an edge.
+
+The schema version moves when market context attaches
+(`fs_v1_shift1_l2+layers.…`), so a model trained with these features can
+never be scored against one trained without them while both claim the same
+version. The demo path deliberately does **not** join them: the demo teams
+reuse real NBA abbreviations, so the join would succeed and produce numbers
+that mean nothing.
+
 ## Disclaimer
 
 Decision board output is a research ranking for your judgment — not a lock,

@@ -284,6 +284,7 @@ def build_feature_matrix(
     player_panel: pd.DataFrame,
     *,
     team_games: pd.DataFrame | None = None,
+    market_lines: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix from a raw player game-log panel.
@@ -296,6 +297,11 @@ def build_feature_matrix(
     date, team and points). When supplied, pre-game Elo ratings are joined
     on; when absent, the team-strength columns are simply not created and
     the run is narrower rather than silently filled.
+
+    ``market_lines`` is the matching ``market_lines`` frame. Only its OPENING
+    spread and total are read, because those are posted before tip. Closing
+    lines are refused outright — see src/features/market_context.py — since
+    a number known only at tip is the market's final answer, not a feature.
     """
     if player_panel.empty:
         logger.warning("Empty player panel — returning it unchanged.")
@@ -344,6 +350,10 @@ def build_feature_matrix(
             )
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
 
+    # Layers that depend on an external frame being supplied, recorded so the
+    # schema version reflects what a run actually had.
+    market_layers: list[str] = []
+
     df = attach_team_pace(df)
     df = attach_fatigue_column(df)
 
@@ -356,10 +366,26 @@ def build_feature_matrix(
         # Elo is computed over the full team history in date order, then
         # joined by pre-game value only. elo_post never reaches the panel.
         df = attach_elo_features(df, compute_team_elo(team_games))
+        market_layers.append("team_elo")
     else:
         logger.info(
             "Team Elo skipped: no team_games frame supplied, so no opponent-strength "
             "features. Pass the BigDataBall team_game_stats frame to enable them."
+        )
+
+    if market_lines is not None and not market_lines.empty:
+        # OPENING spread and total only. attach_market_context raises on any
+        # closing column rather than quietly dropping it.
+        from src.features.market_context import attach_market_context
+
+        before = set(df.columns)
+        df = attach_market_context(df, market_lines)
+        if set(df.columns) - before:
+            market_layers.append("market_context")
+    else:
+        logger.info(
+            "Market context skipped: no market_lines frame supplied, so no "
+            "implied team totals. Pass the BigDataBall market_lines frame."
         )
 
     # PACE_MULTIPLIER is NOT materialized when absent. Writing 1.0 into the
@@ -421,7 +447,7 @@ def build_feature_matrix(
     # matrix down: these are enrichments, and losing one should narrow the
     # feature set, not stop the pipeline. assert_no_lookahead still runs
     # over whatever they produced.
-    attached: list[str] = []
+    attached: list[str] = list(market_layers)
     for layer_name, attach in _ADDITIVE_FEATURE_LAYERS:
         try:
             df = attach(df)

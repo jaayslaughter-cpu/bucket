@@ -28,29 +28,42 @@ def _setup_logging(verbose: bool = False) -> None:
 
 
 def _load_team_games():
-    """Team-level results for Elo, from the licensed workbook when configured.
+    """Team results and market lines from the licensed workbook.
 
-    Returns None when unavailable — the builder then skips team-strength
-    features and says so, rather than inventing ratings.
+    Returns ``(team_games, market_lines)``, or ``(None, None)`` when the
+    workbook is unavailable — the builder then skips team-strength and
+    market features and says so, rather than inventing ratings or lines.
     """
     import os
 
     path = os.environ.get("BIGDATABALL_XLSX")
     if not path or not Path(path).exists():
+        # Fall back to the documented drop-in location so the workbook works
+        # the moment it is placed there, without a second configuration step.
+        found = sorted(Path("data/external/bigdataball").glob("*.xlsx"))
+        path = str(found[0]) if found else None
+    if not path:
         logger.info(
-            "BIGDATABALL_XLSX unset or missing — no team Elo features this run. "
-            "Point it at the licensed workbook to enable them."
+            "BIGDATABALL_XLSX unset and no workbook in data/external/bigdataball — "
+            "no team Elo or market context this run. Drop the licensed workbook "
+            "there, or point BIGDATABALL_XLSX at it."
         )
-        return None
+        return None, None
     try:
         from src.ingestion.bigdataball import load_bigdataball_workbook
 
-        team_games, _market = load_bigdataball_workbook(path)
-        logger.info("Loaded %d team-game rows for Elo from %s", len(team_games), path)
-        return team_games
+        team_games, market_lines = load_bigdataball_workbook(path)
+        logger.info(
+            "Loaded %d team-game rows and %d market-line rows from %s",
+            len(team_games), len(market_lines), path,
+        )
+        return team_games, market_lines
     except Exception as exc:  # noqa: BLE001 — degrade with a reason, never fake it
-        logger.warning("Could not load team games (%s) — proceeding without Elo", exc)
-        return None
+        logger.warning(
+            "Could not load the workbook (%s) — proceeding without Elo or market "
+            "context", exc,
+        )
+        return None, None
 
 
 def _load_real_or_demo(
@@ -70,12 +83,14 @@ def _load_real_or_demo(
     from src.features.builder import build_feature_matrix
     from src.models.data_audit import make_demo_panel
 
-    team_games = _load_team_games()
+    team_games, market_lines = _load_team_games()
 
     if demo:
         logger.warning("DEMO MODE — synthetic panel; do not treat metrics as real")
         raw = make_demo_panel()
-        # Real team ratings must never be joined onto synthetic players.
+        # Real team ratings and real market lines must never be joined onto
+        # synthetic players. The demo teams reuse real NBA abbreviations, so
+        # the join would SUCCEED and produce numbers that mean nothing.
         return build_feature_matrix(raw), True
     try:
         from src.ingestion.boxscores import BoxScoreLoadConfig, load_player_game_logs
@@ -98,7 +113,9 @@ def _load_real_or_demo(
         raw = load_player_game_logs(config)
         if raw is None or raw.empty:
             raise RuntimeError("empty player logs")
-        return build_feature_matrix(raw, team_games=team_games), False
+        return build_feature_matrix(
+            raw, team_games=team_games, market_lines=market_lines,
+        ), False
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Real panel unavailable (%s). Re-run with --demo for wiring tests, "
@@ -924,6 +941,60 @@ def fit_leg_correlations_cmd(
             "generated data, not the NBA."
         )
     typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("game-clv")
+def game_clv_cmd(
+    out: Path = typer.Option(Path("outputs/game_clv.csv"), "--out"),
+    taken_col: str = typer.Option(
+        "opening_spread", "--taken-col",
+        help="The price you are measuring FROM (the opener, by default)",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Closing-line value on game spreads, from the licensed workbook.
+
+    CLV asks whether the PRICE was right; EV asks whether the model was.
+    They are reported separately and never summed into a return.
+    """
+    _setup_logging(verbose)
+    from src.features.market_context import MarketContextError, closing_line_value
+
+    _team_games, market_lines = _load_team_games()
+    if market_lines is None or market_lines.empty:
+        typer.echo(
+            "DATA_NOT_AVAILABLE: no market lines. Drop the licensed workbook in "
+            "data/external/bigdataball, or set BIGDATABALL_XLSX.",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    try:
+        clv = closing_line_value(market_lines, taken_col=taken_col)
+    except MarketContextError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    clv.to_csv(out, index=False)
+
+    graded = clv[clv["status"] == "OK"]
+    moves = graded["clv_line_points"]
+    typer.echo(json.dumps({
+        "research_status": "RESEARCH_ONLY",
+        "rows": int(len(clv)),
+        "priced_both_ends": int(len(graded)),
+        "unpriced": int((clv["status"] != "OK").sum()),
+        "mean_move_points": round(float(moves.mean()), 4) if len(graded) else None,
+        "mean_abs_move_points": round(float(moves.abs().mean()), 4) if len(graded) else None,
+        "moved_at_least_1pt": int((moves.abs() >= 1).sum()) if len(graded) else 0,
+        "out": str(out),
+        "note": (
+            "Line CLV on game spreads. Zero-sum across the two sides of a game, "
+            "so a non-zero mean would indicate a parsing error, not an edge. "
+            "Never added into ROI."
+        ),
+    }, indent=2))
 
 
 @app.command("notify-discord")
