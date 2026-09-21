@@ -177,6 +177,39 @@ including two that are pinned here by regression test in
 The audit independently found the same push-mass defect described above,
 which is the second reason it is worth stating twice.
 
+## Parlays
+
+`src/quant/parlay.py` prices a ticket someone is considering. It does not
+select tickets, and it cannot produce one from this repository today —
+every leg needs a real price, and no odds exist yet.
+
+The one thing it will not do is multiply leg probabilities together and
+call that a parlay. That product is correct only for independent legs, and
+same-game legs never are: a player's points and his team's total move
+together. So `evaluate_parlay` **refuses** a ticket whose legs share a
+`game_id` unless it is given a correlation matrix. Joint probability comes
+from a Gaussian copula, which reduces exactly to the product at R = I, so
+independence is a point in the same model rather than a separate path. R is
+the **tetrachoric** correlation — the latent normal one, not the observed
+correlation of the 0/1 outcomes.
+
+It also refuses a leg on a whole line: a push voids that leg and re-prices
+the whole ticket at the remaining legs' odds, which a win/lose model does
+not represent.
+
+`calibration_amplification` is the number worth reading before any of this
+is used. At a 5% per-leg optimism:
+
+| legs | believed | true | overstated by |
+|---|---|---|---|
+| 2 | 0.3364 | 0.3036 | 10.8% |
+| 3 | 0.1951 | 0.1673 | 16.6% |
+| 5 | 0.0656 | 0.0508 | 29.2% |
+
+A parlay is where an uncalibrated model's error compounds fastest, which
+makes it the worst available way to express an unproven edge rather than
+the best.
+
 ## Disclaimer
 
 Decision board output is a research ranking for your judgment — not a lock,
