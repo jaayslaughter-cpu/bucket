@@ -22,7 +22,7 @@ CALIB_DISCLAIMER = (
 
 
 def _side_aligned_probs(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Convert model P(over) + bet side into P(side) vs hit indicator."""
+    """Align settled rows: ``model_prob`` is P(taken side) for over OR under."""
     probs: list[float] = []
     hits: list[float] = []
     for _, r in df.iterrows():
@@ -32,13 +32,11 @@ def _side_aligned_probs(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         if p is None or (isinstance(p, float) and not np.isfinite(p)):
             continue
         side = str(r.get("bet_side", "")).lower()
+        if side not in {"over", "o", "under", "u"}:
+            continue
         won = r.get("bet_result") == "WIN"
-        if side in {"over", "o"}:
-            probs.append(float(p))
-            hits.append(1.0 if won else 0.0)
-        elif side in {"under", "u"}:
-            probs.append(1.0 - float(p))
-            hits.append(1.0 if won else 0.0)
+        probs.append(float(p))
+        hits.append(1.0 if won else 0.0)
     return np.asarray(probs, dtype=float), np.asarray(hits, dtype=float)
 
 

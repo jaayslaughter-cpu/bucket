@@ -205,10 +205,43 @@ def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
     team["PACE_ROLL"] = _group_shift_roll(
         team, "POSSESSIONS_EST", team_keys, window=10, min_periods=3
     )
-    league = (
-        team.groupby(season_col)["PACE_ROLL"].transform("mean") if season_col
-        else team["PACE_ROLL"].mean()
-    )
+    # League mean must be as-of-date. A season-wide transform("mean") includes
+    # later games' pregame pace rolls and leaks future information into early
+    # PACE_MULTIPLIER values.
+    if season_col:
+        daily = (
+            team.groupby([season_col, "GAME_DATE"], as_index=False)["PACE_ROLL"]
+            .mean()
+            .rename(columns={"PACE_ROLL": "DAY_LEAGUE_PACE"})
+            .sort_values([season_col, "GAME_DATE"])
+            .reset_index(drop=True)
+        )
+        daily["LEAGUE_PACE_ASOF"] = daily.groupby(season_col, sort=False)[
+            "DAY_LEAGUE_PACE"
+        ].transform(lambda s: s.expanding(min_periods=3).mean().shift(1))
+        team = team.merge(
+            daily[[season_col, "GAME_DATE", "LEAGUE_PACE_ASOF"]],
+            on=[season_col, "GAME_DATE"],
+            how="left",
+        )
+        league = team["LEAGUE_PACE_ASOF"]
+    else:
+        daily = (
+            team.groupby("GAME_DATE", as_index=False)["PACE_ROLL"]
+            .mean()
+            .rename(columns={"PACE_ROLL": "DAY_LEAGUE_PACE"})
+            .sort_values("GAME_DATE")
+            .reset_index(drop=True)
+        )
+        daily["LEAGUE_PACE_ASOF"] = (
+            daily["DAY_LEAGUE_PACE"].expanding(min_periods=3).mean().shift(1)
+        )
+        team = team.merge(
+            daily[["GAME_DATE", "LEAGUE_PACE_ASOF"]],
+            on="GAME_DATE",
+            how="left",
+        )
+        league = team["LEAGUE_PACE_ASOF"]
     # Rows without enough prior games keep NaN rather than a neutral 1.0.
     team["PACE_MULTIPLIER"] = (team["PACE_ROLL"] / league).clip(0.7, 1.3)
 
@@ -305,7 +338,7 @@ def build_feature_matrix(
         )
     for stat in present:
         df[stat] = pd.to_numeric(df[stat], errors="coerce")
-        for window in (2, 5, 10):
+        for window in (5, 10):
             df[f"{stat}_L{window}"] = by_player[stat].transform(
                 _prior_window_mean, window=window
             )

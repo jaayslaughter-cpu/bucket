@@ -191,6 +191,21 @@ class EvEngine:
         )
 
         if model_prob_b is None:
+            # Whole-number lines can carry push mass. Folding that mass into
+            # under via 1-P(over) overstates under EV / mis-calibrates.
+            whole_line = False
+            if line is not None:
+                try:
+                    lf = float(line)
+                    whole_line = math.isfinite(lf) and lf == float(int(lf))
+                except (TypeError, ValueError):
+                    whole_line = False
+            if whole_line:
+                out.reason = (
+                    "model_prob_b required for whole-number lines (push mass); "
+                    "refusing silent 1-P(over) complement"
+                )
+                return out
             model_prob_b = 1.0 - float(model_prob_a)
 
         for name, value in (("model_prob_a", model_prob_a), ("model_prob_b", model_prob_b)):
@@ -199,7 +214,10 @@ class EvEngine:
                 return out
 
         try:
-            fair = multiplicative_devig(int(american_a), int(american_b))
+            aa, ab = int(american_a), int(american_b)
+            if aa == 0 or ab == 0:
+                raise ValueError("American odds of 0 are not a price")
+            fair = multiplicative_devig(aa, ab)
         except (TypeError, ValueError) as exc:
             out.reason = f"Cannot de-vig this market: {exc}"
             return out
@@ -251,6 +269,7 @@ class EvEngine:
         model_prob_over: float,
         *,
         market_type: MarketType = "player_prop",
+        model_prob_under: float | None = None,
     ) -> EvEvaluation:
         """
         Price a posted market, but only after the gate allows it.
@@ -259,6 +278,9 @@ class EvEngine:
         computed at all — pick'em boards, missing odds, absent lines. Going
         around it here would reintroduce exactly the silent-EV path it
         exists to prevent.
+
+        Pass ``model_prob_under`` for whole-number lines so push mass is
+        not silently assigned to under.
         """
         context = (
             market.to_market_context()
@@ -280,6 +302,7 @@ class EvEngine:
             american_a=int(context.over_odds_american),
             american_b=int(context.under_odds_american),
             model_prob_a=float(model_prob_over),
+            model_prob_b=model_prob_under,
             label_a="over", label_b="under",
             line=context.line,
             market_type=market_type,

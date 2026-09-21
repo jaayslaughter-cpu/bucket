@@ -34,15 +34,19 @@ vocabulary before a row can be written.
 | `why` | Short human-readable reason, including every refusal |
 | `rank` | CONSIDER first, then band, then score |
 | `book_source` | `propline` or `oddspapi` — which feed priced this row |
-| `fallback_used` | True when PropLine was present but unusable |
-| `sources_skipped` | What was passed over, and the gate's reason for each |
+| `book_fallback_used` | True when PropLine was present but unusable |
+| `book_sources_skipped` | What was passed over, and the gate's reason for each |
 | `line_can_push` | True on a whole line (and on an unknown one) |
+| `model_prob` | P(this side) — never P(over) for an under row |
+| `rank_score` | EV for priced rows, lean for unpriced ones (banded, never mixed) |
 
 ## Source precedence
 
 `resolve_market` walks `SOURCE_PRECEDENCE = ("propline", "oddspapi")` and
 takes the first source whose market clears the EV gate — **by precedence,
-not by arrival order**. The common fallback is a PrizePicks or Underdog
+not by arrival order**. `enrich_row_with_resolved_market(row, candidates)`
+is the entry point that applies it and stamps the source onto the row;
+`enrich_row_with_book` prices whatever snapshot it is handed. The common fallback is a PrizePicks or Underdog
 row: a pick'em board publishes a payout multiplier rather than a two-way
 price, so it cannot be de-vigged, PropLine is skipped for pricing, and
 OddsPapi prices the row instead. That is recorded, never silent:
@@ -112,26 +116,19 @@ PYTHONPATH=. python scripts/nba_model_cli.py log-manual-bet \
 PYTHONPATH=. python scripts/nba_model_cli.py paper-report
 ```
 
-### `--model-prob` vs `--model-prob-side`
+### `--model-prob` is P(the side you took)
 
-These are **two different quantities** and the distinction is not cosmetic:
+`--model-prob` is **P(the side you took)** — P(over) for an over, P(under)
+for an under. One quantity, stored as logged and read back unchanged by
+both `paper-report` and `paper-calibration`.
 
-- `--model-prob` is **P(over)**, always, whichever side you took. It is what
-  the store records and what the calibration reads.
-- `--model-prob-side` is **P(the side you took)**.
+This matters because the alternative convention (always store P(over), and
+derive the under as `1 − P(over)`) is wrong on exactly the lines where it is
+used: a whole line's complement includes the push mass. Storing P(side)
+removes the conversion, and with it the bug.
 
-Pass both when you have both. `decision_log_fields` emits both, already
-aligned.
-
-If you pass only `--model-prob-side` for an **under** bet, the CLI converts
-it to P(over) — but only on a half-line, where `1 − P(under)` is exact. On a
-whole line it refuses, because recovering P(over) would need the push mass
-that is not on the command line.
-
-Rows logged without `model_prob_side` still calibrate, except for under bets
-on whole lines: those are **skipped and counted** in
-`probability_calibration.skipped_push_ambiguous` rather than scored against
-`1 − P(over)`, which is known to be too high.
+`candidate_to_manual_bet_fields` emits the right value for the row you
+picked, so you can copy it straight across.
 
 ## Flags
 
@@ -145,8 +142,11 @@ on whole lines: those are **skipped and counted** in
 
 ## Modules
 
-- `src/quant/decision_board.py` — precedence, push rule, expand / rank / CSV,
-  and the handoff fields for the manual log
+- `src/quant/decision_board.py` — source precedence, expand / rank / CSV, and
+  the handoff fields for the manual log (`build_decision_board`,
+  `BettingDecisionCandidate`, `candidate_to_manual_bet_fields`)
+- `src/quant/paper_research.py` — `resolve_two_way_model_probs` /
+  `model_prob_for_side` hold the push rule
 - `src/quant/paper_research.py` — dual-side slate + manual log
 - CLI: `decision-board` · `research-slate` · `log-manual-bet` · `paper-report`
 
@@ -157,6 +157,25 @@ No archived PropLine pull exists in this repository yet, so
 `model_lean` or `unavailable`**. That is the truthful state, not a bug:
 there is nothing priced to rank. Once a PropLine pull is archived, pass it
 as `markets` to `decision_board_from_slate` and the `book_ev` band fills in.
+
+## Audit provenance
+
+An external audit (2026-09-20) reviewed this tree and found 17 defects,
+including two that are pinned here by regression test in
+`tests/test_audit_fixes.py`:
+
+- `PACE_MULTIPLIER` divided each team's rolling pace by a **season-wide**
+  league mean, so every early-season row was measured against games that had
+  not happened yet. The baseline is now an as-of expanding daily mean, and
+  the test proves it by deleting later games and checking that no earlier
+  value moves.
+- `line_diff` and `enrich_row_with_book` both advertised
+  `MarketContext | PropMarketSnapshot` but read `market.total`, which
+  `MarketContext` does not have — every `MarketContext` caller raised
+  `AttributeError`.
+
+The audit independently found the same push-mass defect described above,
+which is the second reason it is worth stating twice.
 
 ## Disclaimer
 

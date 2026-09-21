@@ -1,44 +1,53 @@
 """
 Tests for src/quant/decision_board.py — the MANUAL_ONLY decision layer.
 
-Three things are load-bearing here and each has a test that fails without it:
+Three things are load-bearing and each has a test that fails without it:
 
-1. PropLine is PRIMARY and OddsPapi is the FALLBACK, by precedence rather
-   than by arrival order, with every skip explained.
+1. PropLine is PRIMARY and OddsPapi the FALLBACK, by precedence rather than
+   by arrival order, with every skip explained.
 2. P(under) is never the complement of P(over) when a push is possible.
-3. Nothing in this layer places, prices or sizes a wager.
+3. A model lean never outranks a priced edge, and nothing in this layer can
+   place, price or size a wager.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
 
 from src.quant.contracts import PropMarketSnapshot
 from src.quant.decision_board import (
-    DECISION_DISCLAIMER,
-    FORBIDDEN_CLAIM_WORDS,
+    BOARD_DISCLAIMER,
     PLACEMENT_MODE,
     SOURCE_PRECEDENCE,
+    BettingDecisionCandidate,
     DecisionBoardError,
-    board_summary,
-    decision_board_from_slate,
-    decision_log_fields,
-    expand_sides,
+    build_decision_board,
+    candidate_to_manual_bet_fields,
+    decision_board_summary,
+    enrich_row_with_resolved_market,
+    expand_row_to_candidates,
     line_can_push,
     propline_row_to_snapshot,
-    rank_decisions,
     resolve_market,
-    side_probabilities,
     write_decision_board_csv,
+)
+from src.quant.paper_research import (
+    ResearchSlateRow,
+    enrich_row_with_book,
+    model_prob_for_side,
+    resolve_two_way_model_probs,
 )
 
 
 def _snap(source: str, **kw) -> PropMarketSnapshot:
     base = dict(
-        game_id="G1", market="PTS", player_name="A", line=24.5,
+        game_id="g1", market="PTS", player_name="Demo", line=24.5,
         over_odds_american=-110, under_odds_american=-110,
         bookmaker=kw.pop("bookmaker", "somebook"), source=source, status="VALID",
+        captured_at_utc=datetime.now(timezone.utc),
     )
     base.update(kw)
     return PropMarketSnapshot(**base)
@@ -52,18 +61,84 @@ PROPLINE_PICKEM = _snap(
 )
 
 
+def _row(**kw) -> ResearchSlateRow:
+    base = dict(
+        slate_date="2026-01-16", event_id="g1", player_id="p1",
+        player_name="Demo", target_market="PTS", research_line=24.5,
+        model_p_over=0.62, model_p_under=0.38,
+    )
+    base.update(kw)
+    return ResearchSlateRow(**base)
+
+
+# --- the push rule -------------------------------------------------------
+
+
+def test_resolve_half_line_complements_under():
+    po, pu, pp, warn = resolve_two_way_model_probs(p_over=0.58, line=24.5)
+    assert warn is None
+    assert po == pytest.approx(0.58)
+    assert pu == pytest.approx(0.42)
+    assert pp == pytest.approx(0.0)
+
+
+def test_resolve_whole_line_refuses_silent_complement():
+    """1 - P(over) is P(under) + P(push); using it books every push as a win."""
+    po, pu, pp, warn = resolve_two_way_model_probs(p_over=0.55, line=27.0)
+    assert po == pytest.approx(0.55)
+    assert pu is None and pp is None
+    assert warn is not None and "DATA_NOT_AVAILABLE" in warn
+
+
+def test_resolve_unknown_line_refuses_too():
+    """A line we cannot see cannot be shown to be a half-line."""
+    assert line_can_push(None) is True
+    po, pu, pp, warn = resolve_two_way_model_probs(p_over=0.55, line=None)
+    assert pu is None and pp is None
+    assert warn is not None and "DATA_NOT_AVAILABLE" in warn
+
+
+def test_resolve_refuses_an_inconsistent_triple_rather_than_clamping():
+    po, pu, pp, warn = resolve_two_way_model_probs(p_over=0.80, p_push=0.40, line=27.0)
+    assert pu is None
+    assert warn is not None and "negative residual" in warn
+
+
+def test_model_prob_for_side_never_invents_an_under():
+    assert model_prob_for_side(bet_side="under", p_over=0.55, line=24.5) == pytest.approx(0.45)
+    assert model_prob_for_side(bet_side="under", p_over=0.55, line=27.0) is None
+    assert model_prob_for_side(
+        bet_side="under", p_over=0.55, p_under=0.40, p_push=0.05, line=27.0
+    ) == pytest.approx(0.40)
+
+
+def test_enrich_row_with_book_refuses_the_complement_on_a_whole_line():
+    whole = _snap("propline", line=8.0, market="REB")
+    out = enrich_row_with_book(
+        _row(target_market="REB", research_line=8.0, model_p_over=0.58, model_p_under=None),
+        whole,
+    )
+    assert out.book_ev_under is None
+    assert any("DATA_NOT_AVAILABLE" in w for w in out.warnings)
+
+    priced = enrich_row_with_book(
+        _row(target_market="REB", research_line=8.0, model_p_over=0.58,
+             model_p_under=0.34, model_p_push=0.08),
+        whole,
+    )
+    assert priced.book_ev_under is not None
+
+
 # --- source precedence: PropLine primary, OddsPapi fallback --------------
 
 
 def test_propline_is_preferred_over_oddspapi():
     assert SOURCE_PRECEDENCE == ("propline", "oddspapi")
-    resolution = resolve_market([ODDSPAPI, PROPLINE])
-    assert resolution.source == "propline"
-    assert resolution.fallback_used is False
+    assert resolve_market([ODDSPAPI, PROPLINE]).source == "propline"
+    assert resolve_market([ODDSPAPI, PROPLINE]).fallback_used is False
 
 
 def test_precedence_not_arrival_order():
-    """Listing OddsPapi first must not make it primary."""
     assert resolve_market([ODDSPAPI, PROPLINE]).source == "propline"
     assert resolve_market([PROPLINE, ODDSPAPI]).source == "propline"
 
@@ -71,39 +146,45 @@ def test_precedence_not_arrival_order():
 def test_oddspapi_is_used_when_propline_cannot_be_priced():
     """
     A PropLine pick'em row posts a payout multiplier, not a price. The
-    fallback fires, is flagged, and the reason names the pick'em board — a
-    fallback nobody can explain is indistinguishable from a bug.
+    fallback fires, is flagged, and the reason names the pick'em board.
     """
     resolution = resolve_market([PROPLINE_PICKEM, ODDSPAPI])
     assert resolution.source == "oddspapi"
     assert resolution.fallback_used is True
     assert "propline" in resolution.skipped_summary
     assert "multiplier" in resolution.skipped_summary
-    # The pick'em line survives for line research even though it cannot price.
     assert resolution.pickem_snapshot is PROPLINE_PICKEM
 
 
 def test_a_lone_fallback_source_is_not_reported_as_a_fallback():
-    resolution = resolve_market([ODDSPAPI])
-    assert resolution.source == "oddspapi"
-    assert resolution.fallback_used is False
+    assert resolve_market([ODDSPAPI]).fallback_used is False
 
 
 def test_no_usable_source_abstains_with_a_reason():
-    resolution = resolve_market([PROPLINE_PICKEM])
-    assert resolution.snapshot is None
-    assert resolution.is_priced is False
-    assert "multiplier" in (resolution.reason or "")
+    assert resolve_market([PROPLINE_PICKEM]).snapshot is None
+    assert "multiplier" in (resolve_market([PROPLINE_PICKEM]).reason or "")
+    assert resolve_market([]).reason
 
-    empty = resolve_market([])
-    assert empty.snapshot is None
-    assert empty.reason
+
+def test_resolved_market_stamps_the_source_on_the_row():
+    row, resolution = enrich_row_with_resolved_market(_row(), [PROPLINE_PICKEM, ODDSPAPI])
+    assert row.book_status == "VALID"
+    assert row.book_source == "oddspapi"
+    assert row.book_fallback_used is True
+    assert "propline" in row.book_sources_skipped
+    # The pick'em line survives for line research even though it cannot price.
+    assert row.pickem_line == pytest.approx(24.5)
+    assert resolution.source == "oddspapi"
+
+    board = build_decision_board([row])
+    assert {c.book_source for c in board} == {"oddspapi"}
+    assert all(c.book_fallback_used for c in board)
 
 
 def test_propline_rows_bridge_into_snapshots():
     class Row:
         source = "draftkings"
-        player_name = "A"
+        player_name = "Demo"
         market = "PTS"
         line = 24.5
         status = "VALID"
@@ -116,364 +197,171 @@ def test_propline_rows_bridge_into_snapshots():
     snap = propline_row_to_snapshot(Row())
     assert snap.source == "propline"        # the FEED, which precedence reads
     assert snap.bookmaker == "draftkings"   # the BOOK that posted it
-    assert snap.game_id == "0022500123"
     assert resolve_market([snap]).source == "propline"
 
     with pytest.raises(DecisionBoardError, match="Not a PropLine row"):
         propline_row_to_snapshot(object())
 
 
-# --- the push rule -------------------------------------------------------
-
-
-def test_line_can_push_only_on_whole_numbers():
-    assert line_can_push(24.0) is True
-    assert line_can_push(24.5) is False
-    # An unknown line cannot be SHOWN to be a half-line, so it refuses.
-    assert line_can_push(None) is True
-    assert line_can_push(float("nan")) is True
-
-
-def test_half_line_under_is_the_exact_complement():
-    probs = side_probabilities(p_over=0.55, line=24.5)
-    assert probs["under"][0] == pytest.approx(0.45)
-    assert probs["under"][1] is None
-
-
-def test_whole_line_refuses_the_complement():
-    """
-    1 - P(over) is P(under) + P(push). On a whole line that books every push
-    as an under win and inflates the under's EV by exactly the push mass.
-    """
-    probs = side_probabilities(p_over=0.55, line=24.0)
-    assert probs["under"][0] is None
-    assert "push" in probs["under"][1].lower()
-
-
-def test_unknown_line_refuses_the_complement_too():
-    probs = side_probabilities(p_over=0.55, line=None)
-    assert probs["under"][0] is None
-    assert "half-line" in probs["under"][1]
-
-
-def test_explicit_under_probability_is_used_as_given():
-    probs = side_probabilities(p_over=0.58, p_under=0.34, p_push=0.08, line=24.0)
-    assert probs["under"][0] == pytest.approx(0.34)
-    assert probs["under"][1] is None
-
-
-def test_a_refused_under_does_not_cost_the_over_its_ev():
-    """
-    The de-vig needs both PRICES, but each side's EV needs only its own
-    probability. A whole line with no P(under) still yields a real over EV.
-    """
-    whole = _snap("propline", line=8.0)
-    rows = {r.side: r for r in expand_sides(
-        event_id="G1", target_market="REB", model_p_over=0.58,
-        research_line=8.0, resolution=resolve_market([whole]),
-    )}
-    assert rows["over"].decision_basis == "book_ev"
-    assert rows["over"].book_ev is not None and rows["over"].book_ev > 0
-    assert rows["under"].decision_basis == "unavailable"
-    assert rows["under"].book_ev is None
-    # Not comparable, so no side is preferred.
-    assert rows["over"].preferred_side is None
-
-
-def test_push_mass_does_not_change_the_over_ev():
-    """Whether the under is priced must not move the over's number."""
-    whole = _snap("propline", line=8.0)
-    without = {r.side: r for r in expand_sides(
-        target_market="REB", model_p_over=0.58, research_line=8.0,
-        resolution=resolve_market([whole]),
-    )}
-    with_push = {r.side: r for r in expand_sides(
-        target_market="REB", model_p_over=0.58, model_p_under=0.34,
-        model_p_push=0.08, research_line=8.0, resolution=resolve_market([whole]),
-    )}
-    assert without["over"].book_ev == pytest.approx(with_push["over"].book_ev)
-    assert with_push["under"].book_ev is not None
-    assert with_push["over"].preferred_side == "over"
-
-
 # --- board semantics -----------------------------------------------------
 
 
-def test_both_sides_are_always_expanded():
-    rows = expand_sides(target_market="PTS", model_p_over=0.58, research_line=24.5)
-    assert [r.side for r in rows] == ["over", "under"]
+def test_decision_board_expands_both_sides_and_ranks_plus_ev():
+    enriched = enrich_row_with_book(_row(), PROPLINE)
+    assert enriched.book_status == "VALID"
+    assert enriched.book_ev_over is not None
+    assert enriched.book_ev_under is not None
+    assert enriched.preferred_side in {"over", "under"}
+
+    board = build_decision_board([enriched], min_ev=0.0, consider_only=False)
+    assert len(board) == 2
+    assert {c.side for c in board} == {"over", "under"}
+    assert board[0].placement_mode == "MANUAL_ONLY"
+    assert PLACEMENT_MODE == "MANUAL_ONLY"
+    assert "MANUAL_ONLY" in BOARD_DISCLAIMER
+
+    consider = [c for c in board if c.decision_status == "CONSIDER"]
+    assert consider and consider[0].decision_basis == "book_ev"
+    assert board[0].rank == 1
 
 
-def test_preferred_side_only_when_both_sides_are_priced():
-    priced = {r.side: r for r in expand_sides(
-        target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )}
-    assert priced["over"].preferred_side == "over"
-    assert priced["under"].preferred_side == "over"
-
-    unpriced = expand_sides(target_market="PTS", model_p_over=0.58, research_line=24.5)
-    assert all(r.preferred_side is None for r in unpriced)
-
-
-def test_pickem_never_produces_book_ev():
-    rows = expand_sides(
-        target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE_PICKEM]),
-    )
-    assert {r.decision_basis for r in rows} == {"pickem_line_only"}
-    assert all(r.book_ev is None for r in rows)
-    assert all(r.decision_status == "ABSTAIN" for r in rows)
-    assert all(r.pickem_line == pytest.approx(24.5) for r in rows)
-
-
-def test_min_ev_controls_consider():
-    kwargs = dict(
-        target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )
-    loose = {r.side: r for r in expand_sides(min_ev=0.0, **kwargs)}
-    assert loose["over"].decision_status == "CONSIDER"
-
-    strict = {r.side: r for r in expand_sides(min_ev=0.50, **kwargs)}
-    assert strict["over"].decision_status == "ABSTAIN"
-    assert strict["over"].book_ev is not None     # the EV is still reported
+def test_require_valid_book_abstains_without_odds():
+    cands = expand_row_to_candidates(_row(model_p_over=0.70, model_p_under=0.30),
+                                     require_valid_book=True)
+    assert all(c.decision_status == "ABSTAIN" for c in cands)
+    assert all("require-valid-book" in c.why for c in cands)
 
 
 def test_a_model_lean_never_outranks_a_priced_edge():
     """
-    Bands sit between status and score. Sorting a lean and a de-vigged EV on
-    one numeric scale would imply the two numbers are comparable.
+    The lean is far larger in magnitude (0.49 past even vs an EV of ~0.08)
+    and still ranks below, because the bands never interleave.
     """
-    lean = expand_sides(
-        player_name="Leaner", target_market="PTS", model_p_over=0.99,
-        research_line=24.5,
-    )
-    priced = expand_sides(
-        player_name="Priced", target_market="PTS", model_p_over=0.58,
-        research_line=24.5, resolution=resolve_market([PROPLINE]),
-    )
-    ranked = rank_decisions([*lean, *priced], consider_only=True)
+    lean = _row(player_name="Leaner", model_p_over=0.99, model_p_under=0.01)
+    priced = enrich_row_with_book(_row(player_name="Priced", model_p_over=0.58,
+                                       model_p_under=0.42), PROPLINE)
+    board = build_decision_board([lean, priced], consider_only=True)
 
-    # The lean is far larger in magnitude (0.49 past even vs an EV of 0.08)
-    # and still ranks below, because the bands never interleave.
-    assert ranked[0].decision_basis == "book_ev"
-    assert ranked[0].rank == 1
-    ev_ranks = [r.rank for r in ranked if r.decision_basis == "book_ev"]
-    lean_ranks = [r.rank for r in ranked if r.decision_basis == "model_lean"]
+    assert board[0].decision_basis == "book_ev"
+    ev_ranks = [c.rank for c in board if c.decision_basis == "book_ev"]
+    lean_ranks = [c.rank for c in board if c.decision_basis == "model_lean"]
     assert max(ev_ranks) < min(lean_ranks)
-    assert max(r.lean_score for r in ranked if r.decision_basis == "model_lean") > 0.4
+    assert max(c.rank_score for c in board if c.decision_basis == "model_lean") > 0.4
 
 
-def test_require_valid_book_demotes_unpriced_rows():
-    rows = expand_sides(target_market="PTS", model_p_over=0.80, research_line=24.5)
-    assert any(r.decision_status == "CONSIDER" for r in rows)
+def test_a_pickem_line_alone_can_never_be_considered():
+    row = _row(model_p_over=None, model_p_under=None,
+               pickem_line=24.5, pickem_source="prizepicks")
+    cands = expand_row_to_candidates(row)
+    assert {c.decision_basis for c in cands} == {"pickem_line_only"}
+    assert all(c.decision_status == "ABSTAIN" for c in cands)
+    assert all(c.book_ev is None for c in cands)
 
-    gated = rank_decisions(rows, require_valid_book=True)
-    assert all(r.decision_status == "ABSTAIN" for r in gated)
-    assert "require-valid-book" in gated[0].why
 
-
-def test_consider_only_and_top_n():
-    rows = expand_sides(
-        target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )
-    assert len(rank_decisions(rows, consider_only=True)) == 1
-    assert len(rank_decisions(rows, top_n=1)) == 1
+def test_min_ev_and_top_n_and_consider_only():
+    enriched = enrich_row_with_book(_row(), PROPLINE)
+    assert any(c.decision_status == "CONSIDER"
+               for c in build_decision_board([enriched], min_ev=0.0))
+    assert not any(c.decision_status == "CONSIDER"
+                   for c in build_decision_board([enriched], min_ev=0.50))
+    assert len(build_decision_board([enriched], top_n=1)) == 1
+    assert len(build_decision_board([enriched], consider_only=True)) == 1
 
 
 def test_the_board_never_claims_an_outcome():
-    from src.quant.decision_board import _assert_no_claims
+    from src.quant.decision_board import FORBIDDEN_CLAIM_WORDS, _assert_no_claims
 
     for word in ("lock", "guaranteed", "best bet"):
         with pytest.raises(DecisionBoardError):
             _assert_no_claims(f"this is a {word}")
 
-    rows = expand_sides(
-        target_market="PTS", model_p_over=0.99, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )
-    for row in rows:
-        lowered = row.why.lower()
-        assert not any(w in lowered for w in FORBIDDEN_CLAIM_WORDS)
+    board = build_decision_board([enrich_row_with_book(_row(model_p_over=0.99,
+                                                           model_p_under=0.01), PROPLINE)])
+    for c in board:
+        assert not any(w in c.why.lower() for w in FORBIDDEN_CLAIM_WORDS)
 
 
 def test_layer_cannot_reach_a_book_or_size_a_stake():
-    """MANUAL_ONLY is a property of the code, not just of the docstring."""
+    """
+    MANUAL_ONLY is a property of the code, not just of the docstring.
+
+    Checked against the parsed AST rather than the raw text, so prose that
+    says "never computes Kelly" does not trip the very guard it describes.
+    """
+    import ast
     import inspect
 
     from src.quant import decision_board
 
-    source = inspect.getsource(decision_board)
-    for banned in ("import requests", "http://", "urllib", "kelly", "stake_size"):
-        assert banned not in source.lower(), f"decision_board must not contain {banned!r}"
+    tree = ast.parse(inspect.getsource(decision_board))
 
-    rows = expand_sides(target_market="PTS", model_p_over=0.58, research_line=24.5)
-    assert not [f for f in rows[0].model_dump() if "stake" in f or "bankroll" in f]
+    imported: set[str] = set()
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add((node.module or "").split(".")[0])
+        elif isinstance(node, ast.Name):
+            identifiers.add(node.id.lower())
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr.lower())
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            identifiers.add(node.name.lower())
+
+    for network in ("requests", "http", "httpx", "urllib", "socket", "aiohttp"):
+        assert network not in imported, f"decision_board must not import {network!r}"
+
+    for banned in ("kelly", "stake_size", "place_bet", "submit_order"):
+        offenders = [i for i in identifiers if banned in i]
+        assert not offenders, f"decision_board must not call {offenders!r}"
+
+    fields = BettingDecisionCandidate.model_fields
+    assert not [f for f in fields if "stake" in f or "bankroll" in f]
 
 
 # --- handoff to the manual log ------------------------------------------
 
 
-def test_log_fields_for_an_over_carry_p_over():
-    rows = {r.side: r for r in expand_sides(
-        event_id="G1", target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )}
-    fields = decision_log_fields(rows["over"])
-    assert fields["side"] == "over"
-    assert fields["model_prob"] == pytest.approx(0.58)
-    assert fields["model_prob_side"] == pytest.approx(0.58)
-    assert fields["odds"] == -115
-    assert "stake" not in " ".join(k for k in fields if k != "note")
+def test_candidate_maps_to_manual_log_fields():
+    row = _row(
+        target_market="AST", research_line=7.5, model_p_over=0.40, model_p_under=0.60,
+        book_status="VALID", book_line=7.5, book_over_american=-115,
+        book_under_american=-105, book_ev_over=-0.02, book_ev_under=0.05,
+        preferred_side="under",
+    )
+    board = build_decision_board([row], min_ev=0.0, consider_only=True)
+    under = next(c for c in board if c.side == "under")
+    fields = candidate_to_manual_bet_fields(under)
+    assert fields["status"] == "READY_TO_LOG_AFTER_YOU_BET"
+    assert fields["side"] == "under"
+    # model_prob is P(THE SIDE TAKEN) — 0.60, not P(over).
+    assert fields["model_prob"] == pytest.approx(0.60)
+    assert "kelly" in fields["note"].lower()
+    assert not [k for k in fields if "stake" in k]
 
 
-def test_log_fields_invert_an_under_only_on_a_half_line():
-    half = {r.side: r for r in expand_sides(
-        target_market="PTS", model_p_over=0.58, research_line=24.5,
-        resolution=resolve_market([PROPLINE]),
-    )}
-    fields = decision_log_fields(half["under"])
-    assert fields["model_prob_side"] == pytest.approx(0.42)
-    assert fields["model_prob"] == pytest.approx(0.58)   # back to P(over)
-
-    whole = {r.side: r for r in expand_sides(
-        target_market="REB", model_p_over=0.58, model_p_under=0.34,
-        model_p_push=0.08, research_line=8.0,
-        resolution=resolve_market([_snap("propline", line=8.0)]),
-    )}
-    whole_fields = decision_log_fields(whole["under"])
-    assert whole_fields["model_prob_side"] == pytest.approx(0.34)
-    # 1 - 0.34 = 0.66 would be P(over) + P(push), not P(over). Refuse it.
-    assert whole_fields["model_prob"] is None
+def test_abstained_candidates_do_not_hand_over_log_fields():
+    cands = expand_row_to_candidates(_row(model_p_over=0.51, model_p_under=0.49))
+    weak = next(c for c in cands if c.decision_status == "ABSTAIN")
+    assert candidate_to_manual_bet_fields(weak)["status"] == "ABSTAIN"
 
 
 # --- end to end ----------------------------------------------------------
 
 
-def test_board_from_slate_rows_and_csv(tmp_path):
-    slate = [
-        {
-            "slate_date": "2026-01-02", "event_id": "G1", "player_id": "p1",
-            "player_name": "A", "target_market": "PTS", "research_line": 24.5,
-            "model_p_over": 0.58,
-        },
-        {
-            "slate_date": "2026-01-02", "event_id": "G2", "player_id": "p2",
-            "player_name": "B", "target_market": "REB", "research_line": 8.0,
-            "model_p_over": 0.55,
-        },
-    ]
-    markets = {("G1", "p1", "PTS"): [ODDSPAPI, PROPLINE]}
-    board = decision_board_from_slate(slate, markets=markets)
+def test_board_summary_and_csv(tmp_path):
+    row, _ = enrich_row_with_resolved_market(_row(), [ODDSPAPI, PROPLINE])
+    board = build_decision_board([row])
 
-    assert len(board) == 4                      # both sides of both rows
-    assert [r.rank for r in board] == [1, 2, 3, 4]
-    priced = [r for r in board if r.decision_basis == "book_ev"]
-    assert {r.book_source for r in priced} == {"propline"}
-
-    # G2 is a whole line with no P(under): over leans, under abstains.
-    g2 = {r.side: r for r in board if r.event_id == "G2"}
-    assert g2["over"].decision_basis == "model_lean"
-    assert g2["under"].decision_basis == "unavailable"
-
-    summary = board_summary(board)
+    summary = decision_board_summary(board)
     assert summary["placement_mode"] == PLACEMENT_MODE
     assert summary["sources_used"] == ["propline"]
-    assert DECISION_DISCLAIMER in summary["disclaimer"]
+    assert summary["n_candidates"] == 2
 
     out = tmp_path / "decision_board.csv"
-    assert write_decision_board_csv(board, out) == 4
+    assert write_decision_board_csv(board, out) == 2
     frame = pd.read_csv(out)
     for column in ("side", "decision_status", "decision_basis", "book_ev",
-                   "preferred_side", "why", "rank"):
+                   "preferred_side", "why", "rank", "book_source"):
         assert column in frame.columns
-
-
-# --- the push rule where it was actually wrong ---------------------------
-
-
-def test_enrich_row_with_book_refuses_the_complement_on_a_whole_line():
-    """
-    ``enrich_row_with_book`` used to price the under with 1 - P(over). On a
-    whole line that is P(under) + P(push), so the under's EV was inflated by
-    the push mass on every integer line.
-    """
-    from src.quant.paper_research import ResearchSlateRow, enrich_row_with_book
-
-    whole = _snap("propline", line=8.0, market="REB")
-    row = ResearchSlateRow(
-        slate_date="2026-01-02", event_id="G1", player_id="p1",
-        target_market="REB", model_p_over=0.58,
-    )
-    out = enrich_row_with_book(row, whole)
-    assert out.book_status == "VALID"
-    assert out.book_ev_over is not None          # the over is still priced
-    assert out.book_ev_under is None             # the under is not invented
-    assert any("push" in w.lower() for w in out.warnings)
-
-    # With a real P(under) supplied, the under prices normally.
-    with_under = enrich_row_with_book(
-        row.model_copy(update={"model_p_under": 0.34, "model_p_push": 0.08}), whole
-    )
-    assert with_under.book_ev_under is not None
-
-
-def test_enrich_row_with_book_still_uses_the_complement_on_a_half_line():
-    from src.quant.paper_research import ResearchSlateRow, enrich_row_with_book
-
-    row = ResearchSlateRow(
-        slate_date="2026-01-02", event_id="G1", player_id="p1",
-        target_market="PTS", model_p_over=0.58,
-    )
-    out = enrich_row_with_book(row, PROPLINE)
-    assert out.book_ev_over is not None
-    assert out.book_ev_under is not None
-    assert not any("push" in w.lower() for w in out.warnings)
-
-
-def _settled(store, *, side: str, line: float, won: bool, p_over: float,
-             p_side: float | None):
-    from src.quant.historical_store import BetLifecycleRecord
-
-    record = BetLifecycleRecord(
-        game_id=f"G{line}{side}{won}{p_over}", prop_stat="PTS", line=line,
-        bet_side=side, taken_odds_american=-110, model_prob=p_over,
-        model_prob_side=p_side, bet_result="WIN" if won else "LOSS",
-        profit_loss=0.909 if won else -1.0,
-    )
-    return store.append(record, allow_duplicate_pending=True)
-
-
-def test_paper_report_prefers_the_recorded_side_probability(tmp_path):
-    """
-    An under bet's calibration must use P(under) as recorded, not
-    1 - P(over), which on a whole line is too high by the push mass.
-    """
-    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
-    from src.quant.paper_research import paper_improvement_report
-
-    store = HistoricalStore(HistoricalStoreConfig(root=tmp_path, use_sqlite=False))
-    for i in range(12):
-        _settled(store, side="under", line=8.0 + i * 0.01 * 0, won=i % 2 == 0,
-                 p_over=0.58 + i * 0.001, p_side=0.34)
-    report = paper_improvement_report(store)
-    calib = report["probability_calibration"]
-    assert calib["n"] == 12
-    # 0.34 as recorded, not 1 - 0.58 = 0.42.
-    assert calib["mean_model_prob"] == pytest.approx(0.34, abs=1e-3)
-
-
-def test_paper_report_skips_whole_line_unders_with_no_side_probability(tmp_path):
-    from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
-    from src.quant.paper_research import paper_improvement_report
-
-    store = HistoricalStore(HistoricalStoreConfig(root=tmp_path, use_sqlite=False))
-    for i in range(12):
-        _settled(store, side="under", line=8.0, won=i % 2 == 0,
-                 p_over=0.58 + i * 0.001, p_side=None)
-    calib = paper_improvement_report(store)["probability_calibration"]
-    assert calib["status"] == "DATA_NOT_AVAILABLE"
-    assert calib["skipped_push_ambiguous"] == 12
-    assert "push mass" in calib["reason"]

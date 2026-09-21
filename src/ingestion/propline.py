@@ -540,7 +540,10 @@ def normalize_event_props(
     mapping = market_map or DEFAULT_MARKET_MAP
     event_id = str(payload.get("id") or "") or None
     commence = _parse_iso(payload.get("commence_time"))
-    game_date = commence.date() if commence else None
+    from src.utils.timezones import pacific_calendar_date
+
+    # Pacific slate day, not UTC date — a 7pm PT tip is still that day's slate.
+    game_date = pacific_calendar_date(commence) if commence else None
 
     # (book, market, player, point) -> partially built row
     pending: dict[tuple, dict[str, Any]] = {}

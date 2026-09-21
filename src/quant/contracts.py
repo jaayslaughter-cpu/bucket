@@ -137,6 +137,21 @@ def devig_two_way(over_odds: int, under_odds: int) -> dict[str, float]:
     }
 
 
+def _finite_american(odds: Any) -> int | None:
+    """Coerce to int American odds; treat None/NaN/non-finite as missing."""
+    if odds is None:
+        return None
+    try:
+        if isinstance(odds, float) and not math.isfinite(odds):
+            return None
+        value = int(odds)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if value == 0:
+        return None
+    return value
+
+
 def market_ev_gate(context: MarketContext) -> dict[str, Any]:
     """
     Decide whether EV may be computed for this market.
@@ -171,7 +186,9 @@ def market_ev_gate(context: MarketContext) -> dict[str, Any]:
         )
         return verdict
 
-    if context.over_odds_american is None or context.under_odds_american is None:
+    over = _finite_american(context.over_odds_american)
+    under = _finite_american(context.under_odds_american)
+    if over is None or under is None:
         verdict["reason"] = "Two-way American odds required; one or both sides are missing"
         return verdict
 
@@ -182,7 +199,7 @@ def market_ev_gate(context: MarketContext) -> dict[str, Any]:
         return verdict
 
     try:
-        fair = devig_two_way(context.over_odds_american, context.under_odds_american)
+        fair = devig_two_way(over, under)
     except (ValueError, TypeError, OverflowError, ArithmeticError) as exc:
         verdict["reason"] = f"Could not de-vig: {exc}"
         return verdict

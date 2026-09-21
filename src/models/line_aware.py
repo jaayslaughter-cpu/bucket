@@ -409,7 +409,13 @@ class LineAwarePropModel:
         # its inputs, so the mask that guards a line-blind classifier would
         # discard every answer it produces.
         self.model.line_aware = True
-        self.model.fit(labelled, validation_data)
+        val = validation_data
+        if val is not None and not val.empty:
+            val_aug = augment_lines(val, self.stat, offsets=self.offsets)
+            assert_lines_are_pregame(val_aug, self.stat)
+            val = val_aug.loc[val_aug["over_hit"].notna()].reset_index(drop=True)
+            assert_no_augmented_row_straddles(labelled, val)
+        self.model.fit(labelled, val)
         logger.info(
             "Line-aware %s fitted on %d (line, label) pairs; %s",
             self.stat, len(labelled), self.augmentation_report,

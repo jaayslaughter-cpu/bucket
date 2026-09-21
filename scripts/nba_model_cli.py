@@ -801,9 +801,9 @@ def decision_board_cmd(
     _setup_logging(verbose)
     from src.models.compare import compare_models_on_panel, load_comparison_config
     from src.quant.decision_board import (
-        DECISION_DISCLAIMER,
-        board_summary,
-        decision_board_from_slate,
+        BOARD_DISCLAIMER,
+        build_decision_board,
+        decision_board_summary,
         write_decision_board_csv,
     )
     from src.quant.paper_research import research_slate_from_predictions
@@ -826,12 +826,13 @@ def decision_board_cmd(
     )
 
     # No archived PropLine pull exists in this repository yet, so no market
-    # candidates are attached here. Every row therefore lands on model_lean
-    # or unavailable — which is the truthful state, not a bug. Pass markets
-    # into decision_board_from_slate once a pull is archived.
-    board = decision_board_from_slate(
+    # candidates are attached and nothing is priced. Every row therefore
+    # lands on model_lean or unavailable — the truthful state, not a bug.
+    # Once a pull is archived, enrich each row with
+    # decision_board.enrich_row_with_resolved_market(row, candidates), which
+    # applies the PropLine-primary / OddsPapi-fallback precedence.
+    board = build_decision_board(
         slate_rows,
-        markets=None,
         min_ev=min_ev,
         min_lean=min_lean,
         require_valid_book=require_valid_book,
@@ -840,7 +841,7 @@ def decision_board_cmd(
     )
     n = write_decision_board_csv(board, out)
 
-    summary = board_summary(board)
+    summary = decision_board_summary(board)
     summary.update({
         "slate_date": slate,
         "written_rows": n,
@@ -850,9 +851,9 @@ def decision_board_cmd(
         "require_valid_book": require_valid_book,
         "next_step": (
             "Scan CONSIDER rows, place the wager YOURSELF outside PropIQ, then "
-            "log-manual-bet --side <side> --model-prob-side <P(side you took)>"
+            "log-manual-bet --side <side> --model-prob <P(side you took)>"
         ),
-        "disclaimer": DECISION_DISCLAIMER,
+        "disclaimer": BOARD_DISCLAIMER,
     })
     typer.echo(json.dumps(summary, indent=2, default=str))
 
@@ -864,11 +865,9 @@ def log_manual_bet_cmd(
     line: float = typer.Option(..., "--line"),
     side: str = typer.Option(..., "--side", help="over|under"),
     odds: int = typer.Option(..., "--odds", help="American odds you took"),
-    model_prob: Optional[float] = typer.Option(
-        None, "--model-prob", help="Model P(OVER) — always P(over), whichever side you took"
-    ),
-    model_prob_side: Optional[float] = typer.Option(
-        None, "--model-prob-side", help="Model P(the side you took). Preferred."
+    model_prob: float = typer.Option(
+        ..., "--model-prob",
+        help="Model P(THE SIDE YOU TOOK) — P(over) for an over, P(under) for an under",
     ),
     player_id: Optional[str] = typer.Option(None, "--player-id"),
     player_name: Optional[str] = typer.Option(None, "--player-name"),
@@ -879,7 +878,6 @@ def log_manual_bet_cmd(
 ) -> None:
     """Log a bet YOU placed manually (paper research). Never places a wager."""
     _setup_logging(verbose)
-    from src.quant.decision_board import line_can_push
     from src.quant.historical_store import HistoricalStore, HistoricalStoreConfig
     from src.quant.paper_research import ManualBetInput, log_manual_bet
 
@@ -887,31 +885,12 @@ def log_manual_bet_cmd(
     if side_l not in {"over", "under"}:
         typer.echo("DATA_NOT_AVAILABLE: --side must be over|under", err=True)
         raise SystemExit(2)
-    if model_prob is None and model_prob_side is None:
+    if not 0.0 <= float(model_prob) <= 1.0:
         typer.echo(
-            "DATA_NOT_AVAILABLE: supply --model-prob (P(over)) or --model-prob-side "
-            "(P of the side you took)",
+            f"DATA_NOT_AVAILABLE: --model-prob must be a probability, got {model_prob!r}",
             err=True,
         )
         raise SystemExit(2)
-
-    # The store records P(OVER) as model_prob. Deriving it from P(under)
-    # needs 1 - P(under) - P(push), and on a whole line the push mass is
-    # unknown here — so refuse rather than record a number that is too high.
-    p_over = model_prob
-    if p_over is None:
-        if side_l == "over":
-            p_over = model_prob_side
-        elif line_can_push(line):
-            typer.echo(
-                f"DATA_NOT_AVAILABLE: line {line:g} is a whole number, so it can "
-                "push and P(over) is not 1 - P(under) — the difference is the push "
-                "mass. Pass --model-prob with P(over) as well.",
-                err=True,
-            )
-            raise SystemExit(2)
-        else:
-            p_over = 1.0 - float(model_prob_side)
 
     store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
     bet = ManualBetInput(
@@ -922,8 +901,7 @@ def log_manual_bet_cmd(
         line=line,
         bet_side=side_l,  # type: ignore[arg-type]
         taken_odds_american=odds,
-        model_prob=float(p_over),
-        model_prob_side=model_prob_side,
+        model_prob=float(model_prob),
         bookmaker=bookmaker,
         unit_stake=unit_stake,
     )
