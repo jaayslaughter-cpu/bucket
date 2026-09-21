@@ -22,6 +22,7 @@ originals.
 | `src/models/xgboost_pipeline.py` | New. **Not your prior baseline** — see below |
 | `src/quant/contracts.py` | New. `MarketContext`, `market_ev_gate`, two-way de-vig |
 | `src/ingestion/boxscores.py` | New. Player game logs from the NBA stats API |
+| `src/ingestion/basketball_reference.py` | New. SR season tables. Prior-season only — refuses same-season joins |
 
 **The XGBoost baseline is new code.** No earlier PropIQ baseline was
 available, so `xgboost_pipeline.py` was written from scratch. A comparison
@@ -260,6 +261,15 @@ player lines.
 - **`CLOSING SPREAD` / `CLOSING TOTAL`** are known only at tip. Using them
   as features for a projection made hours earlier is look-ahead. Opening
   values are the safe choice.
+- **Basketball-Reference season tables** (per game, play-by-play, adjusted
+  shooting) are SEASON AGGREGATES. Joined onto their own season they leak
+  the future into every game: a season TS% is computed from the game being
+  predicted and from every game after it. The `Awards` column is the same
+  trap at its most extreme — award shares are voted after the season ends.
+  `src/ingestion/basketball_reference.py` refuses that join outright
+  (`SeasonAggregateLeakageError`); only PRIOR-season aggregates are
+  admissible, and within-season form must come from the shift-1 rollers in
+  `builder.py`.
 
 ## 5. What unblocks the most, fastest
 

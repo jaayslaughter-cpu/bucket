@@ -254,6 +254,67 @@ def ingest_kaggle(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
+@app.command("ingest-basketball-reference")
+def ingest_basketball_reference(
+    path: str = typer.Argument(..., help="Basketball-Reference season CSV on disk"),
+    season: str = typer.Option(
+        ..., "--season",
+        help="Season the table covers, e.g. 2024-25. NOT inferred: the CSV "
+             "does not carry it, and a wrong season defeats the leakage check.",
+    ),
+    out: str = typer.Option(
+        None, "--out",
+        help="Write the parsed season totals to this CSV (one row per player)",
+    ),
+    splits: bool = typer.Option(
+        False, "--splits",
+        help="Write per-team rows for traded players instead of season totals",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Parse a Basketball-Reference per-game / play-by-play / adjusted-shooting table.
+
+    These tables are SEASON AGGREGATES. They are safe as PRIOR-season
+    features only; joining one onto its own season leaks the future into
+    every game, and src.ingestion.basketball_reference refuses to do it.
+
+    Data from Basketball-Reference.com (Sports Reference LLC). When using SR
+    data, please cite them and provide a link and/or a mention.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.basketball_reference import (
+        BasketballReferenceError,
+        describe_sr_table,
+        multi_team_report,
+        read_sr_season_csv,
+        season_totals,
+        team_splits,
+    )
+
+    try:
+        table = read_sr_season_csv(path, season=season)
+        summary = describe_sr_table(table)
+    except BasketballReferenceError as exc:
+        typer.echo(f"Parse failed: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    mismatches = multi_team_report(table)
+    summary["multi_team_blocks"] = int(len(mismatches))
+    summary["multi_team_games_mismatched"] = (
+        int((~mismatches["MATCHES"]).sum()) if len(mismatches) else 0
+    )
+
+    if out:
+        frame = team_splits(table) if splits else season_totals(table)
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(out, index=False)
+        summary["written"] = out
+        summary["written_rows"] = int(len(frame))
+        summary["written_view"] = "team_splits" if splits else "season_totals"
+
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
 @app.command("audit-data")
 def audit_data(
     demo: bool = typer.Option(False, help="Audit a DEMO panel only"),
