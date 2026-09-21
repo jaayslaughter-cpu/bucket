@@ -81,6 +81,28 @@ ADJUSTED_SHOOTING_CSV = (
 )
 
 
+# Per 100 Possessions: a single-row header, and the ONLY columns separating it
+# from the per-game table are ORtg/DRtg. Koloko's 2-game LAL row has blank
+# shooting and a blank ORtg because he never attempted a shot.
+PER_100_CSV = (
+    "Rk,Player,Age,Team,Pos,G,GS,MP,FG,FGA,FG%,3P,3PA,3P%,2P,2PA,2P%,eFG%,FT,FTA,"
+    "FT%,ORB,DRB,TRB,AST,STL,BLK,TOV,PF,PTS,ORtg,DRtg,Awards,Player-additional\n"
+    "37,Luka Don\u010di\u0107,26,LAL,PG,64,64,2289,14.8,31.1,.476,5.4,14.8,.366,9.4,16.3,"
+    ".575,.563,10.7,13.8,.780,0.9,9.7,10.6,11.3,2.2,0.7,5.4,3.3,45.7,120,114,"
+    "MVP-4CPOY-8ASNBA1,doncilu01\n"
+    "84,Jalen Duren,22,DET,C,70,70,1976,12.8,19.7,.650,0.0,0.0,,12.8,19.7,.650,.650,"
+    "7.9,10.5,.747,6.5,11.6,18.0,3.4,1.4,1.4,3.2,4.8,33.4,134,108,DPOY-11ASNBA3,durenja01\n"
+    "421,Christian Koloko,25,3TM,C,27,4,357,4.1,9.8,.419,0.1,1.2,.111,4.0,8.6,.462,.426,"
+    "1.3,2.0,.667,4.1,6.6,10.7,2.4,1.9,3.0,2.1,6.4,9.7,100,114,,kolokch01\n"
+    "421,Christian Koloko,25,LAL,C,2,0,6,0.0,0.0,,0.0,0.0,,0.0,0.0,,,0.0,0.0,,0.0,8.1,"
+    "8.1,0.0,0.0,0.0,0.0,8.1,0.0,,120,,kolokch01\n"
+    "421,Christian Koloko,25,MEM,C,11,2,195,3.4,8.5,.400,0.0,0.2,.000,3.4,8.3,.412,.400,"
+    "0.2,1.0,.250,4.6,6.1,10.7,2.4,2.4,3.2,1.7,4.9,7.0,98,115,,kolokch01\n"
+    "421,Christian Koloko,25,ATL,C,14,2,156,5.1,11.8,.436,0.3,2.4,.125,4.8,9.4,.516,.449,"
+    "2.7,3.3,.818,3.6,7.3,10.9,2.4,1.2,3.0,2.7,8.2,13.3,102,112,,kolokch01\n"
+    ",League Average,,,,,,,,,.471,,,.360,,,.550,.546,,,.783,,,,,,,,,,,,,-9999\n"
+)
+
 def _read(csv_text: str, season: str = "2024-25"):
     return read_sr_season_csv(io.StringIO(csv_text), season=season)
 
@@ -107,9 +129,65 @@ def test_repeated_column_names_are_disambiguated_by_group():
 
 def test_table_kinds_are_inferred():
     assert _read(PER_GAME_CSV).kind == "per_game"
+    assert _read(PER_100_CSV).kind == "per_100_poss"
     assert _read(PLAY_BY_PLAY_CSV).kind == "play_by_play"
     assert _read(ADJUSTED_SHOOTING_CSV).kind == "adjusted_shooting"
     assert infer_table_kind(["RK", "PLAYER"]) == "unknown"
+
+
+def test_per_100_is_not_mistaken_for_per_game():
+    """
+    The two tables share every counting column; only ORtg/DRtg tell them
+    apart. Misread, Dončić's 45.7 points per 100 possessions lands in the
+    column that holds his 33.5 points per game — same name, different
+    quantity, no error raised anywhere.
+    """
+    per_game = prior_season_features(
+        _read(PER_GAME_CSV), target_season="2025-26", columns=("PTS",)
+    ).set_index("PLAYER_KEY")
+    per_100 = prior_season_features(
+        _read(PER_100_CSV), target_season="2025-26", columns=("PTS",)
+    ).set_index("PLAYER_KEY")
+
+    assert "SR_PG_PRIOR_PTS" in per_game.columns
+    assert "SR_P100_PRIOR_PTS" in per_100.columns
+    assert per_game.at["luka doncic", "SR_PG_PRIOR_PTS"] == pytest.approx(33.5)
+    assert per_100.at["luka doncic", "SR_P100_PRIOR_PTS"] == pytest.approx(45.7)
+    shared_keys = {"BBREF_PLAYER_ID", "PLAYER", "SR_PRIOR_SEASON"}
+    overlap = (set(per_game.columns) & set(per_100.columns)) - shared_keys
+    assert overlap == set(), f"stat columns collide across table kinds: {overlap}"
+
+
+def test_blank_offensive_rating_is_nan_not_a_zero_rating():
+    """
+    Koloko's 2-game LAL row has no shot attempts, so SR leaves ORtg blank.
+    A 0.0 there is not a missing value — it is the worst offensive rating
+    ever recorded.
+    """
+    frame = _read(PER_100_CSV).frame.set_index(["PLAYER", "TEAM"])
+    assert pd.isna(frame.at[("Christian Koloko", "LAL"), "ORTG"])
+    assert frame.at[("Christian Koloko", "LAL"), "DRTG"] == 120
+    assert pd.isna(frame.at[("Christian Koloko", "LAL"), "FG_PCT"])
+
+
+def test_three_team_blocks_collapse_like_two_team_blocks():
+    table = _read(PER_100_CSV)
+    totals = season_totals(table)
+    koloko = totals[totals["BBREF_PLAYER_ID"] == "kolokch01"]
+    assert len(koloko) == 1
+    assert koloko["TEAM"].iloc[0] == "3TM"
+    assert koloko["G"].iloc[0] == 27
+    assert team_splits(table)[
+        team_splits(table)["BBREF_PLAYER_ID"] == "kolokch01"
+    ]["G"].sum() == 27
+
+
+def test_a_title_pasted_onto_the_header_line_is_stripped():
+    """SR pages put the table's name above the export; pasting glues it on."""
+    titled = "Per 100 Possessions    " + PER_100_CSV
+    table = _read(titled)
+    assert table.kind == "per_100_poss"
+    assert "RK" in table.frame.columns
 
 
 def test_column_prefixes_keep_per_game_and_total_minutes_apart():

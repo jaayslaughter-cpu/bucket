@@ -272,7 +272,7 @@ def ingest_basketball_reference(
     ),
     verbose: bool = False,
 ) -> None:
-    """Parse a Basketball-Reference per-game / play-by-play / adjusted-shooting table.
+    """Parse a Basketball-Reference season table (per game, per 100 possessions, play-by-play, adjusted shooting).
 
     These tables are SEASON AGGREGATES. They are safe as PRIOR-season
     features only; joining one onto its own season leaks the future into

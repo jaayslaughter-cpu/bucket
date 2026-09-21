@@ -18,6 +18,7 @@ The CSVs exported from a season page, one file per table:
 | Table | Basketball-Reference page | Parsed `kind` | Column prefix |
 | --- | --- | --- | --- |
 | Per Game | `.../leagues/NBA_2026_per_game.html` | `per_game` | `SR_PG_` |
+| Per 100 Poss. | `.../leagues/NBA_2026_per_poss.html` | `per_100_poss` | `SR_P100_` |
 | Play-by-Play | `.../leagues/NBA_2026_play-by-play.html` | `play_by_play` | `SR_PBP_` |
 | Adjusted Shooting | `.../leagues/NBA_2026_adj_shooting.html` | `adjusted_shooting` | `SR_ADJ_` |
 
@@ -93,6 +94,16 @@ season, and a wrong one silently defeats every leakage check.
    Committed", once under "Fouls Drawn". A naive read yields `Shoot` and
    `Shoot.1` and invites mapping fouls drawn onto fouls committed. The group
    row is used to disambiguate: `FOULS_COMMITTED_SHOOT`, `FOULS_DRAWN_SHOOT`.
+5. **Per-game and per-100 look identical.** The two tables carry the same
+   column names for different quantities — Dončić is 33.5 `PTS` in one and
+   45.7 `PTS` in the other — and only `ORtg`/`DRtg` distinguish them. The
+   kind is inferred with per-100 checked first, and the prefixes (`SR_PG_`
+   vs `SR_P100_`) keep them from ever landing in the same column. This is
+   the same reason `MP` is namespaced: it is minutes per game in the
+   per-game table and season minutes in the other three.
+6. **A blank rate is not a zero rate.** Koloko's 2-game, 6-minute stint has
+   a blank `ORtg` because he never attempted a shot. `0` there is not
+   missing data; it is the worst offensive rating ever recorded.
 
 ## Joining to the panel
 

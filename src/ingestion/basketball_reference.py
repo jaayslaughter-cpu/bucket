@@ -105,6 +105,7 @@ SR_NULL_SENTINEL = "-9999"
 # one would silently overwrite the other on a merge.
 TABLE_PREFIXES: dict[str, str] = {
     "per_game": "SR_PG",
+    "per_100_poss": "SR_P100",
     "play_by_play": "SR_PBP",
     "adjusted_shooting": "SR_ADJ",
     "unknown": "SR",
@@ -173,12 +174,22 @@ def _flatten_header(group_row: list[str] | None, name_row: list[str]) -> list[st
     return out
 
 
-def _find_header_row(raw: pd.DataFrame) -> int:
-    """SR exports may carry one or two header rows; the real one starts 'Rk'."""
+def _find_header_row(raw: pd.DataFrame) -> tuple[int, str | None]:
+    """
+    SR exports may carry one or two header rows; the real one starts 'Rk'.
+
+    Returns the row index and, when the table's title was pasted onto the
+    front of that cell ("Per 100 Possessions    Rk"), the prefix that was
+    stripped — so the caller can say what it dropped rather than silently
+    reinterpreting the file.
+    """
     for idx in range(min(len(raw), 5)):
         first = str(raw.iat[idx, 0]).strip()
         if first.lower() == "rk":
-            return idx
+            return idx, None
+        row = {str(c).strip().lower() for c in raw.iloc[idx]}
+        if first.lower().endswith("rk") and "player" in row:
+            return idx, first[: -2].strip()
     raise BasketballReferenceError(
         "No header row starting with 'Rk' in the first five lines. This does "
         "not look like a Basketball-Reference season table; refusing to guess "
@@ -199,10 +210,14 @@ def _identify_id_column(columns: list[str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 _KIND_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    # Ordered most-specific first. Adjusted shooting is checked before
-    # per-game because it also carries FG_PCT.
+    # Ordered most-specific first, and the order is load-bearing. The per-100
+    # and per-game tables share every counting column; only ORtg/DRtg tell
+    # them apart. Checked the other way round, a per-100 table parses as
+    # per_game and Dončić's 45.7 points per 100 possessions lands in the
+    # column that holds 33.5 points per game.
     ("adjusted_shooting", ("TS_PLUS", "EFG_PLUS")),
     ("play_by_play", ("PG_PCT", "ONCOURT")),
+    ("per_100_poss", ("ORTG", "DRTG", "PTS")),
     ("per_game", ("PTS", "TRB", "FG_PCT")),
 )
 
@@ -312,9 +327,17 @@ def read_sr_season_csv(
     if raw.empty:
         raise BasketballReferenceError(f"{source}: file is empty")
 
-    header_idx = _find_header_row(raw)
+    header_idx, title_prefix = _find_header_row(raw)
+    header_cells = list(raw.iloc[header_idx])
+    if title_prefix:
+        logger.warning(
+            "%s: header cell began with %r; treating the rest as the 'Rk' "
+            "column. This happens when a table's title is pasted onto the "
+            "header line.", source, title_prefix,
+        )
+        header_cells[0] = "Rk"
     group_row = list(raw.iloc[header_idx - 1]) if header_idx > 0 else None
-    columns = _flatten_header(group_row, list(raw.iloc[header_idx]))
+    columns = _flatten_header(group_row, header_cells)
 
     body = raw.iloc[header_idx + 1 :].copy()
     body.columns = columns
