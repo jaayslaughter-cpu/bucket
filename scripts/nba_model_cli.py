@@ -926,6 +926,116 @@ def fit_leg_correlations_cmd(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
+@app.command("notify-discord")
+def notify_discord_cmd(
+    source: str = typer.Option(
+        "decision-board", "--source",
+        help="decision-board | parlay | abstention",
+    ),
+    board_csv: Path = typer.Option(
+        Path("outputs/demo/decision_board.csv"), "--board-csv",
+        help="Decision board CSV written by the decision-board command",
+    ),
+    ticket_id: Optional[str] = typer.Option(
+        None, "--ticket-id", help="Parlay ticket id from the parlay log"
+    ),
+    store_dir: Path = typer.Option(
+        Path("data/external/parlay_log"), "--store-dir"
+    ),
+    message: Optional[str] = typer.Option(
+        None, "--message", help="Text for --source abstention"
+    ),
+    max_rows: int = typer.Option(10, "--max-rows"),
+    send: bool = typer.Option(
+        False, "--send",
+        help="Actually POST. Without it the payload is printed and nothing is sent.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Post research output to Discord. Dry run unless --send is passed.
+
+    A notification, never a bet instruction: no stake is suggested, claim
+    words are refused, and the research disclaimer rides on every embed.
+    The webhook URL is read from DISCORD_WEBHOOK_URL and is never printed.
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.notify.discord import (
+        DiscordConfig,
+        DiscordDispatchError,
+        build_abstention_embed,
+        build_decision_board_embed,
+        build_parlay_embed,
+        preview_json,
+        send_embeds,
+    )
+
+    config = DiscordConfig(dry_run=not send)
+
+    try:
+        if source == "decision-board":
+            if not board_csv.exists():
+                typer.echo(
+                    f"DATA_NOT_AVAILABLE: {board_csv} missing — run decision-board first",
+                    err=True,
+                )
+                raise SystemExit(2)
+            frame = pd.read_csv(board_csv)
+            rows = [
+                type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
+                for r in frame.to_dict("records")
+            ]
+            slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
+            embeds = [build_decision_board_embed(rows, slate_date=slate, max_rows=max_rows)]
+
+        elif source == "parlay":
+            from src.quant.parlay_log import ParlayLegRecord, ParlayLogStore, ParlayTicketRecord
+
+            store = ParlayLogStore(store_dir)
+            tickets = store.load_tickets()
+            if tickets.empty:
+                typer.echo("DATA_NOT_AVAILABLE: no tickets logged yet", err=True)
+                raise SystemExit(2)
+            row = (
+                tickets[tickets["ticket_id"] == ticket_id]
+                if ticket_id else tickets.tail(1)
+            )
+            if row.empty:
+                typer.echo(f"DATA_NOT_AVAILABLE: ticket {ticket_id} not found", err=True)
+                raise SystemExit(2)
+            ticket = ParlayTicketRecord(**row.iloc[0].dropna().to_dict())
+            legs_frame = store.load_legs()
+            legs = [
+                ParlayLegRecord(**r.dropna().to_dict())
+                for _, r in legs_frame[
+                    legs_frame["ticket_id"] == ticket.ticket_id
+                ].iterrows()
+            ]
+            embeds = [build_parlay_embed(ticket, legs)]
+
+        elif source == "abstention":
+            if not message:
+                typer.echo("DATA_NOT_AVAILABLE: --message is required", err=True)
+                raise SystemExit(2)
+            embeds = [build_abstention_embed(message)]
+
+        else:
+            typer.echo(f"DATA_NOT_AVAILABLE: unknown --source {source!r}", err=True)
+            raise SystemExit(2)
+
+        result = send_embeds(embeds, config=config)
+    except DiscordDispatchError as exc:
+        typer.echo(f"REFUSED: {exc}", err=True)
+        raise SystemExit(3) from exc
+
+    if result.status == "DRY_RUN":
+        typer.echo(preview_json(result))
+    typer.echo(json.dumps(result.as_dict() | {"payload_preview": "omitted"}, indent=2))
+    if result.status in {"FAILED", "REFUSED"}:
+        raise SystemExit(4)
+
+
 @app.command("log-manual-bet")
 def log_manual_bet_cmd(
     game_id: str = typer.Option(..., "--game-id"),
