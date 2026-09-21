@@ -1,0 +1,166 @@
+# Betting decision layer
+
+**Status: RESEARCH_ONLY · MANUAL_ONLY**
+
+When it is time to bet, PropIQ ranks Over and Under so **you** choose. You
+place the wager outside PropIQ. No auto-placement. No Kelly.
+
+## Guarantees
+
+| Rule | Behavior |
+|------|----------|
+| Placement | **Never** calls a book / DFS order API |
+| Bankroll | **Never** auto-sizes stake |
+| EV | Only from `MarketContext.status=VALID` two-way American odds |
+| Source | **PropLine primary, OddsPapi fallback** — and the source is on every row |
+| Pick'em | Line / line-diff research only — never VALID EV |
+| Whole lines | Refuses silent `1 − P(over)` for the under when a push is possible |
+| Language | Refuses to emit "lock", "best bet", "guaranteed" and the like |
+
+The first three are enforced in code, not just documented:
+`test_layer_cannot_reach_a_book_or_size_a_stake` greps the module for
+network and staking symbols, and `_assert_no_claims` raises on the banned
+vocabulary before a row can be written.
+
+## What you get
+
+| Field | Meaning |
+|---|---|
+| `side` | `over` or `under` — **both sides always expanded** |
+| `decision_status` | `CONSIDER` or `ABSTAIN` |
+| `decision_basis` | `book_ev` · `model_lean` · `pickem_line_only` · `unavailable` |
+| `book_ev` | Side EV, only when a source cleared the gate |
+| `preferred_side` | Higher-EV side, **only when both sides are priced** |
+| `why` | Short human-readable reason, including every refusal |
+| `rank` | CONSIDER first, then band, then score |
+| `book_source` | `propline` or `oddspapi` — which feed priced this row |
+| `fallback_used` | True when PropLine was present but unusable |
+| `sources_skipped` | What was passed over, and the gate's reason for each |
+| `line_can_push` | True on a whole line (and on an unknown one) |
+
+## Source precedence
+
+`resolve_market` walks `SOURCE_PRECEDENCE = ("propline", "oddspapi")` and
+takes the first source whose market clears the EV gate — **by precedence,
+not by arrival order**. The common fallback is a PrizePicks or Underdog
+row: a pick'em board publishes a payout multiplier rather than a two-way
+price, so it cannot be de-vigged, PropLine is skipped for pricing, and
+OddsPapi prices the row instead. That is recorded, never silent:
+`fallback_used=True` and `sources_skipped` carries the gate's own reason.
+
+The pick'em line itself survives on the row for line-diff research even
+when it cannot price anything.
+
+## The four bases, and why they are banded
+
+Only one of the four is a price.
+
+- **`book_ev`** — two-way American odds cleared the gate; the EV is real.
+- **`model_lean`** — no priced market. The model leans, and a lean is not an
+  edge, because nothing here says what it costs.
+- **`pickem_line_only`** — a pick'em board posted a line. EV stays undefined.
+- **`unavailable`** — nothing to say.
+
+Rows are sorted by **status, then band, then score**. A model lean can never
+outrank a priced edge, however large the lean. Putting the two on one
+numeric scale would imply they are comparable, and they are not: one has a
+price behind it and the other does not.
+
+## The push rule
+
+On a whole-number line N the bet has three outcomes: over (> N), under
+(< N), and push (= N). So:
+
+```
+1 − P(over)  =  P(under) + P(push)
+```
+
+Using the complement as P(under) books **every push as an under win** and
+inflates the under's EV by exactly the push mass. This layer refuses it
+whenever a push is possible, including when the line is unknown — an unseen
+line cannot be shown to be a half-line, and the safe default is the one that
+refuses. Half-lines cannot push, so there the complement is exact and is
+used.
+
+A refused under does **not** cost the over its EV. The de-vig needs both
+*prices* (which the gate has already guaranteed), but each side's EV needs
+only its own probability. So a whole line with no explicit P(under) still
+produces a real over EV, the under abstains with a named reason, and
+`preferred_side` is `None` because the pair is not comparable.
+
+To price both sides of a whole line, supply `model_p_under` (and
+`model_p_push`). `research_slate_from_predictions` now carries both through
+from the model's own over/under/push output.
+
+## Workflow
+
+```bash
+# 1. Build the board
+PYTHONPATH=. python scripts/nba_model_cli.py decision-board --demo
+
+# 2. Scan CONSIDER rows
+open outputs/demo/decision_board.csv
+
+# 3. Bet outside PropIQ (book / pick'em app) — by hand, at your own size
+
+# 4. Log what you actually took
+PYTHONPATH=. python scripts/nba_model_cli.py log-manual-bet \
+    --game-id G1 --prop-stat PTS --line 24.5 --side under \
+    --odds -110 --model-prob 0.58 --model-prob-side 0.42 --unit-stake 1
+
+# 5. Grade and audit
+PYTHONPATH=. python scripts/nba_model_cli.py paper-report
+```
+
+### `--model-prob` vs `--model-prob-side`
+
+These are **two different quantities** and the distinction is not cosmetic:
+
+- `--model-prob` is **P(over)**, always, whichever side you took. It is what
+  the store records and what the calibration reads.
+- `--model-prob-side` is **P(the side you took)**.
+
+Pass both when you have both. `decision_log_fields` emits both, already
+aligned.
+
+If you pass only `--model-prob-side` for an **under** bet, the CLI converts
+it to P(over) — but only on a half-line, where `1 − P(under)` is exact. On a
+whole line it refuses, because recovering P(over) would need the push mass
+that is not on the command line.
+
+Rows logged without `model_prob_side` still calibrate, except for under bets
+on whole lines: those are **skipped and counted** in
+`probability_calibration.skipped_push_ambiguous` rather than scored against
+`1 − P(over)`, which is known to be too high.
+
+## Flags
+
+| Flag | Effect |
+|---|---|
+| `--min-ev 0.02` | CONSIDER only when VALID book EV clears 2% |
+| `--require-valid-book` | Demote every non-`book_ev` row to ABSTAIN |
+| `--min-lean 0.05` | For unpriced rows: how far past P=0.50 the lean must be |
+| `--consider-only` | Drop ABSTAIN rows |
+| `--top-n 25` | Keep the top ranked candidates |
+
+## Modules
+
+- `src/quant/decision_board.py` — precedence, push rule, expand / rank / CSV,
+  and the handoff fields for the manual log
+- `src/quant/paper_research.py` — dual-side slate + manual log
+- CLI: `decision-board` · `research-slate` · `log-manual-bet` · `paper-report`
+
+## Current state
+
+No archived PropLine pull exists in this repository yet, so
+`decision-board` attaches no market candidates and **every row lands on
+`model_lean` or `unavailable`**. That is the truthful state, not a bug:
+there is nothing priced to rank. Once a PropLine pull is archived, pass it
+as `markets` to `decision_board_from_slate` and the `book_ev` band fills in.
+
+## Disclaimer
+
+Decision board output is a research ranking for your judgment — not a lock,
+not live P&L, and not automated wagering. Nothing here has been shown to be
+profitable, and a positive EV is a statement about the model's probability
+being right, which is exactly what has not been established yet.

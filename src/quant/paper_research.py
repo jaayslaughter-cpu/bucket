@@ -16,7 +16,7 @@ from src.models.arbitration import arbitrate_probabilities
 from src.models.edge_grades import research_edge_letter_grade
 from src.models.projection_card import build_projection_card
 from src.quant.contracts import MarketContext, PropMarketSnapshot, market_ev_gate
-from src.quant.ev_engine import EvEngine
+from src.quant.decision_board import line_can_push, price_sides, side_probabilities
 from src.quant.historical_store import BetLifecycleRecord, HistoricalStore
 from src.quant.line_diff import pickem_vs_book_line_diff
 from src.utils.timezones import DISPLAY_TZ_NAME, format_pacific_iso, now_pacific
@@ -40,7 +40,12 @@ class ManualBetInput(BaseModel):
     line: float
     bet_side: BetSide
     taken_odds_american: int
+    # model_prob is P(OVER), always — that is what the store records and what
+    # the calibration reads. model_prob_side is P(the side you took); supply
+    # it and nothing downstream has to reconstruct it with a complement that
+    # is wrong on a whole line.
     model_prob: float
+    model_prob_side: float | None = None
     bookmaker: str | None = None
     unit_stake: float = 1.0
     season: str | None = None
@@ -68,6 +73,12 @@ class ResearchSlateRow(BaseModel):
     prediction_mean: float | None = None
     prediction_std: float | None = None
     model_p_over: float | None = None
+    # P(under) and P(push) are carried explicitly because on a WHOLE line
+    # P(under) is not 1 - P(over) — the difference is the push mass. Dropping
+    # them forces every downstream consumer to reconstruct the under with a
+    # complement that is wrong exactly when it matters.
+    model_p_under: float | None = None
+    model_p_push: float | None = None
     model_name: str | None = None
     confidence_tier: str | None = None
     edge_letter_grade: str | None = None
@@ -88,17 +99,32 @@ class ResearchSlateRow(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+def _as_probability(value: Any) -> float | None:
+    """Keep a value only if it really is a probability."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return None
+    return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
+
+
 def enrich_row_with_book(
     row: ResearchSlateRow,
     market: MarketContext | PropMarketSnapshot | None,
     *,
     ev_threshold: float = 0.0,
 ) -> ResearchSlateRow:
-    """Attach OddsPapi VALID two-way EV when available; else leave DATA_NOT_AVAILABLE."""
+    """
+    Attach VALID two-way EV when a source provides it; else DATA_NOT_AVAILABLE.
+
+    Source-neutral by design: PropLine is the primary feed and OddsPapi the
+    fallback (see ``decision_board.resolve_market``), so this takes whichever
+    snapshot was resolved rather than naming a vendor.
+    """
     out = row.model_copy(deep=True)
     if market is None:
         out.book_status = "DATA_NOT_AVAILABLE"
-        out.warnings.append("No OddsPapi market attached")
+        out.warnings.append("No priced market attached (PropLine or OddsPapi)")
         return out
 
     ctx = market.to_market_context() if isinstance(market, PropMarketSnapshot) else market
@@ -122,26 +148,35 @@ def enrich_row_with_book(
         out.warnings.append("Model P(over) or American odds missing for EV")
         return out
 
-    eng = EvEngine(ev_threshold=ev_threshold)
-    ev = eng.evaluate_two_way(
-        game_id=out.event_id,
-        american_a=int(out.book_over_american),
-        american_b=int(out.book_under_american),
-        model_prob_a=float(out.model_p_over),
-        model_prob_b=1.0 - float(out.model_p_over),
-        label_a="over",
-        label_b="under",
+    # NOT 1 - P(over). On a whole line that complement is P(under) + P(push),
+    # so it books every push as an under win and inflates the under's EV by
+    # exactly the push mass. side_probabilities refuses it when a push is
+    # possible and says so by name.
+    probs = side_probabilities(
+        p_over=out.model_p_over,
+        p_under=out.model_p_under,
+        p_push=out.model_p_push,
         line=out.book_line,
-        market_type="player_prop",
     )
-    if ev.status == "OK":
-        for s in ev.sides:
-            if s.side == "over":
-                out.book_ev_over = s.ev
-            elif s.side == "under":
-                out.book_ev_under = s.ev
-    else:
-        out.warnings.append(ev.reason or ev.status)
+    p_under, under_refusal = probs["under"]
+    if p_under is None:
+        out.warnings.append(str(under_refusal))
+
+    priced, price_warning = price_sides(
+        probs,
+        over_american=out.book_over_american,
+        under_american=out.book_under_american,
+        game_id=out.event_id,
+        line=out.book_line,
+        min_ev=ev_threshold,
+        p_push=out.model_p_push,
+    )
+    if "over" in priced:
+        out.book_ev_over = priced["over"].ev
+    if "under" in priced:
+        out.book_ev_under = priced["under"].ev
+    if price_warning and price_warning != under_refusal:
+        out.warnings.append(price_warning)
     return out
 
 
@@ -231,6 +266,8 @@ def research_slate_from_predictions(
                 prediction_mean=chosen.get("prediction_mean"),
                 prediction_std=chosen.get("prediction_std_or_dispersion"),
                 model_p_over=None if p_over is None else float(p_over),
+                model_p_under=_as_probability(chosen.get("probability_under_raw")),
+                model_p_push=_as_probability(chosen.get("probability_push_raw")),
                 model_name=chosen.get("model_name"),
                 confidence_tier=arb.get("confidence_tier"),
                 edge_letter_grade=grade.get("edge_letter_grade"),
@@ -261,6 +298,7 @@ def log_manual_bet(
         bet_side=bet.bet_side,
         taken_odds_american=bet.taken_odds_american,
         model_prob=bet.model_prob,
+        model_prob_side=bet.model_prob_side,
         bookmaker=bet.bookmaker,
         unit_stake=float(bet.unit_stake),
         season=bet.season,
@@ -317,26 +355,56 @@ def paper_improvement_report(store: HistoricalStore) -> dict[str, Any]:
     if not settled.empty and "model_prob" in settled.columns:
         hit = []
         probs = []
+        skipped_push_ambiguous = 0
         for _, r in settled.iterrows():
             if r["bet_result"] == "PUSH":
                 continue
             side = str(r.get("bet_side", "")).lower()
-            p = r.get("model_prob")
-            if p is None or (isinstance(p, float) and not np.isfinite(p)):
-                continue
             won = r["bet_result"] == "WIN"
-            # Convert to P(side won) alignment: model_prob is P(over)
+
+            # Prefer the recorded P(taken side). It is the only value that is
+            # correct for an under bet on a whole line.
+            p_side = _as_probability(r.get("model_prob_side"))
+            if p_side is not None:
+                probs.append(p_side)
+                hit.append(1.0 if won else 0.0)
+                continue
+
+            p = _as_probability(r.get("model_prob"))
+            if p is None:
+                continue
             if side in {"over", "o"}:
-                probs.append(float(p))
+                probs.append(p)
                 hit.append(1.0 if won else 0.0)
             elif side in {"under", "u"}:
-                probs.append(1.0 - float(p))
+                # 1 - P(over) is P(under) + P(push). On a whole line that
+                # overstates P(under) by the push mass, so the row is skipped
+                # rather than scored against a number we know is too high.
+                if line_can_push(r.get("line")):
+                    skipped_push_ambiguous += 1
+                    continue
+                probs.append(1.0 - p)
                 hit.append(1.0 if won else 0.0)
         if len(probs) >= 10:
             y = np.asarray(hit)
             p = np.clip(np.asarray(probs), 1e-6, 1 - 1e-6)
             brier = float(np.mean((p - y) ** 2))
-            calib = {"n": int(len(y)), "brier": round(brier, 6), "mean_model_prob": round(float(p.mean()), 4)}
+            calib = {
+                "n": int(len(y)),
+                "brier": round(brier, 6),
+                "mean_model_prob": round(float(p.mean()), 4),
+                "skipped_push_ambiguous": skipped_push_ambiguous,
+            }
+        elif skipped_push_ambiguous:
+            calib = {
+                "status": "DATA_NOT_AVAILABLE",
+                "reason": (
+                    f"{skipped_push_ambiguous} under bets on whole lines carry no "
+                    "recorded P(under); 1-P(over) would count push mass as an "
+                    "under win. Log --model-prob-side going forward."
+                ),
+                "skipped_push_ambiguous": skipped_push_ambiguous,
+            }
 
     base.update(
         {

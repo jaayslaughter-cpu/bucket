@@ -42,6 +42,11 @@ class BetLifecycleRecord(BaseModel):
     closing_odds_american: int | None = None
     closing_odds_other_american: int | None = None
     model_prob: float
+    # P(the side actually taken). Carried explicitly because it CANNOT be
+    # recovered from model_prob (which is P(over)) on a whole line: the
+    # complement 1 - P(over) is P(under) + P(push), so using it scores every
+    # push as an under win. None on rows written before this field existed.
+    model_prob_side: float | None = None
     fair_prob_at_bet: float | None = None
     ev_at_bet_time: float | None = None
     clv: float | None = None
