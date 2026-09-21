@@ -243,6 +243,47 @@ never summed into `net_return_units` — EV asks whether the model was right,
 CLV asks whether the price was. `assert_export_safe` refuses any payload
 carrying an api key, token, connection string or email address.
 
+## Fitting leg correlations (step 3 of 3)
+
+`src/quant/leg_correlation.py` produces the correlations `evaluate_parlay`
+refuses to guess.
+
+**You cannot fit them per player pair.** Two specific players share a few
+dozen games at most, and a correlation fitted on a few dozen binary outcomes
+is noise that moves the parlay probability in whichever direction flatters
+the ticket. So pairs are pooled into buckets by the relationship between the
+legs and the two markets:
+
+| bucket | meaning |
+|---|---|
+| `same_player` | one player's own two markets (PTS x REB) |
+| `same_team` | two teammates |
+| `opposing_team` | a player and an opponent |
+| `different_game` | no shared game; left at 0 |
+
+The price of pooling is a prior rather than a bespoke number: two teammates
+get the league's same-team PTS x PTS correlation, not their own.
+
+```bash
+PYTHONPATH=. python scripts/nba_model_cli.py fit-leg-correlations     --as-of 2026-01-15 --markets PTS,REB,AST
+```
+
+`--as-of` is required and excludes the slate itself — a correlation fitted
+on the game being predicted leaks into it, exactly as a season-wide mean
+does.
+
+A bucket that does not clear `--min-pairs` is written out **marked
+unusable, not dropped**. `correlation_for_legs` then names that pair in its
+`unresolved` list and leaves the entry at 0, so the caller can refuse:
+"we could not fit this" and "these legs are independent" are different
+statements, and only one of them is safe to act on.
+
+On the synthetic demo panel the fitter returns `same_player` ~0.19 (shared
+minutes drive a player's own markets together) and `same_team` /
+`opposing_team` ~0.01-0.03. That is the correct answer for a generator that
+draws players independently: it finds the structure that is there and does
+not invent the structure that is not.
+
 ## Disclaimer
 
 Decision board output is a research ranking for your judgment — not a lock,

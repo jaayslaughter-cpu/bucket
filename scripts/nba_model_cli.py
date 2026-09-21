@@ -858,6 +858,74 @@ def decision_board_cmd(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
+@app.command("fit-leg-correlations")
+def fit_leg_correlations_cmd(
+    as_of: str = typer.Option(
+        ..., "--as-of",
+        help="Slate date YYYY-MM-DD. Only games STRICTLY BEFORE it are fitted on.",
+    ),
+    markets: str = typer.Option("PTS,REB,AST", "--markets"),
+    line_suffix: str = typer.Option(
+        "_L10", "--line-suffix",
+        help="Column per market to use as the line, e.g. PTS_L10. The research "
+             "stand-in until real posted lines are archived.",
+    ),
+    min_pairs: int = typer.Option(200, "--min-pairs", help="Per-bucket minimum"),
+    out: Path = typer.Option(
+        Path("outputs/demo/leg_correlations.csv"), "--out",
+    ),
+    demo: bool = typer.Option(True, help="DEMO panel for wiring"),
+    verbose: bool = False,
+) -> None:
+    """Fit parlay leg correlations from realised games (step 3 of 3).
+
+    evaluate_parlay refuses a same-game ticket without these. Buckets that
+    do not clear --min-pairs are written out marked unusable rather than
+    dropped: "not fitted" is a different statement from "independent".
+
+    --as-of is required and excludes the slate itself. A correlation fitted
+    on the game being predicted leaks into it.
+    """
+    _setup_logging(verbose)
+    from src.quant.leg_correlation import LegCorrelationError, fit_leg_correlations
+
+    panel, is_demo = _load_real_or_demo(demo)
+    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    # The line each leg is graded against. Real posted lines are not archived
+    # yet, so this is the research stand-in ({stat}_L10, a shift-1 prior-ten
+    # mean) and the fitted correlations inherit whatever bias it carries.
+    line_col_for = {m: f"{m}{line_suffix}" for m in mkt}
+    absent = [c for c in line_col_for.values() if c not in panel.columns]
+    if absent:
+        typer.echo(
+            f"DATA_NOT_AVAILABLE: no line columns {absent} in the panel. Pass a "
+            "--line-suffix that exists, or archive real posted lines.",
+            err=True,
+        )
+        raise SystemExit(2)
+    try:
+        priors = fit_leg_correlations(
+            panel, as_of=as_of, markets=mkt, min_pairs=min_pairs,
+            line_col_for=line_col_for,
+        )
+    except LegCorrelationError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    frame = priors.as_frame()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+
+    summary = priors.summary()
+    summary.update({"out": str(out), "demo": demo or is_demo})
+    if is_demo or demo:
+        summary["warning"] = (
+            "Fitted on the SYNTHETIC demo panel. These correlations describe "
+            "generated data, not the NBA."
+        )
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
 @app.command("log-manual-bet")
 def log_manual_bet_cmd(
     game_id: str = typer.Option(..., "--game-id"),
