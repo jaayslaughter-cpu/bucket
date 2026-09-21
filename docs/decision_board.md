@@ -210,6 +210,39 @@ A parlay is where an uncalibrated model's error compounds fastest, which
 makes it the worst available way to express an unproven edge rather than
 the best.
 
+## Logging for the feedback loop
+
+`src/quant/parlay_log.py` is the schema every ticket is written in, so a
+logged ticket is a usable backtest row later. Records are two-level:
+`parlay_tickets.csv` (price, joint probability, EV, stake, logic snapshot,
+settlement) joined to `parlay_legs.csv` (one row per leg, with its own
+at-bet-time snapshot and its own tracking slots). `to_payload()` emits the
+same thing as JSON.
+
+Three properties are enforced, not documented:
+
+**A parlay is not the AND of its legs.** A late scratch VOIDS that leg and
+the ticket re-prices at the remaining legs' odds. Worked example: a 3-leg
+ticket at **+597**, one player scratched, the other two win →
+`ticket_result=WIN`, settled price **+273**, net **+2.73**. Grading as the
+AND of its legs books that same ticket as a loss. For player props this is
+the ordinary case, not an edge case.
+
+**Calibration reads leg results, never ticket results.** A ticket outcome is
+one Bernoulli draw from a joint distribution; the model's probabilities are
+per leg. `leg_calibration_frame()` returns the `(model_prob, hit)` pairs and
+excludes voided and pushed legs, which are not evidence about a probability.
+
+**At-bet-time fields are frozen.** `AT_BET_TIME_FIELDS` is checked on every
+settlement write: outcomes may be filled in, the snapshot may not be
+rewritten. Re-running the model later and overwriting `model_prob` grades it
+on information it never had.
+
+Also: CLV is stored per leg (`clv_line_points`, `clv_prob_points`) and is
+never summed into `net_return_units` — EV asks whether the model was right,
+CLV asks whether the price was. `assert_export_safe` refuses any payload
+carrying an api key, token, connection string or email address.
+
 ## Disclaimer
 
 Decision board output is a research ranking for your judgment — not a lock,
