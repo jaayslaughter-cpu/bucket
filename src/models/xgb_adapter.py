@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.models.labels import mask_probabilities_at_unsupported_lines
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
 from src.models.residuals import (
     CountDispersion,
@@ -62,6 +63,10 @@ class XGBoostAdapter:
         self._fitted = False
         self.mean_model: Any | None = None
         self.dispersion: CountDispersion | None = None
+        # Set by LineAwarePropModel when the line is among the fitted
+        # features. The abstention below exists BECAUSE the line is not
+        # an input; once it is, masking would throw away the answer.
+        self.line_aware: bool = False
 
     def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "XGBoostAdapter":
         # Existing pipeline fits on train only (validation unused — preserved).
@@ -167,7 +172,20 @@ class XGBoostAdapter:
     ) -> pd.Series:
         if not self._fitted or self._pipe.model is None:
             raise RuntimeError("XGBoost adapter is not fitted — cannot silently substitute another model")
-        return pd.Series(self._pipe.predict_proba_over(features), index=features.index)
+        raw = pd.Series(self._pipe.predict_proba_over(features), index=features.index)
+        if self.line_aware:
+            # The line is a fitted feature, so this probability is already
+            # AT the requested line. Nothing to abstain from.
+            return raw
+        # See mask_probabilities_at_unsupported_lines: the classifier's
+        # probability is valid only at the line its labels were built from.
+        masked, _ = mask_probabilities_at_unsupported_lines(
+            raw,
+            features,
+            line,
+            model_name=f"xgboost/{self.target_market}",
+        )
+        return masked
 
     def predict_rows(
         self,

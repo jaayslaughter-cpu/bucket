@@ -65,6 +65,10 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.models.labels import (
+    RESEARCH_LINE_COL,
+    mask_probabilities_at_unsupported_lines,
+)
 from src.utils.timezones import DISPLAY_TZ_NAME, now_pacific, pacific_calendar_date
 
 load_dotenv()
@@ -161,26 +165,29 @@ def ingest_market_lines(xlsx_path: Path, persist: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) -> pd.DataFrame:
+    """
+    Pull posted NBA prop lines from PropLine.
+
+    An absent source is not a pipeline failure — it is the same "no lines
+    available" state the off-season produces, and downstream stages already
+    abstain on it. Crashing here would take out feature building, scoring
+    and persistence for a source that only supplies optional prop lines.
+    """
     try:
-        from src.ingestion.pickem import pull_pickem_boards
+        from src.ingestion.propline import pull_nba_prop_lines
     except ImportError:
-        # No pick'em loader in this repository yet. An absent source is not a
-        # pipeline failure — it is the same "no lines available" state the
-        # off-season produces, and downstream stages already abstain on it.
-        # Crashing here would take out feature building, scoring and
-        # persistence for a source that only supplies optional prop lines.
         logger.warning(
-            "Prop-line ingest skipped: src/ingestion/pickem.py is not present. "
+            "Prop-line ingest skipped: src/ingestion/propline.py is not present. "
             "Downstream stages will abstain on prop lines; see docs/DATA_GAPS.md."
         )
         return pd.DataFrame()
 
-    sources = None
+    books = None
     if guideline and "approved_prop_sources" in guideline:
-        sources = tuple(guideline["approved_prop_sources"])
-        logger.info("Prop sources from master guideline: %s", sources)
+        books = list(guideline["approved_prop_sources"])
+        logger.info("Prop books from master guideline: %s", books)
 
-    snapshots = pull_pickem_boards(sources)
+    snapshots = pull_nba_prop_lines(bookmakers=books)
     rows: list[dict[str, Any]] = []
     for snap in snapshots:
         if snap.status != "VALID":
@@ -188,18 +195,26 @@ def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) ->
             continue
         for line in snap.lines:
             rows.append({
-                "source": snap.source,
-                "is_pickem": True,
-                "captured_at_utc": snap.captured_at_utc,
-                "player_name": getattr(line, "player_name", None),
-                "market": getattr(line, "market", None),
-                "line": getattr(line, "line", None),
-                # Pick'em boards give a payout multiplier, not two-way
-                # American odds. Leaving these None is what keeps
-                # market_ev_gate correctly abstaining downstream.
-                "over_odds_american": getattr(line, "over_odds_american", None),
-                "under_odds_american": getattr(line, "under_odds_american", None),
-                "status": "VALID",
+                "source": line.source,
+                # Per ROW, never hardcoded. This used to be a literal True,
+                # which made market_ev_gate abstain on every prop including
+                # genuine two-way sportsbook prices — the gate would have
+                # refused the very data it exists to evaluate.
+                "is_pickem": line.is_pickem,
+                # The source's own observation time, or NULL when it did not
+                # report one. Never now(): see PropLineSnapshot.captured_at_utc.
+                "captured_at_utc": line.captured_at_utc,
+                "player_name": line.player_name,
+                "nba_player_id": line.nba_player_id,
+                "market": line.market,
+                "line": line.line,
+                "over_odds_american": line.over_odds_american,
+                "under_odds_american": line.under_odds_american,
+                "payout_multiplier": line.payout_multiplier,
+                "game_date": line.game_date,
+                "nba_game_id": line.nba_game_id,
+                "status": line.status,
+                "raw_json": line.raw,
             })
 
     df = pd.DataFrame(rows)
@@ -214,6 +229,43 @@ def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) ->
 # ---------------------------------------------------------------------------
 # [5][6] features + FATIGUE VERIFICATION (not re-application)
 # ---------------------------------------------------------------------------
+
+def _filter_to_slate(features: pd.DataFrame, slate: str) -> tuple[pd.DataFrame, int]:
+    """
+    Keep only the rows whose game falls on the requested Pacific slate date.
+
+    Called AFTER feature-building, never before: the shifted rolling windows
+    need the surrounding history to read, but that history must not be
+    projected or persisted as though it were today's work.
+
+    A missing GAME_DATE column is treated as unfilterable rather than as an
+    empty slate — dropping every row on a schema surprise would look exactly
+    like a quiet night.
+    """
+    if "GAME_DATE" not in features.columns:
+        logger.warning(
+            "No GAME_DATE column — cannot filter to slate %s, so every panel row "
+            "would be scored. Refusing to guess; returning the frame unfiltered "
+            "for the caller to reject.",
+            slate,
+        )
+        return features, len(features)
+
+    try:
+        target = pd.Timestamp(slate).normalize()
+    except (TypeError, ValueError):
+        logger.warning("Unparseable slate date %r — not filtering", slate)
+        return features, len(features)
+
+    dates = pd.to_datetime(features["GAME_DATE"], errors="coerce").dt.normalize()
+    on_slate = features.loc[dates == target]
+    logger.info(
+        "Slate filter: %d of %d panel rows fall on %s; the rest are history "
+        "feeding the rolling features.",
+        len(on_slate), len(features), slate,
+    )
+    return on_slate, len(on_slate)
+
 
 def build_features_and_verify_fatigue(player_panel: pd.DataFrame) -> pd.DataFrame:
     """
@@ -325,12 +377,22 @@ def score_prob_over(
         booster.load_model(str(model_path))
         pipeline.model = booster
 
-        probs = pipeline.predict_proba_over(features)
-        logger.info(
-            "P(Over) scored for %d rows (mean %.4f) for market %s",
-            len(probs), float(pd.Series(probs).mean()), scored_market,
+        raw = pd.Series(pipeline.predict_proba_over(features), index=features.index)
+        # The classifier does not take the line as an input, so this number
+        # is P(over) at the line its labels were built from. Writing it beside
+        # a posted sportsbook line would present one line's probability as
+        # another's. Rows scored at a different line abstain instead.
+        scored, n_masked = mask_probabilities_at_unsupported_lines(
+            raw, features, features.get(RESEARCH_LINE_COL, float("nan")),
+            model_name=f"xgboost/{scored_market}",
         )
-        scored = pd.Series(probs, index=features.index)
+        usable = scored.notna().sum()
+        logger.info(
+            "P(Over) scored for %d of %d rows for market %s (mean %.4f); "
+            "%d abstained on an unsupported line",
+            usable, len(scored), scored_market,
+            float(scored.mean()) if usable else float("nan"), n_masked,
+        )
         scored.attrs["target_market"] = scored_market
         return scored
 
@@ -605,6 +667,37 @@ def main() -> int:
             return 0
 
         features = build_features_and_verify_fatigue(panel)
+
+        # The panel deliberately carries ~400 days so the shift-1 rolling
+        # features have history to read. Those historical rows are INPUT,
+        # not output: projecting and persisting them turns a request for one
+        # slate into a retrospective projection of the whole lookback. Filter
+        # after feature-building so the history is used but not scored.
+        slate = args.date or str(pacific_calendar_date())
+        features, slate_rows = _filter_to_slate(features, slate)
+        stage_summary["slate_filter"] = {
+            "slate_pt": slate,
+            "panel_rows": len(panel),
+            "slate_rows": slate_rows,
+        }
+        if features.empty:
+            # Not the same condition as an empty panel, and the distinction
+            # matters: the panel holds COMPLETED games, so a future slate is
+            # legitimately absent from it and needs a schedule source, not
+            # more box scores.
+            logger.warning(
+                "No rows for slate %s (%s) in a panel of %d rows. The player "
+                "game log holds completed games, so a future slate will not "
+                "appear here until those games are played and ingested.",
+                slate, DISPLAY_TZ_NAME, len(panel),
+            )
+            stage_summary["projections"] = {"rows": 0, "reason": "no rows on the requested slate"}
+            if persist:
+                from src.db.repository import record_run
+
+                record_run(run_id, status="success_no_data", stage_summary=stage_summary)
+            return 0
+
         prob_over = score_prob_over(features, prop_df, Path(args.model))
         ev_verdict = evaluate_ev_gate(prop_df, market_df)
         stage_summary["ev_gate"] = ev_verdict

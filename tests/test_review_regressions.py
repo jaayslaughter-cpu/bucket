@@ -8,6 +8,7 @@ like a slightly different metric rather than an error.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -243,6 +244,60 @@ def test_dispersion_round_trip_keeps_full_precision():
     assert restored == original
     assert restored.phi == original.phi  # not rounded to 4dp
     assert CountDispersion.from_dict(None) is None
+
+
+def test_minutes_model_round_trips_every_head(tmp_path):
+    """train-minutes fitted four boosters and discarded all of them.
+
+    MinutesModel was the only model in the project with no save/load, so
+    the command reported success and left nothing behind.
+    """
+    pytest.importorskip("catboost")
+    from src.models.minutes_model import MinutesModel
+
+    panel = build_feature_matrix(make_demo_panel(n_players=6, n_games=30))
+    train = panel.dropna(subset=["MIN_L5", "MIN_L10"])
+    model = MinutesModel(hyperparameters={"iterations": 30})
+    model.fit(train)
+
+    scoring = train.head(10)
+    before_mean = model.predict_mean(scoring).to_numpy()
+    before_q = model.predict_quantiles(scoring)
+
+    model.save(tmp_path / "minutes")
+    reloaded = MinutesModel(hyperparameters={"iterations": 30}).load(tmp_path / "minutes")
+
+    assert sorted(reloaded.quantile_models) == sorted(model.quantile_models)
+    assert reloaded.feature_cols == model.feature_cols
+    assert reloaded.categorical_features == model.categorical_features
+
+    np.testing.assert_allclose(before_mean, reloaded.predict_mean(scoring).to_numpy(), rtol=1e-6)
+    after_q = reloaded.predict_quantiles(scoring)
+    for col in before_q.columns:
+        np.testing.assert_allclose(
+            before_q[col].to_numpy(dtype=float),
+            after_q[col].to_numpy(dtype=float),
+            rtol=1e-6,
+            err_msg=f"quantile {col} changed across the round trip",
+        )
+
+
+def test_minutes_model_refuses_a_partial_artifact(tmp_path):
+    """A missing quantile head would narrow every interval without saying so."""
+    pytest.importorskip("catboost")
+    from src.models.minutes_model import MinutesModel
+
+    panel = build_feature_matrix(make_demo_panel(n_players=6, n_games=30))
+    model = MinutesModel(hyperparameters={"iterations": 20})
+    model.fit(panel.dropna(subset=["MIN_L5", "MIN_L10"]))
+    model.save(tmp_path / "minutes")
+
+    (tmp_path / "minutes.q0.9.cbm").unlink()
+    with pytest.raises(FileNotFoundError, match="quantile head"):
+        MinutesModel(hyperparameters={"iterations": 20}).load(tmp_path / "minutes")
+
+    with pytest.raises(FileNotFoundError):
+        MinutesModel(hyperparameters={"iterations": 20}).load(tmp_path / "nonexistent")
 
 
 def test_distribution_load_refuses_a_missing_artifact():
@@ -538,6 +593,73 @@ def test_stake_of_zero_is_not_promoted_to_one_unit():
 
 
 # --------------------------------------------------------------------------
+# A classifier answers only the line it was labelled against
+# --------------------------------------------------------------------------
+
+def test_classifier_abstains_when_asked_at_a_line_it_was_not_labelled_on():
+    """The same P(over) was returned for every line, including a real one.
+
+    `over_hit` is P(stat > RESEARCH_LINE) and the line is not a model input,
+    so a fitted classifier returns the identical number at any line. Written
+    beside a posted sportsbook line, that is a confident, precise answer to
+    a question nobody asked. NaN is the honest output.
+    """
+    pytest.importorskip("xgboost")
+    from src.models.xgb_adapter import XGBoostAdapter
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    cols = ["PTS_L5", "PTS_L10", "MIN_L5"]
+    model = XGBoostAdapter(cols, target_market="PTS", model_params={"n_estimators": 20})
+    model.fit(panel)
+
+    scoring = panel.head(20).copy()
+
+    # At the labelled line the model is entitled to an opinion.
+    at_labelled = model.predict_probability_over(scoring, scoring["RESEARCH_LINE"])
+    assert at_labelled.notna().all()
+
+    # Shifted by two points, it is not.
+    shifted = scoring["RESEARCH_LINE"] + 2.0
+    at_shifted = model.predict_probability_over(scoring, shifted)
+    assert at_shifted.isna().all(), (
+        "a classifier that ignores the line returned a probability for one anyway"
+    )
+
+    # And the answers must not have been identical in the first place — that
+    # is the property that makes reusing them across lines wrong.
+    raw = model._pipe.predict_proba_over(scoring)
+    assert len(set(np.round(raw, 6))) > 1, "fixture is degenerate"
+
+
+def test_line_mask_abstains_when_there_is_nothing_to_verify_against():
+    """No RESEARCH_LINE means validity cannot be established, so abstain."""
+    from src.models.labels import mask_probabilities_at_unsupported_lines
+
+    features = pd.DataFrame({"PTS_L5": [10.0, 12.0]})
+    probs = pd.Series([0.6, 0.4])
+    masked, n = mask_probabilities_at_unsupported_lines(
+        probs, features, 20.5, model_name="test"
+    )
+    assert n == 2
+    assert masked.isna().all()
+
+
+def test_line_mask_keeps_rows_matching_the_labelled_line():
+    """Partial mismatch must mask only the mismatched rows."""
+    from src.models.labels import mask_probabilities_at_unsupported_lines
+
+    features = pd.DataFrame({"RESEARCH_LINE": [20.5, 18.5, np.nan]})
+    probs = pd.Series([0.6, 0.4, 0.5])
+    masked, n = mask_probabilities_at_unsupported_lines(
+        probs, features, pd.Series([20.5, 22.5, 20.5]), model_name="test"
+    )
+    assert n == 2                      # the shifted row and the unknowable one
+    assert masked.iloc[0] == pytest.approx(0.6)
+    assert pd.isna(masked.iloc[1])
+    assert pd.isna(masked.iloc[2])     # a NaN line is itself unanswerable
+
+
+# --------------------------------------------------------------------------
 # A calendar date is not an instant
 # --------------------------------------------------------------------------
 
@@ -650,6 +772,218 @@ def test_elo_rates_a_well_formed_game():
     assert len(out) == 2
     assert set(out["team"]) == {"LAL", "BOS"}
     assert out.loc[out["team"] == "LAL", "elo_post"].iloc[0] > 1500.0
+
+
+def test_predict_slate_emits_predictions_not_a_row_count(tmp_path, monkeypatch):
+    """`predict-slate` filtered the panel and reported len() as its output.
+
+    Its docstring said "score a slate". A row count is not a score, and the
+    command exited 0 either way, so a slate that was never scored looked
+    exactly like one that was.
+    """
+    pytest.importorskip("catboost")
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    # Nothing trained yet: the command must say so and fail, not report rows.
+    unscored = runner.invoke(
+        app, ["predict-slate", "--date", "2025-01-30", "--markets", "PTS", "--demo"]
+    )
+    assert unscored.exit_code == 4
+    assert "DATA_NOT_AVAILABLE" in unscored.stdout
+
+    trained = runner.invoke(app, [
+        "train-stats", "--market", "PTS",
+        "--start-date", "2024-11-01", "--end-date", "2025-03-01", "--demo",
+    ])
+    assert trained.exit_code == 0
+
+    out_csv = tmp_path / "slate.csv"
+    scored = runner.invoke(app, [
+        "predict-slate", "--date", "2025-01-30", "--markets", "PTS",
+        "--demo", "--out", str(out_csv),
+    ])
+    assert scored.exit_code == 0, scored.stdout
+    payload = json.loads(scored.stdout[scored.stdout.index("{"):])
+    assert payload["by_market"]["PTS"]["status"] == "SCORED"
+    assert payload["predictions"] > 0
+
+    frame = pd.read_csv(out_csv)
+    assert {"projection", "probability_over", "research_line"}.issubset(frame.columns)
+    assert frame["projection"].notna().any()
+    # The line must never be presented as a sportsbook number.
+    assert (frame["line_source"] == "RESEARCH_L10_NOT_A_SPORTSBOOK_LINE").all()
+
+
+def test_train_stats_does_not_hand_categoricals_to_xgboost(tmp_path, monkeypatch):
+    """XGBoost rejects non-numerics, so it silently wrote only 2 of 3 artifacts."""
+    pytest.importorskip("catboost")
+    pytest.importorskip("xgboost")
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, [
+        "train-stats", "--market", "PTS",
+        "--start-date", "2024-11-01", "--end-date", "2025-03-01", "--demo",
+    ])
+    assert result.exit_code == 0
+    for name in ("distribution", "xgboost", "catboost"):
+        assert f"fitted {name} PTS" in result.stdout, f"{name} did not fit"
+
+
+def test_catboost_names_the_offending_column_not_the_labels():
+    """An undeclared string feature emptied the panel via dropna.
+
+    CatBoost then reported "Labels variable is empty", pointing at the
+    target rather than at the string column that actually caused it.
+    """
+    pytest.importorskip("catboost")
+    from src.models.catboost_pipeline import CatBoostPropPipeline
+
+    panel = _labelled_panel(n_players=6, n_games=30)
+    # TEAM_ABBREVIATION is a feature here but is NOT declared categorical.
+    model = CatBoostPropPipeline(
+        ["PTS_L5", "TEAM_ABBREVIATION"],
+        target_market="PTS",
+        categorical_features=[],
+        hyperparameters={"iterations": 20},
+    )
+    with pytest.raises(ValueError, match="TEAM_ABBREVIATION"):
+        model.fit(panel)
+
+
+def test_player_logs_have_a_writer_and_it_maps_the_panel_to_the_table():
+    """Nothing ever wrote `player_game_logs`, so the orchestrator's panel
+    was permanently empty and every run reported `success_no_data` — a
+    pipeline that looked healthy while doing nothing.
+    """
+    from unittest import mock
+
+    from src.db import repository
+
+    panel = pd.DataFrame({
+        "PLAYER_ID": [201939, 201939],
+        "PLAYER_NAME": ["Demo Player", "Demo Player"],
+        "GAME_ID": ["0022400001", "0022400002"],
+        "GAME_DATE": pd.to_datetime(["2025-01-10", "2025-01-12"]),
+        "SEASON": ["2024-25", "2024-25"],
+        "TEAM_ABBREVIATION": ["GSW", "GSW"],
+        "OPPONENT_ABBREVIATION": ["DEN", "LAL"],
+        "IS_HOME": [False, True],
+        "MIN": [32.5, 28.0],
+        "PTS": [30, 22], "REB": [5, 6], "AST": [7, 9],
+        "FG3M": [6, 3], "STL": [1, 2], "BLK": [0, 1], "TOV": [3, 2],
+    })
+
+    captured = {}
+
+    class _Session:
+        def execute(self, stmt):
+            captured["stmt"] = stmt
+
+    with mock.patch.object(repository, "session_scope") as scope, \
+         mock.patch.object(repository, "_lookup_neutral_site") as neutral:
+        scope.return_value.__enter__ = lambda self: _Session()
+        scope.return_value.__exit__ = lambda self, *a: False
+        neutral.side_effect = lambda work: pd.Series(False, index=work.index, dtype=bool)
+        written = repository.upsert_player_game_logs(panel)
+
+    assert written == 2
+    values = captured["stmt"].compile().params
+    # Ids are strings in the schema; a stringified int must not carry a ".0".
+    assert all("." not in str(v) for k, v in values.items() if "nba_player_id" in k)
+    assert captured["stmt"]._post_values_clause is not None, "not an upsert"
+
+
+def test_player_log_writer_refuses_an_incomplete_panel():
+    """A missing key column must raise, not write partial rows."""
+    from src.db import repository
+
+    with pytest.raises(ValueError, match="DATA_NOT_AVAILABLE"):
+        repository.upsert_player_game_logs(pd.DataFrame({"PLAYER_ID": [1], "GAME_ID": ["g"]}))
+
+    # An empty frame is not an error, but it is not a successful ingest either.
+    assert repository.upsert_player_game_logs(pd.DataFrame()) == 0
+
+
+def test_neutral_site_games_are_not_relabelled_as_home_games():
+    """IS_HOME was rewritten to True for neutral rows to suppress the altitude tax.
+
+    It worked, but IS_HOME is an active model feature and a reporting field,
+    so every neutral game trained and reported as a home game. The exclusion
+    belongs in the altitude rule, not in the home flag.
+    """
+    from src.features.fatigue_logic import ALTITUDE_PENALTY, attach_fatigue_column
+
+    base = {
+        "PLAYER_ID": "p1", "SEASON": "2024-25",
+        "GAME_DATE": pd.Timestamp("2025-01-15"),
+    }
+    frame = pd.DataFrame([
+        # Genuinely away at Denver — taxed.
+        {**base, "OPPONENT_ABBREVIATION": "DEN", "IS_HOME": False, "IS_NEUTRAL_SITE": False},
+        # Neutral-site game against Denver — nobody travels to altitude.
+        {**base, "OPPONENT_ABBREVIATION": "DEN", "IS_HOME": False, "IS_NEUTRAL_SITE": True},
+        # Away against a sea-level team — untaxed.
+        {**base, "OPPONENT_ABBREVIATION": "BOS", "IS_HOME": False, "IS_NEUTRAL_SITE": False},
+    ])
+
+    out = attach_fatigue_column(frame)
+    mult = out["fatigue_multiplier"]
+
+    assert mult.iloc[0] == pytest.approx(mult.iloc[2] * ALTITUDE_PENALTY)
+    assert mult.iloc[1] == pytest.approx(mult.iloc[2]), "neutral-site row was taxed"
+
+    # And the home flag itself must survive untouched.
+    assert out["IS_HOME"].tolist() == [False, False, False]
+
+
+def test_a_slate_run_scores_only_the_slate_not_the_whole_lookback():
+    """A `--date` run projected and persisted ~400 days of historical games.
+
+    The panel's history is INPUT — the shift-1 rolling windows need it — but
+    scoring it turns a request for one slate into a retrospective projection
+    of the entire lookback, written to the projections table as though it
+    were today's work.
+    """
+    from main import _filter_to_slate
+
+    features = pd.DataFrame({
+        "GAME_DATE": pd.to_datetime(
+            ["2025-01-28", "2025-01-29", "2025-01-30", "2025-01-30", "2025-01-31"]
+        ),
+        "PLAYER_ID": ["p1", "p1", "p1", "p2", "p1"],
+    })
+
+    on_slate, n = _filter_to_slate(features, "2025-01-30")
+    assert n == 2
+    assert len(on_slate) == 2
+    assert set(on_slate["PLAYER_ID"]) == {"p1", "p2"}
+
+    # A slate with no games is empty, not an error.
+    empty, n_empty = _filter_to_slate(features, "2025-02-05")
+    assert empty.empty and n_empty == 0
+
+
+def test_slate_filter_does_not_silently_empty_the_frame_on_a_schema_surprise():
+    """Dropping every row when GAME_DATE is absent would look like a quiet night."""
+    from main import _filter_to_slate
+
+    features = pd.DataFrame({"PLAYER_ID": ["p1", "p2"]})
+    out, n = _filter_to_slate(features, "2025-01-30")
+    assert len(out) == 2 and n == 2
+
+    dated = pd.DataFrame({"GAME_DATE": pd.to_datetime(["2025-01-30"]), "PLAYER_ID": ["p1"]})
+    out2, n2 = _filter_to_slate(dated, "not-a-date")
+    assert len(out2) == 1 and n2 == 1
 
 
 def test_the_documented_settlement_commands_exist_and_dispatch():

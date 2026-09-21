@@ -36,6 +36,11 @@ data/**
 !data/external/bigdataball/
 !data/external/bigdataball/.gitkeep
 data/external/bigdataball/*.xlsx
+!data/external/basketball_reference/
+!data/external/basketball_reference/.gitkeep
+!data/external/basketball_reference/README.md
+# Sports Reference CSVs are licensed third-party data - local only.
+data/external/basketball_reference/*.csv
 data/cache/
 
 # Model comparison exports (keep README + gitkeep only)

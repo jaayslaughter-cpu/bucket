@@ -120,6 +120,11 @@ def make_demo_panel(n_players: int = 24, n_games: int = 70, seed: int = 42) -> p
                 opp = teams[(p + 4 + g) % len(teams)]
             mins = float(rng.uniform(18, 36))
             pts = float(rng.poisson(mins * 0.45))
+            # Shot volume consistent with the points drawn above, so the
+            # efficiency layer has something coherent to work on. Still
+            # synthetic — see this function's warning.
+            fga = float(max(1, rng.poisson(mins * 0.32)))
+            fta = float(rng.poisson(mins * 0.08))
             reb = float(rng.poisson(mins * 0.15))
             ast = float(rng.poisson(mins * 0.12))
             rows.append(
@@ -136,9 +141,16 @@ def make_demo_panel(n_players: int = 24, n_games: int = 70, seed: int = 42) -> p
                     "PTS": pts,
                     "REB": reb,
                     "AST": ast,
+                    "FGA": fga,
+                    "FGM": float(min(fga, rng.poisson(fga * 0.46))),
+                    "FTA": fta,
+                    "FTM": float(min(fta, rng.poisson(fta * 0.78))),
+                    "OREB": float(min(reb, rng.poisson(reb * 0.25))),
+                    "DREB": float(reb - min(reb, rng.poisson(reb * 0.25))),
                     "FG3M": float(rng.poisson(1.2)),
                     "STL": float(rng.poisson(0.8)),
                     "BLK": float(rng.poisson(0.4)),
+                    "TOV": float(rng.poisson(mins * 0.06)),
                     "DEMO_ONLY": True,
                 }
             )

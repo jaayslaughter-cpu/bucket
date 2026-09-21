@@ -22,6 +22,7 @@ originals.
 | `src/models/xgboost_pipeline.py` | New. **Not your prior baseline** — see below |
 | `src/quant/contracts.py` | New. `MarketContext`, `market_ev_gate`, two-way de-vig |
 | `src/ingestion/boxscores.py` | New. Player game logs from the NBA stats API |
+| `src/ingestion/basketball_reference.py` | New. SR season tables. Prior-season only — refuses same-season joins |
 
 **The XGBoost baseline is new code.** No earlier PropIQ baseline was
 available, so `xgboost_pipeline.py` was written from scratch. A comparison
@@ -147,17 +148,69 @@ player lines.
     observation time that CLV and line movement are measured against~~,
     ~~the settlement README documented a CLI that did not exist~~.
 
+12c. Wave merge, third pass — all four previously-open merge items closed:
+    ~~config/model_comparison.yaml was stale~~ (merged and WIRED, since
+    config nothing reads states a value the system is not using);
+    ~~scoring_efficiency.py was referenced and absent~~ (written with the
+    real True Shooting formula, and FGA/FTA/OREB/DREB added to both
+    ingesters so it has genuine inputs); ~~PACE_MULTIPLIER was a
+    fabricated 1.0~~ (now measured from box scores via the standard
+    possessions estimate, null where it cannot be measured);
+    ~~prob_calibration lacked ECE~~ (ported, with the sparse-bin coverage
+    gate that stops a two-bin reliability diagram winning selection).
+
+    Deliberately NOT merged, with reasons:
+
+    - `_soft_fill` (compare.py). This is the silent feature fabrication
+      removed as item 2 above. Taking the wave version back would reverse
+      a documented fix.
+    - `zip.zero_infl` / `combo.var_fudge` (config). Both are now fitted;
+      setting them would reintroduce the hardcoded dispersion of item 4.
+    - `propiq_analyst.py`. A Streamlit dashboard, which is out of scope by
+      instruction, and it imports four modules (`propiq_logic_v2`,
+      `matchup_overlay`, `ml_learner`, `vault_store`) that exist in no
+      pack and in no version of this repository. Merging it would add a
+      file that cannot run and re-add a dependency deliberately dropped.
+
 **Still open**
 
-13. **The classifiers ignore the line they are scored at.** `CatBoost`,
-    `XGBoostAdapter` and `XGBoostPropPipeline` are binary classifiers
-    trained against one line definition, so asking for a probability at a
-    different line returns the same number. The distribution path handles
-    arbitrary lines correctly because it derives them from a fitted count
-    distribution. Making the classifiers line-aware means retraining with
-    the line as a feature — a modelling change, not a patch. Until then,
-    treat classifier probabilities as valid only at the line they were
-    labelled against.
+13. **The classifiers can now be made line-aware.** `over_hit` is
+    P(stat > RESEARCH_LINE) and the line was not a model input, so a
+    fitted classifier returned the identical probability at every line.
+    Measured on the demo panel: a line-blind XGBoost returns 0.3879 at
+    8.5, 12.5, 16.5 and 20.5 alike — a range of exactly 0.0000.
+
+    `src/models/line_aware.py` puts the line into the features and trains
+    against labels built at many lines, so the model learns
+    P(stat > L | features, L). The same measurement on the same panel
+    gives 0.768 → 0.052 across that ladder, monotonically non-increasing.
+
+    Two things make this safe rather than merely impressive:
+
+    - **Candidate lines are generated from pregame quantities only.**
+      Anchor them on the realised stat and the line feature carries the
+      outcome; validation would look superb and a live slate would fail,
+      because at scoring time the book cannot see the result either.
+      `assert_lines_are_pregame` runs before every fit and rejects both
+      an exact leak and a noisy one.
+    - **Augmented copies of one game share one outcome**, so they must
+      never straddle a train/validation split. They share a GAME_DATE, so
+      a chronological split keeps them together;
+      `assert_no_augmented_row_straddles` checks rather than assumes.
+
+    The model abstains outside the standardised line range it was trained
+    on. A boosted tree extrapolates badly there — the raw curve ticked
+    back UP at the top of the ladder, which is impossible for a survival
+    function. That was found by the monotonicity test, not reasoned about
+    in advance.
+
+    **Still to do:** train against genuinely posted lines rather than
+    generated candidates. `augment_lines(keep_real_line_col=...)` already
+    accepts them and marks them `line_source='posted'`; it needs a
+    PropLine archive, which starts accumulating from the first
+    `ingest-props` run. Generated candidates are a bridge, not the
+    destination — they teach the shape of the probability curve, not the
+    market's own view of where the line belongs.
 
 14. **Orchestrator paths carry known defects** that cannot be verified
     until player data lands: `main.py` scores the whole lookback panel
@@ -172,8 +225,16 @@ player lines.
    the same rolling history. Brier and log loss measure "is recent form
    above medium-term form", not prop skill. Only real prop lines fix this.
 
-8. **The minutes model is orphaned.** `MinutesModel` is built but never
-   used by `compare.py`, and is the only model with no `save()`/`load()`.
+8. **The minutes model is trained but not consumed.** `MinutesModel` now
+   has `save()`/`load()` (mean head plus every quantile head, refusing a
+   partial artifact rather than silently narrowing the interval), and
+   `train-minutes` writes the artifact instead of discarding it.
+
+   It is still not consumed by `compare.py` or the orchestrator, and that
+   is deliberate rather than pending: feeding projected minutes into the
+   stat projections changes every number the pipeline produces. That is a
+   modelling decision, not a wiring fix, and it wants real player data to
+   evaluate against before it is made.
 
 9. **Calibrator selection leak (minor).** `choose_calibrator()` selects a
    method on a clean 70/30 chronological split, then refits the deployed
@@ -200,6 +261,15 @@ player lines.
 - **`CLOSING SPREAD` / `CLOSING TOTAL`** are known only at tip. Using them
   as features for a projection made hours earlier is look-ahead. Opening
   values are the safe choice.
+- **Basketball-Reference season tables** (per game, per 100 possessions,
+  play-by-play, adjusted shooting) are SEASON AGGREGATES. Joined onto their own season they leak
+  the future into every game: a season TS% is computed from the game being
+  predicted and from every game after it. The `Awards` column is the same
+  trap at its most extreme — award shares are voted after the season ends.
+  `src/ingestion/basketball_reference.py` refuses that join outright
+  (`SeasonAggregateLeakageError`); only PRIOR-season aggregates are
+  admissible, and within-season form must come from the shift-1 rollers in
+  `builder.py`.
 
 ## 5. What unblocks the most, fastest
 

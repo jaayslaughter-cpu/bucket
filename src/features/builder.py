@@ -21,6 +21,7 @@ re-applies; applying it twice would compound the penalty.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import pandas as pd
@@ -39,6 +40,186 @@ ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN")
 BASELINE_WEIGHTS = {"L5": 0.5, "L10": 0.3, "SEASON": 0.2}
 
 FEATURE_SCHEMA_VERSION = "fs_v1_shift1_l2"
+
+
+def resolved_feature_schema_version(attached_layers: "list[str] | None" = None) -> str:
+    """
+    The schema version for the feature set actually produced.
+
+    The base version covers the core shift-1 columns. Additive layers can
+    be absent (a module not in this repository) or skipped (a layer that
+    raised), so a run with fewer layers genuinely has a different feature
+    set. Encoding the attached layers as a short suffix keeps two such
+    runs from both claiming ``fs_v1_shift1_l2`` and being silently
+    interchangeable.
+    """
+    if not attached_layers:
+        return FEATURE_SCHEMA_VERSION
+    digest = hashlib.sha256("|".join(sorted(attached_layers)).encode()).hexdigest()[:8]
+    return f"{FEATURE_SCHEMA_VERSION}+layers.{digest}"
+
+
+def _layer_config() -> dict:
+    """
+    Read the layer settings from config/model_comparison.yaml.
+
+    Config that nothing reads is worse than no config: it states a value
+    the system is not using. These layers take keyword arguments, so the
+    settings are threaded through here rather than left decorative.
+
+    A missing or unreadable config yields {} and every layer runs on its
+    own documented defaults.
+    """
+    try:
+        from src.models.compare import load_comparison_config
+
+        return load_comparison_config() or {}
+    except Exception as exc:  # noqa: BLE001 — config is optional, never fatal
+        logger.info("Layer config unavailable (%s) — using module defaults.", exc)
+        return {}
+
+
+def _additive_feature_layers() -> list[tuple[str, object]]:
+    """
+    Optional feature layers, resolved at import time, with config applied.
+
+    Imported individually so a module absent from this repository simply
+    does not contribute a layer.
+    """
+    cfg = _layer_config()
+    halflife_cfg = cfg.get("halflife") or {}
+    hot_hand_cfg = cfg.get("hot_hand") or {}
+
+    def _halflife(df):
+        from src.features.halflife import attach_halflife_shrink_features
+
+        return attach_halflife_shrink_features(
+            df,
+            halflife_games=float(halflife_cfg.get("games", 10.0)),
+            shrink_k=float(halflife_cfg.get("shrink_k", 8.0)),
+        )
+
+    def _hot_hand(df):
+        from src.features.hot_hand import attach_hot_hand_features
+
+        return attach_hot_hand_features(
+            df,
+            z_threshold=float(hot_hand_cfg.get("z_threshold", 1.0)),
+            minutes_stable_ratio=float(hot_hand_cfg.get("minutes_stable_ratio", 0.15)),
+        )
+
+    configured: list[tuple[str, object]] = []
+    if _module_has("src.features.halflife", "attach_halflife_shrink_features"):
+        configured.append(("halflife.shrink", _halflife))
+    if _module_has("src.features.halflife", "attach_pra_component_rollups"):
+        from src.features.halflife import attach_pra_component_rollups
+
+        configured.append(("halflife.pra_rollups", attach_pra_component_rollups))
+    if _module_has("src.features.hot_hand", "attach_hot_hand_features"):
+        configured.append(("hot_hand", _hot_hand))
+
+    for module_path, func_name, label in (
+        ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
+        ("src.features.sports_ev_features", "attach_sports_ev_features", "sports_ev"),
+        ("src.features.scoring_efficiency", "attach_box_ts_features", "scoring_efficiency"),
+    ):
+        if _module_has(module_path, func_name):
+            module = __import__(module_path, fromlist=[func_name])
+            configured.append((label, getattr(module, func_name)))
+        else:
+            logger.info("Feature layer %s not present — skipped.", label)
+    return configured
+
+
+def _module_has(module_path: str, func_name: str) -> bool:
+    try:
+        module = __import__(module_path, fromlist=[func_name])
+        return hasattr(module, func_name)
+    except ImportError:
+        return False
+
+
+_ADDITIVE_FEATURE_LAYERS = _additive_feature_layers()
+
+
+
+def _group_shift_roll(
+    df: pd.DataFrame,
+    col: str,
+    group_keys: list[str],
+    *,
+    window: int,
+    min_periods: int = 1,
+) -> pd.Series:
+    """Prior-games rolling mean within a group. Shift and window in one call."""
+    def _prior(series: pd.Series) -> pd.Series:
+        return series.shift(1).rolling(window, min_periods=min_periods).mean()
+
+    return df.groupby(group_keys, sort=False)[col].transform(_prior)
+
+
+def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Estimate team pace from box scores, never from market totals.
+
+    Possessions follow the standard estimate:
+
+        POSS = FGA - OREB + TOV + 0.44 * FTA
+
+    rolled shift-1 within team-season and divided by the league mean for
+    that season, giving a multiplier around 1.0.
+
+    THE FALLBACK IS ABSTENTION, NOT 1.0. An earlier version of this file
+    wrote PACE_MULTIPLIER = 1.0 whenever the inputs were missing, which
+    created a column that looked measured, entered the feature list, and
+    told every model that pace was exactly neutral. When the inputs are
+    absent the columns are simply not created.
+    """
+    needed = {"TEAM_ABBREVIATION", "GAME_ID", "FGA", "OREB", "TOV", "FTA"}
+    missing = needed - set(df.columns)
+    if missing:
+        logger.info(
+            "Pace estimate skipped: %s absent. PACE_MULTIPLIER is NOT created — "
+            "a neutral 1.0 would read as a measurement.", sorted(missing),
+        )
+        return df
+
+    work = df.copy()
+    season_col = "SEASON" if "SEASON" in work.columns else None
+    group = ["SEASON", "TEAM_ABBREVIATION", "GAME_ID"] if season_col else [
+        "TEAM_ABBREVIATION", "GAME_ID"
+    ]
+
+    team = work.groupby(group, as_index=False).agg(
+        GAME_DATE=("GAME_DATE", "first"),
+        FGA=("FGA", "sum"), OREB=("OREB", "sum"),
+        TOV=("TOV", "sum"), FTA=("FTA", "sum"),
+    )
+    team["POSSESSIONS_EST"] = (
+        team["FGA"] - team["OREB"] + team["TOV"] + 0.44 * team["FTA"]
+    )
+    sort_keys = ["TEAM_ABBREVIATION"] + ([season_col] if season_col else []) + ["GAME_DATE"]
+    team = team.sort_values(sort_keys).reset_index(drop=True)
+
+    team_keys = ["TEAM_ABBREVIATION"] + ([season_col] if season_col else [])
+    team["PACE_ROLL"] = _group_shift_roll(
+        team, "POSSESSIONS_EST", team_keys, window=10, min_periods=3
+    )
+    league = (
+        team.groupby(season_col)["PACE_ROLL"].transform("mean") if season_col
+        else team["PACE_ROLL"].mean()
+    )
+    # Rows without enough prior games keep NaN rather than a neutral 1.0.
+    team["PACE_MULTIPLIER"] = (team["PACE_ROLL"] / league).clip(0.7, 1.3)
+
+    keep = group + ["PACE_ROLL", "PACE_MULTIPLIER"]
+    out = work.merge(team[keep], on=group, how="left")
+    known = int(out["PACE_MULTIPLIER"].notna().sum())
+    logger.info(
+        "Pace estimated from box scores for %d of %d rows (rest lack prior games "
+        "and stay null).", known, len(out),
+    )
+    return out
 
 
 class LookaheadError(AssertionError):
@@ -130,6 +311,7 @@ def build_feature_matrix(
             )
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
 
+    df = attach_team_pace(df)
     df = attach_fatigue_column(df)
 
     if {"TEAM_ABBREVIATION", "GAME_ID"}.issubset(df.columns):
@@ -154,12 +336,33 @@ def build_feature_matrix(
     # source is joined the column simply does not exist, resolve_feature_cols
     # drops it with a warning, and the layer-2 adjustment below uses a scalar
     # 1.0 that never reaches the feature matrix.
+    # Pace is now MEASURED (attach_team_pace) rather than assumed, which
+    # means it is legitimately unknown for a team's first few games of a
+    # season — min_periods=3 on the rolling possessions estimate.
+    #
+    # That unknown must not silently become 1.0, and it must not wipe out
+    # L2 either. So layer 2 is published as two columns:
+    #
+    #   {stat}_L2        BASELINE x fatigue. Claims nothing about pace, and
+    #                    is defined for every row, exactly as before.
+    #   {stat}_L2_PACE   BASELINE x fatigue x pace. NaN wherever pace was
+    #                    never measured, because a pace-adjusted projection
+    #                    without a pace estimate does not exist.
+    #
+    # Collapsing these into one column would force a choice between
+    # fabricating a neutral pace and discarding every early-season row.
     has_pace = "PACE_MULTIPLIER" in df.columns
-    pace_adjustment = df["PACE_MULTIPLIER"] if has_pace else 1.0
-    if not has_pace:
+    if has_pace:
+        known = int(df["PACE_MULTIPLIER"].notna().sum())
         logger.info(
-            "PACE_MULTIPLIER absent — layer 2 applies no pace adjustment and the "
-            "column is left out of the feature matrix rather than filled."
+            "Layer 2: pace measured on %d of %d rows. {stat}_L2_PACE is null "
+            "elsewhere; {stat}_L2 carries no pace claim and is always defined.",
+            known, len(df),
+        )
+    else:
+        logger.info(
+            "PACE_MULTIPLIER absent — no {stat}_L2_PACE column. {stat}_L2 is "
+            "unaffected and makes no pace claim."
         )
 
     for stat in present:
@@ -171,11 +374,36 @@ def build_feature_matrix(
         # Early-season rows have no season mean yet; fall back to what exists
         # rather than dropping the row or inventing a value.
         df[f"{stat}_BASELINE"] = blended.fillna(df[f"{stat}_L5"]).fillna(df[f"{stat}_L10"])
-        df[f"{stat}_L2"] = (
-            df[f"{stat}_BASELINE"] * df["fatigue_multiplier"] * pace_adjustment
-        )
+        df[f"{stat}_L2"] = df[f"{stat}_BASELINE"] * df["fatigue_multiplier"]
+        if has_pace:
+            df[f"{stat}_L2_PACE"] = df[f"{stat}_L2"] * df["PACE_MULTIPLIER"]
 
-    df["FEATURE_SCHEMA_VERSION"] = FEATURE_SCHEMA_VERSION
+    # --- additive feature layers (waves 2, 4b, 5a) ------------------------
+    # Each of these ONLY adds columns; none rewrites the core L2/L5/L10/
+    # BASELINE set above. They run here, after the season baselines exist,
+    # because hot_hand measures recent form against {stat}_SEASON and would
+    # otherwise have nothing to compare to.
+    #
+    # A layer that fails is logged and skipped rather than taking the whole
+    # matrix down: these are enrichments, and losing one should narrow the
+    # feature set, not stop the pipeline. assert_no_lookahead still runs
+    # over whatever they produced.
+    attached: list[str] = []
+    for layer_name, attach in _ADDITIVE_FEATURE_LAYERS:
+        try:
+            df = attach(df)
+            attached.append(layer_name)
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Feature layer %s skipped (%s) — its columns are absent, not "
+                "filled with a placeholder.", layer_name, exc,
+            )
+
+    # The schema version must reflect what was ACTUALLY attached. Layers can
+    # be absent or fail, so a fixed string would let an artifact trained
+    # with one feature set be scored against another while both claim the
+    # same version.
+    df["FEATURE_SCHEMA_VERSION"] = resolved_feature_schema_version(attached)
 
     assert_no_lookahead(df)
     logger.info(

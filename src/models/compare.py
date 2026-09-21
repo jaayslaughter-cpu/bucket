@@ -21,6 +21,27 @@ from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_CATEGORICAL_COLS = ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON")
+
+# Columns holding THIS game's realised outcome. They sit in the feature
+# matrix because later rows' rolling windows are built from them, but
+# using one as a feature hands the model the answer.
+#
+# The raw stat names are obvious. The efficiency columns are the dangerous
+# ones: TS_PCT and SHOT_VOLUME read like engineered features and are not —
+# they are same-game box-score quantities, and only their shifted _L5/_L10
+# forms are safe to model on.
+POSTGAME_ONLY_COLS = frozenset({
+    "PTS", "REB", "AST", "PRA", "FG3M", "FG3A", "STL", "BLK", "TOV", "MIN",
+    "FGM", "FGA", "FTM", "FTA",
+    "TS_PCT", "SHOT_VOLUME", "FT_RATE",
+})
+
+
+class PostgameFeatureError(ValueError):
+    """Raised when a feature list contains a same-game outcome column."""
+
+
 def load_comparison_config(path: Path | str = "config/model_comparison.yaml") -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -37,6 +58,18 @@ def resolve_feature_cols(df: pd.DataFrame, cols: list[str]) -> tuple[list[str], 
     A missing column is now dropped and reported, so the run is narrower
     but honest.
     """
+    # Refuse outright rather than dropping: a postgame column in a feature
+    # list is a leak, not a narrower run, and silently removing it would
+    # hide a mistake the caller needs to see.
+    leaking = sorted(set(cols) & POSTGAME_ONLY_COLS)
+    if leaking:
+        raise PostgameFeatureError(
+            f"Feature list contains same-game outcome column(s) {leaking}. "
+            "These hold THIS game's result — use their shifted _L5/_L10 "
+            "forms instead. (TS_PCT and SHOT_VOLUME look like engineered "
+            "features but are raw box-score quantities.)"
+        )
+
     present = [c for c in cols if c in df.columns]
     absent = [c for c in cols if c not in df.columns]
     if absent:
@@ -119,11 +152,27 @@ def build_components(
             from src.models.catboost_pipeline import CatBoostPropPipeline
 
             cb_cfg = cfg.get("catboost") or {}
+            # Fall back to the known-categorical names when the config does
+            # not list them. Without this, a run started outside the repo
+            # root (where config/model_comparison.yaml is not found) treated
+            # TEAM_ABBREVIATION and friends as numeric, coerced every value
+            # to NaN, and dropped the entire training set — surfacing as
+            # CatBoost's "Labels variable is empty", which names the wrong
+            # thing entirely.
+            configured_cats = list(cb_cfg.get("categorical_features") or [])
+            if not configured_cats:
+                configured_cats = [c for c in DEFAULT_CATEGORICAL_COLS if c in feature_cols]
+                if configured_cats:
+                    logger.info(
+                        "No categorical_features configured — treating %s as categorical "
+                        "by name, since coercing them to numeric would empty the panel.",
+                        configured_cats,
+                    )
             components["catboost"] = CatBoostPropPipeline(
                 feature_cols,
                 target_market=market,
                 feature_schema_version=schema,
-                categorical_features=list(cb_cfg.get("categorical_features") or []),
+                categorical_features=configured_cats,
                 hyperparameters={k: v for k, v in cb_cfg.items() if k != "categorical_features"},
                 random_seed=seed,
             )

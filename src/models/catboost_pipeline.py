@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.models.labels import mask_probabilities_at_unsupported_lines
 from src.models.prediction_schema import ModelMetadata, ModelPrediction
 from src.models.residuals import (
     CountDispersion,
@@ -87,6 +88,9 @@ class CatBoostPropPipeline:
         self.random_seed = random_seed
         self.model: Any | None = None
         self.mean_model: Any | None = None
+        # See XGBoostAdapter.line_aware — masking is only correct while
+        # the line is absent from the fitted features.
+        self.line_aware: bool = False
         self.dispersion: CountDispersion | None = None
         self._meta_extra: dict[str, Any] = {}
 
@@ -97,9 +101,24 @@ class CatBoostPropPipeline:
         work = df.copy()
         for c in self.categorical_features:
             work[c] = work[c].astype(str).fillna("MISSING")
+        emptied = []
         for c in self.feature_cols:
             if c not in self.categorical_features:
-                work[c] = pd.to_numeric(work[c], errors="coerce")
+                coerced = pd.to_numeric(work[c], errors="coerce")
+                # A column that was entirely non-numeric becomes entirely NaN,
+                # and the dropna below then removes every row. CatBoost reports
+                # that as "Labels variable is empty", which points at the target
+                # rather than at the string column that is really the problem.
+                if len(work) and coerced.isna().all() and work[c].notna().any():
+                    emptied.append(c)
+                work[c] = coerced
+        if emptied:
+            raise ValueError(
+                f"DATA_NOT_AVAILABLE: feature column(s) {emptied} hold no numeric "
+                "values and are not declared categorical, so coercing them would "
+                "drop every training row. Declare them in catboost."
+                "categorical_features, or remove them from the feature list."
+            )
         return work
 
     def _carve_early_stopping_split(
@@ -125,7 +144,12 @@ class CatBoostPropPipeline:
         cut = int(len(train) * (1.0 - holdout_fraction))
         return train.iloc[:cut], train.iloc[cut:]
 
-    def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "CatBoostPropPipeline":
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        validation_data: pd.DataFrame | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> "CatBoostPropPipeline":
         if "over_hit" not in train_data.columns:
             raise ValueError("DATA_NOT_AVAILABLE: missing over_hit")
         train = self._prepare(train_data).dropna(subset=self.feature_cols + ["over_hit"])
@@ -145,10 +169,22 @@ class CatBoostPropPipeline:
                 self._prepare(validation_data).dropna(subset=self.feature_cols + ["over_hit"])
             )
 
+        # Align by index: fit_rows is a filtered, sorted slice of the input.
+        fit_weights = None
+        if sample_weight is not None:
+            fit_weights = pd.Series(sample_weight).reindex(fit_rows.index)
+            if fit_weights.isna().any():
+                raise ValueError(
+                    "DATA_NOT_AVAILABLE: sample_weight does not cover every "
+                    "training row after filtering and sorting."
+                )
+            fit_weights = fit_weights.to_numpy()
+
         train_pool = Pool(
             fit_rows[self.feature_cols],
             fit_rows["over_hit"].astype(int),
             cat_features=self.categorical_features or None,
+            weight=fit_weights,
         )
         eval_set = None
         if stop_rows is not None and not stop_rows.empty:
@@ -281,7 +317,18 @@ class CatBoostPropPipeline:
             if c not in self.categorical_features:
                 work[c] = work[c].fillna(0.0)
         proba = self.model.predict_proba(work[self.feature_cols])[:, 1]
-        return pd.Series(proba, index=features.index)
+        if self.line_aware:
+            return pd.Series(proba, index=features.index)
+        # The line is not a model input, so this probability answers only the
+        # line the labels were built from. Asking at any other line abstains
+        # rather than returning that number under a different label.
+        masked, _ = mask_probabilities_at_unsupported_lines(
+            pd.Series(proba, index=features.index),
+            features,
+            line,
+            model_name=f"catboost/{self.target_market}",
+        )
+        return masked
 
     def predict_rows(
         self,

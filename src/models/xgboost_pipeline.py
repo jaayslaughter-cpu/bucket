@@ -99,7 +99,12 @@ class XGBoostPropPipeline:
         # default split direction, which beats imputing a value nobody chose.
         return out
 
-    def fit(self, train_data: pd.DataFrame, target_col: str = "over_hit") -> "XGBoostPropPipeline":
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        target_col: str = "over_hit",
+        sample_weight: "pd.Series | None" = None,
+    ) -> "XGBoostPropPipeline":
         """Fit on chronologically ordered rows, reporting TimeSeriesSplit scores."""
         if target_col not in train_data.columns:
             raise ValueError(f"DATA_NOT_AVAILABLE: missing target {target_col!r}")
@@ -154,7 +159,28 @@ class XGBoostPropPipeline:
             logger.info("Only %d rows — skipping TimeSeriesSplit scoring.", len(X))
 
         self.model = XGBClassifier(**self.model_params)
-        self.model.fit(X, y)
+        # Recency weights, when supplied, are aligned by index rather than
+        # position: rows were dropped above for missing targets, so a
+        # positional zip would silently pair each weight with the wrong game.
+        weights = None
+        if sample_weight is not None:
+            weights = pd.Series(sample_weight).reindex(X.index)
+            if weights.isna().any():
+                raise ValueError(
+                    "DATA_NOT_AVAILABLE: sample_weight does not cover every "
+                    "training row after filtering — refusing to fit with "
+                    "weights that do not line up with the rows."
+                )
+            self.sample_weight_summary_ = {
+                "n": int(len(weights)),
+                "effective_sample_size": round(
+                    float(weights.sum() ** 2 / (weights ** 2).sum()), 1
+                ),
+            }
+            logger.info(
+                "xgboost fitting with recency weights: %s", self.sample_weight_summary_
+            )
+        self.model.fit(X, y, sample_weight=weights)
 
         logger.info(
             "xgboost fitted rows=%d features=%d folds=%d mean_cv_log_loss=%s",

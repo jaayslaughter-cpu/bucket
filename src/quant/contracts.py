@@ -42,6 +42,71 @@ class MarketContext:
     captured_at_utc: Any | None = None
 
 
+@dataclass(frozen=True)
+class PropMarketSnapshot:
+    """
+    One book's posted prop market at a point in time.
+
+    Distinct from ``MarketContext``, which is the gate's input: this is
+    what a source actually published, including the fields the gate does
+    not read (the book's name, the capture time, the total). It converts
+    to a MarketContext so the gate keeps a single entry point rather than
+    learning about snapshots.
+
+    ``captured_at_utc`` is the SOURCE's observation time and may be None —
+    see PropLineSnapshot.captured_at_utc for why that is never defaulted
+    to now().
+    """
+
+    game_id: str
+    market: str | None = None
+    # The book's own identifier for this market, when it publishes one.
+    # Joining on it beats matching player name + line + side.
+    market_id: str | None = None
+    player_name: str | None = None
+    player_id: str | None = None
+    line: float | None = None
+    total: float | None = None
+    over_odds_american: int | None = None
+    under_odds_american: int | None = None
+    payout_multiplier: float | None = None
+    is_pickem: bool = False
+    bookmaker: str | None = None
+    source: str | None = None
+    status: MarketStatus = "DATA_NOT_AVAILABLE"
+    captured_at_utc: Any | None = None
+
+    def to_market_context(self) -> "MarketContext":
+        """Narrow to exactly what the EV gate reads."""
+        return MarketContext(
+            game_id=self.game_id,
+            status=self.status,
+            market=self.market,
+            player_name=self.player_name,
+            line=self.line,
+            over_odds_american=self.over_odds_american,
+            under_odds_american=self.under_odds_american,
+            payout_multiplier=self.payout_multiplier,
+            is_pickem=self.is_pickem,
+            source=self.source or self.bookmaker,
+            captured_at_utc=self.captured_at_utc,
+        )
+
+    @property
+    def market_key(self) -> str | None:
+        """The book's market id when present, else our market name."""
+        return self.market_id or self.market
+
+    def has_two_way_price(self) -> bool:
+        """True only when both sides carry a real American price."""
+        return (
+            self.over_odds_american is not None
+            and self.under_odds_american is not None
+            and not self.is_pickem
+            and self.payout_multiplier is None
+        )
+
+
 def american_to_implied_probability(odds: int) -> float:
     """Implied probability of a single American price, vig included."""
     odds = int(odds)

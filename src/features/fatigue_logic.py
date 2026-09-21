@@ -85,9 +85,9 @@ def attach_fatigue_column(df: pd.DataFrame) -> pd.DataFrame:
     compounding them would double-count the same tired legs.
 
     The altitude tax is separate and DOES stack: it fires only on an away
-    game against an altitude team. Neutral-site rows arrive with
-    ``IS_HOME=True`` (set by the panel loader) precisely so a team that is
-    not travelling to altitude is not taxed for it.
+    game against an altitude team that is actually played in that team's
+    arena. A neutral-site game is excluded via ``IS_NEUTRAL_SITE``, so a
+    team that is not travelling to altitude is not taxed for it.
     """
     df = assess_schedule_density(df)
 
@@ -99,6 +99,19 @@ def attach_fatigue_column(df: pd.DataFrame) -> pd.DataFrame:
     if "OPPONENT_ABBREVIATION" in df.columns and "IS_HOME" in df.columns:
         away = ~df["IS_HOME"].fillna(False).astype(bool)
         at_altitude = df["OPPONENT_ABBREVIATION"].isin(ALTITUDE_TEAMS)
+        # A neutral-site game is not played in the opponent's arena, so
+        # nobody travels to altitude. This check belongs here, where the tax
+        # is applied. It used to be done by rewriting IS_HOME to True for
+        # neutral rows in the panel loader, which suppressed the tax but
+        # corrupted an active model feature and every home/away report.
+        if "IS_NEUTRAL_SITE" in df.columns:
+            neutral = df["IS_NEUTRAL_SITE"].fillna(False).astype(bool)
+            at_altitude = at_altitude & ~neutral
+        else:
+            logger.warning(
+                "No IS_NEUTRAL_SITE column — the altitude tax cannot tell a neutral-site "
+                "game from a trip to Denver, so neutral games will be taxed."
+            )
         multiplier = multiplier.where(~(away & at_altitude), multiplier * ALTITUDE_PENALTY)
     else:
         logger.warning(
