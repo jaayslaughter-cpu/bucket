@@ -24,6 +24,7 @@ SCOPE: NBA only. Any frame carrying NCAA/college markers is refused.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,24 @@ PANEL_COLS = (
 # so the most specific spelling is listed first. Extend this table rather
 # than loosening the matcher — a fuzzy match that lands on the wrong column
 # is the failure this whole module is shaped to avoid.
+# Some exports carry no single name column. The 2025-26 archive splits it
+# into firstName + lastName, so PLAYER_NAME is COMPOSED rather than mapped.
+COMPOSITE_ALIASES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "PLAYER_NAME": (("firstname", "lastname"), ("first", "last")),
+}
+
+# Franchise team ids in this archive are all 1610612xxx. All-Star and
+# exhibition rosters (Team LeBron, East, West) use 9xxx ids and are not
+# franchises, so they never enter the abbreviation crosswalk.
+FRANCHISE_ID_PREFIX = "1610612"
+
+# The crosswalk's own spelling for San Antonio is SAN; every other source in
+# this project (NBA.com, BigDataBall, the market lines) uses SAS. Mapping it
+# is the difference between a panel that joins and one that silently does not.
+ARCHIVE_TO_NBA_TEAM: dict[str, str] = {"SAN": "SAS"}
+
+_ABBREVIATION_PATTERN = re.compile(r"^[A-Z]{2,4}$")
+
 COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "PLAYER_ID": ("personid", "playerid", "nbaplayerid", "idplayer"),
     "PLAYER_NAME": (
@@ -103,6 +122,9 @@ class SchemaReport:
 
     source_columns: list[str] = field(default_factory=list)
     mapped: dict[str, str] = field(default_factory=dict)
+    # Targets built from two or more source columns, e.g. PLAYER_NAME
+    # from firstName + lastName.
+    composed: dict[str, tuple[str, ...]] = field(default_factory=dict)
     missing_required: list[str] = field(default_factory=list)
     missing_optional: list[str] = field(default_factory=list)
     unmapped_source: list[str] = field(default_factory=list)
@@ -117,6 +139,7 @@ class SchemaReport:
             "mapped": self.mapped,
             "missing_required": self.missing_required,
             "missing_optional": self.missing_optional,
+            "composed": {k: list(v) for k, v in self.composed.items()},
             "source_column_count": len(self.source_columns),
             "unmapped_source_columns": self.unmapped_source[:40],
         }
@@ -158,6 +181,27 @@ def describe_schema(df: pd.DataFrame) -> SchemaReport:
     report.unmapped_source = [
         str(c) for c in df.columns if str(c) not in claimed
     ]
+    # A target with no single source column may still be COMPOSABLE. The
+    # 2025-26 archive has firstName and lastName but no full name, and
+    # refusing the file over that would reject the only complete player
+    # history available.
+    lookup = {_norm(c): c for c in df.columns}
+    for target, candidate_sets in COMPOSITE_ALIASES.items():
+        if target in report.mapped:
+            continue
+        for parts in candidate_sets:
+            resolved = [lookup.get(p) for p in parts]
+            if all(resolved):
+                report.composed[target] = tuple(resolved)
+                if target in report.missing_required:
+                    report.missing_required.remove(target)
+                if target in report.missing_optional:
+                    report.missing_optional.remove(target)
+                logger.info(
+                    "%s composed from %s", target, " + ".join(resolved),
+                )
+                break
+
     return report
 
 
@@ -202,9 +246,108 @@ def _coerce_is_home(series: pd.Series) -> pd.Series:
     return series.map(one).astype("boolean")
 
 
+def load_team_crosswalk(path: str | Path) -> pd.DataFrame:
+    """
+    Build an era-aware teamId -> abbreviation table from TeamHistories.csv.
+
+    Franchises move and rename: team 1610612737 is TRI (1948-50), then MIL,
+    then STL, then ATL. A flat teamId -> abbreviation map would stamp the
+    modern code onto every historical row, so the era columns are kept and
+    the lookup is by season.
+
+    Two corrections are applied, and both are join-critical rather than
+    cosmetic: the file's abbreviations carry trailing whitespace ("ATL  "),
+    and its San Antonio code is SAN where every other source here uses SAS.
+    """
+    frame = pd.read_csv(path)
+    required = {"teamId", "teamAbbrev", "seasonFounded", "seasonActiveTill"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise KaggleNbaError(
+            f"DATA_NOT_AVAILABLE: {path} is missing {missing}; expected the "
+            "archive's TeamHistories.csv"
+        )
+
+    out = frame.copy()
+    out["teamId"] = out["teamId"].astype("string").str.strip()
+    out["abbreviation"] = (
+        out["teamAbbrev"].astype("string").str.strip().str.upper()
+    )
+    out["abbreviation"] = out["abbreviation"].replace(ARCHIVE_TO_NBA_TEAM)
+    # All-Star and exhibition rosters are not franchises.
+    out = out[out["teamId"].str.startswith(FRANCHISE_ID_PREFIX, na=False)]
+    if "league" in out.columns:
+        out = out[out["league"].astype("string").str.strip().isin(["NBA", "BAA"])]
+    out["season_from"] = pd.to_numeric(out["seasonFounded"], errors="coerce")
+    out["season_to"] = pd.to_numeric(out["seasonActiveTill"], errors="coerce")
+
+    logger.info(
+        "team crosswalk: %d franchise-era rows across %d teams",
+        len(out), out["teamId"].nunique(),
+    )
+    return out[["teamId", "abbreviation", "season_from", "season_to"]].reset_index(drop=True)
+
+
+def _season_start_year(season: Any) -> float:
+    try:
+        return float(str(season).strip()[:4])
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _map_team_ids(
+    ids: pd.Series,
+    seasons: pd.Series,
+    crosswalk: pd.DataFrame,
+) -> pd.Series:
+    """Resolve each (teamId, season) to the abbreviation in use that year."""
+    years = seasons.map(_season_start_year)
+    table = crosswalk.set_index("teamId")
+    result = pd.Series(pd.NA, index=ids.index, dtype="string")
+    for team_id, block in ids.groupby(ids):
+        if team_id is pd.NA or str(team_id) not in table.index:
+            continue
+        eras = crosswalk[crosswalk["teamId"] == str(team_id)]
+        for idx in block.index:
+            year = years.get(idx, float("nan"))
+            match = eras[(eras["season_from"] <= year) & (year <= eras["season_to"])]
+            if match.empty:
+                # Outside every recorded era: use the most recent one rather
+                # than nothing, since a franchise always has a current code.
+                match = eras.sort_values("season_to").tail(1)
+            if not match.empty:
+                result.at[idx] = match["abbreviation"].iloc[0]
+    return result
+
+
+def assert_abbreviations(series: pd.Series, *, column: str) -> None:
+    """
+    Refuse nicknames in a column the rest of the project joins on.
+
+    ``playerteamName`` holds "Lakers", not "LAL". It matches the alias table
+    and maps cleanly, and then every downstream join — market lines, Elo,
+    team pace — silently matches nothing. A loud refusal here is the only
+    thing that separates that from working code.
+    """
+    values = series.dropna().astype(str).str.strip()
+    if values.empty:
+        return
+    bad = sorted({v for v in values.unique() if not _ABBREVIATION_PATTERN.match(v)})
+    if bad:
+        raise KaggleNbaError(
+            f"DATA_NOT_AVAILABLE: {column} contains {bad[:5]}, which are names "
+            "rather than NBA abbreviations. Everything downstream joins on codes "
+            "like LAL and BOS, so these would match nothing while looking "
+            "correct. Pass team_crosswalk=load_team_crosswalk('TeamHistories.csv') "
+            "to resolve them from the team ids."
+        )
+
+
 def normalize_player_box_scores(
     df: pd.DataFrame,
     report: SchemaReport | None = None,
+    *,
+    team_crosswalk: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Map a discovered frame onto the panel contract.
@@ -232,6 +375,17 @@ def normalize_player_box_scores(
     out = pd.DataFrame(index=df.index)
     for target, source in report.mapped.items():
         out[target] = df[source]
+
+    for target, parts in report.composed.items():
+        joined = (
+            df[list(parts)]
+            .astype("string")
+            .fillna("")
+            .agg(" ".join, axis=1)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+        out[target] = joined.replace({"": pd.NA})
 
     out["GAME_DATE"] = pd.to_datetime(out["GAME_DATE"], errors="coerce")
     undated = int(out["GAME_DATE"].isna().sum())
@@ -268,6 +422,54 @@ def normalize_player_box_scores(
             else f"{d.year - 1}-{str(d.year)[2:]}"
         )
         logger.info("SEASON was absent — derived from GAME_DATE")
+
+    # Team codes: resolve from the archive's team ids when a crosswalk is
+    # supplied, then REFUSE anything that is still a nickname.
+    team_sources = {
+        "TEAM_ABBREVIATION": ("playerteamid", "playerteamId"),
+        "OPPONENT_ABBREVIATION": ("opponentteamid", "opponentteamId"),
+    }
+    if team_crosswalk is not None and not team_crosswalk.empty:
+        lookup = {_norm(c): c for c in df.columns}
+        for target, candidates in team_sources.items():
+            source = next((lookup.get(_norm(c)) for c in candidates if lookup.get(_norm(c))), None)
+            if source is None:
+                continue
+            ids = df[source].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+            resolved = _map_team_ids(ids, out["SEASON"], team_crosswalk)
+            matched = int(resolved.notna().sum())
+            logger.info(
+                "%s resolved from %s for %d of %d rows (%.1f%%)",
+                target, source, matched, len(out), 100.0 * matched / max(len(out), 1),
+            )
+            out[target] = resolved
+
+    for target in team_sources:
+        if target in out.columns:
+            assert_abbreviations(out[target], column=target)
+
+    # Game type and DNP reason are carried, not dropped: preseason must not
+    # be pooled into regular-season rolling features, and the comment column
+    # is where a did-not-play is recorded.
+    passthrough = {"GAME_TYPE": ("gametype",), "DNP_COMMENT": ("comment",)}
+    lookup = {_norm(c): c for c in df.columns}
+    for target, candidates in passthrough.items():
+        source = next((lookup.get(c) for c in candidates if lookup.get(c)), None)
+        if source is not None:
+            out[target] = df[source]
+    if "GAME_TYPE" in out.columns:
+        kinds = out["GAME_TYPE"].astype("string").str.strip().str.lower()
+        out["IS_REGULAR_SEASON"] = kinds.eq("regular season")
+        counts = kinds.value_counts().to_dict()
+        if counts:
+            logger.info("game types present: %s", counts)
+        if not out["IS_REGULAR_SEASON"].all():
+            logger.warning(
+                "Panel contains %d non-regular-season rows. Filter on "
+                "IS_REGULAR_SEASON before building rolling features — preseason "
+                "minutes and rotations do not describe the same competition.",
+                int((~out["IS_REGULAR_SEASON"]).sum()),
+            )
 
     if "PLAYER_ID" not in out.columns:
         logger.warning(

@@ -200,6 +200,12 @@ def ingest_kaggle(
         None, "--file",
         help="Which file inside the Kaggle dataset to load (required for --dataset)",
     ),
+    team_crosswalk: Optional[str] = typer.Option(
+        None, "--team-crosswalk",
+        help="TeamHistories.csv from the archive. Required for this export: "
+             "it has team ids and nicknames but no abbreviations, and the rest "
+             "of the pipeline joins on codes like LAL.",
+    ),
     describe: bool = typer.Option(
         False, "--describe",
         help="Report the discovered column mapping and exit without writing",
@@ -222,6 +228,7 @@ def ingest_kaggle(
         describe_schema,
         load_from_kagglehub,
         load_local_export,
+        load_team_crosswalk,
         normalize_player_box_scores,
     )
 
@@ -241,8 +248,16 @@ def ingest_kaggle(
         # scripted check cannot read "column not recognised" as success.
         raise SystemExit(0 if report.usable else 3)
 
+    crosswalk = None
+    if team_crosswalk:
+        try:
+            crosswalk = load_team_crosswalk(team_crosswalk)
+        except KaggleNbaError as exc:
+            typer.echo(f"Ingest failed: {exc}", err=True)
+            raise SystemExit(2) from exc
+
     try:
-        panel = normalize_player_box_scores(raw, report)
+        panel = normalize_player_box_scores(raw, report, team_crosswalk=crosswalk)
     except KaggleNbaError as exc:
         typer.echo(f"Ingest failed: {exc}", err=True)
         raise SystemExit(3) from exc
@@ -253,7 +268,12 @@ def ingest_kaggle(
         "first_game_date": str(panel["GAME_DATE"].min().date()),
         "last_game_date": str(panel["GAME_DATE"].max().date()),
         "mapped_columns": report.mapped,
+        "composed_columns": {k: list(v) for k, v in report.composed.items()},
         "missing_optional": report.missing_optional,
+        "regular_season_rows": (
+            int(panel["IS_REGULAR_SEASON"].sum())
+            if "IS_REGULAR_SEASON" in panel.columns else None
+        ),
     }
 
     if persist:
