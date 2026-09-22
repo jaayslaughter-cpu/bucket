@@ -39,6 +39,63 @@ class EnsemblePropModel:
 
     model_name = "ensemble"
 
+    @property
+    def oof(self):
+        """
+        Blend the components' out-of-fold probabilities, weight for weight.
+
+        Rebuilding the whole ensemble on a separate split to calibrate it
+        re-fits every component — by far the most expensive calibration in
+        the comparison. The components already computed their own
+        out-of-fold probabilities on chronological folds; blending those with
+        the same weights answers the same question without refitting
+        anything.
+
+        Only rows every contributing component predicted are used. A row one
+        component missed would otherwise be blended from a different mix of
+        models than the weights describe.
+        """
+        import numpy as np
+        import pandas as pd
+
+        from src.models.oof import OutOfFoldPredictions
+
+        usable = {
+            name: model.oof
+            for name, model in self.components.items()
+            if getattr(model, "oof", None) is not None
+            and getattr(model.oof, "usable", False)
+            and float(self.weights.get(name, 0.0)) > 0.0
+        }
+        if len(usable) < 2:
+            return None
+
+        frames = {n: o.frame for n, o in usable.items()}
+        shared = None
+        for frame in frames.values():
+            idx = frame.index[frame["prob_over"].notna() & frame["y_over"].notna()]
+            shared = idx if shared is None else shared.intersection(idx)
+        if shared is None or len(shared) == 0:
+            return None
+
+        total = sum(float(self.weights.get(n, 0.0)) for n in usable)
+        if total <= 0:
+            return None
+        blended = np.zeros(len(shared), dtype=float)
+        for name, frame in frames.items():
+            w = float(self.weights.get(name, 0.0)) / total
+            blended += w * frame.loc[shared, "prob_over"].to_numpy(dtype=float)
+
+        any_frame = next(iter(frames.values()))
+        return OutOfFoldPredictions(
+            pd.DataFrame(
+                {"prob_over": blended,
+                 "y_over": any_frame.loc[shared, "y_over"].to_numpy(dtype=float)},
+                index=shared,
+            ),
+            n_folds=min(o.n_folds for o in usable.values()),
+        )
+
     def __init__(
         self,
         components: dict[str, Any],

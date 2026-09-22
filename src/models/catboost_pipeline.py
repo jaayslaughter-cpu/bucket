@@ -61,6 +61,8 @@ class CatBoostPropPipeline:
                 "Install with: pip install 'propiq-analytics[ml]'"
             )
         self.feature_cols = list(feature_cols)
+        self.oof = None
+        self._skip_oof = False
         self.target_market = target_market
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
@@ -223,6 +225,7 @@ class CatBoostPropPipeline:
             val_rows,
             self.categorical_features,
         )
+        self._fit_out_of_fold(train_data)
         return self
 
     def _fit_mean_head(self, train: pd.DataFrame) -> None:
@@ -302,6 +305,58 @@ class CatBoostPropPipeline:
                 "method": self.dispersion.family,
             },
             index=features.index,
+        )
+
+    def _fit_out_of_fold(self, train_data: pd.DataFrame) -> None:
+        """
+        Out-of-fold P(over) for the calibrator — same folds, one pass.
+
+        The fold models are instances of this same class, so each of their
+        fits would re-enter here and recurse without bound. ``_skip_oof``
+        marks a fold model as a leaf.
+        """
+        from src.models.oof import chronological_oof_probabilities
+
+        if getattr(self, "_skip_oof", False):
+            self.oof = None
+            return
+        if "over_hit" not in train_data.columns:
+            self.oof = None
+            return
+        work = train_data
+        if "GAME_DATE" in work.columns:
+            work = work.sort_values("GAME_DATE")
+        y = pd.to_numeric(work["over_hit"], errors="coerce")
+        rows = work.loc[y.notna()]
+        if rows.empty:
+            self.oof = None
+            return
+
+        cls = type(self)
+        cols, cats, params = self.feature_cols, self.categorical_features, self.hyperparameters
+        line_col = "RESEARCH_LINE"
+
+        def _fit_predict(rows_tr, y_tr, rows_va):
+            fold = cls(
+                cols,
+                target_market=self.target_market,
+                categorical_features=cats,
+                hyperparameters={k: v for k, v in params.items()},
+            )
+            fold._skip_oof = True          # a fold model is a leaf
+            fold.fit(rows_tr)
+            # The REAL line, not NaN. predict_probability_over abstains on an
+            # unusable line by design, so a NaN placeholder made every fold
+            # return nothing while reporting three successful folds.
+            line = (
+                rows_va[line_col] if line_col in rows_va.columns
+                else pd.Series(np.nan, index=rows_va.index)
+            )
+            return fold.predict_probability_over(rows_va, line).to_numpy()
+
+        self.oof = chronological_oof_probabilities(
+            _fit_predict, rows, y.loc[rows.index].to_numpy(),
+            market=self.target_market,
         )
 
     def predict_probability_over(

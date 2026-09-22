@@ -240,6 +240,7 @@ def fit_calibrator_from_earlier_data(
     train: pd.DataFrame,
     *,
     calib_fraction: float = 0.3,
+    fitted_model: Any | None = None,
 ) -> tuple[Any | None, dict[str, Any]]:
     """
     Fit a probability calibrator using only data earlier than the evaluation.
@@ -258,6 +259,26 @@ def fit_calibrator_from_earlier_data(
     min_rows = int((cfg.get("calibration") or {}).get("min_oof_rows", 200))
     if len(train) < min_rows:
         return None, {"reason": f"only {len(train)} training rows, need {min_rows}"}
+
+    # FAST PATH: the fitted model already produced out-of-fold probabilities
+    # during its own fit, on the same chronological folds the dispersion
+    # used. Refitting the whole component on a separate 70/30 split both
+    # duplicates that work and disagrees with it — and it showed the
+    # calibrator only the last 30% of the training window.
+    oof = getattr(fitted_model, "oof", None) if fitted_model is not None else None
+    if oof is not None and getattr(oof, "usable", False):
+        y_oof, p_oof = oof.arrays()
+        try:
+            calibrator, scores = choose_calibrator(y_oof, p_oof)
+        except ValueError as exc:
+            return None, {"reason": f"shared out-of-fold calibration failed: {exc}"}
+        return calibrator, {
+            "method": calibrator.method,
+            "source": "shared_out_of_fold",
+            "n_rows": int(len(y_oof)),
+            "scores": scores,
+            **oof.as_metadata(),
+        }
 
     ordered = train.sort_values("GAME_DATE") if "GAME_DATE" in train.columns else train
     cut = int(len(ordered) * (1 - calib_fraction))
@@ -399,7 +420,8 @@ def compare_models_on_panel(
 
             # Calibrate using only data earlier than this evaluation window.
             calibrator, calib_info = fit_calibrator_from_earlier_data(
-                name, market, feature_cols, xgb_cols, cfg, train
+                name, market, feature_cols, xgb_cols, cfg, train,
+                fitted_model=model,
             )
             p_cal = np.full_like(p_over, np.nan)
             if calibrator is not None:
@@ -442,9 +464,29 @@ def compare_models_on_panel(
                 "brier_score": bin_s.get("brier"),
                 "log_loss": bin_s.get("log_loss"),
                 "calibration_error": None,
+                # The CALIBRATED counterparts. Without them the comparison
+                # fits a calibrator, applies it to the exported predictions,
+                # and then scores the raw number — so nothing in the harness
+                # could say whether calibration helped or hurt.
+                "brier_score_calibrated": None,
+                "log_loss_calibrated": None,
+                "calibration_error_calibrated": None,
+                "calibration_source": (calib_info or {}).get("source"),
+                "calibration_rows": (calib_info or {}).get("n_rows"),
                 "interval_coverage": None,
                 "notes": "RESEARCH_ONLY; RESEARCH_LINE={stat}_L10; not sportsbook",
             }
+            cal_mask = np.isfinite(p_cal) & np.isfinite(y_true)
+            if cal_mask.sum() >= 20:
+                cal_s = score_binary(y_true[cal_mask], p_cal[cal_mask])
+                row["brier_score_calibrated"] = cal_s.get("brier")
+                row["log_loss_calibrated"] = cal_s.get("log_loss")
+                cal_table = reliability_table(y_true[cal_mask], p_cal[cal_mask])
+                if cal_table:
+                    gaps = [abs(t["calibration_gap"]) * t["n_predictions"] for t in cal_table]
+                    ntot = sum(t["n_predictions"] for t in cal_table)
+                    row["calibration_error_calibrated"] = round(sum(gaps) / max(ntot, 1), 4)
+
             # Simple ECE proxy from reliability table
             mask = np.isfinite(p_over) & np.isfinite(y_true)
             if mask.sum() >= 20:

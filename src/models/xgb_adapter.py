@@ -53,6 +53,7 @@ class XGBoostAdapter:
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
         self.feature_cols = list(feature_cols)
+        self.oof = None
         self._pipe = XGBoostPropPipeline(
             self.feature_cols,
             n_splits=n_splits,
@@ -79,6 +80,7 @@ class XGBoostAdapter:
         self._pipe.fit(train_data, target_col="over_hit")
         self._fitted = True
         self._fit_mean_head(train_data)
+        self._fit_out_of_fold(train_data)
         self._meta_extra = {
             "train_row_count": int(len(train_data)),
             "validation_row_count": int(len(validation_data)) if validation_data is not None else 0,
@@ -134,6 +136,45 @@ class XGBoostAdapter:
 
         self.mean_model = XGBRegressor(objective="reg:squarederror", **params)
         self.mean_model.fit(X, y)
+
+    def _fit_out_of_fold(self, train_data: pd.DataFrame) -> None:
+        """
+        Out-of-fold P(over) over the training window, for the calibrator.
+
+        Produced here rather than by refitting the whole component later:
+        the calibrator then sees the WHOLE training window instead of its
+        last 30%, and on the same chronological folds the dispersion used.
+        """
+        from src.models.oof import chronological_oof_probabilities
+
+        if "over_hit" not in train_data.columns:
+            self.oof = None
+            return
+        work = train_data
+        if "GAME_DATE" in work.columns:
+            work = work.sort_values("GAME_DATE")
+        y = pd.to_numeric(work["over_hit"], errors="coerce")
+        rows = work.loc[y.notna()]
+        if rows.empty:
+            self.oof = None
+            return
+
+        pipe_cls = type(self._pipe)
+        params = self._pipe.model_params
+
+        # Whole rows travel through the folds, not just the feature matrix:
+        # the pipeline reads GAME_DATE to verify its own splits are
+        # chronological, and handing it a bare X made it warn that it could
+        # not check the very property this pass exists to guarantee.
+        def _fit_predict(rows_tr, y_tr, rows_va):
+            fold = pipe_cls(self.feature_cols, model_params=params)
+            fold.fit(rows_tr, target_col="over_hit")
+            return fold.predict_proba_over(rows_va)
+
+        self.oof = chronological_oof_probabilities(
+            _fit_predict, rows, y.loc[rows.index].to_numpy(),
+            market=self.target_market,
+        )
 
     def predict_mean(self, features: pd.DataFrame) -> pd.Series:
         if self.mean_model is None:

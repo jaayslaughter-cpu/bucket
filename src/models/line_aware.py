@@ -527,6 +527,17 @@ class LineAwarePropModel:
         """The wrapped model owns the fitted count distribution."""
         return getattr(self.model, "dispersion", None)
 
+    @property
+    def oof(self):
+        """
+        Out-of-fold probabilities from the wrapped model.
+
+        They were produced on the AUGMENTED frame, which is the right sample:
+        that is what this model was fitted on, and the calibrator it feeds
+        corrects predictions made at a line.
+        """
+        return getattr(self.model, "oof", None)
+
     def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
         """Mean and spread come from the wrapped model, unchanged."""
         if self.model is None:
