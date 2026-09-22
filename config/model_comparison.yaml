@@ -148,3 +148,24 @@ sports_ev:
 recency:
   half_life_days: 240
   enabled: false
+
+# ---------------------------------------------------------------------------
+# Line-aware classifier (src/models/line_aware.py)
+# ---------------------------------------------------------------------------
+# A line-blind classifier learns "does this player go over" and answers the
+# same number whatever line you ask about. Augmenting each player-game with
+# several candidate lines and giving the line to the model as a feature makes
+# it answer AT the line — which is what a prop model is for.
+#
+# The offsets are added to a PREGAME anchor, never to the realised stat. A
+# line derived from the outcome would post excellent validation numbers and
+# no metric computed afterwards would reveal why, so assert_lines_are_pregame
+# runs before fitting rather than after.
+#
+# Cost: training rows are multiplied by len(offsets). Nine offsets on a
+# 600-row market is 5,400 (line, label) pairs.
+line_aware:
+  enabled: true
+  # Which component to wrap. Numeric-only so the line features join cleanly.
+  base: xgboost
+  offsets: [-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0]

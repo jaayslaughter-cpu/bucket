@@ -178,6 +178,56 @@ def build_components(
             )
         except ImportError as exc:
             logger.warning("CatBoost unavailable: %s", exc)
+
+    # Line-aware wrapper. It does not replace a model — it trains one of the
+    # components above on a frame whose features include the line, so two
+    # different lines on the same player-game genuinely produce two different
+    # probabilities. A line-blind classifier cannot do that by construction.
+    line_cfg = cfg.get("line_aware") or {}
+    if line_cfg.get("enabled"):
+        base_name = str(line_cfg.get("base", "xgboost"))
+        if base_name not in components:
+            logger.warning(
+                "line_aware base %r is not among the built components %s — "
+                "skipping rather than silently wrapping a different model.",
+                base_name, sorted(components),
+            )
+        else:
+            try:
+                from src.models.line_aware import (
+                    DEFAULT_LINE_OFFSETS,
+                    LineAwarePropModel,
+                )
+
+                offsets = tuple(
+                    float(o) for o in (line_cfg.get("offsets") or DEFAULT_LINE_OFFSETS)
+                )
+                # The factory is handed the augmented column list at fit time,
+                # which includes the line features — so the base model is built
+                # to see them rather than retrofitted afterwards.
+                base_cols = xgb_cols if base_name == "xgboost" else feature_cols
+
+                # The inner build must NOT re-enter this block: it would
+                # nest a wrapper inside the wrapper, and fitting it would
+                # recurse. Disable the layer for the inner call explicitly.
+                base_cfg = {**cfg, "line_aware": {"enabled": False}}
+
+                def _base_factory(cols: list[str], _name: str = base_name):
+                    return build_components(
+                        market, cols, base_cfg,
+                        include_catboost=(_name == "catboost"),
+                        include_xgboost=(_name == "xgboost"),
+                        xgb_feature_cols=cols,
+                    )[_name]
+
+                components["line_aware"] = LineAwarePropModel(
+                    _base_factory,
+                    stat=market,
+                    base_feature_cols=base_cols,
+                    offsets=offsets,
+                )
+            except ImportError as exc:
+                logger.warning("line_aware unavailable: %s", exc)
     return components
 
 

@@ -269,3 +269,135 @@ def test_fit_refuses_when_line_features_are_missing(panel):
 def test_default_offsets_span_both_sides_of_the_baseline():
     assert min(DEFAULT_LINE_OFFSETS) < 0 < max(DEFAULT_LINE_OFFSETS)
     assert 0.0 in DEFAULT_LINE_OFFSETS
+
+
+# ---------------------------------------------------------------------------
+# Wiring into the comparison pipeline
+# ---------------------------------------------------------------------------
+
+
+def _fitted_pair(panel):
+    """A fitted line-aware model and its line-blind counterpart."""
+    from src.models.compare import build_components, load_comparison_config, prepare_market_panel
+    from src.models.labels import attach_research_over_labels, default_feature_cols
+    from src.models.walk_forward import fixed_cutoff_split
+
+    work = attach_research_over_labels(prepare_market_panel(panel, "PTS"), stat="PTS")
+    split = fixed_cutoff_split(work, train_end="2025-01-15", validation_end="2025-02-15")
+    train = work.loc[split.train_idx].reset_index(drop=True)
+    valid = work.loc[split.validation_idx].reset_index(drop=True)
+
+    cfg = load_comparison_config()
+    cols = [c for c in default_feature_cols("PTS") if c in work.columns]
+    model = build_components("PTS", cols, cfg)["line_aware"]
+    model.fit(train, valid)
+    return model, valid
+
+
+def test_source_row_identity_is_not_the_positional_index():
+    """
+    Train and validation are augmented separately and each resets its own
+    index, so positional ids collide across the two frames: different
+    player-games get the same number. That fired the straddle guard on a
+    clean chronological split, and would equally have MISSED a real straddle
+    whenever the positions happened not to line up.
+    """
+    import pandas as pd
+
+    from src.models.line_aware import SOURCE_ROW_COL, augment_lines
+
+    def _frame(player_ids, game_ids):
+        return pd.DataFrame({
+            "PLAYER_ID": player_ids, "GAME_ID": game_ids,
+            "PLAYER_NAME": player_ids,
+            "GAME_DATE": pd.to_datetime(["2025-01-01"] * len(player_ids)),
+            "PTS": [20.0] * len(player_ids), "PTS_L10": [18.0] * len(player_ids),
+            "PTS_SEASON": [19.0] * len(player_ids),
+        })
+
+    left = augment_lines(_frame(["p1", "p2"], ["g1", "g1"]), "PTS")
+    right = augment_lines(_frame(["p3", "p4"], ["g2", "g2"]), "PTS")
+
+    # Positionally these are rows 0 and 1 on both sides; by identity they
+    # share nothing.
+    assert set(left[SOURCE_ROW_COL]) & set(right[SOURCE_ROW_COL]) == set()
+    assert all("@" in str(v) for v in left[SOURCE_ROW_COL])
+
+
+def test_a_clean_chronological_split_passes_the_straddle_guard(panel):
+    from src.models.compare import prepare_market_panel
+    from src.models.line_aware import (
+        assert_no_augmented_row_straddles,
+        augment_lines,
+    )
+    from src.models.walk_forward import fixed_cutoff_split
+
+    work = prepare_market_panel(panel, "PTS")
+    split = fixed_cutoff_split(work, train_end="2025-01-15", validation_end="2025-02-15")
+    train = augment_lines(work.loc[split.train_idx].reset_index(drop=True), "PTS")
+    valid = augment_lines(work.loc[split.validation_idx].reset_index(drop=True), "PTS")
+
+    assert_no_augmented_row_straddles(train, valid)     # must not raise
+
+
+def test_the_model_answers_differently_at_different_lines(panel):
+    """
+    The whole point. A line-blind classifier returns one number whatever it
+    is asked; this must produce a survival curve that falls as the line rises.
+    """
+    model, valid = _fitted_pair(panel)
+    row = valid.head(1)
+    lines = [8.0, 11.0, 14.0, 17.0]
+    probs = [float(model.predict_probability_over(row, line).iloc[0]) for line in lines]
+
+    assert all(pd.notna(p) for p in probs)
+    assert max(probs) - min(probs) > 0.20          # genuinely line-dependent
+    assert probs == sorted(probs, reverse=True)    # monotone, as a survival fn must be
+
+
+def test_predict_rows_satisfies_the_contract_compare_py_calls(panel):
+    """
+    compare.py calls .predict_rows — the method the wrapper did not have,
+    which is why 511 tested lines sat disconnected from the pipeline.
+    """
+    from src.models.prediction_schema import ModelPrediction
+
+    model, valid = _fitted_pair(panel)
+    rows = model.predict_rows(valid.head(20), line_col="RESEARCH_LINE")
+
+    assert len(rows) == 20
+    assert all(isinstance(r, ModelPrediction) for r in rows)
+    assert {r.model_name for r in rows} == {"line_aware"}
+    assert all("line_aware" in r.model_version for r in rows)
+
+    answered = [r for r in rows if r.probability_over is not None]
+    assert answered, "every row abstained — the wrapper is not answering at all"
+    for r in answered:
+        total = r.probability_over + r.probability_under + (r.probability_push or 0.0)
+        assert total == pytest.approx(1.0, abs=1e-3)
+
+
+def test_an_out_of_support_line_abstains_rather_than_extrapolating(panel):
+    """
+    A boosted tree asked outside its trained line range can return a
+    probability that RISES with the line, which no survival function does.
+    None with a named warning beats a number the fit cannot support.
+    """
+    model, valid = _fitted_pair(panel)
+    absurd = valid.head(5).copy()
+    absurd["RESEARCH_LINE"] = 400.0
+
+    rows = model.predict_rows(absurd, line_col="RESEARCH_LINE")
+    assert all(r.probability_over is None for r in rows)
+    assert all(
+        any("outside the range" in w for w in r.warnings) for r in rows
+    )
+
+
+def test_the_mean_is_a_property_of_the_game_not_of_the_line(panel):
+    """The projection must not move when only the asked line moves."""
+    model, valid = _fitted_pair(panel)
+    row = valid.head(3)
+    first = model.predict_mean(row.assign(RESEARCH_LINE=10.0))
+    second = model.predict_mean(row.assign(RESEARCH_LINE=30.0))
+    pd.testing.assert_series_equal(first, second, check_names=False)

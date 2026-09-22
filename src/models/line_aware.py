@@ -41,6 +41,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.models.prediction_schema import ModelPrediction
+
 logger = logging.getLogger(__name__)
 
 # Columns this module adds. Feed these to the classifier alongside the
@@ -182,6 +184,41 @@ def label_at_line(
     return work
 
 
+def _source_row_identity(df: pd.DataFrame) -> pd.Series:
+    """
+    A STABLE id for the player-game an augmented copy came from.
+
+    Not the positional index. Train and validation are augmented separately
+    and each resets its own index, so positional ids collide across the two
+    frames: different player-games are handed the same number. That made
+    ``assert_no_augmented_row_straddles`` fire on a perfectly clean
+    chronological split — and, worse, it would also MISS a real straddle
+    whenever the positions happened not to line up. Identity has to come
+    from the data.
+    """
+    keys = [c for c in ("PLAYER_ID", "GAME_ID") if c in df.columns]
+    if len(keys) == 2:
+        return (
+            df["PLAYER_ID"].astype("string").fillna("?")
+            + "@"
+            + df["GAME_ID"].astype("string").fillna("?")
+        )
+    if "PLAYER_ID" in df.columns and "GAME_DATE" in df.columns:
+        return (
+            df["PLAYER_ID"].astype("string").fillna("?")
+            + "@"
+            + pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.strftime("%Y-%m-%d")
+        )
+    # No identity columns: fall back to position and say so, because the
+    # straddle check is only as good as the id it compares.
+    logger.warning(
+        "augment_lines: no PLAYER_ID/GAME_ID to identify a source row — falling "
+        "back to the positional index, which cannot detect a straddle across "
+        "two separately-indexed frames."
+    )
+    return pd.Series(df.index, index=df.index).astype("string")
+
+
 def augment_lines(
     df: pd.DataFrame,
     stat: str,
@@ -204,7 +241,7 @@ def augment_lines(
     """
     stat = stat.upper()
     work = df.copy().reset_index(drop=True)
-    work[SOURCE_ROW_COL] = work.index
+    work[SOURCE_ROW_COL] = _source_row_identity(work)
 
     centre_col = _centre_column(work, stat)
     centre = pd.to_numeric(work[centre_col], errors="coerce")
@@ -429,34 +466,148 @@ class LineAwarePropModel:
     ) -> pd.Series:
         if self.model is None:
             raise RuntimeError("LineAwarePropModel is not fitted")
+        work = self._prepare(features, line)
+        probs = self.model.predict_probability_over(work, work["LINE"])
+
+        return self._mask_out_of_support(probs, work)
+
+    def _prepare(self, features: pd.DataFrame, line) -> pd.DataFrame:
+        """Attach the line features the wrapped model was fitted with."""
         work = features.copy()
         work["LINE"] = (
             pd.to_numeric(line, errors="coerce") if isinstance(line, pd.Series)
             else float(line)
         )
-        work = attach_line_features(work, self.stat, line_col="LINE")
-        probs = self.model.predict_probability_over(work, work["LINE"])
+        return attach_line_features(work, self.stat, line_col="LINE")
 
-        # Outside the trained line range the model is extrapolating, and a
-        # boosted tree has no sensible behaviour there — the probability can
-        # even tick UP with the line, which is impossible for a survival
-        # function. Abstain rather than publish a number the fit cannot
-        # support.
-        if self.trained_z_range is not None:
-            low, high = self.trained_z_range
-            z = pd.to_numeric(work["LINE_Z"], errors="coerce")
-            outside = (z < low) | (z > high) | z.isna()
-            n_outside = int(outside.sum())
-            if n_outside:
-                probs = probs.copy()
-                probs.loc[outside] = float("nan")
-                logger.warning(
-                    "%s: %d of %d row(s) asked at a line outside the trained "
-                    "range (LINE_Z %.2f..%.2f) — abstaining rather than "
-                    "extrapolating.",
-                    self.stat, n_outside, len(work), low, high,
-                )
+    def _mask_out_of_support(self, probs: pd.Series, work: pd.DataFrame) -> pd.Series:
+        """
+        Blank any probability asked at a line the fit never saw.
+
+        Outside the trained range the model is extrapolating, and a boosted
+        tree has no sensible behaviour there — the probability can even tick
+        UP with the line, which is impossible for a survival function.
+        """
+        if self.trained_z_range is None:
+            return probs
+        low, high = self.trained_z_range
+        z = pd.to_numeric(work["LINE_Z"], errors="coerce")
+        outside = (z < low) | (z > high) | z.isna()
+        n_outside = int(outside.sum())
+        if n_outside:
+            probs = probs.copy()
+            probs.loc[outside] = float("nan")
+            logger.warning(
+                "%s: %d of %d row(s) asked at a line outside the trained "
+                "range (LINE_Z %.2f..%.2f) — abstaining rather than "
+                "extrapolating.",
+                self.stat, n_outside, len(work), low, high,
+            )
         return probs
+
+    # ------------------------------------------------------------------
+    # the contract compare.py actually calls
+    # ------------------------------------------------------------------
+
+    @property
+    def model_version(self) -> str:
+        base = getattr(self.model, "model_version", "unknown")
+        return f"line_aware/{getattr(self.model, 'model_name', 'base')}@{base}"
+
+    @property
+    def target_market(self) -> str:
+        return getattr(self.model, "target_market", self.stat)
+
+    @property
+    def feature_schema_version(self) -> str:
+        return getattr(self.model, "feature_schema_version", "fs_v1_shift1_l2")
+
+    @property
+    def dispersion(self):
+        """The wrapped model owns the fitted count distribution."""
+        return getattr(self.model, "dispersion", None)
+
+    def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Mean and spread come from the wrapped model, unchanged."""
+        if self.model is None:
+            raise RuntimeError("LineAwarePropModel is not fitted")
+        return self.model.predict_distribution(self._prepare(features, np.nan))
+
+    def predict_mean(self, features: pd.DataFrame) -> pd.Series:
+        """The projection. A property of the player-game, not of the line."""
+        if self.model is None:
+            raise RuntimeError("LineAwarePropModel is not fitted")
+        work = self._prepare(features, np.nan)
+        if hasattr(self.model, "predict_mean"):
+            return self.model.predict_mean(work)
+        return self.model.predict_distribution(work)["prediction_mean"]
+
+    def predict_rows(
+        self,
+        features: pd.DataFrame,
+        *,
+        line_col: str = "RESEARCH_LINE",
+    ) -> list[ModelPrediction]:
+        """
+        Predictions at the requested line, reusing the wrapped model's mean,
+        spread and push mass and substituting only the probability.
+
+        Being line-aware changes exactly one thing: WHICH probability answers
+        "over this number". The projection, the dispersion and the push mass
+        are properties of the player-game, not of the line, so they are taken
+        from the wrapped model rather than recomputed — a second copy of that
+        arithmetic is a second place for it to drift.
+
+        A row whose line falls outside the trained support gets
+        ``probability_over = None`` and a named warning. Clipping an
+        abstention into a number is the one outcome worse than not answering.
+        """
+        if self.model is None:
+            raise RuntimeError("LineAwarePropModel is not fitted")
+        if line_col not in features.columns:
+            raise ValueError(f"DATA_NOT_AVAILABLE: missing {line_col}")
+
+        # The wrapped model was fitted WITH the line features, so it must be
+        # given them here too. Passing the raw frame asks it for columns it
+        # learned on and cannot find.
+        work = self._prepare(features, features[line_col])
+        rows = self.model.predict_rows(work, line_col=line_col)
+        probs = self._mask_out_of_support(
+            self.model.predict_probability_over(work, work["LINE"]), work
+        )
+
+        abstained = 0
+        for i, prediction in enumerate(rows):
+            prediction.model_name = self.model_name
+            prediction.model_version = self.model_version
+
+            raw = probs.iloc[i] if i < len(probs) else float("nan")
+            if pd.isna(raw):
+                abstained += 1
+                prediction.probability_over = None
+                prediction.probability_under = None
+                prediction.warnings = [
+                    *prediction.warnings,
+                    "line_aware abstained: the requested line is outside the "
+                    "range the model was trained on, where a boosted tree "
+                    "extrapolates without bound",
+                ]
+                continue
+
+            p_over = float(np.clip(float(raw), 1e-6, 1.0 - 1e-6))
+            # The push mass already computed by the wrapped model from its
+            # fitted distribution; the classifier splits only what is left.
+            p_push = prediction.probability_push or 0.0
+            remaining = max(0.0, 1.0 - float(p_push))
+            prediction.probability_over = round(remaining * p_over, 6)
+            prediction.probability_under = round(remaining * (1.0 - p_over), 6)
+
+        if abstained:
+            logger.info(
+                "line_aware %s: %d of %d row(s) abstained on an out-of-support line",
+                self.stat, abstained, len(rows),
+            )
+        return rows
 
     def probability_curve(
         self,

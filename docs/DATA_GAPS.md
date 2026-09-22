@@ -24,6 +24,7 @@ originals.
 | `src/ingestion/boxscores.py` | New. Player game logs from the NBA stats API |
 | `src/ingestion/basketball_reference.py` | New. SR season tables. Prior-season only — refuses same-season joins |
 | `src/features/market_context.py` | New. Pregame opening spread/total + implied team totals. Refuses closing lines |
+| `src/models/line_aware.py` | **Now wired** into build_components as the `line_aware` component |
 
 **The XGBoost baseline is new code.** No earlier PropIQ baseline was
 available, so `xgboost_pipeline.py` was written from scratch. A comparison
