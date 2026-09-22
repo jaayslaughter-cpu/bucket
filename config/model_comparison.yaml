@@ -169,3 +169,20 @@ line_aware:
   # Which component to wrap. Numeric-only so the line features join cleanly.
   base: xgboost
   offsets: [-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0]
+
+# ---------------------------------------------------------------------------
+# Blowout risk from the opening spread (src/features/blowout.py)
+# ---------------------------------------------------------------------------
+# OFF because it was measured, not because it was never tried. On 1,322 real
+# 2025-26 games the favourite/underdog fourth-quarter gap is real (t = 3.38)
+# and far too small to predict with (0.235 of one game's sd). For the tree
+# models this project uses it is empty by construction: a hinge is a monotone
+# transform of the spread, and XGBoost gave both hinges an importance of
+# exactly 0.0 while returning predictions identical to the spread-only arm.
+#
+# The full numbers are in src/features/blowout.py. Re-run the decision with
+#   python -m scripts.feature_ab --layer blowout --markets PTS
+# rather than by arguing with this comment.
+blowout:
+  enabled: false
+  spread_threshold: 9.0

@@ -89,6 +89,7 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
     cfg = _layer_config()
     halflife_cfg = cfg.get("halflife") or {}
     hot_hand_cfg = cfg.get("hot_hand") or {}
+    blowout_cfg = cfg.get("blowout") or {}
 
     def _halflife(df):
         from src.features.halflife import attach_halflife_shrink_features
@@ -108,6 +109,19 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
             minutes_stable_ratio=float(hot_hand_cfg.get("minutes_stable_ratio", 0.15)),
         )
 
+    def _blowout(df):
+        from src.features.blowout import (
+            DEFAULT_SPREAD_THRESHOLD,
+            attach_blowout_features,
+        )
+
+        return attach_blowout_features(
+            df,
+            spread_threshold=float(
+                blowout_cfg.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+            ),
+        )
+
     configured: list[tuple[str, object]] = []
     if _module_has("src.features.halflife", "attach_halflife_shrink_features"):
         configured.append(("halflife.shrink", _halflife))
@@ -117,6 +131,20 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
         configured.append(("halflife.pra_rollups", attach_pra_component_rollups))
     if _module_has("src.features.hot_hand", "attach_hot_hand_features"):
         configured.append(("hot_hand", _hot_hand))
+
+    # Blowout risk is the one layer gated on config rather than on the
+    # module being present, because it is DISABLED BY DEFAULT on measured
+    # evidence -- see src/features/blowout.py. Its columns change the
+    # feature set, so a run with it on gets a different schema digest and
+    # cannot be mistaken for a run with it off.
+    if blowout_cfg.get("enabled", False):
+        if _module_has("src.features.blowout", "attach_blowout_features"):
+            configured.append(("blowout", _blowout))
+        else:
+            logger.warning(
+                "blowout.enabled is true but src.features.blowout is absent — "
+                "no blowout columns this run."
+            )
 
     for module_path, func_name, label in (
         ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),

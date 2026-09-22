@@ -71,6 +71,28 @@ def default_feature_cols(market: str) -> list[str]:
         # on every market of every run.
         "IS_HOME",
         "CAREER_GAMES_PRIOR",
+        # Pregame market context. OPENING lines only -- src/features/
+        # market_context.py refuses closing ones, which are known at tip.
+        #
+        # These were computed and attached for some time before anything
+        # read them: build_feature_matrix wrote MKT_IMPLIED_TEAM_TOTAL, the
+        # module's own docstring called it "the single most informative
+        # pregame number available" for a points prop, and no feature list
+        # named it, so no model ever saw it. Listing them here is what makes
+        # the market layer reachable.
+        #
+        # They exist only when a market_lines frame was supplied. Without
+        # one, resolve_feature_cols drops them with a warning and the run is
+        # narrower -- it does not zero-fill a spread the panel never had.
+        "MKT_OPENING_SPREAD",
+        "MKT_OPENING_TOTAL",
+        "MKT_IMPLIED_TEAM_TOTAL",
+        "MKT_IMPLIED_OPP_TOTAL",
+        "MKT_IS_FAVORITE",
+        # Blowout risk. Off by default and absent from most panels -- see
+        # src/features/blowout.py for the measurement that keeps it off.
+        "BLOWOUT_FAV_HINGE",
+        "BLOWOUT_DOG_HINGE",
     ]
 
 
