@@ -93,7 +93,44 @@ def default_feature_cols(market: str) -> list[str]:
         # src/features/blowout.py for the measurement that keeps it off.
         "BLOWOUT_FAV_HINGE",
         "BLOWOUT_DOG_HINGE",
+        # Opponent defence. Present only when a team_games frame was supplied.
+        #
+        # DEF_RATING_INDEX_L10 is built and exported but deliberately NOT a
+        # feature: within a season it correlates with DEF_RATING_L10 at
+        # r = 0.999, so a model receives one number twice and splits its
+        # attention between identical candidates. It stays available for
+        # reporting, where a league-relative 1.0-centred number is the
+        # readable one.
+        "DEF_RATING_L10",
+        # Pace is published separately from defensive quality on purpose:
+        # points allowed per GAME confounds the two. On the real 2025-26
+        # panel a team's prior-10 pace predicts tonight's possessions at
+        # r = +0.327, so tempo is persistent and worth its own column.
+        "DEF_PACE_L10",
+        *_DEFENSE_BY_MARKET.get(market, ()),
     ]
+
+
+# Which defensive rate actually bears on which market. The naive mirror --
+# "opponent STL allowed" for a steals prop -- is wrong twice over: steals are
+# made BY a defence, not allowed by it, and what drives a player's steal
+# count is how loose the OPPONENT is with the ball. Same for blocks, which
+# need shot volume to exist at all.
+_DEFENSE_BY_MARKET: dict[str, tuple[str, ...]] = {
+    # PTS needs nothing extra: DEF_RATING_L10 already IS points allowed per
+    # 100 possessions, and is in the universal set above.
+    "PTS": (),
+    # A rebound needs a miss, so how well the opponent shoots against this
+    # defence matters as much as how many boards it concedes.
+    "REB": ("DEF_REB_ALLOWED_PER100_L10", "DEF_FG_PCT_ALLOWED_L10"),
+    "AST": ("DEF_AST_ALLOWED_PER100_L10",),
+    "FG3M": ("DEF_FG3M_ALLOWED_PER100_L10", "DEF_FG_PCT_ALLOWED_L10"),
+    # Steals come from opponent turnovers, not from the opponent's own steals.
+    "STL": ("DEF_TOV_FORCED_PER100_L10",),
+    # Blocks need shots to block.
+    "BLK": ("DEF_FGA_ALLOWED_PER100_L10",),
+    "PRA": ("DEF_REB_ALLOWED_PER100_L10", "DEF_AST_ALLOWED_PER100_L10"),
+}
 
 
 def attach_research_over_labels(

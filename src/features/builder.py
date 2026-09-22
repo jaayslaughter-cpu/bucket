@@ -395,10 +395,26 @@ def build_feature_matrix(
         # joined by pre-game value only. elo_post never reaches the panel.
         df = attach_elo_features(df, compute_team_elo(team_games))
         market_layers.append("team_elo")
+
+        # Opponent defence, from TEAM totals rather than from sums over the
+        # player panel. A panel sum measures roster coverage as much as it
+        # measures defence — see src/features/defense.py. A failure here
+        # narrows the run rather than stopping it, like the other layers.
+        try:
+            from src.features.defense import attach_defense_features, build_team_defense
+
+            df = attach_defense_features(df, build_team_defense(team_games))
+            market_layers.append("opponent_defense")
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Opponent-defence layer skipped (%s) — its columns are absent, "
+                "not filled with a league average.", exc,
+            )
     else:
         logger.info(
-            "Team Elo skipped: no team_games frame supplied, so no opponent-strength "
-            "features. Pass the BigDataBall team_game_stats frame to enable them."
+            "Team Elo and opponent defence skipped: no team_games frame supplied, "
+            "so no opponent-strength or defensive-matchup features. Pass the "
+            "BigDataBall team_game_stats frame to enable them."
         )
 
     if market_lines is not None and not market_lines.empty:

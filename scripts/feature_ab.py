@@ -28,6 +28,7 @@ import logging
 import sys
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("feature_ab")
@@ -92,6 +93,24 @@ LAYERS: dict[str, Layer] = {
         attach=_attach_blowout,
         note="Spread hinges. Off by default — see src/features/blowout.py.",
     ),
+    "defense": Layer(
+        (
+            "DEF_RATING_L10",
+            "DEF_RATING_INDEX_L10",
+            "DEF_PACE_L10",
+            "DEF_REB_ALLOWED_PER100_L10",
+            "DEF_AST_ALLOWED_PER100_L10",
+            "DEF_FG3M_ALLOWED_PER100_L10",
+            "DEF_FGA_ALLOWED_PER100_L10",
+            "DEF_TOV_FORCED_PER100_L10",
+            "DEF_FG_PCT_ALLOWED_L10",
+        ),
+        note=(
+            "Opponent defence per 100 possessions. Needs the team_games frame at "
+            "build time, so this arm is subtractive: supply the workbook and the "
+            "control drops the columns."
+        ),
+    ),
     "market_context": Layer(
         (
             "MKT_OPENING_SPREAD",
@@ -117,6 +136,28 @@ METRICS = (
 )
 
 
+def _fold_windows(
+    train_end: str, validation_end: str, folds: int, step_days: int
+) -> list[tuple[str, str]]:
+    """Successive chronological windows, each advanced by ``step_days``.
+
+    Fold 0 is exactly the window the caller asked for; later folds train on
+    strictly more history and validate strictly later, so no fold is ever
+    scored on rows an earlier fold trained on.
+    """
+    folds = max(1, int(folds))
+    step = pd.Timedelta(days=max(1, int(step_days)))
+    t0, v0 = pd.Timestamp(train_end), pd.Timestamp(validation_end)
+    if v0 <= t0:
+        raise ValueError(
+            f"validation_end {validation_end} is not after train_end {train_end}"
+        )
+    return [
+        (str((t0 + i * step).date()), str((v0 + i * step).date()))
+        for i in range(folds)
+    ]
+
+
 def _fmt(value: Any) -> str:
     return "     --" if value is None or pd.isna(value) else f"{float(value):7.5f}"
 
@@ -138,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--markets", default="PTS")
     ap.add_argument("--train-end", default="2025-01-15")
     ap.add_argument("--validation-end", default="2025-02-15")
+    ap.add_argument("--folds", type=int, default=1,
+                    help="Chronological windows to average over. The delta from "
+                         "a single window cannot be told apart from noise, so "
+                         "more than one is strongly preferred.")
+    ap.add_argument("--step-days", type=int, default=None,
+                    help="Days to advance each fold (default: walk_forward.step_days).")
     ap.add_argument("--demo", action="store_true",
                     help="Synthetic panel. Wiring only — the numbers mean nothing.")
     ap.add_argument("--seasons", default=None)
@@ -182,34 +229,77 @@ def main(argv: list[str] | None = None) -> int:
         print("  every value is null — the comparison below cannot show a difference.")
     print()
 
-    arms: dict[str, pd.DataFrame] = {}
-    for arm, frame in (("off", control), ("on", treatment)):
-        result = compare_models_on_panel(
-            frame, markets=markets, train_end=args.train_end,
-            validation_end=args.validation_end, cfg=cfg,
-        )
-        arms[arm] = pd.DataFrame(result["summary"])
+    windows = _fold_windows(
+        args.train_end, args.validation_end, args.folds,
+        args.step_days or int((cfg.get("walk_forward") or {}).get("step_days", 14)),
+    )
+    if len(windows) > 1:
+        print(f"{len(windows)} chronological folds, "
+              f"{windows[0][0]} -> {windows[-1][1]}\n")
 
+    per_fold: list[dict[str, pd.DataFrame]] = []
+    for train_end, validation_end in windows:
+        fold: dict[str, pd.DataFrame] = {}
+        for arm, frame in (("off", control), ("on", treatment)):
+            result = compare_models_on_panel(
+                frame, markets=markets, train_end=train_end,
+                validation_end=validation_end, cfg=cfg,
+            )
+            fold[arm] = pd.DataFrame(result["summary"])
+        if not fold["off"].empty or not fold["on"].empty:
+            per_fold.append(fold)
+
+    if not per_fold:
+        print("ERROR: no fold produced any scored model.", file=sys.stderr)
+        return 2
+
+    arms = {
+        arm: pd.concat([f[arm] for f in per_fold], ignore_index=True)
+        for arm in ("off", "on")
+    }
+
+    n_folds = len(per_fold)
     for market in markets:
-        off = arms["off"][arms["off"]["target_market"] == market].set_index("model_name")
-        on = arms["on"][arms["on"]["target_market"] == market].set_index("model_name")
+        off = arms["off"][arms["off"]["target_market"] == market]
+        on = arms["on"][arms["on"]["target_market"] == market]
         if off.empty and on.empty:
             print(f"{market}: no models scored — skipped.\n")
             continue
         print(f"=== {market} ===")
-        n = off["n_predictions"].max() if not off.empty else on["n_predictions"].max()
-        print(f"    validation rows: {n}")
-        header = f"    {'model':<13}{'metric':<12}{'layer off':>10}{'layer on':>10}   delta"
+        rows = int(off["n_predictions"].sum()) if not off.empty else int(on["n_predictions"].sum())
+        print(f"    validation rows across {n_folds} fold(s): {rows}")
+        if n_folds > 1:
+            header = (f"    {'model':<13}{'metric':<12}{'off':>9}{'on':>9}"
+                      f"{'delta':>10}{'sd':>9}  folds better")
+        else:
+            header = f"    {'model':<13}{'metric':<12}{'off':>9}{'on':>9}{'delta':>10}"
         print(header)
         print("    " + "-" * (len(header) - 4))
-        for model in sorted(set(off.index) | set(on.index)):
+        for model in sorted(set(off["model_name"]) | set(on["model_name"])):
+            a_all = off[off["model_name"] == model]
+            b_all = on[on["model_name"] == model]
             for key, label in METRICS:
-                a = off.at[model, key] if model in off.index else None
-                b = on.at[model, key] if model in on.index else None
-                print(f"    {model:<13}{label:<12}{_fmt(a):>10}{_fmt(b):>10}  {_delta(b, a)}")
+                a = pd.to_numeric(a_all[key], errors="coerce")
+                b = pd.to_numeric(b_all[key], errors="coerce")
+                line = (f"    {model:<13}{label:<12}"
+                        f"{_fmt(a.mean()):>9}{_fmt(b.mean()):>9}")
+                if n_folds > 1 and len(a) == len(b) and len(a):
+                    d = (b.to_numpy() - a.to_numpy())
+                    finite = np.isfinite(d)
+                    if finite.any():
+                        d = d[finite]
+                        line += (f"{d.mean():+10.5f}{d.std():9.5f}"
+                                 f"   {int((d < 0).sum())}/{len(d)}")
+                    else:
+                        line += f"{'--':>10}{'--':>9}   --"
+                else:
+                    line += f"  {_delta(b.mean() if len(b) else None, a.mean() if len(a) else None)}"
+                print(line)
             print()
-    print("Lower is better for every metric above. A delta that does not exceed the "
-          "fold-to-fold spread is not evidence.")
+    print("Lower is better for every metric above. A mean delta smaller than the "
+          "fold-to-fold sd is not evidence;")
+    print("neither is a single fold, which is why --folds defaults to a number "
+          "you should raise.")
     return 0
 
 
