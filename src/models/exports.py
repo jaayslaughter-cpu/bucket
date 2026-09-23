@@ -153,6 +153,27 @@ def write_comparison_exports(
             json.dumps(result["confidence_verdicts"], indent=2, default=str), encoding="utf-8"
         )
 
+    # A run that lost a component is a different run. Recording it here means
+    # a reader of the outputs can see that the "ensemble" row was a blend of
+    # something other than the configured weights, instead of the failure
+    # living only in a log line nobody kept.
+    failures = result.get("fit_failures") or []
+    composition = result.get("ensemble_composition") or []
+    if failures:
+        (root / "fit_failures.json").write_text(
+            json.dumps(failures, indent=2, default=str), encoding="utf-8"
+        )
+        files["fit_failures.json"] = len(failures)
+        logger.warning(
+            "%d component fit(s) FAILED and were skipped — see fit_failures.json. "
+            "The ensemble was blended without them.", len(failures),
+        )
+    if composition:
+        (root / "ensemble_composition.json").write_text(
+            json.dumps(composition, indent=2, default=str), encoding="utf-8"
+        )
+        files["ensemble_composition.json"] = len(composition)
+
     manifest = {
         "generated_at_pt": format_pacific_iso(now_pacific()),
         "timezone_display": DISPLAY_TZ_NAME,
@@ -160,6 +181,13 @@ def write_comparison_exports(
         "research_only": True,
         "files": {},
         "winners_by_market": result.get("winners") or {},
+        "components_failed_to_fit": sorted(
+            {f"{f.get('target_market')}/{f.get('model_name')}" for f in failures}
+        ),
+        "ensemble_matches_config": all(
+            not c.get("failed_to_fit") and not c.get("fitted_but_unweighted")
+            for c in composition
+        ) if composition else None,
     }
     for name, nrows in files.items():
         p = root / name

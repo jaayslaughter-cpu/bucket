@@ -365,6 +365,8 @@ def compare_models_on_panel(
     cfg = cfg or load_comparison_config()
     weights = cfg.get("ensemble_weights") or {}
     summary_rows: list[dict[str, Any]] = []
+    fit_failures: list[dict[str, Any]] = []
+    ensemble_composition: list[dict[str, Any]] = []
     detail_rows: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
     calib_rows: list[dict[str, Any]] = []
@@ -430,15 +432,63 @@ def compare_models_on_panel(
                 model.fit(train, val)
                 fitted[name] = model
             except Exception as exc:  # noqa: BLE001
+                # A component that cannot fit is skipped so the run continues,
+                # but it is RECORDED. Skipping silently is how catboost ran at
+                # 0.50 of the configured ensemble weight while contributing
+                # nothing, with no exported artifact saying so.
                 logger.warning("fit failed market=%s model=%s: %s", market, name, exc)
+                fit_failures.append({
+                    "target_market": market,
+                    "model_name": name,
+                    "configured_ensemble_weight": float(weights.get(name, 0.0)),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
 
         if len(fitted) >= 2:
+            component_weights = {k: weights.get(k, 0.0) for k in fitted}
             ens = EnsemblePropModel(
                 {k: fitted[k] for k in fitted},
-                weights={k: weights.get(k, 0.0) for k in fitted},
+                weights=component_weights,
                 target_market=market,
             )
             fitted["ensemble"] = ens
+
+            # What the blend ACTUALLY is, beside what was configured. A
+            # component that failed to fit never reaches component_weights at
+            # all, so it cannot appear in the ensemble's own dropped-models
+            # warning -- its absence is invisible without this record. A
+            # component that fitted but carries no configured weight is
+            # silently excluded too, which is worth seeing.
+            live = {k: v for k, v in component_weights.items() if v > 0}
+            total = sum(live.values())
+            effective = (
+                {k: round(v / total, 6) for k, v in live.items()} if total > 0 else {}
+            )
+            ensemble_composition.append({
+                "target_market": market,
+                "configured": dict(weights),
+                "effective": effective,
+                "failed_to_fit": sorted(
+                    set(weights) - set(fitted) - {"ensemble"}
+                ),
+                "fitted_but_unweighted": sorted(
+                    k for k, v in component_weights.items() if v <= 0
+                ),
+            })
+            unweighted = [k for k, v in component_weights.items() if v <= 0]
+            if unweighted:
+                logger.warning(
+                    "Market %s: %s fitted but carry no ensemble weight, so the "
+                    "blend excludes them. Add them to ensemble_weights or accept "
+                    "that they are model comparisons only.",
+                    market, unweighted,
+                )
+            if effective != {k: round(v / sum(weights.values()), 6)
+                             for k, v in weights.items() if v > 0}:
+                logger.warning(
+                    "Market %s: the ensemble is %s, NOT the configured %s.",
+                    market, effective, dict(weights),
+                )
 
         y_true = val["over_hit"].astype(float).to_numpy()
         actual = pd.to_numeric(val[market], errors="coerce").to_numpy() if market in val.columns else np.full(len(val), np.nan)
@@ -641,4 +691,9 @@ def compare_models_on_panel(
         "edge_buckets": bucket_rows,
         "confidence_verdicts": confidence_rows,
         "winners": winners,
+        # Which components failed to fit, and what the ensemble actually is.
+        # Exported so a run that quietly lost half its configured weight
+        # leaves a record instead of an unremarkable-looking summary row.
+        "fit_failures": fit_failures,
+        "ensemble_composition": ensemble_composition,
     }

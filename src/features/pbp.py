@@ -415,10 +415,33 @@ def attach_pbp_rolling_features(
 
     # Rates only. See PBP_DIAGNOSTIC_COLS for what is deliberately excluded.
     value_cols = [c for c in PBP_RATE_COLS if c in src.columns]
+    # One summary row per (game, player), or the left join fans out and every
+    # panel row silently becomes several. attach_defense_features guards the
+    # same way; a duplicated key is a data fault, not something to average
+    # over quietly.
+    duplicated = int(src.duplicated(subset=["GAME_ID", "_pid"]).sum())
+    if duplicated:
+        raise PbpFeatureError(
+            f"player_games has {duplicated} duplicate (game, player) row(s). "
+            "Joining them would multiply panel rows and misalign every column "
+            "assigned positionally afterwards."
+        )
+
     merged = out.merge(
         src[["GAME_ID", "_pid", *value_cols]], on=["GAME_ID", "_pid"], how="left"
     )
-    merged = merged.sort_values(["_pid", "GAME_DATE"]).reset_index(drop=True)
+    if len(merged) != len(out):
+        raise PbpFeatureError(
+            f"the pbp join changed the row count ({len(out)} -> {len(merged)})"
+        )
+    # Remember the caller's order. Rolling needs the rows in player-then-date
+    # order, but returning them that way silently reorders the panel: the
+    # values stay attached to their own rows, so nothing is mis-joined, and
+    # then any caller that assigns a column positionally afterwards corrupts
+    # every row. The original order is restored before returning.
+    merged.index = out.index
+    original_order = merged.index
+    merged = merged.sort_values(["_pid", "GAME_DATE"])
 
     grouped = merged.groupby("_pid", sort=False)
     created: list[str] = []
@@ -433,7 +456,7 @@ def attach_pbp_rolling_features(
     # The same-game columns are dropped: they describe THIS game and would be
     # postgame information if any feature list ever named one.
     drop = [c for c in (*PBP_GAME_COLS, "_pid") if c in merged.columns]
-    merged = merged.drop(columns=drop)
+    merged = merged.drop(columns=drop).reindex(original_order)
     covered = (
         float(merged[created[0]].notna().mean()) if created else 0.0
     )
@@ -442,4 +465,4 @@ def attach_pbp_rolling_features(
         "value. Same-game pbp columns are dropped, not carried.",
         len(created), 100 * covered,
     )
-    return merged.sort_index()
+    return merged
