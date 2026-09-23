@@ -326,8 +326,83 @@ def team_possessions(events: pd.DataFrame) -> pd.DataFrame:
     return ev.loc[changed, ["gameId", "elapsed"]].reset_index(drop=True)
 
 
+def check_log_completeness(
+    events: pd.DataFrame,
+    panel: pd.DataFrame,
+    *,
+    min_exact_share: float = 0.80,
+    max_median_gap: float = 2.0,
+) -> dict[str, float]:
+    """
+    Compare the event log's shot count to the box score's, per season.
+
+    Two independent counts of the same thing. They should agree; where they
+    do not, the log is missing events and every RATE built from it is biased
+    by whatever was dropped.
+
+    This is not hypothetical. A 2025-26 log supplied as nine of ten parts
+    measured 3% short and looked like random sub-sampling; the tenth part
+    made it whole. A 2023-24 log supplied as five of about eleven parts was
+    short by a median of 88 attempts in every one of its 1,164 games --
+    roughly half of each game -- while still naming every game, so nothing
+    about its shape said "partial" except this check.
+
+    Returns one row of numbers per season. Seasons that fail are named in
+    ``failing`` so a caller can exclude them rather than average over them.
+    """
+    if "GAME_ID" not in panel.columns or "FGA" not in panel.columns:
+        raise PbpFeatureError(
+            "DATA_NOT_AVAILABLE: panel needs GAME_ID and FGA to check the event "
+            "log against an independent count"
+        )
+    shots = (
+        events[events["actionType"].isin(SHOT_ACTIONS)]
+        .groupby("gameId").size().rename("pbp_fga")
+    )
+    work = panel.copy()
+    work["gameId"] = work["GAME_ID"].astype(str)
+    season = work["SEASON"] if "SEASON" in work.columns else pd.Series("all", index=work.index)
+    box = work.groupby(["gameId", season])["FGA"].sum().rename("box_fga").reset_index()
+    box.columns = ["gameId", "season", "box_fga"]
+    joined = box.merge(shots, left_on="gameId", right_index=True, how="inner")
+    if joined.empty:
+        raise PbpFeatureError(
+            "DATA_NOT_AVAILABLE: no game appears in both the event log and the panel"
+        )
+    joined["gap"] = joined["box_fga"] - joined["pbp_fga"]
+
+    report: dict[str, dict[str, float]] = {}
+    failing: list[str] = []
+    for name, block in joined.groupby("season"):
+        exact = float((block["gap"] == 0).mean())
+        median_gap = float(block["gap"].median())
+        report[str(name)] = {
+            "games": float(len(block)),
+            "exact_share": exact,
+            "median_gap": median_gap,
+        }
+        if exact < min_exact_share or median_gap > max_median_gap:
+            failing.append(str(name))
+            logger.warning(
+                "pbp log for %s is INCOMPLETE: %.1f%% of %d games match the box "
+                "score exactly, median shortfall %.0f attempts. Rates built from "
+                "it are biased by whatever is missing. Supply the remaining "
+                "parts before using this season.",
+                name, 100 * exact, len(block), median_gap,
+            )
+        else:
+            logger.info(
+                "pbp log for %s: %.1f%% of %d games match the box score exactly, "
+                "median gap %.0f.", name, 100 * exact, len(block), median_gap,
+            )
+    return {"seasons": report, "failing": failing}
+
+
 def summarise_player_games(
-    pbp: pd.DataFrame, panel: pd.DataFrame | None = None
+    pbp: pd.DataFrame,
+    panel: pd.DataFrame | None = None,
+    *,
+    require_complete: bool = False,
 ) -> pd.DataFrame:
     """
     One row per (game, player) of SAME-GAME play-by-play summaries.
@@ -367,6 +442,14 @@ def summarise_player_games(
             out[col] = np.nan
 
     if panel is not None:
+        completeness = check_log_completeness(events, panel)
+        if completeness["failing"] and require_complete:
+            raise PbpFeatureError(
+                f"DATA_NOT_AVAILABLE: the event log is incomplete for "
+                f"{completeness['failing']}. Every rate built from it would be "
+                "biased by the missing events."
+            )
+        out.attrs["log_completeness"] = completeness
         report = validate_on_court_against_minutes(on_court, panel)
         if report.get("n"):
             logger.info(

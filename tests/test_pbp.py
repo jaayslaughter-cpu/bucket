@@ -197,3 +197,85 @@ def test_missing_columns_are_refused_rather_than_guessed():
             pd.DataFrame({"PLAYER_ID": ["p"]}),
             pd.DataFrame({"gameId": ["g"], "personId": ["p"]}),
         )
+
+
+# --- log completeness -------------------------------------------------------
+
+
+def _log_and_panel(n_games: int = 40, fga_per_game: int = 180, keep: float = 1.0,
+                   season: str = "2025-26"):
+    """An event log and the box score it should agree with."""
+    events, rows = [], []
+    for g in range(n_games):
+        gid = f"002250{g:04d}"
+        kept = int(fga_per_game * keep)
+        for i in range(kept):
+            events.append({
+                "gameId": gid, "actionType": "2pt", "period": 1,
+                "clock": "PT06M00.00S", "orderNumber": i,
+            })
+        rows.append({"GAME_ID": gid, "FGA": float(fga_per_game), "SEASON": season})
+    return pd.DataFrame(events), pd.DataFrame(rows)
+
+
+def test_a_complete_log_passes_the_completeness_check():
+    from src.features.pbp import check_log_completeness
+
+    events, panel = _log_and_panel()
+    report = check_log_completeness(prepare_events(events), panel)
+    assert report["failing"] == []
+    assert report["seasons"]["2025-26"]["exact_share"] == 1.0
+    assert report["seasons"]["2025-26"]["median_gap"] == 0.0
+
+
+def test_a_half_supplied_log_is_caught():
+    """Five of about eleven parts named every game and was short by half of
+    each. Nothing about its shape said 'partial' except this check."""
+    from src.features.pbp import check_log_completeness
+
+    events, panel = _log_and_panel(keep=0.5)
+    report = check_log_completeness(prepare_events(events), panel)
+    assert report["failing"] == ["2025-26"]
+    assert report["seasons"]["2025-26"]["exact_share"] == 0.0
+    assert report["seasons"]["2025-26"]["median_gap"] == 90.0
+
+
+def test_completeness_is_reported_per_season_not_pooled():
+    """One whole season must not mask a missing one."""
+    from src.features.pbp import check_log_completeness
+
+    good_ev, good_panel = _log_and_panel(n_games=30, season="2025-26")
+    bad_ev, bad_panel = _log_and_panel(n_games=30, keep=0.5, season="2023-24")
+    bad_ev["gameId"] = bad_ev["gameId"].str.replace("002250", "002230", regex=False)
+    bad_panel["GAME_ID"] = bad_panel["GAME_ID"].str.replace("002250", "002230", regex=False)
+
+    report = check_log_completeness(
+        prepare_events(pd.concat([good_ev, bad_ev], ignore_index=True)),
+        pd.concat([good_panel, bad_panel], ignore_index=True),
+    )
+    assert report["failing"] == ["2023-24"]
+    assert report["seasons"]["2025-26"]["exact_share"] == 1.0
+
+
+def test_summaries_can_refuse_to_build_on_an_incomplete_log():
+    from src.features.pbp import PbpFeatureError, summarise_player_games
+
+    events, panel = _log_and_panel(keep=0.5)
+    events["personId"] = "p1"
+    events["shotDistance"] = 10.0
+    events["shotResult"] = "Made"
+    panel["PLAYER_ID"] = "p1"
+    panel["MIN"] = 30.0
+    with pytest.raises(PbpFeatureError, match="incomplete"):
+        summarise_player_games(events, panel=panel, require_complete=True)
+    # Default is to warn and continue, so an exploratory run still works.
+    out = summarise_player_games(events, panel=panel)
+    assert out.attrs["log_completeness"]["failing"] == ["2025-26"]
+
+
+def test_a_panel_without_attempts_cannot_be_checked_against():
+    from src.features.pbp import PbpFeatureError, check_log_completeness
+
+    events, panel = _log_and_panel()
+    with pytest.raises(PbpFeatureError, match="DATA_NOT_AVAILABLE"):
+        check_log_completeness(prepare_events(events), panel.drop(columns=["FGA"]))
