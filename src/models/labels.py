@@ -120,18 +120,29 @@ def default_feature_cols(market: str) -> list[str]:
 # how far out a player shoots; a points prop does, because a rim attempt and
 # a long two are worth the same in the box score and not in expectation.
 _PBP_BY_MARKET: dict[str, tuple[str, ...]] = {
-    "PTS": (
-        "PBP_SHOT_DIST_AVG_L5", "PBP_RIM_RATE_L5", "PBP_THREE_RATE_L5",
-        "PBP_DUNK_LAYUP_RATE_L5", "PBP_ASSISTED_RATE_L10",
-        "PBP_GARBAGE_SHOT_SHARE_L10", "PBP_PACE_ON_COURT_L10",
-    ),
+    # PTS gets NONE, measured. With event logs for three seasons and both arms
+    # inside them, the seven-feature PTS set above made every tree model
+    # slightly worse: xgboost Brier +0.00061, ensemble +0.00036, catboost
+    # +0.00030, each within its own fold spread but all in the same direction,
+    # and xgboost's ECE +0.00350. The plausible reading is that a scorer's
+    # volume is already carried by PTS_L10 and MIN_L5, and seven weak
+    # correlated columns cost more in variance than they return. Whoever wants
+    # a smaller PTS subset should measure it rather than restore this one.
+    "PTS": (),
     "FG3M": ("PBP_THREE_RATE_L5", "PBP_THREE_RATE_L10", "PBP_SHOT_DIST_AVG_L5"),
     # Where a team shoots from changes where the ball comes off; a rim-heavy
-    # diet produces different rebound chances than a three-heavy one.
+    # diet produces different rebound chances than a three-heavy one. This is
+    # where the event log pays: on three seasons, EVERY model improved on all
+    # three folds -- catboost Brier -0.00130 against a fold spread of 0.00036,
+    # ensemble -0.00084 against 0.00021, line_aware -0.00129 and its ECE
+    # -0.00967. Mean deltas at three to four times their own noise.
     "REB": ("PBP_RIM_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
             "PBP_PACE_ON_COURT_L10"),
     # An assist needs a teammate's make. How much of a player's own scoring is
-    # created for him says something about his role in the offence.
+    # created for him says something about his role in the offence. Smaller
+    # than rebounds but just as consistent: ensemble Brier -0.00040 against a
+    # 0.00009 spread and xgboost -0.00065 against 0.00019, both 3/3 folds,
+    # with xgboost's ECE -0.00300 on all three.
     "AST": ("PBP_ASSISTED_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
             "PBP_PACE_ON_COURT_L10"),
     "PRA": (

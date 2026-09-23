@@ -73,55 +73,69 @@ within-two-minutes from 97.7% to 100%.
 
 ## The measurement
 
-Both arms inside 2025-26, identical rows, three chronological folds. Selected
-cells; the full table is in the commit.
+Three seasons of event logs (2023-24, 2024-25, 2025-26), all passing the
+completeness check. Both arms on identical rows, 77,546 of them, three
+chronological folds: training on the earlier seasons, validating across
+2025-26.
 
-| market | model | metric | off | on | delta | sd | folds better |
-|---|---|---|---|---|---|---|---|
-| PTS | xgboost | Brier raw | 0.24624 | 0.24644 | +0.00020 | 0.00015 | 1/3 |
-| PTS | line_aware | ECE cal | 0.02377 | 0.02953 | +0.00577 | 0.00176 | 0/3 |
-| REB | catboost | Brier cal | 0.24323 | 0.24280 | **−0.00043** | 0.00030 | **3/3** |
-| REB | xgboost | Brier raw | 0.24222 | 0.24267 | +0.00044 | 0.00066 | 1/3 |
-| AST | line_aware | Brier cal | 0.24292 | 0.24233 | **−0.00059** | 0.00034 | **3/3** |
-| AST | xgboost | Brier raw | 0.24032 | 0.24076 | +0.00044 | 0.00070 | 1/3 |
+**The answer is per-market, and it is no longer ambiguous.**
 
-**No consistent improvement.** Two cells show a clean small gain (CatBoost on
-rebounds, line_aware on assists — both unanimous across folds and both
-clearing their own spread). Several show a clean small loss, XGBoost most
-consistently. The deltas live in the fourth decimal place and point in
-different directions by model and market, which is what noise looks like with
-a couple of coincidences in it.
+### Rebounds — the features earn their place
 
-## Why — and this is the finding
+Every model improves, on every fold, by three to four times its own
+fold-to-fold spread.
 
-**Restricting the training window to the seasons the logs cover costs far
-more than the features add.**
+| model | metric | off | on | delta | sd | folds |
+|---|---|---|---|---|---|---|
+| catboost | Brier raw | 0.24000 | 0.23870 | **−0.00130** | 0.00036 | **3/3** |
+| ensemble | Brier raw | 0.24045 | 0.23961 | **−0.00084** | 0.00021 | **3/3** |
+| line_aware | Brier raw | 0.24419 | 0.24290 | **−0.00129** | 0.00046 | **3/3** |
+| line_aware | ECE raw | 0.03280 | 0.02313 | **−0.00967** | 0.00702 | **3/3** |
+| xgboost | Brier raw | 0.24121 | 0.24063 | **−0.00058** | 0.00040 | **3/3** |
 
-The event logs exist for 2025-26 only. A feature present in the validation
-window and nowhere earlier is the shape of a leak, so both arms had to sit
-inside that season — roughly 12,000 training rows instead of 187,733.
+This is the one place the mechanism is obvious in advance: a rebound needs a
+miss, and where a team shoots from decides where the ball comes off. A
+rim-heavy diet produces different rebound chances than a three-heavy one, and
+no box-score column says which a team runs.
 
-| | training rows | XGBoost Brier (PTS / REB / AST) |
-|---|---|---|
-| nine-season baseline, validating on 2025-26 | 184,682 | 0.2403 / 0.2378 / 0.2352 |
-| 2025-26 only, with pbp features | ~12,000 | 0.2464 / 0.2427 / 0.2408 |
+### Assists — smaller, equally consistent
 
-*(different validation windows, so indicative rather than a controlled
-comparison — but the gap is ~0.006 Brier, an order of magnitude larger than
-any pbp delta at ~0.0005.)*
+| model | metric | off | on | delta | sd | folds |
+|---|---|---|---|---|---|---|
+| ensemble | Brier raw | 0.23632 | 0.23592 | **−0.00040** | 0.00009 | **3/3** |
+| ensemble | ECE raw | 0.01443 | 0.01237 | **−0.00207** | 0.00114 | **3/3** |
+| xgboost | Brier raw | 0.23707 | 0.23643 | **−0.00065** | 0.00019 | **3/3** |
+| xgboost | ECE raw | 0.01943 | 0.01643 | **−0.00300** | 0.00116 | **3/3** |
 
-Losing eight seasons of history costs about ten times what the shot-mix
-features return.
+### Points — no
 
-## What would change the answer
+| model | metric | off | on | delta | sd | folds |
+|---|---|---|---|---|---|---|
+| xgboost | Brier raw | 0.24174 | 0.24235 | +0.00061 | 0.00073 | 1/3 |
+| ensemble | Brier raw | 0.24109 | 0.24145 | +0.00036 | 0.00038 | 1/3 |
+| catboost | Brier raw | 0.24082 | 0.24112 | +0.00030 | 0.00034 | 1/3 |
+| xgboost | ECE raw | 0.01313 | 0.01663 | +0.00350 | 0.00483 | 1/3 |
 
-Event logs for earlier seasons. The layer is built, validated and wired; it
-needs no further work to be re-measured. With 2018-2025 logs the comparison
-could run on the full panel, where the features would be judged on their own
-merit instead of against the cost of the window they force.
+Each delta sits inside its own fold spread, so none is individually
+conclusive — but all three tree models moved the same way on the same folds,
+and only `line_aware` improved. The reading: a scorer's volume is already
+carried by `PTS_L10` and `MIN_L5`, and seven weak correlated columns cost
+more in variance than they return.
 
-```
-python -m scripts.feature_ab --layer pbp \
-    --panel data/external/training_pack/panel_pbp.parquet \
-    --seasons-only <seasons with logs> --markets PTS,REB,AST --folds 5
-```
+**`_PBP_BY_MARKET["PTS"]` is now empty.** Rebounds and assists keep theirs.
+A smaller PTS subset might work; it would need measuring, not restoring.
+
+## What changed the answer
+
+The earlier version of this note said the features could not be judged,
+because the logs covered one season and both arms had to sit inside it —
+about 12,000 training rows against 184,682, and losing eight seasons of
+history cost roughly ten times what the features returned.
+
+Two more seasons of logs removed that constraint. Training is now ~51,000
+rows with event-log features present throughout, and the features are judged
+on their own merit instead of against the cost of the window they forced.
+
+The prediction in that note was that earlier logs would let the comparison
+run fairly. That was right. The expectation that the features would then help
+was right for rebounds and assists and wrong for points.

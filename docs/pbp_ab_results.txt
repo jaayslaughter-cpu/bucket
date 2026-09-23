@@ -1,97 +1,97 @@
-Restricted to season(s) ['2025-26']: 214,381 -> 26,648 rows. Both arms use exactly these rows.
+Restricted to season(s) ['2023-24', '2024-25', '2025-26']: 214,381 -> 77,546 rows. Both arms use exactly these rows.
 
 Layer 'pbp' under test: ['PBP_PACE_ON_COURT_L5', 'PBP_PACE_ON_COURT_L10', 'PBP_SHOT_DIST_AVG_L5', 'PBP_SHOT_DIST_AVG_L10', 'PBP_RIM_RATE_L5', 'PBP_RIM_RATE_L10', 'PBP_MID_RATE_L5', 'PBP_MID_RATE_L10', 'PBP_THREE_RATE_L5', 'PBP_THREE_RATE_L10', 'PBP_DUNK_LAYUP_RATE_L5', 'PBP_DUNK_LAYUP_RATE_L10', 'PBP_ASSISTED_RATE_L5', 'PBP_ASSISTED_RATE_L10', 'PBP_CLOSE_SHOT_SHARE_L5', 'PBP_CLOSE_SHOT_SHARE_L10', 'PBP_GARBAGE_SHOT_SHARE_L5', 'PBP_GARBAGE_SHOT_SHARE_L10']
   Shot mix and game-state context from the event log, as prior-game rolling means. Only exists for seasons whose logs were supplied, so both arms must sit inside those seasons.
-  non-null coverage: PBP_PACE_ON_COURT_L5=95.6%, PBP_PACE_ON_COURT_L10=95.6%, PBP_SHOT_DIST_AVG_L5=94.6%, PBP_SHOT_DIST_AVG_L10=94.9%, PBP_RIM_RATE_L5=94.6%, PBP_RIM_RATE_L10=94.9%, PBP_MID_RATE_L5=94.6%, PBP_MID_RATE_L10=94.9%, PBP_THREE_RATE_L5=94.6%, PBP_THREE_RATE_L10=94.9%, PBP_DUNK_LAYUP_RATE_L5=94.6%, PBP_DUNK_LAYUP_RATE_L10=94.9%, PBP_ASSISTED_RATE_L5=91.7%, PBP_ASSISTED_RATE_L10=93.7%, PBP_CLOSE_SHOT_SHARE_L5=94.6%, PBP_CLOSE_SHOT_SHARE_L10=94.9%, PBP_GARBAGE_SHOT_SHARE_L5=94.6%, PBP_GARBAGE_SHOT_SHARE_L10=94.9%
+  non-null coverage: PBP_PACE_ON_COURT_L5=97.9%, PBP_PACE_ON_COURT_L10=97.9%, PBP_SHOT_DIST_AVG_L5=97.1%, PBP_SHOT_DIST_AVG_L10=97.5%, PBP_RIM_RATE_L5=97.1%, PBP_RIM_RATE_L10=97.5%, PBP_MID_RATE_L5=97.1%, PBP_MID_RATE_L10=97.5%, PBP_THREE_RATE_L5=97.1%, PBP_THREE_RATE_L10=97.5%, PBP_DUNK_LAYUP_RATE_L5=97.1%, PBP_DUNK_LAYUP_RATE_L10=97.5%, PBP_ASSISTED_RATE_L5=94.3%, PBP_ASSISTED_RATE_L10=96.5%, PBP_CLOSE_SHOT_SHARE_L5=97.1%, PBP_CLOSE_SHOT_SHARE_L10=97.5%, PBP_GARBAGE_SHOT_SHARE_L5=97.1%, PBP_GARBAGE_SHOT_SHARE_L10=97.5%
 
-3 chronological folds, 2026-01-15 -> 2026-03-29
+3 chronological folds, 2025-10-01 -> 2026-02-13
 
 === PTS ===
-    validation rows across 3 fold(s): 68284
+    validation rows across 3 fold(s): 153312
     model        metric            off       on     delta       sd  folds better
     ----------------------------------------------------------------------------
-    catboost     Brier raw     0.24704  0.24706  +0.00001  0.00046   1/3
-    catboost     Brier cal     0.24714  0.24807  +0.00094  0.00139   1/3
-    catboost     ECE raw       0.02713  0.02737  +0.00023  0.00219   2/3
-    catboost     ECE cal       0.02437  0.03107  +0.00670  0.00539   0/3
+    catboost     Brier raw     0.24082  0.24112  +0.00030  0.00034   1/3
+    catboost     Brier cal     0.24099  0.24116  +0.00018  0.00034   1/3
+    catboost     ECE raw       0.01223  0.01420  +0.00197  0.00342   1/3
+    catboost     ECE cal       0.01570  0.01380  -0.00190  0.00348   2/3
 
-    distribution Brier raw     0.25595  0.25595  +0.00000  0.00000   0/3
-    distribution Brier cal     0.24885  0.24885  +0.00000  0.00000   0/3
-    distribution ECE raw       0.08047  0.08047  +0.00000  0.00000   0/3
-    distribution ECE cal       0.02330  0.02330  +0.00000  0.00000   0/3
+    distribution Brier raw     0.25244  0.25244  +0.00000  0.00000   0/3
+    distribution Brier cal     0.24652  0.24652  +0.00000  0.00000   0/3
+    distribution ECE raw       0.06737  0.06737  +0.00000  0.00000   0/3
+    distribution ECE cal       0.01363  0.01363  +0.00000  0.00000   0/3
 
-    ensemble     Brier raw     0.24655  0.24643  -0.00012  0.00033   2/3
-    ensemble     Brier cal     0.24655  0.24648  -0.00007  0.00037   2/3
-    ensemble     ECE raw       0.03730  0.03593  -0.00137  0.00215   1/3
-    ensemble     ECE cal       0.03257  0.03220  -0.00037  0.00233   2/3
+    ensemble     Brier raw     0.24109  0.24145  +0.00036  0.00038   1/3
+    ensemble     Brier cal     0.24126  0.24164  +0.00038  0.00032   1/3
+    ensemble     ECE raw       0.00950  0.01100  +0.00150  0.00135   1/3
+    ensemble     ECE cal       0.01350  0.01513  +0.00163  0.00253   1/3
 
-    line_aware   Brier raw     0.24517  0.24525  +0.00008  0.00056   2/3
-    line_aware   Brier cal     0.24498  0.24527  +0.00029  0.00041   1/3
-    line_aware   ECE raw       0.02807  0.02937  +0.00130  0.00156   1/3
-    line_aware   ECE cal       0.02377  0.02953  +0.00577  0.00176   0/3
+    line_aware   Brier raw     0.24268  0.24222  -0.00046  0.00044   2/3
+    line_aware   Brier cal     0.24262  0.24213  -0.00050  0.00042   2/3
+    line_aware   ECE raw       0.01990  0.01887  -0.00103  0.00106   2/3
+    line_aware   ECE cal       0.01987  0.01710  -0.00277  0.00137   3/3
 
-    xgboost      Brier raw     0.24624  0.24644  +0.00020  0.00015   1/3
-    xgboost      Brier cal     0.24626  0.24681  +0.00055  0.00024   0/3
-    xgboost      ECE raw       0.02713  0.02483  -0.00230  0.00273   2/3
-    xgboost      ECE cal       0.02207  0.02437  +0.00230  0.00143   0/3
+    xgboost      Brier raw     0.24174  0.24235  +0.00061  0.00073   1/3
+    xgboost      Brier cal     0.24178  0.24232  +0.00053  0.00068   1/3
+    xgboost      ECE raw       0.01313  0.01663  +0.00350  0.00483   1/3
+    xgboost      ECE cal       0.01063  0.01450  +0.00387  0.00399   1/3
 
 === REB ===
-    validation rows across 3 fold(s): 67675
+    validation rows across 3 fold(s): 151850
     model        metric            off       on     delta       sd  folds better
     ----------------------------------------------------------------------------
-    catboost     Brier raw     0.24315  0.24288  -0.00027  0.00048   2/3
-    catboost     Brier cal     0.24323  0.24280  -0.00043  0.00030   3/3
-    catboost     ECE raw       0.01093  0.00883  -0.00210  0.00313   2/3
-    catboost     ECE cal       0.01517  0.01143  -0.00373  0.00606   1/3
+    catboost     Brier raw     0.24000  0.23870  -0.00130  0.00036   3/3
+    catboost     Brier cal     0.24006  0.23878  -0.00128  0.00050   3/3
+    catboost     ECE raw       0.01233  0.01323  +0.00090  0.00173   1/3
+    catboost     ECE cal       0.00943  0.01043  +0.00100  0.00216   1/3
 
-    distribution Brier raw     0.24657  0.24657  +0.00000  0.00000   0/3
-    distribution Brier cal     0.24440  0.24440  +0.00000  0.00000   0/3
-    distribution ECE raw       0.03880  0.03880  +0.00000  0.00000   0/3
-    distribution ECE cal       0.01617  0.01617  +0.00000  0.00000   0/3
+    distribution Brier raw     0.25002  0.25002  +0.00000  0.00000   0/3
+    distribution Brier cal     0.24584  0.24584  +0.00000  0.00000   0/3
+    distribution ECE raw       0.05403  0.05403  +0.00000  0.00000   0/3
+    distribution ECE cal       0.00727  0.00727  +0.00000  0.00000   0/3
 
-    ensemble     Brier raw     0.24151  0.24141  -0.00010  0.00051   2/3
-    ensemble     Brier cal     0.24177  0.24151  -0.00026  0.00056   2/3
-    ensemble     ECE raw       0.01393  0.01357  -0.00037  0.00278   1/3
-    ensemble     ECE cal       0.01777  0.01363  -0.00413  0.00490   2/3
+    ensemble     Brier raw     0.24045  0.23961  -0.00084  0.00021   3/3
+    ensemble     Brier cal     0.24071  0.23990  -0.00081  0.00026   3/3
+    ensemble     ECE raw       0.02123  0.02040  -0.00083  0.00129   2/3
+    ensemble     ECE cal       0.02600  0.02623  +0.00023  0.00214   2/3
 
-    line_aware   Brier raw     0.24253  0.24286  +0.00032  0.00062   1/3
-    line_aware   Brier cal     0.24268  0.24292  +0.00025  0.00058   1/3
-    line_aware   ECE raw       0.02080  0.02303  +0.00223  0.00111   0/3
-    line_aware   ECE cal       0.02357  0.02430  +0.00073  0.00295   2/3
+    line_aware   Brier raw     0.24419  0.24290  -0.00129  0.00046   3/3
+    line_aware   Brier cal     0.24393  0.24276  -0.00117  0.00041   3/3
+    line_aware   ECE raw       0.03280  0.02313  -0.00967  0.00702   3/3
+    line_aware   ECE cal       0.02883  0.02057  -0.00827  0.00606   3/3
 
-    xgboost      Brier raw     0.24222  0.24267  +0.00044  0.00066   1/3
-    xgboost      Brier cal     0.24240  0.24276  +0.00037  0.00047   0/3
-    xgboost      ECE raw       0.00923  0.01250  +0.00327  0.00230   0/3
-    xgboost      ECE cal       0.01670  0.01233  -0.00437  0.00465   2/3
+    xgboost      Brier raw     0.24121  0.24063  -0.00058  0.00040   3/3
+    xgboost      Brier cal     0.24092  0.24029  -0.00063  0.00033   3/3
+    xgboost      ECE raw       0.02647  0.02460  -0.00187  0.00267   2/3
+    xgboost      ECE cal       0.02190  0.01790  -0.00400  0.00502   2/3
 
 === AST ===
-    validation rows across 3 fold(s): 67175
+    validation rows across 3 fold(s): 150300
     model        metric            off       on     delta       sd  folds better
     ----------------------------------------------------------------------------
-    catboost     Brier raw     0.24157  0.24165  +0.00009  0.00011   1/3
-    catboost     Brier cal     0.24173  0.24147  -0.00026  0.00039   2/3
-    catboost     ECE raw       0.02693  0.02937  +0.00243  0.00139   0/3
-    catboost     ECE cal       0.02730  0.02243  -0.00487  0.00568   2/3
+    catboost     Brier raw     0.23618  0.23621  +0.00003  0.00014   1/3
+    catboost     Brier cal     0.23642  0.23645  +0.00003  0.00016   1/3
+    catboost     ECE raw       0.00950  0.00987  +0.00037  0.00285   2/3
+    catboost     ECE cal       0.01303  0.01473  +0.00170  0.00329   1/3
 
-    distribution Brier raw     0.24752  0.24752  +0.00000  0.00000   0/3
-    distribution Brier cal     0.24357  0.24357  +0.00000  0.00000   0/3
-    distribution ECE raw       0.04950  0.04950  +0.00000  0.00000   0/3
-    distribution ECE cal       0.02283  0.02283  +0.00000  0.00000   0/3
+    distribution Brier raw     0.24692  0.24692  +0.00000  0.00000   0/3
+    distribution Brier cal     0.24224  0.24224  +0.00000  0.00000   0/3
+    distribution ECE raw       0.04840  0.04840  +0.00000  0.00000   0/3
+    distribution ECE cal       0.01930  0.01930  +0.00000  0.00000   0/3
 
-    ensemble     Brier raw     0.24034  0.24046  +0.00012  0.00019   2/3
-    ensemble     Brier cal     0.24027  0.24015  -0.00012  0.00050   2/3
-    ensemble     ECE raw       0.02933  0.02930  -0.00003  0.00042   1/3
-    ensemble     ECE cal       0.02363  0.02313  -0.00050  0.00494   2/3
+    ensemble     Brier raw     0.23632  0.23592  -0.00040  0.00009   3/3
+    ensemble     Brier cal     0.23661  0.23635  -0.00026  0.00020   3/3
+    ensemble     ECE raw       0.01443  0.01237  -0.00207  0.00114   3/3
+    ensemble     ECE cal       0.02147  0.02280  +0.00133  0.00216   1/3
 
-    line_aware   Brier raw     0.24263  0.24240  -0.00023  0.00023   3/3
-    line_aware   Brier cal     0.24292  0.24233  -0.00059  0.00034   3/3
-    line_aware   ECE raw       0.02323  0.02723  +0.00400  0.00545   1/3
-    line_aware   ECE cal       0.02353  0.02540  +0.00187  0.00541   1/3
+    line_aware   Brier raw     0.24090  0.24065  -0.00025  0.00089   2/3
+    line_aware   Brier cal     0.24130  0.24075  -0.00055  0.00080   2/3
+    line_aware   ECE raw       0.02623  0.02630  +0.00007  0.00446   1/3
+    line_aware   ECE cal       0.03070  0.02883  -0.00187  0.00249   2/3
 
-    xgboost      Brier raw     0.24032  0.24076  +0.00044  0.00070   1/3
-    xgboost      Brier cal     0.24043  0.24101  +0.00059  0.00065   0/3
-    xgboost      ECE raw       0.02197  0.02167  -0.00030  0.00036   2/3
-    xgboost      ECE cal       0.01750  0.01920  +0.00170  0.00391   2/3
+    xgboost      Brier raw     0.23707  0.23643  -0.00065  0.00019   3/3
+    xgboost      Brier cal     0.23708  0.23660  -0.00047  0.00023   3/3
+    xgboost      ECE raw       0.01943  0.01643  -0.00300  0.00116   3/3
+    xgboost      ECE cal       0.01887  0.01807  -0.00080  0.00147   2/3
 
 Lower is better for every metric above. A mean delta smaller than the fold-to-fold sd is not evidence;
 neither is a single fold, which is why --folds defaults to a number you should raise.
