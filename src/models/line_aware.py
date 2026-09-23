@@ -397,10 +397,20 @@ class LineAwarePropModel:
         stat: str = "PTS",
         base_feature_cols: list[str] | None = None,
         offsets: tuple[float, ...] = DEFAULT_LINE_OFFSETS,
+        max_augmented_rows: int | None = None,
     ) -> None:
         self.stat = stat.upper()
         self.base_feature_cols = list(base_feature_cols or [])
         self.offsets = tuple(offsets)
+        # Augmentation multiplies the panel by len(offsets), and the
+        # out-of-fold pass then fits that frame several more times. On nine
+        # real seasons -- 184,682 training rows across nine offsets, so
+        # 1.66M (line, label) pairs -- this reached 13.9 GB resident and was
+        # killed by the OOM killer. None means no cap, which is right for the
+        # small panels this ran on before real data existed.
+        self.max_augmented_rows = (
+            int(max_augmented_rows) if max_augmented_rows else None
+        )
         self._base_factory = base_factory
         self.model = None
         self.feature_cols: list[str] = []
@@ -410,6 +420,47 @@ class LineAwarePropModel:
         # badly — see predict_probability_over.
         self.trained_z_range: tuple[float, float] | None = None
 
+    def _cap_source_rows(self, panel: pd.DataFrame) -> pd.DataFrame:
+        """
+        Trim the panel so augmentation cannot exhaust memory.
+
+        SOURCE ROWS are dropped, never offsets. Dropping offsets would thin
+        the line grid every retained game is trained across, which is the
+        one thing this model exists to provide; dropping whole games leaves
+        the grid intact for the games that remain.
+
+        The MOST RECENT rows are kept. That keeps the retained rows
+        chronologically contiguous, which TimeSeriesSplit and the early-
+        stopping folds both depend on, and recent seasons describe the
+        current rotations. It is a real reduction in training data and is
+        logged as one rather than passed over.
+        """
+        cap = self.max_augmented_rows
+        if not cap or not len(self.offsets):
+            return panel
+        keep = max(1, cap // len(self.offsets))
+        if len(panel) <= keep:
+            return panel
+
+        work = panel
+        if "GAME_DATE" in panel.columns:
+            work = panel.sort_values("GAME_DATE")
+        trimmed = work.tail(keep)
+        dropped = len(panel) - len(trimmed)
+        oldest = (
+            str(pd.to_datetime(trimmed["GAME_DATE"]).min().date())
+            if "GAME_DATE" in trimmed.columns else "unknown"
+        )
+        logger.warning(
+            "line_aware: %d source rows x %d offsets would be %d augmented rows, "
+            "over the %d cap. Keeping the most recent %d rows (from %s) and "
+            "DROPPING %d older ones. This is less training data, not a free "
+            "optimisation — raise line_aware.max_augmented_rows if memory allows.",
+            len(panel), len(self.offsets), len(panel) * len(self.offsets), cap,
+            keep, oldest, dropped,
+        )
+        return trimmed.reset_index(drop=True)
+
     def fit(self, panel: pd.DataFrame, validation_data: pd.DataFrame | None = None):
         """
         Augment, verify the lines are pregame, then fit the wrapped model.
@@ -418,6 +469,7 @@ class LineAwarePropModel:
         on outcome-derived lines would post excellent validation numbers,
         and no metric computed afterwards would reveal why.
         """
+        panel = self._cap_source_rows(panel)
         augmented = augment_lines(panel, self.stat, offsets=self.offsets)
         self.augmentation_report = assert_lines_are_pregame(augmented, self.stat)
 

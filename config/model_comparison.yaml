@@ -198,6 +198,19 @@ line_aware:
   # Which component to wrap. Numeric-only so the line features join cleanly.
   base: xgboost
   offsets: [-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0]
+  # Ceiling on (source rows x offsets). Augmentation multiplies the panel,
+  # and the out-of-fold pass then fits that frame several more times: on nine
+  # real seasons (184,682 training rows -> 1.66M pairs) this reached 13.9 GB
+  # resident and was killed by the OOM killer.
+  #
+  # The cap drops the OLDEST SOURCE ROWS, never offsets. Thinning the offsets
+  # would thin the line grid every retained game is trained across, which is
+  # the one thing this model exists to provide. Keeping the most recent rows
+  # also leaves them chronologically contiguous, which TimeSeriesSplit and the
+  # early-stopping folds both need.
+  #
+  # This is a real reduction in training data. Raise it if memory allows.
+  max_augmented_rows: 600000
 
 # ---------------------------------------------------------------------------
 # Blowout risk from the opening spread (src/features/blowout.py)

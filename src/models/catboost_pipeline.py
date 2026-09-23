@@ -154,7 +154,14 @@ class CatBoostPropPipeline:
     ) -> "CatBoostPropPipeline":
         if "over_hit" not in train_data.columns:
             raise ValueError("DATA_NOT_AVAILABLE: missing over_hit")
-        train = self._prepare(train_data).dropna(subset=self.feature_cols + ["over_hit"])
+        # Drop on the LABEL only. Dropping on every feature as well means one
+        # sparse column empties the whole training set: on the nine-season
+        # panel the MKT_* market columns are absent before 2025-26, and this
+        # dropna took 187,733 rows to zero, whereupon CatBoost failed with
+        # "Labels variable is empty" and the ensemble quietly ran without its
+        # highest-weighted component. CatBoost handles NaN in numeric
+        # features natively, exactly as XGBoost does.
+        train = self._prepare(train_data).dropna(subset=["over_hit"])
         if "GAME_DATE" in train.columns:
             train = train.sort_values("GAME_DATE")
 
@@ -278,9 +285,9 @@ class CatBoostPropPipeline:
             logger.warning("catboost: mean head unfitted — returning nulls, not a fallback column")
             return pd.Series([None] * len(features), index=features.index, dtype="object")
         work = self._prepare(features)
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = work[c].fillna(0.0)
+        # NaN stays NaN, as in predict_probability_over: the mean head learned
+        # its own split direction for missing values, and a zero fill would
+        # tell it a quantity was measured at zero rather than not measured.
         preds = np.clip(self.mean_model.predict(work[self.feature_cols]), 0, None)
         return pd.Series(preds, index=features.index, dtype=float)
 
@@ -367,10 +374,13 @@ class CatBoostPropPipeline:
         if self.model is None:
             raise RuntimeError("CatBoost model is not fitted")
         work = self._prepare(features)
-        # Unseen categories → CatBoost handles; numeric NaNs filled with column median of train if needed
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = work[c].fillna(0.0)
+        # NaNs are left as NaN. CatBoost applies the same split direction it
+        # learned during training, which is the whole point of its nan_mode.
+        # The previous fillna(0.0) did two wrong things at once: it disagreed
+        # with training, where the value was absent rather than zero, and it
+        # turned "no market line for this game" into a total of zero points,
+        # which the model reads as a real measurement. The comment above it
+        # claimed a train-median fill that the code never performed.
         proba = self.model.predict_proba(work[self.feature_cols])[:, 1]
         if self.line_aware:
             return pd.Series(proba, index=features.index)

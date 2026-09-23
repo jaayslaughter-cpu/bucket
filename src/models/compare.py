@@ -229,6 +229,7 @@ def build_components(
                     stat=market,
                     base_feature_cols=base_cols,
                     offsets=offsets,
+                    max_augmented_rows=line_cfg.get("max_augmented_rows"),
                 )
             except ImportError as exc:
                 logger.warning("line_aware unavailable: %s", exc)
@@ -391,6 +392,36 @@ def compare_models_on_panel(
         split = fixed_cutoff_split(work, train_end=train_end, validation_end=validation_end)
         train = work.loc[split.train_idx]
         val = work.loc[split.validation_idx]
+
+        # A feature can be present in the panel and still be entirely empty
+        # inside the TRAINING window — the market columns only exist for the
+        # seasons a line feed covered, which here is the validation season and
+        # nothing before it. resolve_feature_cols cannot see this: it runs on
+        # the whole panel, where the column looks partially populated.
+        #
+        # Such a column teaches a model nothing and actively harms one that
+        # drops incomplete rows. Worse, a feature observed only in validation
+        # is exactly the shape of a leak, so it is refused rather than
+        # tolerated.
+        empty_in_train = [
+            c for c in feature_cols
+            if c in train.columns and not train[c].notna().any()
+        ]
+        if empty_in_train:
+            logger.warning(
+                "Market %s: dropping %d feature(s) with NO values in the "
+                "training window %s: %s. They are populated later in the panel, "
+                "so they would be visible only where the model is scored.",
+                market, len(empty_in_train), train_end, empty_in_train,
+            )
+            feature_cols = [c for c in feature_cols if c not in empty_in_train]
+            xgb_cols = [c for c in xgb_cols if c not in empty_in_train]
+            if not xgb_cols:
+                logger.error(
+                    "Market %s has no feature with training-window coverage — "
+                    "skipping.", market,
+                )
+                continue
 
         components = build_components(market, feature_cols, cfg, xgb_feature_cols=xgb_cols)
         fitted: dict[str, Any] = {}

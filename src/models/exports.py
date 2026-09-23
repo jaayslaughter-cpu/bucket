@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 SUMMARY_COLS = [
     "target_market", "model_name", "evaluation_start_date", "evaluation_end_date",
     "n_predictions", "mae", "rmse", "mean_bias", "brier_score", "log_loss",
+    # The CALIBRATED counterparts. compare_models_on_panel computes these,
+    # and leaving them out of the export meant the one file a reader opens
+    # showed only the raw numbers — which is the gap that made calibration
+    # unmeasurable in the first place.
+    "brier_score_calibrated", "log_loss_calibrated",
+    "calibration_error_calibrated", "calibration_source", "calibration_rows",
     "calibration_error", "interval_coverage", "notes",
 ]
 
