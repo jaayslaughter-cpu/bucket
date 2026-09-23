@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,10 @@ FRANCHISE_ID_PREFIX = "1610612"
 # this project (NBA.com, BigDataBall, the market lines) uses SAS. Mapping it
 # is the difference between a panel that joins and one that silently does not.
 ARCHIVE_TO_NBA_TEAM: dict[str, str] = {"SAN": "SAS"}
+
+# City spellings the box scores use that TeamHistories does not. Only exact,
+# verified equivalences belong here -- this is a rename, not a guess.
+CITY_ALIASES: dict[str, str] = {"LA": "Los Angeles"}
 
 _ABBREVIATION_PATTERN = re.compile(r"^[A-Z]{2,4}$")
 
@@ -281,11 +286,25 @@ def load_team_crosswalk(path: str | Path) -> pd.DataFrame:
     out["season_from"] = pd.to_numeric(out["seasonFounded"], errors="coerce")
     out["season_to"] = pd.to_numeric(out["seasonActiveTill"], errors="coerce")
 
+    # City and team name are kept so a row whose teamId is missing can still
+    # be resolved. In the 2018-2026 archive 54,547 rows carry no playerteamId
+    # while every one of them names its team, and dropping them would discard
+    # 31,559 REGULAR-SEASON player-games for a null in a column the row does
+    # not actually need.
+    for col, target in (("teamCity", "city"), ("teamName", "name")):
+        out[target] = (
+            out[col].astype("string").str.strip() if col in out.columns
+            else pd.Series(pd.NA, index=out.index, dtype="string")
+        )
+    out["city"] = out["city"].replace({v: k for k, v in CITY_ALIASES.items()})
+
     logger.info(
         "team crosswalk: %d franchise-era rows across %d teams",
         len(out), out["teamId"].nunique(),
     )
-    return out[["teamId", "abbreviation", "season_from", "season_to"]].reset_index(drop=True)
+    return out[
+        ["teamId", "abbreviation", "season_from", "season_to", "city", "name"]
+    ].reset_index(drop=True)
 
 
 def _season_start_year(season: Any) -> float:
@@ -295,29 +314,96 @@ def _season_start_year(season: Any) -> float:
         return float("nan")
 
 
+def _resolve_by_era(
+    keys: pd.DataFrame,
+    years: pd.Series,
+    table: pd.DataFrame,
+    key_cols: list[str],
+) -> pd.Series:
+    """
+    Join ``keys`` to ``table``'s franchise eras and take the abbreviation in
+    use that season.
+
+    Vectorised on purpose. The row-by-row version this replaces took minutes
+    on the 305,614-row archive, which is long enough that ingestion stops
+    being something you re-run while checking your work.
+
+    A key outside every recorded era falls back to that franchise's most
+    recent one, because a franchise always has a current code. A key the
+    table does not contain at all stays NA -- see _map_team_names for why
+    that matters.
+    """
+    left = keys.copy()
+    left["_row"] = np.arange(len(left))
+    left["_year"] = years.to_numpy()
+
+    merged = left.merge(table, on=key_cols, how="left")
+    in_era = (
+        (merged["season_from"] <= merged["_year"])
+        & (merged["_year"] <= merged["season_to"])
+    )
+    # Prefer an era that actually contains the season; otherwise the latest.
+    merged["_rank"] = np.where(in_era, 0, 1)
+    merged = merged.sort_values(
+        ["_row", "_rank", "season_to"], ascending=[True, True, False]
+    ).drop_duplicates("_row", keep="first")
+
+    out = pd.Series(pd.NA, index=keys.index, dtype="string")
+    hit = merged["abbreviation"].notna()
+    out.iloc[merged.loc[hit, "_row"].to_numpy()] = (
+        merged.loc[hit, "abbreviation"].to_numpy()
+    )
+    return out
+
+
 def _map_team_ids(
     ids: pd.Series,
     seasons: pd.Series,
     crosswalk: pd.DataFrame,
 ) -> pd.Series:
     """Resolve each (teamId, season) to the abbreviation in use that year."""
-    years = seasons.map(_season_start_year)
-    table = crosswalk.set_index("teamId")
-    result = pd.Series(pd.NA, index=ids.index, dtype="string")
-    for team_id, block in ids.groupby(ids):
-        if team_id is pd.NA or str(team_id) not in table.index:
-            continue
-        eras = crosswalk[crosswalk["teamId"] == str(team_id)]
-        for idx in block.index:
-            year = years.get(idx, float("nan"))
-            match = eras[(eras["season_from"] <= year) & (year <= eras["season_to"])]
-            if match.empty:
-                # Outside every recorded era: use the most recent one rather
-                # than nothing, since a franchise always has a current code.
-                match = eras.sort_values("season_to").tail(1)
-            if not match.empty:
-                result.at[idx] = match["abbreviation"].iloc[0]
-    return result
+    keys = pd.DataFrame({"teamId": ids.astype("string").str.strip()}, index=ids.index)
+    table = crosswalk[["teamId", "abbreviation", "season_from", "season_to"]].copy()
+    table["teamId"] = table["teamId"].astype("string").str.strip()
+    return _resolve_by_era(keys, seasons.map(_season_start_year), table, ["teamId"])
+
+
+def _map_team_names(
+    cities: pd.Series,
+    names: pd.Series,
+    seasons: pd.Series,
+    crosswalk: pd.DataFrame,
+) -> pd.Series:
+    """
+    Resolve each (city, name, season) to the abbreviation in use that year.
+
+    A fallback for rows whose teamId is missing, NOT a replacement for the id
+    path: ids are unambiguous and names are not, so this runs second and only
+    fills gaps.
+
+    A pair the crosswalk does not know stays NA. In this archive the unknown
+    pairs are Guangzhou Loong-Lions, Hapoel Jerusalem, Melbourne United and
+    South East Melbourne Phoenix -- preseason exhibition opponents that are
+    not NBA franchises and must never be handed an NBA abbreviation.
+    """
+    if not {"city", "name"}.issubset(crosswalk.columns):
+        return pd.Series(pd.NA, index=cities.index, dtype="string")
+
+    keys = pd.DataFrame(
+        {
+            "city": cities.astype("string").str.strip().replace(CITY_ALIASES),
+            "name": names.astype("string").str.strip(),
+        },
+        index=cities.index,
+    )
+    table = crosswalk.dropna(subset=["city", "name"])[
+        ["city", "name", "abbreviation", "season_from", "season_to"]
+    ].copy()
+    table["city"] = table["city"].astype("string").replace(CITY_ALIASES)
+    table["name"] = table["name"].astype("string")
+    return _resolve_by_era(
+        keys, seasons.map(_season_start_year), table, ["city", "name"]
+    )
 
 
 def assert_abbreviations(series: pd.Series, *, column: str) -> None:
@@ -426,21 +512,51 @@ def normalize_player_box_scores(
     # Team codes: resolve from the archive's team ids when a crosswalk is
     # supplied, then REFUSE anything that is still a nickname.
     team_sources = {
-        "TEAM_ABBREVIATION": ("playerteamid", "playerteamId"),
-        "OPPONENT_ABBREVIATION": ("opponentteamid", "opponentteamId"),
+        "TEAM_ABBREVIATION": (
+            ("playerteamid", "playerteamId"), ("playerteamcity",), ("playerteamname",),
+        ),
+        "OPPONENT_ABBREVIATION": (
+            ("opponentteamid", "opponentteamId"), ("opponentteamcity",),
+            ("opponentteamname",),
+        ),
     }
     if team_crosswalk is not None and not team_crosswalk.empty:
         lookup = {_norm(c): c for c in df.columns}
-        for target, candidates in team_sources.items():
-            source = next((lookup.get(_norm(c)) for c in candidates if lookup.get(_norm(c))), None)
-            if source is None:
-                continue
-            ids = df[source].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
-            resolved = _map_team_ids(ids, out["SEASON"], team_crosswalk)
+
+        def _find(candidates: tuple[str, ...]) -> str | None:
+            return next(
+                (lookup.get(_norm(c)) for c in candidates if lookup.get(_norm(c))), None
+            )
+
+        for target, (id_cands, city_cands, name_cands) in team_sources.items():
+            id_source = _find(id_cands)
+            resolved = pd.Series(pd.NA, index=out.index, dtype="string")
+            if id_source is not None:
+                ids = (
+                    df[id_source].astype("string").str.strip()
+                    .str.replace(r"\.0$", "", regex=True)
+                )
+                resolved = _map_team_ids(ids, out["SEASON"], team_crosswalk)
+            from_id = int(resolved.notna().sum())
+
+            # Fill the gaps from the team's name. Ids are unambiguous, so they
+            # win; a row with no id still knows who it played for.
+            city_source, name_source = _find(city_cands), _find(name_cands)
+            if city_source is not None and name_source is not None:
+                gaps = resolved.isna()
+                if gaps.any():
+                    by_name = _map_team_names(
+                        df.loc[gaps, city_source], df.loc[gaps, name_source],
+                        out.loc[gaps, "SEASON"], team_crosswalk,
+                    )
+                    resolved.loc[gaps] = by_name
             matched = int(resolved.notna().sum())
             logger.info(
-                "%s resolved from %s for %d of %d rows (%.1f%%)",
-                target, source, matched, len(out), 100.0 * matched / max(len(out), 1),
+                "%s resolved for %d of %d rows (%.1f%%) — %d from the team id, "
+                "%d from the team name. The %d still unresolved carry no "
+                "abbreviation rather than a guessed one.",
+                target, matched, len(out), 100.0 * matched / max(len(out), 1),
+                from_id, matched - from_id, len(out) - matched,
             )
             out[target] = resolved
 

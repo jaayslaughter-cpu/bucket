@@ -70,6 +70,7 @@ def _load_real_or_demo(
     demo: bool,
     seasons: str | None = None,
     season_type: str | None = None,
+    panel_path: str | None = None,
 ):
     """
     Build the feature matrix from real logs, or a synthetic demo panel.
@@ -82,6 +83,25 @@ def _load_real_or_demo(
     """
     from src.features.builder import build_feature_matrix
     from src.models.data_audit import make_demo_panel
+
+    # An already-built feature matrix, e.g. from scripts.ingest_training_pack.
+    # Loaded as-is: rebuilding it here would apply a second pass of rolling
+    # features over columns that already carry them.
+    if panel_path:
+        import pandas as pd
+
+        path = Path(panel_path)
+        if not path.exists():
+            logger.error("Panel %s not found. Run scripts.ingest_training_pack first.", path)
+            raise SystemExit(2)
+        panel = pd.read_parquet(path)
+        panel["GAME_DATE"] = pd.to_datetime(panel["GAME_DATE"])
+        logger.info(
+            "Loaded prebuilt panel %s: %d rows x %d cols, %s -> %s",
+            path, len(panel), panel.shape[1],
+            panel["GAME_DATE"].min().date(), panel["GAME_DATE"].max().date(),
+        )
+        return panel, False
 
     team_games, market_lines = _load_team_games()
 
@@ -522,6 +542,10 @@ def compare_models(
         help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
     ),
     season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
+    panel: str = typer.Option(
+        None, "--panel",
+        help="A prebuilt feature matrix (parquet) from scripts.ingest_training_pack.",
+    ),
     verbose: bool = False,
 ) -> None:
     """Chronological comparison across models; writes outputs/ CSVs."""
@@ -530,7 +554,7 @@ def compare_models(
     from src.models.data_audit import audit_player_panel
     from src.models.exports import write_comparison_exports
 
-    panel, is_demo = _load_real_or_demo(demo or False, seasons, season_type)
+    panel, is_demo = _load_real_or_demo(demo or False, seasons, season_type, panel)
     demo = demo or is_demo
     mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
     cfg = load_comparison_config()
