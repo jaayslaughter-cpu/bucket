@@ -111,6 +111,24 @@ LAYERS: dict[str, Layer] = {
             "control drops the columns."
         ),
     ),
+    "pbp": Layer(
+        (
+            "PBP_PACE_ON_COURT_L5", "PBP_PACE_ON_COURT_L10",
+            "PBP_SHOT_DIST_AVG_L5", "PBP_SHOT_DIST_AVG_L10",
+            "PBP_RIM_RATE_L5", "PBP_RIM_RATE_L10",
+            "PBP_MID_RATE_L5", "PBP_MID_RATE_L10",
+            "PBP_THREE_RATE_L5", "PBP_THREE_RATE_L10",
+            "PBP_DUNK_LAYUP_RATE_L5", "PBP_DUNK_LAYUP_RATE_L10",
+            "PBP_ASSISTED_RATE_L5", "PBP_ASSISTED_RATE_L10",
+            "PBP_CLOSE_SHOT_SHARE_L5", "PBP_CLOSE_SHOT_SHARE_L10",
+            "PBP_GARBAGE_SHOT_SHARE_L5", "PBP_GARBAGE_SHOT_SHARE_L10",
+        ),
+        note=(
+            "Shot mix and game-state context from the event log, as prior-game "
+            "rolling means. Only exists for seasons whose logs were supplied, so "
+            "both arms must sit inside those seasons."
+        ),
+    ),
     "market_context": Layer(
         (
             "MKT_OPENING_SPREAD",
@@ -189,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="Synthetic panel. Wiring only — the numbers mean nothing.")
     ap.add_argument("--seasons", default=None)
     ap.add_argument("--season-type", default=None)
+    ap.add_argument("--panel", default=None,
+                    help="A prebuilt feature matrix (parquet) to use instead of "
+                         "the loader's own.")
+    ap.add_argument("--seasons-only", default=None,
+                    help="Restrict BOTH arms to these seasons, comma separated. "
+                         "Required when a layer exists for only part of the panel.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -204,7 +228,15 @@ def main(argv: list[str] | None = None) -> int:
     markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
     layer = LAYERS[args.layer]
 
-    panel, is_demo = _load_real_or_demo(args.demo, args.seasons, args.season_type)
+    panel, is_demo = _load_real_or_demo(
+        args.demo, args.seasons, args.season_type, args.panel
+    )
+    if args.seasons_only and "SEASON" in panel.columns:
+        keep = [s.strip() for s in args.seasons_only.split(",") if s.strip()]
+        before = len(panel)
+        panel = panel[panel["SEASON"].isin(keep)].reset_index(drop=True)
+        print(f"Restricted to season(s) {keep}: {before:,} -> {len(panel):,} rows. "
+              f"Both arms use exactly these rows.\n")
     if is_demo:
         print("DEMO PANEL — synthetic players. These numbers test wiring, not accuracy.\n")
 

@@ -108,7 +108,36 @@ def default_feature_cols(market: str) -> list[str]:
         # r = +0.327, so tempo is persistent and worth its own column.
         "DEF_PACE_L10",
         *_DEFENSE_BY_MARKET.get(market, ()),
+        # Play-by-play shot mix and game-state context, as prior-game rolling
+        # means. Present only for seasons whose event logs were supplied;
+        # elsewhere resolve_feature_cols drops them and compare_models_on_panel
+        # refuses any that are empty across the training window.
+        *_PBP_BY_MARKET.get(market, ()),
     ]
+
+
+# Which shot-mix signal bears on which market. A rebound prop does not care
+# how far out a player shoots; a points prop does, because a rim attempt and
+# a long two are worth the same in the box score and not in expectation.
+_PBP_BY_MARKET: dict[str, tuple[str, ...]] = {
+    "PTS": (
+        "PBP_SHOT_DIST_AVG_L5", "PBP_RIM_RATE_L5", "PBP_THREE_RATE_L5",
+        "PBP_DUNK_LAYUP_RATE_L5", "PBP_ASSISTED_RATE_L10",
+        "PBP_GARBAGE_SHOT_SHARE_L10", "PBP_PACE_ON_COURT_L10",
+    ),
+    "FG3M": ("PBP_THREE_RATE_L5", "PBP_THREE_RATE_L10", "PBP_SHOT_DIST_AVG_L5"),
+    # Where a team shoots from changes where the ball comes off; a rim-heavy
+    # diet produces different rebound chances than a three-heavy one.
+    "REB": ("PBP_RIM_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
+            "PBP_PACE_ON_COURT_L10"),
+    # An assist needs a teammate's make. How much of a player's own scoring is
+    # created for him says something about his role in the offence.
+    "AST": ("PBP_ASSISTED_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
+            "PBP_PACE_ON_COURT_L10"),
+    "PRA": (
+        "PBP_RIM_RATE_L10", "PBP_THREE_RATE_L5", "PBP_ASSISTED_RATE_L10",
+    ),
+}
 
 
 # Which defensive rate actually bears on which market. The naive mirror --
