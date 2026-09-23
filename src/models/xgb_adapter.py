@@ -48,6 +48,7 @@ class XGBoostAdapter:
         n_splits: int = 5,
         random_state: int = 42,
         model_params: dict[str, Any] | None = None,
+        tuning: dict[str, Any] | None = None,
     ) -> None:
         self.target_market = target_market
         self.model_version = model_version
@@ -59,6 +60,7 @@ class XGBoostAdapter:
             n_splits=n_splits,
             random_state=random_state,
             model_params=model_params,
+            tuning=tuning,
         )
         self._meta_extra: dict[str, Any] = {}
         self._fitted = False
@@ -322,7 +324,7 @@ class XGBoostAdapter:
             "target_market": self.target_market,
             "model_version": self.model_version,
             "feature_schema_version": self.feature_schema_version,
-            "model_params": self._pipe.model_params,
+            "model_params": self._pipe.effective_params(),
             "dispersion": None if self.dispersion is None else self.dispersion.to_dict(),
             "has_mean_head": self.mean_model is not None,
             **self._meta_extra,
@@ -382,7 +384,7 @@ class XGBoostAdapter:
             model_version=self.model_version,
             target_market=self.target_market,
             feature_cols=self.feature_cols,
-            hyperparameters=dict(self._pipe.model_params),
+            hyperparameters=self._pipe.effective_params(),
             train_row_count=self._meta_extra.get("train_row_count"),
             validation_row_count=self._meta_extra.get("validation_row_count"),
             train_start_date=self._meta_extra.get("train_start_date"),

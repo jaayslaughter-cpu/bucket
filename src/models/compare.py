@@ -138,12 +138,16 @@ def build_components(
     if include_xgboost:
         try:
             from src.models.xgb_adapter import XGBoostAdapter
+            from src.models.xgboost_pipeline import split_xgboost_config
 
+            xgb_params, xgb_tuning = split_xgboost_config(cfg.get("xgboost") or {})
             components["xgboost"] = XGBoostAdapter(
                 xgb_cols,
                 target_market=market,
                 feature_schema_version=schema,
                 random_state=seed,
+                model_params=xgb_params or None,
+                tuning=xgb_tuning or None,
             )
         except ImportError as exc:
             logger.warning("XGBoost unavailable: %s", exc)
