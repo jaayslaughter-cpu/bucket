@@ -1257,6 +1257,95 @@ def paper_calibration_cmd(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
+@app.command("fetch-pbp")
+def fetch_pbp_cmd(
+    panel: str = typer.Option(
+        "data/external/training_pack/panel.parquet", "--panel",
+        help="Panel whose games need event logs.",
+    ),
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
+    out: Path = typer.Option(
+        Path("data/external/training_pack/pbp_fetched.parquet"), "--out"
+    ),
+    limit: int = typer.Option(0, "--limit", help="Fetch at most N games (0 = all)."),
+    pause: float = typer.Option(0.6, "--pause", help="Seconds between games."),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume",
+        help="Skip games already present in --out.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Fetch play-by-play from the NBA CDN for a panel's games.
+
+    Writes the same frame shape the uploaded CSVs carry, so the result feeds
+    src/features/pbp.py unchanged. Completeness is checked against the box
+    score afterwards, exactly as it is for a CSV ingest.
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.ingestion.nba_playbyplay import (
+        PlayByPlayError,
+        fetch_many_playbyplay,
+        game_ids_from_panel,
+    )
+
+    panel_path = Path(panel)
+    if not panel_path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {panel_path} missing", err=True)
+        raise SystemExit(2)
+    frame = pd.read_parquet(panel_path)
+    season_list = (
+        [s.strip() for s in seasons.split(",") if s.strip()] if seasons else None
+    )
+    wanted = game_ids_from_panel(frame, seasons=season_list)
+
+    existing = None
+    if resume and out.exists():
+        existing = pd.read_parquet(out)
+        have = set(existing["gameId"].astype(str))
+        before = len(wanted)
+        wanted = [g for g in wanted if g not in have]
+        logger.info("Resuming: %d of %d game(s) already fetched.", before - len(wanted), before)
+    if limit and limit > 0:
+        wanted = wanted[: int(limit)]
+    if not wanted:
+        typer.echo(json.dumps({"status": "nothing to fetch", "out": str(out)}, indent=2))
+        return
+
+    logger.info("Fetching play-by-play for %d game(s).", len(wanted))
+    try:
+        events, failures = fetch_many_playbyplay(wanted, pause_seconds=pause)
+    except PlayByPlayError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if existing is not None and not existing.empty:
+        events = pd.concat([existing, events], ignore_index=True)
+        events = events.drop_duplicates(subset=["gameId", "actionNumber"], keep="first")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    events.to_parquet(out, index=False)
+
+    summary = {
+        "out": str(out),
+        "games_requested": len(wanted),
+        "games_failed": len(failures),
+        "events_total": int(len(events)),
+        "games_total": int(events["gameId"].nunique()),
+    }
+    try:
+        from src.features.pbp import check_log_completeness, prepare_events
+
+        report = check_log_completeness(prepare_events(events), frame)
+        summary["completeness"] = report["seasons"]
+        summary["seasons_incomplete"] = report["failing"]
+    except Exception as exc:  # noqa: BLE001 — the fetch still succeeded
+        summary["completeness"] = f"not checked: {exc}"
+    if failures:
+        summary["failures"] = failures[:10]
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
 if __name__ == "__main__":
     app()
 
