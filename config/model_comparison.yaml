@@ -15,10 +15,44 @@ markets_post_launch:
   - BLK
   - PRA
 
+# FITTED, not chosen. scripts/fit_ensemble_weights.py splits the training
+# window again, fits every component on the earlier part, and optimises
+# non-negative weights on the simplex against log-loss on the later part. The
+# evaluation season is never read. Re-run it when the components change:
+#
+#   python -m scripts.fit_ensemble_weights --markets PTS,REB,AST
+#
+# Measured on 2018-2025 training rows (held-out log-loss, lower is better):
+#
+#            xgboost  catboost  line_aware  distribution   fitted   previous
+#   PTS        0.619     0.273       0.089         0.019  0.67228   0.67352
+#   REB        0.589     0.403       0.000         0.008  0.66933   0.67038
+#   AST        0.957     0.043       0.000         0.000  0.66162   0.66484
+#
+# Three things this says, none of them what the old defaults said:
+#
+#   line_aware belongs, but barely, and only for points. It is the most
+#   decorrelated of the tree models from xgboost (prediction correlation
+#   0.88/0.80/0.74 against catboost's 0.91/0.87/0.94), which is why it earns
+#   anything at all despite ranking third standalone. On REB and AST the
+#   optimiser gives it exactly zero.
+#
+#   distribution was configured at 0.20 and measures at 0.009. It is the
+#   weakest component and adds almost nothing to the blend. It is kept at a
+#   token weight rather than removed, because it is the only non-tree model
+#   here and the only one whose probabilities come from a fitted count
+#   distribution rather than a classifier.
+#
+#   the best weights differ by market -- catboost runs 0.273 / 0.403 / 0.043 --
+#   and this file holds one set for all of them. The pooled weights below are
+#   an average, and on assists in particular they are not what that market
+#   would choose on its own. Per-market weights are a change to the config
+#   contract, not just to these numbers.
 ensemble_weights:
-  catboost: 0.50
-  xgboost: 0.30
-  distribution: 0.20
+  xgboost: 0.72
+  catboost: 0.24
+  line_aware: 0.03
+  distribution: 0.01
 
 catboost:
   task_type: CPU          # GPU optional only — never default
