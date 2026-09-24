@@ -279,3 +279,23 @@ def test_a_panel_without_attempts_cannot_be_checked_against():
     events, panel = _log_and_panel()
     with pytest.raises(PbpFeatureError, match="DATA_NOT_AVAILABLE"):
         check_log_completeness(prepare_events(events), panel.drop(columns=["FGA"]))
+
+
+def test_completeness_check_accepts_a_raw_log_with_integer_game_ids():
+    """The 2021-22 upload read gameId as int64 because those ids carry no
+    leading zero, and the check raised a dtype error on the merge instead of
+    reporting on the log. It is the guard you run BEFORE anything else
+    touches a log, so it cannot presuppose prepare_events having cast."""
+    from src.features.pbp import check_log_completeness
+
+    events, panel = _log_and_panel(keep=0.5)
+    raw = events.copy()
+    raw["gameId"] = raw["gameId"].str.lstrip("0").astype("int64")
+    panel = panel.copy()
+    panel["GAME_ID"] = panel["GAME_ID"].str.lstrip("0").astype("int64")
+
+    report = check_log_completeness(raw, panel)
+
+    assert report["failing"] == ["2025-26"]
+    assert report["seasons"]["2025-26"]["games"] == 40.0
+    assert report["seasons"]["2025-26"]["median_gap"] == 90.0

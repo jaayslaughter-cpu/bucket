@@ -355,10 +355,15 @@ def check_log_completeness(
             "DATA_NOT_AVAILABLE: panel needs GAME_ID and FGA to check the event "
             "log against an independent count"
         )
-    shots = (
-        events[events["actionType"].isin(SHOT_ACTIONS)]
-        .groupby("gameId").size().rename("pbp_fga")
-    )
+    # Cast here rather than trusting the caller to have run prepare_events.
+    # A raw CSV read gives gameId as int64 when the ids carry no leading zero
+    # and as str when they do, so the merge below would fail on dtype for
+    # some seasons and succeed for others. This check exists to be run on a
+    # log BEFORE anything else touches it; it cannot presuppose preparation.
+    shot_games = events.loc[
+        events["actionType"].isin(SHOT_ACTIONS), "gameId"
+    ].astype(str)
+    shots = shot_games.value_counts().rename("pbp_fga")
     work = panel.copy()
     work["gameId"] = work["GAME_ID"].astype(str)
     season = work["SEASON"] if "SEASON" in work.columns else pd.Series("all", index=work.index)
