@@ -251,6 +251,33 @@ def main(argv: list[str] | None = None) -> int:
               "nothing to compare.", file=sys.stderr)
         return 2
 
+    # A layer can be present in the panel and still be read by no model for
+    # the markets under test. _PBP_BY_MARKET["PTS"] is deliberately empty on
+    # measured evidence, so `--layer pbp` with the default `--markets PTS`
+    # produced a table of exact zeros -- a correct answer to a question
+    # nobody meant to ask. Say so instead of printing it.
+    from src.models.labels import default_feature_cols
+
+    read_by = {
+        m: sorted(set(under_test) & set(default_feature_cols(m))) for m in markets
+    }
+    if not any(read_by.values()):
+        print(
+            f"ERROR: no market in {markets} reads any '{args.layer}' column. The "
+            f"layer is in the panel, but default_feature_cols() selects none of "
+            f"{under_test} for these markets, so both arms would train on "
+            f"identical features and every delta would be exactly zero. Pick "
+            f"markets that read this layer, or wire it in src/models/labels.py.",
+            file=sys.stderr,
+        )
+        return 2
+    for market, cols in read_by.items():
+        if not cols:
+            print(f"  NOTE: {market} reads none of these columns; its arms are "
+                  f"identical and its deltas will be exactly zero.")
+        else:
+            print(f"  {market} reads {len(cols)} of them: {cols}")
+
     coverage = {c: float(treatment[c].notna().mean()) for c in under_test}
     print(f"Layer '{args.layer}' under test: {under_test}")
     if layer.note:
