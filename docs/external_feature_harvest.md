@@ -148,3 +148,47 @@ same-game outcomes in any feature list — verified by the audit's check 7.
 **The largest genuine gap** is not on this list: 87 of the 147 numeric columns
 the builder produces are read by no model. Several harvest ideas marked
 "done" above are done *and unused*.
+
+---
+
+## Batch review: NBAPlayerValue · nba-prediction · NBA-Machine-Learning-Tutorial (2026-09-24)
+
+Harvest notes only. No foreign code imported, no dependency added.
+
+| Repo | Target | Verdict |
+|------|--------|---------|
+| NBA-Machine-Learning-Tutorial | n/a (blog walkthrough) | **Skip.** 210 lines across 2 files; bulk is Basketball-Reference season totals (one row per player-season), unusable for game-T features. |
+| nba-prediction | team win/loss | **Skip as a whole** (different label; 245 team columns don't transfer). Two ideas below. |
+| NBAPlayerValue | player archetypes | **One idea worth reimplementing** (below). NCAA half out of scope. |
+
+### Ideas taken (to implement natively, later)
+
+| Idea | Source | Note | Likely layer |
+|------|--------|------|--------------|
+| Venue-split rollings (home-only / away-only L_n) | nba-prediction `feature_engineering.py:228` | PropIQ has `IS_HOME` as a flag but no venue-split rolling | `src/features` |
+| Head-to-head rolling by (team, opponent) | nba-prediction `feature_engineering.py:344` | Confirms prop-scout "same-opponent L5", still unimplemented | `src/features` |
+| Player archetype clusters from shot-profile | NBAPlayerValue `nbaPlayerFitting.py` + `cluster.py` | StandardScaler -> LDA(2) -> KMeans(k=8), k chosen by silhouette sweep. Discriminating axes (avg shot distance, corner-3 rate, 3PA share, rim rate, assisted-FG rate) are already `PBP_RATE_COLS`. Fills the "positional/archetype defensive matchup" gap: `DEF_*` says what a defence allows, not to whom. | `src/features` |
+
+**Leakage condition on the archetype idea.** The source fits on five pooled
+seasons of aggregates (`data['g']>40`, 2012-17). Ported as-is that leaks. A
+PropIQ version must fit the clusterer on an expanding as-of window and assign
+each game-T row from prior-games-only rates, like every other rolling here.
+
+### Cross-check performed, no change needed
+
+nba-prediction uses `groupby(...).rolling(n, closed="left")` where PropIQ uses
+`shift(1).rolling(n)`. These are equivalent. Every rolling in `src/features/`
+(`builder`, `hot_hand`, `sports_ev_features`, `minutes_weighted`,
+`scoring_efficiency`, `pbp`, `defense`) was re-read against this idiom and all
+shift before rolling. `minutes_weighted._weighted_roll` does not shift
+internally; its caller passes an already-shifted series. No defect found.
+
+### Not taken
+
+| Skip | Why |
+|------|-----|
+| `chromedriver.exe`, Streamlit app | Windows binary; PropIQ is not a Streamlit app (Discord notification path) |
+| NCAA scrapers / NCAA fitting (`ncaaScraper.py`, `ncaaPlayerFitting.py`) | NBA-only project rule |
+| Lineup-as-powers-of-ten encoding (`nbaLineups.py`) | Collides when two players share an archetype; research display over a lineup CSV we do not have |
+| Basketball-Reference season-totals CSVs | Season aggregates cannot produce a leakage-safe game-T feature |
+| LDA supervised on `Pos` | PropIQ panel has no reliable position column; would need an unsupervised or PCA reduction instead |
