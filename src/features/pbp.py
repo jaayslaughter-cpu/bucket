@@ -76,6 +76,9 @@ MID_MIN_FT = 14.0
 
 SHOT_ACTIONS = ("2pt", "3pt")
 
+# Columns prepare_events adds. Their presence marks a prepared frame.
+_DERIVED_COLS = frozenset({"clock_seconds", "elapsed", "margin_abs"})
+
 _CLOCK_RE = re.compile(r"PT(\d+)M([\d.]+)S")
 
 # Shipped as features: rates and pace, none of them a count and none of them
@@ -149,6 +152,15 @@ def prepare_events(pbp: pd.DataFrame) -> pd.DataFrame:
         raise PbpFeatureError(
             f"DATA_NOT_AVAILABLE: event log missing {sorted(missing)}"
         )
+
+    # Idempotent: preparing an already-prepared frame returns it unchanged
+    # rather than copying it again. Callers legitimately prepare once and
+    # hand the result to several functions that each prepare defensively,
+    # and on a full multi-season log each redundant copy is gigabytes.
+    if _DERIVED_COLS.issubset(pbp.columns) and not pd.api.types.is_numeric_dtype(
+        pbp["gameId"]
+    ):
+        return pbp
 
     ev = pbp.copy()
     ev["gameId"] = ev["gameId"].astype(str)

@@ -299,3 +299,30 @@ def test_completeness_check_accepts_a_raw_log_with_integer_game_ids():
     assert report["failing"] == ["2025-26"]
     assert report["seasons"]["2025-26"]["games"] == 40.0
     assert report["seasons"]["2025-26"]["median_gap"] == 90.0
+
+
+def test_prepare_events_is_idempotent():
+    """Preparing twice must return the same frame, not a second copy. The
+    panel build prepares once and hands the result to functions that each
+    prepare defensively; on a full multi-season log a redundant copy is
+    gigabytes, and the second one OOM-killed the rebuild."""
+    events, _ = _log_and_panel(n_games=3, fga_per_game=10)
+
+    once = prepare_events(events)
+    twice = prepare_events(once)
+
+    assert twice is once, "already-prepared frame was copied again"
+    pd.testing.assert_frame_equal(once, twice)
+
+
+def test_prepare_events_still_prepares_a_raw_frame_with_integer_game_ids():
+    """The idempotence guard must not mistake a raw frame for a prepared one."""
+    events, _ = _log_and_panel(n_games=3, fga_per_game=10)
+    raw = events.copy()
+    raw["gameId"] = raw["gameId"].str.lstrip("0").astype("int64")
+
+    out = prepare_events(raw)
+
+    assert pd.api.types.is_string_dtype(out["gameId"])
+    assert {"clock_seconds", "elapsed", "margin_abs"}.issubset(out.columns)
+    assert out["clock_seconds"].notna().all()
