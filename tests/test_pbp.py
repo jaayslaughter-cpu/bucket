@@ -175,7 +175,7 @@ def test_counts_and_duplicated_minutes_are_not_offered_as_features():
     assert "PBP_SECONDS_ON_COURT" in PBP_DIAGNOSTIC_COLS
     assert not set(PBP_RATE_COLS) & set(PBP_DIAGNOSTIC_COLS)
     # Pace IS shipped: possessions per 48 on court is not in the box score.
-    assert "PBP_PACE_ON_COURT" in PBP_RATE_COLS
+    assert "PBP_GAME_PACE" in PBP_RATE_COLS
 
 
 def test_pbp_features_never_reach_a_postgame_feature_list():
@@ -326,3 +326,69 @@ def test_prepare_events_still_prepares_a_raw_frame_with_integer_game_ids():
     assert pd.api.types.is_string_dtype(out["gameId"])
     assert {"clock_seconds", "elapsed", "margin_abs"}.issubset(out.columns)
     assert out["clock_seconds"].notna().all()
+
+
+def _game_with_two_players_of_different_minutes():
+    """One game: a starter who plays throughout, a bench player who does not."""
+    rows = []
+    n = 0
+
+    def ev(**kw):
+        nonlocal n
+        n += 1
+        rows.append({"gameId": "0022500001", "period": 1, "orderNumber": n,
+                     "clock": kw.pop("clock", "PT06M00.00S"), **kw})
+
+    # Possession alternates every event, so the count covers BOTH teams.
+    for i in range(40):
+        ev(actionType="2pt", personId="starter" if i % 2 else "bench",
+           possession="1610612737" if i % 2 else "1610612738",
+           shotResult="Made", shotDistance=5.0)
+    # Both players start (each one's first substitution is an "out"), but the
+    # bench player sits at the 6:00 mark while the starter plays to the buzzer.
+    # reconstruct_on_court only emits a row for a player with a substitution,
+    # so the starter needs one too.
+    ev(actionType="substitution", subType="out", personId="bench",
+       possession="1610612737", clock="PT06M00.00S")
+    ev(actionType="substitution", subType="out", personId="starter",
+       possession="1610612737", clock="PT00M00.00S")
+    ev(actionType="period", subType="end", personId=None,
+       possession="1610612737", clock="PT00M00.00S")
+    return pd.DataFrame(rows)
+
+
+def test_game_pace_is_constant_across_every_player_in_the_game():
+    """PBP_GAME_PACE was once called PBP_PACE_ON_COURT and documented as a
+    per-player measurement. The player's seconds cancel out of the arithmetic,
+    so it never was one. This pins that, so nobody re-documents it as
+    player-specific or reintroduces a player term believing it varies."""
+    from src.features.pbp import summarise_player_games
+
+    summary = summarise_player_games(_game_with_two_players_of_different_minutes())
+    pace = summary["PBP_GAME_PACE"].dropna()
+    seconds = summary["PBP_SECONDS_ON_COURT"].dropna()
+
+    assert len(pace) >= 2, "need at least two players to compare"
+    assert seconds.nunique() > 1, "the two players must differ in minutes"
+    assert pace.nunique() == 1, (
+        f"PBP_GAME_PACE varies within one game: {sorted(pace.unique())}. "
+        "It is a game constant by construction."
+    )
+
+
+def test_game_pace_is_per_team_not_both_teams():
+    """team_possessions counts changes of the possessing team, so its total
+    covers both teams. Reporting that un-halved put 'pace' near 200, double
+    the league convention, and made the column unreadable against any
+    published pace figure."""
+    from src.features.pbp import prepare_events, summarise_player_games, team_possessions
+
+    events = _game_with_two_players_of_different_minutes()
+    both_teams = len(team_possessions(prepare_events(events)))
+    game_seconds = prepare_events(events)["elapsed"].max()
+
+    pace = summarise_player_games(events)["PBP_GAME_PACE"].dropna().iloc[0]
+    expected = (both_teams / 2.0) * 2880.0 / game_seconds
+
+    assert pace == pytest.approx(expected), f"{pace} != {expected}"
+    assert pace == pytest.approx(both_teams * 2880.0 / game_seconds / 2.0)

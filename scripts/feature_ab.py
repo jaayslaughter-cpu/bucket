@@ -113,7 +113,7 @@ LAYERS: dict[str, Layer] = {
     ),
     "pbp": Layer(
         (
-            "PBP_PACE_ON_COURT_L5", "PBP_PACE_ON_COURT_L10",
+            "PBP_GAME_PACE_L5", "PBP_GAME_PACE_L10",
             "PBP_SHOT_DIST_AVG_L5", "PBP_SHOT_DIST_AVG_L10",
             "PBP_RIM_RATE_L5", "PBP_RIM_RATE_L10",
             "PBP_MID_RATE_L5", "PBP_MID_RATE_L10",

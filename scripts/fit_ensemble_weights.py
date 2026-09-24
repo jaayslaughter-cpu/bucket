@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -171,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Weights are chosen on training rows only (<= {args.train_end}). "
           f"The evaluation window is never read.\n")
-    print(f"configured: {configured}\n")
+    print(f"config held at fit time: {configured}\n")
 
     per_market: dict[str, dict] = {}
     for market in [m.strip().upper() for m in args.markets.split(",") if m.strip()]:
@@ -213,8 +214,27 @@ def main(argv: list[str] | None = None) -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # The key used to be "configured", which reads as "what ships". It is not:
+    # it is what the config held WHEN THIS FIT RAN. The usual workflow writes
+    # the fitted weights back into the config afterwards, at which point the
+    # old name made the artifact quietly contradict config/model_comparison.yaml
+    # -- it recorded {catboost 0.5, xgboost 0.3, distribution 0.2} long after
+    # the config had moved to the fitted set. Name it for what it is, stamp it,
+    # and say plainly that it is a historical record.
     out.write_text(json.dumps(
-        {"configured": configured, "per_market": per_market, "pooled": pooled},
+        {
+            "_note": (
+                "configured_at_fit_time is what config/model_comparison.yaml "
+                "held when this file was written, NOT necessarily what ships "
+                "now. Read the config for that."
+            ),
+            "fitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "panel": str(args.panel),
+            "train_end": str(args.train_end),
+            "configured_at_fit_time": configured,
+            "per_market": per_market,
+            "pooled": pooled,
+        },
         indent=2, default=str,
     ), encoding="utf-8")
     print(f"\nwrote {out}")

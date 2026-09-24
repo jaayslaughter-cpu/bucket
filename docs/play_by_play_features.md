@@ -43,7 +43,19 @@ All as **prior-game rolling means**, L5 and L10.
 | `PBP_ASSISTED_RATE` | share of makes a teammate set up — self-creation |
 | `PBP_CLOSE_SHOT_SHARE` | attempts with the margin inside 5 |
 | `PBP_GARBAGE_SHOT_SHARE` | attempts with the margin 20 or more |
-| `PBP_PACE_ON_COURT` | possessions per 48 while this player is on the floor |
+| `PBP_GAME_PACE` | possessions per 48 **per team**, of the game this player appeared in |
+
+> **`PBP_GAME_PACE` is a game constant, not a player measurement.** It was
+> called `PBP_PACE_ON_COURT` and documented as "possessions per 48 while this
+> player is on the floor". That was wrong: the player's own seconds cancel out
+> of the arithmetic, so every player in a game receives the identical value
+> (verified at a within-game standard deviation of 0.0). It is now computed
+> and named as what it is. Two consequences worth knowing before using it:
+> its total was also un-halved, counting both teams' possessions and putting
+> "pace" near 200 instead of the league's ~100; and it is **not independent**
+> of the panel's existing pace columns — `PBP_GAME_PACE_L10` correlates 0.82
+> with `PACE_ROLL` and 0.78 with `PACE_MULTIPLIER`. It only becomes
+> player-specific after being rolled over each player's own schedule.
 
 ### On-court time is reconstructed and validated
 

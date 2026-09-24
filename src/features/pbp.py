@@ -45,10 +45,25 @@ WHAT IS SHIPPED, AND WHY NOT EVERYTHING. PBP_SECONDS_ON_COURT is NOT a
 feature: it correlates with the box score's MIN at 0.997, and MIN_L5 and
 MIN_SEASON are already among the strongest columns in the panel. Shipping
 it would hand the model one number twice -- the same collinearity mistake
-that cost a third of the opponent-defence layer's gain. PBP_PACE_ON_COURT
-is shipped, because possessions per 48 while a given player is on the floor
-is not something the box score records. PBP_FGA stays a diagnostic: it is a
-count, and it is what the completeness check above is computed from.
+that cost a third of the opponent-defence layer's gain. PBP_FGA stays a
+diagnostic: it is a count, and it is what the completeness check above is
+computed from.
+
+PBP_GAME_PACE IS A GAME CONSTANT, NOT A PLAYER MEASUREMENT. It was once
+called PBP_PACE_ON_COURT and documented as "possessions per 48 while a given
+player is on the floor". That was false. The player's own seconds cancel out
+of the arithmetic exactly -- see the derivation at the computation site --
+so every player in a game receives the identical value, verified at a
+within-game standard deviation of 0.0. It is shipped as what it actually is:
+the pace of the game the player appeared in, which is real information the
+box score does not carry per game, and which becomes player-specific only
+once it is rolled over each player's own schedule.
+
+It is also NOT independent of the panel's existing pace columns:
+PBP_GAME_PACE_L10 correlates 0.82 with PACE_ROLL and 0.78 with
+PACE_MULTIPLIER. That is the collinearity this module warns about two
+paragraphs up, and it is the reason this column should be measured against
+PACE_ROLL rather than assumed additive.
 
 RESEARCH ONLY.
 """
@@ -85,7 +100,7 @@ _CLOCK_RE = re.compile(r"PT(\d+)M([\d.]+)S")
 # a restatement of a column the box score already carries. These get rolled
 # and joined.
 PBP_RATE_COLS: tuple[str, ...] = (
-    "PBP_PACE_ON_COURT",
+    "PBP_GAME_PACE",
     "PBP_SHOT_DIST_AVG",
     "PBP_RIM_RATE",
     "PBP_MID_RATE",
@@ -433,26 +448,40 @@ def summarise_player_games(
 
     out = shots.merge(on_court, on=["gameId", "personId"], how="outer")
 
-    # Possessions while on court, approximated by the share of the game's
-    # possessions that fall inside the player's minutes. Without full lineup
-    # intervals per possession this is a rate, not a count of his own
-    # possessions, and it is named for what it is.
+    # team_possessions counts every change of the possessing team, so its
+    # per-game total covers BOTH teams. Halve it for the league's convention:
+    # possessions per team, which puts pace near 100 rather than near 200.
     poss = team_possessions(events)
     if not poss.empty and "PBP_SECONDS_ON_COURT" in out.columns:
-        per_game = poss.groupby("gameId").size().rename("_game_poss")
+        per_game = (poss.groupby("gameId").size() / 2.0).rename("_team_poss")
         length = events.groupby("gameId")["elapsed"].max().rename("_game_seconds")
         out = out.merge(per_game, left_on="gameId", right_index=True, how="left")
         out = out.merge(length, left_on="gameId", right_index=True, how="left")
+
+        # The player's share of the game's clock. Without lineup intervals per
+        # possession this apportions the team's possessions by time on court
+        # rather than counting his own, and it is named for what it is.
         share = out["PBP_SECONDS_ON_COURT"] / out["_game_seconds"].where(
             out["_game_seconds"] > 0
         )
-        out["PBP_TEAM_POSS_ON_COURT"] = out["_game_poss"] * share
-        out["PBP_PACE_ON_COURT"] = np.where(
-            out["PBP_SECONDS_ON_COURT"] > 0,
-            out["PBP_TEAM_POSS_ON_COURT"] / (out["PBP_SECONDS_ON_COURT"] / 2880.0),
+        out["PBP_TEAM_POSS_ON_COURT"] = out["_team_poss"] * share
+
+        # PACE IS A GAME CONSTANT. Substituting the line above:
+        #
+        #   pace = TEAM_POSS_ON_COURT / (player_sec / 2880)
+        #        = team_poss * (player_sec / game_sec) * 2880 / player_sec
+        #        = team_poss * 2880 / game_sec
+        #
+        # player_sec cancels. Every player in a game gets the same number, so
+        # this is written the short way, which is both cheaper and honest
+        # about what it measures. Deriving it from PBP_SECONDS_ON_COURT made
+        # it look player-specific when it never was.
+        out["PBP_GAME_PACE"] = np.where(
+            out["_game_seconds"] > 0,
+            out["_team_poss"] * 2880.0 / out["_game_seconds"],
             np.nan,
         )
-        out = out.drop(columns=["_game_poss", "_game_seconds"])
+        out = out.drop(columns=["_team_poss", "_game_seconds"])
 
     for col in PBP_GAME_COLS:
         if col not in out.columns:

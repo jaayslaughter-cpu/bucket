@@ -137,14 +137,14 @@ _PBP_BY_MARKET: dict[str, tuple[str, ...]] = {
     # ensemble -0.00084 against 0.00021, line_aware -0.00129 and its ECE
     # -0.00967. Mean deltas at three to four times their own noise.
     "REB": ("PBP_RIM_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
-            "PBP_PACE_ON_COURT_L10"),
+            "PBP_GAME_PACE_L10"),
     # An assist needs a teammate's make. How much of a player's own scoring is
     # created for him says something about his role in the offence. Smaller
     # than rebounds but just as consistent: ensemble Brier -0.00040 against a
     # 0.00009 spread and xgboost -0.00065 against 0.00019, both 3/3 folds,
     # with xgboost's ECE -0.00300 on all three.
     "AST": ("PBP_ASSISTED_RATE_L10", "PBP_GARBAGE_SHOT_SHARE_L10",
-            "PBP_PACE_ON_COURT_L10"),
+            "PBP_GAME_PACE_L10"),
     "PRA": (
         "PBP_RIM_RATE_L10", "PBP_THREE_RATE_L5", "PBP_ASSISTED_RATE_L10",
     ),
