@@ -329,3 +329,39 @@ def test_no_resolution_column_is_reported_rather_than_invented(caplog):
 def test_an_uninspectable_payload_is_refused():
     with pytest.raises(PropLineHistoryError, match="Cannot inspect"):
         describe_resolution_payload(42)
+
+
+# --- Pacific calendar day, not a UTC instant ---------------------------------
+
+
+def test_the_default_window_uses_the_pacific_calendar_day(monkeypatch):
+    """Project rule: UTC storage, America/Los_Angeles for anything a user
+    reads. A retention window is a calendar thing, and it was computed from
+    datetime.now(timezone.utc).date() — so from 16:00/17:00 Pacific onward the
+    UTC date is already tomorrow and the window reported a day ahead, for the
+    whole Pacific evening when someone pulls lines for tonight's slate.
+
+    Patching the helper proves the code path goes THROUGH it: a revert to a UTC
+    instant would ignore this sentinel and fail.
+    """
+    import src.ingestion.propline_history as module
+
+    sentinel = date(2026, 1, 15)
+    monkeypatch.setattr(module, "pacific_calendar_date", lambda: sentinel)
+
+    window = module.plan_history_window("pro")
+
+    assert window.latest == sentinel, (
+        "the window's 'today' did not come from the Pacific calendar helper"
+    )
+
+
+def test_a_pacific_evening_and_its_utc_date_differ_by_a_day():
+    """Pins the boundary the fix is about, so the reasoning stays checkable:
+    during the Pacific evening the UTC calendar date is the NEXT day."""
+    from zoneinfo import ZoneInfo
+
+    evening = datetime(2026, 1, 15, 19, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+    assert evening.date() == date(2026, 1, 15)
+    assert evening.astimezone(timezone.utc).date() == date(2026, 1, 16)

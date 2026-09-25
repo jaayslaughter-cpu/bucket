@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -47,6 +47,7 @@ from src.ingestion.propline import (
     _strip_player_namespace,
 )
 from src.quant.ev_engine import compute_clv
+from src.utils.timezones import pacific_calendar_date
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,13 @@ def plan_history_window(
     whatever the archive holds. Passing ``season_start`` makes that explicit
     rather than leaving it to be discovered by an empty pull.
     """
-    today = as_of or datetime.now(timezone.utc).date()
+    # PACIFIC calendar day, not a UTC instant collapsed to a date. The
+    # project rule is UTC storage, America/Los_Angeles for anything a user
+    # reads, and a retention window is a calendar thing. From 16:00/17:00
+    # Pacific onward the UTC date is already tomorrow, so this reported a
+    # window a day ahead for the whole Pacific evening -- precisely when
+    # someone pulls lines for tonight's slate.
+    today = as_of or pacific_calendar_date()
     key = str(tier).strip().lower().replace("-", "_").replace(" ", "_")
     if key not in TIER_EVENT_AGE_DAYS:
         raise PropLineHistoryError(
