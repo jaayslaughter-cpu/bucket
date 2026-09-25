@@ -82,8 +82,10 @@ def test_same_game_legs_without_a_correlation_are_refused():
     assert result.expected_value_per_unit is None
 
 
-def test_same_game_legs_price_once_a_correlation_is_supplied():
-    result = evaluate_parlay([A, SAME_GAME], correlation={("a", "c"): 0.25})
+def test_same_game_legs_price_once_a_correlation_and_a_quote_are_supplied():
+    result = evaluate_parlay(
+        [A, SAME_GAME], correlation={("a", "c"): 0.25}, ticket_american=+240,
+    )
     assert result.status == "OK"
     # Positive correlation lifts the ticket above the naive product, and the
     # difference is reported rather than folded in silently.
@@ -290,3 +292,120 @@ def test_valid_matrices_still_price_and_independence_matches_the_product():
     assert correlated > independent, "positive rho must raise the joint probability"
     # Independence is the product, within Monte Carlo error.
     assert independent == pytest.approx(0.55 * 0.55, abs=4 * se)
+
+
+# --- the estimate's own edges -------------------------------------------
+
+
+def test_a_saturated_sample_does_not_report_a_certainty():
+    """
+    Every leg has model_prob < 1, so P(all win) < 1 is arithmetic. But a small
+    sample in which every draw wins reports a hit rate of exactly 1.0, and the
+    Wald standard error sqrt(p(1-p)/n) is exactly 0.0 there — so the relative
+    noise guard computed 0.0 / 1.0 and passed. Measured on two legs at 0.9999
+    over 2,000 draws: status OK, joint_probability 1.0, +0.44/unit of EV. A
+    parlay that cannot lose is the one claim this module exists to never make.
+    """
+    legs = [
+        ParlayLeg("a", 0.9999, -500, game_id="G1", line=24.5, model_push_prob=0.0),
+        ParlayLeg("b", 0.9999, -500, game_id="G2", line=7.5, model_push_prob=0.0),
+    ]
+    joint, stderr = copula_joint_probability(legs, None, n_sims=2_000)
+    assert joint == 1.0, "fixture no longer saturates the sample"
+    assert stderr > 0.0, "a saturated sample still has uncertainty in it"
+
+    result = evaluate_parlay(legs, n_sims=2_000)
+    assert result.status == "DATA_NOT_AVAILABLE"
+    assert "saturated" in result.reason
+    assert result.expected_value_per_unit is None
+
+    # With enough draws the losing tail resolves and it prices normally.
+    priced = evaluate_parlay(legs, n_sims=200_000)
+    assert priced.status == "OK"
+    assert priced.joint_probability < 1.0
+
+
+def test_the_joint_cannot_exceed_the_smallest_leg():
+    """P(all win) <= min_i p_i is exact, with equality only in the perfectly
+    correlated limit. A number above it is not describing these legs."""
+    legs = [
+        ParlayLeg("a", 0.60, -110, game_id="G1", line=24.5, model_push_prob=0.0),
+        ParlayLeg("b", 0.90, -110, game_id="G2", line=7.5, model_push_prob=0.0),
+    ]
+    near_perfect = np.array([[1.0, 0.999], [0.999, 1.0]])
+    result = evaluate_parlay(legs, correlation=near_perfect)
+    assert result.status == "OK"
+    assert result.joint_probability == pytest.approx(0.60, abs=0.01)
+
+
+def test_a_same_game_ticket_is_not_priced_at_the_product_of_its_legs():
+    """
+    A book re-prices a same-game parlay for the correlation, so the product of
+    the individual legs is a payout nobody offers — and on positively
+    correlated legs it is the HIGHER number, which inflates EV. Measured on
+    these two legs at rho 0.25: EV/unit is 0.341 at the product-equivalent
+    +264 and 0.252 at a quoted +240, so the product overstates by 0.089/unit.
+    """
+    unpriced = evaluate_parlay([A, SAME_GAME], correlation={("a", "c"): 0.25})
+    assert unpriced.status == "DATA_NOT_AVAILABLE"
+    assert "combined ticket price" in unpriced.reason
+    assert unpriced.expected_value_per_unit is None
+
+    quoted = evaluate_parlay(
+        [A, SAME_GAME], correlation={("a", "c"): 0.25}, ticket_american=+240,
+    )
+    assert quoted.status == "OK"
+    assert quoted.price_source == "quoted_ticket"
+    assert quoted.decimal_price == pytest.approx(3.40)
+
+    product = evaluate_parlay(
+        [A, SAME_GAME], correlation={("a", "c"): 0.25}, ticket_american=+264,
+    )
+    assert product.expected_value_per_unit > quoted.expected_value_per_unit
+
+
+def test_the_cross_game_product_price_is_labelled_as_such():
+    """The product is the right cross-game price, but a ticket has to say which
+    number it used, or a logged EV cannot be re-derived later."""
+    result = evaluate_parlay([A, B])
+    assert result.status == "OK"
+    assert result.price_source == "product_of_legs"
+    assert result.decimal_price == pytest.approx(parlay_decimal_price([A, B]))
+    assert any("product of the legs" in w for w in result.warnings)
+
+    quoted = evaluate_parlay([A, B], ticket_decimal=3.20)
+    assert quoted.price_source == "quoted_ticket"
+    assert quoted.decimal_price == pytest.approx(3.20)
+    assert not any("product of the legs" in w for w in quoted.warnings)
+
+
+def test_two_prices_for_one_ticket_are_refused():
+    assert "not both" in evaluate_parlay(
+        [A, B], ticket_american=+250, ticket_decimal=3.5,
+    ).reason
+    for bad in (1.0, 0.5, float("nan")):
+        assert "above 1.0" in evaluate_parlay([A, B], ticket_decimal=bad).reason
+
+
+def test_a_leg_with_no_game_id_is_refused_rather_than_assumed_independent():
+    """
+    The same-game refusal is the module's central guard, and it used to skip
+    any leg whose game_id was falsy. Two legs FROM THE SAME GAME with game_id
+    omitted therefore priced at 0.330515 on the independent path, carrying the
+    warning "legs are in different games" — not an assumption being flagged but
+    a false statement about the data. An unknown game is not a different one.
+    """
+    for missing in (None, ""):
+        legs = [
+            ParlayLeg("a", 0.60, -110, game_id=missing, line=24.5, model_push_prob=0.0),
+            ParlayLeg("c", 0.55, -110, game_id=missing, line=8.5, model_push_prob=0.0),
+        ]
+        result = evaluate_parlay(legs)
+        assert result.status == "DATA_NOT_AVAILABLE", missing
+        assert "no game_id" in result.reason
+        assert result.joint_probability is None
+        assert not any("different games" in w for w in result.warnings)
+
+    # One leg missing it is enough to refuse, and it is named.
+    partial = evaluate_parlay([A, ParlayLeg("z", 0.55, -110, line=7.5, model_push_prob=0.0)])
+    assert "['z']" in partial.reason

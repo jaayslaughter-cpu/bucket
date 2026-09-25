@@ -118,7 +118,9 @@ def test_fitted_priors_apply_to_a_prospective_ticket():
 
     from src.quant.parlay import evaluate_parlay
 
-    evaluation = evaluate_parlay(legs, correlation=matrix)
+    # Same-game legs, so the combined ticket price has to be the quoted one --
+    # the product of the legs is not a same-game payout any book offers.
+    evaluation = evaluate_parlay(legs, correlation=matrix, ticket_american=+240)
     assert evaluation.status == "OK"
     # Positive correlation lifts the ticket above the naive product.
     assert evaluation.joint_probability > evaluation.independent_probability

@@ -36,7 +36,13 @@ uncalibrated model's error compounds fastest.
 
 NOTHING HERE INVENTS A PRICE. A leg with no American odds cannot be priced
 and the evaluation abstains with a named reason, exactly as the single-leg
-gate does.
+gate does. That extends to the TICKET price: for legs in different games the
+book really does multiply the legs, but a SAME-GAME parlay is re-priced by
+the book with the same correlation this module models, and the product of the
+individual legs is not a number any book offers. Using it would overstate the
+payout on exactly the positively correlated tickets the correlation machinery
+exists to price honestly, so a same-game ticket must be given the combined
+price actually quoted (``ticket_american``) or it abstains.
 """
 
 from __future__ import annotations
@@ -116,6 +122,7 @@ class ParlayEvaluation:
     breakeven_probability: float | None = None
     expected_value_per_unit: float | None = None
     method: str = "none"
+    price_source: str | None = None
     legs: tuple[str, ...] = ()
     placement_mode: str = PLACEMENT_MODE
     research_status: str = RESEARCH_STATUS
@@ -136,6 +143,7 @@ class ParlayEvaluation:
             "breakeven_probability": self.breakeven_probability,
             "expected_value_per_unit": self.expected_value_per_unit,
             "method": self.method,
+            "price_source": self.price_source,
             "legs": list(self.legs),
             "placement_mode": self.placement_mode,
             "research_status": self.research_status,
@@ -291,9 +299,42 @@ def copula_joint_probability(
     rng = np.random.default_rng(seed)
     draws = rng.standard_normal((int(n_sims), len(legs))) @ chol.T
     wins = np.all(draws <= thresholds, axis=1)
-    probability = float(wins.mean())
-    stderr = float(math.sqrt(max(probability * (1.0 - probability), 0.0) / int(n_sims)))
+    n = int(n_sims)
+    n_wins = int(wins.sum())
+    probability = n_wins / n
+    stderr = _binomial_stderr(n_wins, n)
     return probability, stderr
+
+
+# 95% normal quantile, used only for the saturated-sample interval below.
+_AGRESTI_COULL_Z = 1.959963984540054
+
+
+def _binomial_stderr(n_wins: int, n_sims: int) -> float:
+    """Standard error of a Monte Carlo hit rate, non-degenerate at the edges.
+
+    The Wald formula sqrt(p(1-p)/n) is EXACTLY ZERO when every draw wins or
+    every draw loses, which is the one place a caller most needs to be told
+    the estimate is uncertain: a sample of 2,000 that happens to win every
+    time reported p=1.0 with stderr 0.0, and a relative-error guard reading
+    stderr/p then waved it through as a parlay that cannot lose.
+
+    Away from the boundary this is the Wald value; at a saturated sample it is
+    the Agresti-Coull standard error, which adds z^2/2 pseudo-successes and
+    z^2/2 pseudo-failures and so stays positive (~1.4/n at p_hat = 1). It is
+    a width, not a correction to the estimate -- the point estimate returned
+    is still the raw hit rate.
+    """
+    n = int(n_sims)
+    if n <= 0:
+        raise ParlayError("n_sims must be positive")
+    if 0 < int(n_wins) < n:
+        p = int(n_wins) / n
+        return float(math.sqrt(p * (1.0 - p) / n))
+    z_sq = _AGRESTI_COULL_Z ** 2
+    n_tilde = n + z_sq
+    p_tilde = (int(n_wins) + z_sq / 2.0) / n_tilde
+    return float(math.sqrt(p_tilde * (1.0 - p_tilde) / n_tilde))
 
 
 # ---------------------------------------------------------------------------
@@ -302,13 +343,54 @@ def copula_joint_probability(
 
 
 def parlay_decimal_price(legs: Sequence[ParlayLeg]) -> float:
-    """Product of the legs' decimal prices. Raises if any leg has no price."""
+    """Product of the legs' decimal prices. Raises if any leg has no price.
+
+    This is the CROSS-GAME parlay price: for legs in different games a book
+    genuinely multiplies them. It is NOT the price of a same-game parlay --
+    see ``ticket_decimal_price`` and the refusal in ``evaluate_parlay``.
+    """
     price = 1.0
     for leg in legs:
         if leg.american is None:
             raise ParlayError(f"{leg.leg_id}: no American odds, so it cannot be priced")
         price *= american_to_decimal(int(leg.american))
     return price
+
+
+PRICE_SOURCE_QUOTED = "quoted_ticket"
+PRICE_SOURCE_PRODUCT = "product_of_legs"
+
+
+def ticket_decimal_price(
+    legs: Sequence[ParlayLeg],
+    *,
+    ticket_american: int | None = None,
+    ticket_decimal: float | None = None,
+) -> tuple[float, str]:
+    """Resolve the ticket's decimal price and say where it came from.
+
+    A quoted combined price wins over the product whenever one is supplied,
+    because it is the payout that will actually be received. Returns
+    ``(decimal, price_source)``.
+    """
+    if ticket_american is not None and ticket_decimal is not None:
+        raise ParlayError(
+            "Supply ticket_american or ticket_decimal, not both -- two prices "
+            "for one ticket cannot both be what the book offered."
+        )
+    if ticket_american is not None:
+        quoted = american_to_decimal(int(ticket_american))
+    elif ticket_decimal is not None:
+        quoted = float(ticket_decimal)
+    else:
+        return parlay_decimal_price(legs), PRICE_SOURCE_PRODUCT
+
+    if not (math.isfinite(quoted) and quoted > 1.0):
+        raise ParlayError(
+            f"Ticket decimal price must be finite and above 1.0, got {quoted!r}. "
+            "A price of 1.0 or below returns no profit and is not a parlay quote."
+        )
+    return quoted, PRICE_SOURCE_QUOTED
 
 
 def evaluate_parlay(
@@ -318,6 +400,8 @@ def evaluate_parlay(
     n_sims: int = DEFAULT_SIMULATIONS,
     seed: int = DEFAULT_SEED,
     allow_independence_across_games: bool = True,
+    ticket_american: int | None = None,
+    ticket_decimal: float | None = None,
 ) -> ParlayEvaluation:
     """
     Price a ticket, or abstain with a named reason. Never invents an input.
@@ -325,6 +409,7 @@ def evaluate_parlay(
     Refuses when:
 
     - fewer than two legs, or any leg carries no American price
+    - any leg carries no ``game_id``, so whether it shares a game is unknown
     - two legs share a ``game_id`` and no correlation was supplied — the
       naive product is not a conservative simplification there, it is a
       different bet, and books price the difference on purpose
@@ -332,7 +417,15 @@ def evaluate_parlay(
       that leg and re-prices the whole ticket at the remaining legs' odds,
       which this two-outcome model does not represent
     - the correlation matrix is not positive semi-definite
-    - the Monte Carlo estimate is too noisy relative to its own size
+    - the Monte Carlo estimate is too noisy relative to its own size, or it
+      saturated at 0 or 1 where that relative measure stops working
+    - two legs share a ``game_id`` and no combined ticket price was quoted.
+      The book re-prices a same-game parlay for the correlation, so the
+      product of the individual legs is not a payout on offer anywhere
+
+    ``ticket_american`` (or ``ticket_decimal``) is the combined price the book
+    quoted for the whole ticket. Supply it whenever you have it; it is
+    required for a same-game ticket and preferred over the product for any.
     """
     legs = list(legs)
     if len(legs) < 2:
@@ -374,11 +467,27 @@ def evaluate_parlay(
 
     warnings: list[str] = []
 
+    # A leg whose game is unknown cannot be shown NOT to share one, and the
+    # same-game refusal below is the module's central guard. Skipping such a
+    # leg quietly moved it onto the independent path: two legs from one game
+    # with game_id omitted priced at 0.330515 and carried the warning "legs are
+    # in different games", which was not an assumption being flagged but a
+    # false statement about the data. This mirrors the push gate, where an
+    # unknown line is refused rather than assumed not to push.
+    unknown_game = [leg.leg_id for leg in legs if not leg.game_id]
+    if unknown_game:
+        return _abstain(
+            f"Legs {unknown_game} carry no game_id, so it cannot be established "
+            "whether they share a game with another leg. Same-game legs are not "
+            "independent, and an unknown game is not evidence of a different "
+            "one. Supply game_id for every leg.",
+            legs,
+        )
+
     # Same-game legs without a correlation are a refusal, not an assumption.
     by_game: dict[str, list[str]] = {}
     for leg in legs:
-        if leg.game_id:
-            by_game.setdefault(str(leg.game_id), []).append(leg.leg_id)
+        by_game.setdefault(str(leg.game_id), []).append(leg.leg_id)
     shared = {g: ids for g, ids in by_game.items() if len(ids) > 1}
 
     if isinstance(correlation, Mapping):
@@ -423,6 +532,40 @@ def evaluate_parlay(
             "the ticket is rarer than this sample can measure.",
             legs,
         )
+
+    # The mirror of the line above, and the one that actually flatters a
+    # ticket. Every leg has model_prob < 1, so P(all win) < 1 is arithmetic,
+    # not an opinion -- but a sample in which every draw wins reports 1.0, and
+    # the Wald standard error at p_hat = 1 used to be exactly 0.0, so the
+    # relative-error guard below divided 0 by 1 and passed. Two legs at 0.9999
+    # over 2,000 draws returned status OK with joint_probability 1.0 and
+    # +0.44/unit of EV: a parlay that cannot lose, which is precisely the claim
+    # this module exists to refuse to make.
+    if joint >= 1.0:
+        return _abstain(
+            f"Every one of {n_sims:,} simulated draws won, so the estimate "
+            "saturated at 1.0. P(all legs win) is strictly below 1 whenever "
+            "every leg is, so this is a sample too small to resolve the "
+            "ticket's losing tail, not a ticket that cannot lose. Raise n_sims.",
+            legs,
+        )
+
+    # P(all win) <= min_i P(leg i wins) is exact: the intersection cannot be
+    # likelier than its smallest member, with equality only in the perfectly
+    # correlated limit. Exceeding it by more than sampling noise means the
+    # draws are not describing these legs -- too few simulations, or a matrix
+    # that got past the checks above.
+    smallest_leg = min(float(leg.model_prob) for leg in legs)
+    tolerance = 3.0 * max(stderr, 1.0 / float(n_sims))
+    if joint > smallest_leg + tolerance:
+        return _abstain(
+            f"Joint probability {joint:.6f} exceeds the smallest leg's "
+            f"{smallest_leg:.6f} by more than {tolerance:.6f} of sampling "
+            "noise. An intersection cannot be likelier than any one of its "
+            "members, so this estimate is not describing the ticket supplied.",
+            legs,
+        )
+
     if stderr / joint > MAX_RELATIVE_STANDARD_ERROR:
         return _abstain(
             f"Monte Carlo standard error {stderr:.5f} is {stderr / joint:.1%} of "
@@ -431,7 +574,34 @@ def evaluate_parlay(
         )
 
     independent = independent_joint_probability(legs)
-    decimal = parlay_decimal_price(legs)
+
+    # The price gate sits AFTER the probability so that a self-inconsistent
+    # correlation matrix is still reported as such rather than masked by a
+    # missing price: the matrix is the deeper error of the two.
+    if shared and ticket_american is None and ticket_decimal is None:
+        return _abstain(
+            f"Legs share a game ({shared}) and no combined ticket price was "
+            "given. A book re-prices a same-game parlay for exactly the "
+            "correlation this module models, so the product of the individual "
+            "legs is not a payout on offer -- and on positively correlated "
+            "legs it is higher than the real one, which inflates EV. Supply "
+            "ticket_american from the quoted ticket.",
+            legs,
+        )
+
+    try:
+        decimal, price_source = ticket_decimal_price(
+            legs, ticket_american=ticket_american, ticket_decimal=ticket_decimal,
+        )
+    except ParlayError as exc:
+        return _abstain(str(exc), legs)
+    if price_source == PRICE_SOURCE_PRODUCT:
+        warnings.append(
+            "Ticket price is the product of the legs' individual odds. That is "
+            "how a cross-game parlay prices, but books hold more on a parlay "
+            "than on its legs, so treat this as an upper bound on the payout "
+            "and replace it with the quoted ticket price when you have one."
+        )
     breakeven = 1.0 / decimal
     ev = joint * decimal - 1.0
 
@@ -450,6 +620,7 @@ def evaluate_parlay(
         breakeven_probability=breakeven,
         expected_value_per_unit=ev,
         method="gaussian_copula",
+        price_source=price_source,
         legs=tuple(leg_ids),
         warnings=tuple(warnings),
     )
