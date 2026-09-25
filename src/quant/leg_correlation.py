@@ -337,6 +337,41 @@ def fit_leg_correlations(
 # ---------------------------------------------------------------------------
 
 
+
+def _side_sign(leg: Any) -> int | None:
+    """+1 for an over leg, -1 for an under leg, None when it cannot be told.
+
+    WHY THIS EXISTS. The fitted buckets are OVER/OVER correlations --
+    realised_leg_outcomes defaults to side="over" and stores
+    ``1.0 - over`` only when asked for the other side -- but a ticket's legs
+    each pick a side, and model_prob is P(THIS side wins). Copying rho
+    unchanged onto a mixed over/under pair gives the copula the wrong sign of
+    dependence, which moves the joint probability the wrong way and with it
+    the breakeven and EV.
+
+    Verified by simulation rather than asserted: with a latent over/over rho of
+    0.6 and 0.55 marginals, phi(over_a, over_b) = +0.4083 and
+    phi(over_a, under_b) = -0.4083, summing to 0.000000, and a latent rho of
+    -0.6 reproduces the under pairing. So the correction is rho * s_a * s_b.
+
+    Returns None for an unrecognised or absent side. The CALLER decides what
+    that means: correlation_for_legs reads it as "over", matching the side
+    realised_leg_outcomes fits by default, and logs that it did so. Refusing
+    outright would turn every side-agnostic over/over ticket into an
+    abstention, which fixes nothing; the real paths (paper_research) do
+    populate the field, so a declared under leg is signed correctly.
+    """
+    raw = getattr(leg, "side", None)
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in ("over", "o", "more"):
+        return 1
+    if text in ("under", "u", "less"):
+        return -1
+    return None
+
+
 def correlation_for_legs(
     legs: Sequence[ParlayLeg],
     priors: CorrelationPriors,
@@ -377,6 +412,27 @@ def correlation_for_legs(
                 + (bucket.reason if bucket and bucket.reason else "no fitted bucket")
             )
             continue
-        matrix[i, j] = matrix[j, i] = float(bucket.rho)
+        # rho * s_a * s_b -- see _side_sign. Same sign for over/over and for
+        # under/under, flipped for a mixed pair.
+        #
+        # An ABSENT side is read as "over", which is the side
+        # realised_leg_outcomes fits by default, so a caller that never
+        # populated the field gets exactly the behaviour it had before. It is
+        # logged rather than silent: a leg that MEANT under and omitted the
+        # field would be signed wrongly, and the only cure for that is to say
+        # so. Refusing instead would convert every side-agnostic over/over
+        # ticket into an abstention, which fixes nothing and breaks callers.
+        sign_a, sign_b = _side_sign(a), _side_sign(b)
+        for leg, sign in ((a, sign_a), (b, sign_b)):
+            if sign is None:
+                logger.info(
+                    "leg %s declares no side; reading it as OVER to match the "
+                    "side realised_leg_outcomes fits by default. Populate "
+                    "ParlayLeg.side to price an under leg correctly.",
+                    leg.leg_id,
+                )
+        matrix[i, j] = matrix[j, i] = (
+            float(bucket.rho) * (sign_a or 1) * (sign_b or 1)
+        )
 
     return matrix, unresolved

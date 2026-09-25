@@ -234,6 +234,51 @@ def copula_joint_probability(
             f"{(len(legs), len(legs))} for {len(legs)} legs"
         )
 
+    # Cholesky is not a validator. It reads only the LOWER triangle, so an
+    # asymmetric matrix factorises happily while silently discarding whatever
+    # the caller wrote above the diagonal; it accepts a non-unit diagonal,
+    # which breaks the marginals the thresholds above were built from; and a
+    # NaN entry propagates to a joint probability of exactly 0.0 with no error
+    # at all, which reads as "this parlay cannot win".
+    #
+    # Measured on two legs at model_prob 0.55: asymmetric (0.0 upper, 0.6
+    # lower) returned the rho=0.6 answer to machine precision, a diagonal of
+    # 2.0 returned 0.33454 where the correct value is 0.40433, and NaN
+    # returned 0.0. Each is a wrong number rather than a refusal, so the
+    # matrix is checked here instead.
+    correlation = np.asarray(correlation, dtype=float)
+    if not np.all(np.isfinite(correlation)):
+        bad = int((~np.isfinite(correlation)).sum())
+        raise ParlayError(
+            f"Correlation matrix has {bad} non-finite entr{'y' if bad == 1 else 'ies'} "
+            "(NaN or inf). A NaN would otherwise yield a joint probability of "
+            "0.0, which reads as an impossible parlay rather than a missing "
+            "correlation. Supply a correlation or omit the pair."
+        )
+    if not np.allclose(correlation, correlation.T, atol=1e-9):
+        raise ParlayError(
+            "Correlation matrix is not symmetric. Cholesky uses only the lower "
+            "triangle, so the values above the diagonal would be discarded "
+            "without warning and the answer would describe a different matrix "
+            "than the one supplied."
+        )
+    diagonal = np.diag(correlation)
+    if not np.allclose(diagonal, 1.0, atol=1e-9):
+        raise ParlayError(
+            f"Correlation matrix diagonal is {np.round(diagonal, 6).tolist()}, "
+            "not all 1.0. The thresholds above are standard-normal quantiles of "
+            "each leg's model_prob, so a non-unit variance silently changes "
+            "every leg's marginal and the joint probability stops answering the "
+            "question asked."
+        )
+    off_diagonal = correlation[~np.eye(len(legs), dtype=bool)]
+    if off_diagonal.size and np.abs(off_diagonal).max() > 1.0 + 1e-9:
+        raise ParlayError(
+            f"Correlation matrix has an off-diagonal entry of "
+            f"{float(np.abs(off_diagonal).max()):.6f}, outside [-1, 1]. That is "
+            "not a correlation."
+        )
+
     try:
         chol = np.linalg.cholesky(correlation)
     except np.linalg.LinAlgError as exc:

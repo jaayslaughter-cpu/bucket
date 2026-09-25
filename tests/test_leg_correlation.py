@@ -9,6 +9,8 @@ fits on the game being predicted, and that a bucket it could not fit stays
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -202,3 +204,97 @@ def test_summary_carries_provenance():
     assert summary["research_status"] == "RESEARCH_ONLY"
     assert summary["line_source"] == "RESEARCH_LINE"
     assert not priors.as_frame().empty
+
+
+# --- cubic review, PR #3: rho's sign depends on each leg's side -------------
+
+
+def _bucket(rho: float = 0.6):
+    from src.quant.leg_correlation import CorrelationBucket
+
+    class _Priors:
+        def get(self, relationship, market_a, market_b):
+            return CorrelationBucket(
+                relationship=relationship, market_a=market_a, market_b=market_b,
+                rho=rho, n_pairs=500, usable=True, reason=None,
+            )
+
+    return _Priors()
+
+
+def _same_game_legs(side_a, side_b):
+    from src.quant.parlay import ParlayLeg
+
+    return [
+        ParlayLeg(leg_id="a", model_prob=0.55, american=-110, game_id="G1",
+                  player_name="A", market="PTS", side=side_a),
+        ParlayLeg(leg_id="b", model_prob=0.55, american=-110, game_id="G1",
+                  player_name="B", market="REB", side=side_b),
+    ]
+
+
+def _matrix_for(side_a, side_b, rho=0.6):
+    from src.quant.leg_correlation import correlation_for_legs
+
+    return correlation_for_legs(
+        _same_game_legs(side_a, side_b), _bucket(rho),
+        leg_teams={"a": "BOS", "b": "LAL"}, leg_players={"a": "A", "b": "B"},
+    )
+
+
+def test_a_mixed_over_under_pair_flips_the_fitted_rho():
+    """The fitted buckets are OVER/OVER — realised_leg_outcomes defaults to
+    side="over" — but model_prob is P(THIS side wins). Verified by simulation:
+    with a latent over/over rho of 0.6 and 0.55 marginals, phi(over_a, over_b)
+    = +0.4083 and phi(over_a, under_b) = -0.4083, summing to 0.000000.
+    """
+    same_a, _ = _matrix_for("over", "over")
+    same_b, _ = _matrix_for("under", "under")
+    mixed_a, _ = _matrix_for("over", "under")
+    mixed_b, _ = _matrix_for("under", "over")
+
+    assert same_a[0, 1] == pytest.approx(+0.6)
+    assert same_b[0, 1] == pytest.approx(+0.6), "under/under is also same-sign"
+    assert mixed_a[0, 1] == pytest.approx(-0.6)
+    assert mixed_b[0, 1] == pytest.approx(-0.6), "the flip is symmetric in order"
+
+
+def test_an_absent_side_reads_as_over_and_says_so(caplog):
+    """An absent side is read as OVER — the side realised_leg_outcomes fits by
+    default — so a caller that never populated the field keeps the behaviour it
+    had. Refusing instead would turn every side-agnostic over/over ticket into
+    an abstention, which fixes nothing.
+
+    It must not be silent, though: a leg that MEANT under and omitted the field
+    is signed wrongly, and saying so is the only cure.
+    """
+    with caplog.at_level(logging.INFO, logger="src.quant.leg_correlation"):
+        matrix, unresolved = _matrix_for("over", None)
+
+    assert not unresolved, "an absent side is not an unresolved pair"
+    assert matrix[0, 1] == pytest.approx(+0.6), "read as over/over"
+    assert any("declares no side" in r.message for r in caplog.records), (
+        "the assumption must be logged"
+    )
+
+
+def test_a_declared_under_still_flips_even_when_the_other_side_is_absent():
+    """The absent-side default must not swallow a side that WAS declared."""
+    matrix, _ = _matrix_for(None, "under")
+
+    assert matrix[0, 1] == pytest.approx(-0.6)
+
+
+def test_side_spellings_are_recognised():
+    from src.quant.leg_correlation import _side_sign
+
+    class _Leg:
+        def __init__(self, side):
+            self.side = side
+
+    assert _side_sign(_Leg("over")) == 1
+    assert _side_sign(_Leg("Under")) == -1
+    assert _side_sign(_Leg("O")) == 1
+    assert _side_sign(_Leg("u")) == -1
+    for unknown in (None, "", "whatever"):
+        assert _side_sign(_Leg(unknown)) is None

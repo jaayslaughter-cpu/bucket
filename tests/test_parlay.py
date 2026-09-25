@@ -226,3 +226,67 @@ def test_module_cannot_place_or_size_a_bet():
         assert network not in imported
     for banned in ("kelly", "stake_size", "place_bet", "submit_order"):
         assert not [i for i in identifiers if banned in i]
+
+
+# --- cubic review, PR #3: the copula's matrix must be validated -------------
+
+
+def _two_legs(prob: float = 0.55):
+    return [
+        ParlayLeg(leg_id="a", model_prob=prob, american=-110),
+        ParlayLeg(leg_id="b", model_prob=prob, american=-110),
+    ]
+
+
+def test_an_asymmetric_correlation_matrix_is_refused():
+    """Cholesky reads only the LOWER triangle, so an asymmetric matrix
+    factorises happily and silently discards whatever the caller wrote above
+    the diagonal. Measured: an asymmetric (0.0 upper, 0.6 lower) matrix
+    returned the rho=0.6 answer to machine precision."""
+    with pytest.raises(ParlayError, match="not symmetric"):
+        copula_joint_probability(
+            _two_legs(), correlation=np.array([[1.0, 0.0], [0.6, 1.0]]), n_sims=2000,
+        )
+
+
+def test_a_non_unit_diagonal_is_refused():
+    """The thresholds are standard-normal quantiles of each leg's model_prob,
+    so a non-unit variance changes every marginal. Measured: a diagonal of 2.0
+    returned 0.33454 where the correct answer is 0.40433."""
+    with pytest.raises(ParlayError, match="diagonal"):
+        copula_joint_probability(
+            _two_legs(), correlation=np.array([[2.0, 0.6], [0.6, 2.0]]), n_sims=2000,
+        )
+
+
+def test_a_non_finite_correlation_is_refused_rather_than_priced_at_zero():
+    """The dangerous one: a NaN propagated to a joint probability of exactly
+    0.0 with no error, which reads as an impossible parlay rather than a
+    missing correlation."""
+    for bad in (np.nan, np.inf):
+        with pytest.raises(ParlayError, match="non-finite"):
+            copula_joint_probability(
+                _two_legs(), correlation=np.array([[1.0, bad], [bad, 1.0]]), n_sims=2000,
+            )
+
+
+def test_an_out_of_range_correlation_is_refused():
+    with pytest.raises(ParlayError, match=r"outside \[-1, 1\]"):
+        copula_joint_probability(
+            _two_legs(), correlation=np.array([[1.0, 1.5], [1.5, 1.0]]), n_sims=2000,
+        )
+
+
+def test_valid_matrices_still_price_and_independence_matches_the_product():
+    """The guard must not reject the cases it exists to protect."""
+    legs = _two_legs()
+    correlated, _ = copula_joint_probability(
+        legs, correlation=np.array([[1.0, 0.6], [0.6, 1.0]]), n_sims=200_000, seed=1,
+    )
+    independent, se = copula_joint_probability(
+        legs, correlation=np.eye(2), n_sims=200_000, seed=1,
+    )
+
+    assert correlated > independent, "positive rho must raise the joint probability"
+    # Independence is the product, within Monte Carlo error.
+    assert independent == pytest.approx(0.55 * 0.55, abs=4 * se)
