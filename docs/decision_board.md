@@ -339,16 +339,29 @@ PTS×REB **0.385** and PTS×AST **0.247** (one player's own markets share his
 minutes and usage), `same_team` **0.015–0.066**, `opposing_team`
 **0.013–0.032**.
 
-Checked against the outcomes by a path independent of the fitter: over the
-165,742 `same_player` PTS×REB pairs, P(PTS over) = 0.4597 and P(REB over) =
-0.4564, and they land together **0.2693** of the time against a product of
-**0.2098**. The copula at the fitted rho returns 0.2721 — within 0.0029 of
-observed — where independence returns 0.2099, off by 0.0593, about 92 Monte
-Carlo standard errors. So the fitted number is doing real work. Its
-**resolution is about ±0.02 in rho**: `estimate_tetrachoric_correlation`
-bisects against a 40,000-draw estimate whose own standard error is ~0.0022 of
-joint probability, which is where that residual 0.0029 comes from. Treat the
-buckets as good to two decimal places, not four.
+Two things were measured on those buckets. They are different in kind and an
+earlier version of this section conflated them, so they are separated here.
+
+**The dependence is real (a statement about the data).** Over the 165,742
+`same_player` PTS×REB pairs, P(PTS over) = 0.4597 and P(REB over) = 0.4564, and
+they land together **0.2693** of the time against an independent product of
+**0.2098**. Independence is wrong by 0.0595 — roughly 92 Monte Carlo standard
+errors. That gap does not depend on the fitted rho at all, and it is the reason
+a same-game ticket cannot be priced as a product.
+
+**The bisection converged (an IN-SAMPLE diagnostic, not evidence of
+generalisation).** The copula at the fitted rho returns 0.2721, within 0.0029
+of the observed 0.2693. This is *not* independent confirmation:
+`estimate_tetrachoric_correlation` bisects rho until the modelled joint matches
+the observed joint **on these same pairs**, so reproducing it is the fitting
+objective being met, not a held-out test. What the residual does measure is
+**resolution: about ±0.02 in rho**, because the bisection scores against a
+40,000-draw estimate whose own standard error is ~0.0022 of joint probability.
+Treat the buckets as good to two decimal places, not four.
+
+**Not yet measured:** whether these rho values hold on games outside the fitting
+window. That needs a chronological split — fit before a cutoff, score the joint
+rate after it — and has not been run.
 
 On the synthetic demo panel the fitter returns `same_player` ~0.19 (shared
 minutes drive a player's own markets together) and `same_team` /

@@ -409,3 +409,37 @@ def test_a_leg_with_no_game_id_is_refused_rather_than_assumed_independent():
     # One leg missing it is enough to refuse, and it is named.
     partial = evaluate_parlay([A, ParlayLeg("z", 0.55, -110, line=7.5, model_push_prob=0.0)])
     assert "['z']" in partial.reason
+
+
+def test_the_evaluator_abstains_instead_of_raising_on_bad_inputs():
+    """
+    evaluate_parlay's one contract is to abstain with a named reason. Three
+    inputs broke it by raising past the caller instead:
+
+    - n_sims=0 hit `n_wins / n` and raised ZeroDivisionError. The guard was
+      inside _binomial_stderr, which the division reaches first.
+    - ticket_american=0 raised ValueError out of american_to_decimal, and
+      evaluate_parlay catches only ParlayError.
+    - a complex matrix was cast with np.asarray(..., dtype=float), which drops
+      the imaginary part with a ComplexWarning and priced a DIFFERENT matrix:
+      measured at joint 0.40700 for a matrix whose off-diagonal was 0.5+0.9j.
+    """
+    legs = [A, B]
+
+    zero_sims = evaluate_parlay(legs, n_sims=0)
+    assert zero_sims.status == "DATA_NOT_AVAILABLE"
+    assert "n_sims must be positive" in zero_sims.reason
+
+    zero_price = evaluate_parlay(legs, ticket_american=0)
+    assert zero_price.status == "DATA_NOT_AVAILABLE"
+    assert "not a price" in zero_price.reason
+
+    complex_matrix = np.array([[1.0 + 0j, 0.5 + 0.9j], [0.5 + 0.9j, 1.0 + 0j]])
+    imaginary = evaluate_parlay(legs, correlation=complex_matrix)
+    assert imaginary.status == "DATA_NOT_AVAILABLE"
+    assert "complex" in imaginary.reason
+
+    # And the direct entry point raises ParlayError, not ZeroDivisionError,
+    # so any other caller gets the module's own exception type.
+    with pytest.raises(ParlayError, match="n_sims must be positive"):
+        copula_joint_probability(legs, None, n_sims=0)

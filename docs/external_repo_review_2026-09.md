@@ -6,9 +6,11 @@ repositories carry no licence at all (see the licence table at the end), so
 concept-level reimplementation is the only clean path as well as the required
 one.
 
-All 35 were cloned and read. Every claim below cites the file and line it came
-from, on both sides. Where a repository's README claims something its code does
-not do, that is stated.
+All 35 were cloned and read. Every claim about an **external** repository cites
+the file and line it came from. Claims about **PropIQ** cite a file and line
+where one exists; where the point is that we have no equivalent, that is stated
+as an absence rather than given a reference. Where a repository's README claims
+something its code does not do, that is stated.
 
 ---
 
@@ -154,8 +156,9 @@ every `calibration_error` figure our comparison runs have reported.
 `ethangu16/src/utils/betting_advanced.py:123-149` — compute Kelly at the point
 estimate *and* at both ends of the probability CI, then take the **minimum**.
 
-We already produce `joint_probability_stderr` for parlays and abstain on
-relative noise. Propagating that interval into the displayed fractional-Kelly
+We already produce `joint_probability_stderr` (`src/quant/parlay.py:117`, set
+at `:639`) and abstain on relative noise (`MAX_RELATIVE_STANDARD_ERROR`,
+`parlay.py:72`). Propagating that interval into the displayed fractional-Kelly
 figure is a natural extension and stays MANUAL_ONLY: it makes the stake
 suggestion shrink when the model is unsure, rather than only when the edge is
 thin.
@@ -167,9 +170,11 @@ thin.
   "how much better than a coin flip". More legible than a raw Brier in a report.
 - **Calibration circuit-breaker** (`Kalshi/models/calibrator.py:37,270,346`):
   `halt_threshold = 0.25`, and `should_halt(market)` when the rolling Brier
-  exceeds it. We have no kill switch. Framed our way: a market whose live
-  Brier has decayed past the coin-flip line should stop being published until
-  it is re-examined.
+  exceeds it. **We have no equivalent** — grep for `halt`/`circuit` across
+  `src/` returns nothing, and `parlay_log.py:731` (`leg_calibration_frame`)
+  produces the `(model_prob, hit)` pairs but nothing consumes them as a gate.
+  Framed our way: a market whose live Brier has decayed past the coin-flip line
+  should stop being published until it is re-examined.
 - **Seed-averaged model selection** (`conorwalsh99/src/model_selection.py:117,137`):
   fit over several random seeds and average before comparing models. Our A/B
   harness compares deltas against fold SD, which is related but does not remove

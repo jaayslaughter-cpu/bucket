@@ -971,6 +971,18 @@ def fit_leg_correlations_cmd(
             err=True,
         )
         raise SystemExit(2)
+    # Both gates are lower bounds a bucket must CLEAR, so a value below 1
+    # disables the gate rather than loosening it: --min-games 0 or -1 lets a
+    # single game's 2,700 reused pairs mark six buckets usable.
+    for name, value in (("--min-pairs", min_pairs), ("--min-games", min_games)):
+        if value < 1:
+            typer.echo(
+                f"{name} must be at least 1, got {value}. A value below 1 turns "
+                "the gate off instead of relaxing it.",
+                err=True,
+            )
+            raise SystemExit(2)
+
     try:
         priors = fit_leg_correlations(
             panel, as_of=as_of, markets=mkt, min_pairs=min_pairs,

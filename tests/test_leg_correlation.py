@@ -386,12 +386,49 @@ def test_the_default_line_column_is_the_one_the_panel_actually_has():
     assert priors.line_source == "AST=AST_L10, PTS=PTS_L10, REB=REB_L10"
     assert any(b.usable for b in priors.buckets.values())
 
-    # An explicit mapping still wins, and RESEARCH_LINE is still accepted for a
-    # single market, where it is unambiguous.
+    # RESEARCH_LINE is still accepted for a single market, where it is
+    # unambiguous.
     single = fit_leg_correlations(
         _planted_panel(n_games=200), as_of="2026-01-01", markets=("PTS",),
     )
     assert single.line_source == "PTS=RESEARCH_LINE"
+
+
+def test_an_explicit_line_mapping_beats_the_default():
+    """The default must not win over a mapping the caller supplied.
+
+    The previous version of this claim rode on the test above, which never
+    passed line_col_for at all -- so it asserted the default and called that
+    "an explicit mapping still wins". Here BOTH columns exist and they carry
+    DIFFERENT lines, so the two choices give different outcomes and the
+    assertion can actually fail.
+    """
+    panel = _one_game_panel(n_players=6, n_games=60)
+    # PTS_L10 is 20.0 (the default). This alternative sits above every
+    # generated PTS value, so every leg grades UNDER against it.
+    panel["PTS_ALT_LINE"] = 999.0
+
+    default = fit_leg_correlations(panel, as_of="2025-01-01", markets=("PTS",))
+    assert default.line_source == "PTS=PTS_L10"
+
+    explicit = fit_leg_correlations(
+        panel, as_of="2025-01-01", markets=("PTS",),
+        line_col_for={"PTS": "PTS_ALT_LINE"},
+    )
+    assert explicit.line_source == "PTS=PTS_ALT_LINE"
+
+    # And the mapping actually changed the fit, not just the label: against a
+    # line no player clears, the outcome never varies and no bucket is usable.
+    assert any(b.usable for b in default.buckets.values())
+    assert not any(b.usable for b in explicit.buckets.values())
+
+    # A mapping naming a column that does not exist is skipped and named,
+    # never silently replaced by the default.
+    with pytest.raises(LegCorrelationError, match="No usable markets"):
+        fit_leg_correlations(
+            panel, as_of="2025-01-01", markets=("PTS",),
+            line_col_for={"PTS": "NO_SUCH_COLUMN"},
+        )
 
 
 def test_research_line_is_refused_for_a_multi_market_fit():

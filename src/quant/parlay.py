@@ -254,6 +254,12 @@ def copula_joint_probability(
     # 2.0 returned 0.33454 where the correct value is 0.40433, and NaN
     # returned 0.0. Each is a wrong number rather than a refusal, so the
     # matrix is checked here instead.
+    if np.iscomplexobj(correlation):
+        raise ParlayError(
+            "Correlation matrix has complex entries. Casting them to float "
+            "discards the imaginary part without error, so the ticket would be "
+            "priced against a different matrix than the one supplied."
+        )
     correlation = np.asarray(correlation, dtype=float)
     if not np.all(np.isfinite(correlation)):
         bad = int((~np.isfinite(correlation)).sum())
@@ -296,10 +302,20 @@ def copula_joint_probability(
             "each other rather than adjusting one in isolation."
         ) from exc
 
-    rng = np.random.default_rng(seed)
-    draws = rng.standard_normal((int(n_sims), len(legs))) @ chol.T
-    wins = np.all(draws <= thresholds, axis=1)
     n = int(n_sims)
+    if n <= 0:
+        # Checked here, not only inside _binomial_stderr: the division below
+        # reaches ZeroDivisionError first, and an uncaught ZeroDivisionError
+        # out of evaluate_parlay breaks its one contract -- abstain with a
+        # named reason, never raise at the caller.
+        raise ParlayError(
+            f"n_sims must be positive, got {n_sims!r}. A parlay probability "
+            "cannot be estimated from zero draws."
+        )
+
+    rng = np.random.default_rng(seed)
+    draws = rng.standard_normal((n, len(legs))) @ chol.T
+    wins = np.all(draws <= thresholds, axis=1)
     n_wins = int(wins.sum())
     probability = n_wins / n
     stderr = _binomial_stderr(n_wins, n)
@@ -379,7 +395,15 @@ def ticket_decimal_price(
             "for one ticket cannot both be what the book offered."
         )
     if ticket_american is not None:
-        quoted = american_to_decimal(int(ticket_american))
+        try:
+            quoted = american_to_decimal(int(ticket_american))
+        except (ValueError, TypeError) as exc:
+            # american_to_decimal refuses 0 with a ValueError. evaluate_parlay
+            # catches ParlayError only, so this has to be translated or it
+            # escapes as an unhandled exception instead of an abstention.
+            raise ParlayError(
+                f"Ticket American odds {ticket_american!r} are not a price: {exc}"
+            ) from exc
     elif ticket_decimal is not None:
         quoted = float(ticket_decimal)
     else:
