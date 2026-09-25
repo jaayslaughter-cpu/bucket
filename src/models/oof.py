@@ -50,6 +50,14 @@ class OutOfFoldPredictions:
     frame: pd.DataFrame          # index = training rows; columns prob_over, y_over
     n_folds: int = 0
     reason: str | None = None
+    # WHICH ROWS the index labels. None means source panel rows. A model
+    # fitted on a transformed sample -- line_aware trains on source x
+    # candidate-line pairs -- must say so, because its fresh RangeIndex
+    # COLLIDES with the source-row one: both start at 0 over different
+    # universes, so blending them by label silently pairs augmented row i with
+    # source row i. Anything combining two of these must compare this field
+    # first.
+    sample: str | None = None
 
     @property
     def n_usable(self) -> int:
@@ -75,7 +83,65 @@ class OutOfFoldPredictions:
             "oof_folds": self.n_folds,
             "oof_usable_rows": self.n_usable,
             "oof_reason": self.reason,
+            "oof_sample": self.sample or "source_rows",
         }
+
+
+
+def _fold_indices(
+    X: pd.DataFrame, n: int, splits: int, market: str
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Chronological folds that never split a slate across the boundary.
+
+    A positional TimeSeriesSplit cuts by row number, and a slate is ~150 rows
+    (min 20, median 153, max 318 in the current panel), so each boundary lands
+    mid-slate: on the real training window one calendar day per fold ended up
+    with some rows training and others being predicted. That lets a fold train
+    on one game's ``over_hit`` from a slate and then predict another game from
+    the same slate -- information nobody has before tip.
+
+    Measured on the real training window: 3 calendar days straddled, 355 of
+    150,291 validation rows affected (0.24%). Too small to have moved any
+    reported metric, so this is not a correction to past numbers -- it is the
+    difference between a guarantee that holds and one that nearly holds.
+
+    Splitting on DISTINCT DATES keeps every row for a date on one side. Falls
+    back to the positional split, with a warning, when there is no GAME_DATE
+    to group by or too few dates to fold.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+
+    if "GAME_DATE" not in X.columns:
+        logger.warning(
+            "oof %s: no GAME_DATE column, so folds are positional and a slate "
+            "may straddle a boundary. Pass whole rows, not a bare feature matrix.",
+            market or "?",
+        )
+        return list(TimeSeriesSplit(n_splits=splits).split(np.arange(n)))
+
+    # normalize() drops the tip-off time. GAME_DATE is a full timestamp, so
+    # grouping on it raw makes two games on the same night different groups
+    # and leaves the slate split across the boundary -- measured at 2 of the
+    # original 3 straddled days still straddling. A slate is a CALENDAR DAY.
+    dates = pd.to_datetime(X["GAME_DATE"], errors="coerce").dt.normalize()
+    codes, uniques = pd.factorize(dates, sort=True)
+    n_dates = len(uniques)
+    if n_dates < splits + 1:
+        logger.warning(
+            "oof %s: %d distinct date(s) cannot make %d date-grouped fold(s) — "
+            "falling back to positional folds.",
+            market or "?", n_dates, splits,
+        )
+        return list(TimeSeriesSplit(n_splits=splits).split(np.arange(n)))
+
+    positions = np.arange(n)
+    folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for tr_d, va_d in TimeSeriesSplit(n_splits=splits).split(np.arange(n_dates)):
+        tr = positions[np.isin(codes, tr_d)]
+        va = positions[np.isin(codes, va_d)]
+        folds.append((tr, va))
+    return folds
 
 
 def chronological_oof_probabilities(
@@ -96,7 +162,6 @@ def chronological_oof_probabilities(
     Returns predictions aligned to ``X.index``, NaN where no fold covered
     the row.
     """
-    from sklearn.model_selection import TimeSeriesSplit
 
     y_over = np.asarray(y_over, dtype=float)
     n = len(X)
@@ -114,7 +179,7 @@ def chronological_oof_probabilities(
     oof = np.full(n, np.nan)
     completed = 0
 
-    for train_idx, valid_idx in TimeSeriesSplit(n_splits=splits).split(np.arange(n)):
+    for train_idx, valid_idx in _fold_indices(X, n, splits, market):
         if len(train_idx) < MIN_ROWS_PER_FOLD or len(valid_idx) == 0:
             continue
         try:

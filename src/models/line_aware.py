@@ -35,6 +35,7 @@ when supplied, and generated candidates are labelled as such.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 
@@ -587,8 +588,18 @@ class LineAwarePropModel:
         They were produced on the AUGMENTED frame, which is the right sample:
         that is what this model was fitted on, and the calibrator it feeds
         corrects predictions made at a line.
+
+        The frame is LABELLED as an augmented sample. Its index is a fresh
+        RangeIndex over (source row x candidate line) pairs, which collides
+        with the source-row index every other component carries -- both start
+        at 0 over different universes. Without this label the ensemble blended
+        augmented row i against source row i and produced an out-of-fold frame
+        whose probabilities and labels came from different rows.
         """
-        return getattr(self.model, "oof", None)
+        inner = getattr(self.model, "oof", None)
+        if inner is None:
+            return None
+        return dataclasses.replace(inner, sample=f"augmented_lines:{self.stat}")
 
     def predict_distribution(self, features: pd.DataFrame) -> pd.DataFrame:
         """Mean and spread come from the wrapped model, unchanged."""

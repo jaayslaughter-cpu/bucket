@@ -90,3 +90,87 @@ def test_every_weighted_component_can_actually_be_built():
     weighted = {k for k, v in cfg["ensemble_weights"].items() if v > 0}
     missing = sorted(weighted - built)
     assert not missing, f"weighted but never built: {missing}"
+
+
+# --- cubic review, PR #3: line-aware OOF sample identity --------------------
+
+
+def _oof(frame, sample=None):
+    from src.models.oof import OutOfFoldPredictions
+
+    return OutOfFoldPredictions(frame, n_folds=3, sample=sample)
+
+
+class _Stub:
+    def __init__(self, frame, sample=None):
+        self.oof = _oof(frame, sample)
+
+
+def _source_frame(prob: float, n: int = 100):
+    y = np.tile([0.0, 1.0], n // 2)
+    return pd.DataFrame({"prob_over": np.full(n, prob), "y_over": y},
+                        index=pd.RangeIndex(n))
+
+
+def _augmented_frame(n: int = 100, offsets: int = 9):
+    """What line_aware produces: one row per (source row, candidate line),
+    reset to a fresh RangeIndex — which collides with the source-row one."""
+    y = np.tile([0.0, 1.0], n // 2)
+    return pd.DataFrame(
+        {"prob_over": np.linspace(0.01, 0.99, n * offsets),
+         "y_over": np.repeat(y, offsets)},
+        index=pd.RangeIndex(n * offsets),
+    )
+
+
+def test_ensemble_declines_to_blend_oof_frames_over_different_samples():
+    """line_aware trains on source x candidate-line pairs and resets to a
+    fresh RangeIndex, so its labels collide with the source-row index every
+    other component carries — both start at 0 over different universes.
+    Intersecting by label paired augmented row i with source row i and built a
+    blend whose probabilities and labels came from different rows."""
+    from src.models.ensemble import EnsemblePropModel
+
+    ens = EnsemblePropModel(
+        {"xgboost": _Stub(_source_frame(0.6)),
+         "catboost": _Stub(_source_frame(0.4)),
+         "line_aware": _Stub(_augmented_frame(), "augmented_lines:PTS")},
+        weights={"xgboost": 0.5, "catboost": 0.3, "line_aware": 0.2},
+    )
+
+    assert ens.oof is None, "blended mismatched samples instead of declining"
+
+
+def test_ensemble_still_blends_when_every_component_shares_the_sample():
+    """The guard must not disable the fast path for the ordinary case."""
+    from src.models.ensemble import EnsemblePropModel
+
+    ens = EnsemblePropModel(
+        {"xgboost": _Stub(_source_frame(0.6)), "catboost": _Stub(_source_frame(0.4))},
+        weights={"xgboost": 0.5, "catboost": 0.5},
+    )
+
+    result = ens.oof
+    assert result is not None
+    assert len(result.frame) == 100
+    assert result.frame["prob_over"].iloc[0] == pytest.approx(0.5)
+    assert result.sample is None
+
+
+def test_line_aware_labels_its_oof_as_an_augmented_sample():
+    """The ensemble guard only works because line_aware says what its rows are.
+    Without the label the frames look interchangeable."""
+    from src.models.line_aware import LineAwarePropModel
+
+    class _Inner:
+        oof = None
+
+    model = LineAwarePropModel.__new__(LineAwarePropModel)
+    model.stat = "PTS"
+    model.model = _Inner()
+    assert model.oof is None, "no inner oof must stay None"
+
+    model.model.oof = _oof(_augmented_frame())
+    labelled = model.oof
+    assert labelled.sample == "augmented_lines:PTS"
+    assert labelled.n_folds == 3, "wrapping must not lose the fold count"

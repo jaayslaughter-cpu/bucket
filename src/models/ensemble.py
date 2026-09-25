@@ -70,6 +70,27 @@ class EnsemblePropModel:
         if len(usable) < 2:
             return None
 
+        # Every frame must label the SAME rows. line_aware's index is a fresh
+        # RangeIndex over (source row x candidate line) pairs and collides with
+        # the source-row index the other components carry -- both start at 0
+        # over different universes, so intersecting by label paired augmented
+        # row i with source row i and produced a blend whose probabilities and
+        # labels came from different rows. Declining the fast path is the only
+        # safe answer: dropping the odd component out would blend a different
+        # mix of models than the weights describe, which is the very thing the
+        # shared-rows rule above exists to prevent.
+        samples = {o.sample for o in usable.values()}
+        if len(samples) > 1:
+            logger.warning(
+                "ensemble %s: components disagree about which rows their "
+                "out-of-fold frames describe (%s), so the blended fast path is "
+                "declined rather than aligning indexes that mean different "
+                "things. Calibration falls back to the slower refit.",
+                self.target_market,
+                sorted(x or "source_rows" for x in samples),
+            )
+            return None
+
         frames = {n: o.frame for n, o in usable.items()}
         shared = None
         for frame in frames.values():
@@ -94,6 +115,7 @@ class EnsemblePropModel:
                 index=shared,
             ),
             n_folds=min(o.n_folds for o in usable.values()),
+            sample=next(iter(samples)),
         )
 
     def __init__(

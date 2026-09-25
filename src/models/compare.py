@@ -333,6 +333,11 @@ def fit_calibrator_from_earlier_data(
 
     info = {
         "method": calibrator.method,
+        # Name the path. Without this a model that fell back here exported
+        # calibration_source: null, which reads as "no calibration" rather
+        # than "calibrated the slower way" -- and the ensemble falls back
+        # whenever a component's out-of-fold frame describes different rows.
+        "source": "chronological_refit",
         "n_rows": int(ok.sum()),
         "scores": scores,
         "fit_start_date": str(pd.to_datetime(later["GAME_DATE"]).min().date())

@@ -154,10 +154,22 @@ def test_the_shared_path_sees_more_rows_than_the_old_holdout(comparison):
     assert shared > holdout * 2
 
 
-def test_the_ensemble_calibrates_without_refitting_every_component(comparison):
-    """Rebuilding the blend to calibrate it was the most expensive refit."""
+def test_the_ensemble_names_which_calibration_path_it_took(comparison):
+    """Rebuilding the blend to calibrate it was the most expensive refit, and
+    blending the components' own out-of-fold frames avoided it.
+
+    This asserted "shared_out_of_fold" unconditionally. It cannot: line_aware
+    trains on (source row x candidate line) pairs, so its out-of-fold frame
+    describes different rows than the other components'. The fast path used to
+    "work" there only by intersecting two RangeIndexes that both start at 0
+    over different universes -- pairing augmented row i with source row i. With
+    line_aware weighted, declining to the refit is the correct answer, and the
+    field must say so rather than exporting null.
+    """
     rows = {r["model_name"]: r for r in comparison["summary"]}
-    assert rows["ensemble"]["calibration_source"] == "shared_out_of_fold"
+    source = rows["ensemble"]["calibration_source"]
+    assert source in ("shared_out_of_fold", "chronological_refit"), source
+    assert source is not None, "a calibrated model must name its path"
 
 
 def test_calibrated_metrics_are_reported_alongside_the_raw_ones(comparison):
@@ -175,3 +187,98 @@ def test_calibrated_metrics_are_reported_alongside_the_raw_ones(comparison):
     # On this panel calibration is doing real work on the boosted classifier.
     assert xgb["calibration_error_calibrated"] < xgb["calibration_error"]
     assert xgb["brier_score_calibrated"] < xgb["brier_score"]
+
+
+def _slate_frame(n_days: int = 60, seed: int = 0) -> pd.DataFrame:
+    """Player-games across whole slates of VARYING size, two tips per night.
+
+    Slate size must be irregular, as on the real panel (min 20, median 153,
+    max 318). Two earlier versions of this fixture used a constant or a short
+    repeating size, and in both the fold blocks happened to divide exactly
+    onto slate boundaries -- so the positional split landed cleanly and the
+    defect disappeared from the fixture while remaining in production. With a
+    seeded irregular size it straddles 3 days, which is what the real training
+    window does.
+
+    Two tip-off times matter too: GAME_DATE is a full timestamp, so grouping
+    on it raw treats one night as two groups and leaves the slate split.
+    """
+    rng = np.random.default_rng(seed)
+    rows = []
+    for d, size in zip(pd.date_range("2025-01-01", periods=n_days, freq="D"),
+                       rng.integers(20, 41, size=n_days)):
+        for k in range(int(size)):
+            hour = 19 if k % 2 else 22
+            rows.append({"GAME_DATE": d + pd.Timedelta(hours=hour), "f": float(k)})
+    return pd.DataFrame(rows).sort_values("GAME_DATE").reset_index(drop=True)
+
+
+def test_oof_folds_never_split_a_slate_across_the_boundary():
+    """A positional TimeSeriesSplit cuts by row number, so a fold boundary
+    lands mid-slate and a fold trains on one game's over_hit from a night
+    while predicting another game from that same night. Grouping must be by
+    CALENDAR DAY: GAME_DATE carries a tip-off time, and grouping on the raw
+    timestamp left 2 of 3 straddled days still straddling."""
+    from src.models.oof import _fold_indices
+
+    X = _slate_frame()
+    day = X["GAME_DATE"].dt.date
+    folds = _fold_indices(X, len(X), 3, "REB")
+
+    assert folds, "no folds produced"
+    for i, (train_idx, valid_idx) in enumerate(folds, 1):
+        shared = set(day.iloc[train_idx]) & set(day.iloc[valid_idx])
+        assert not shared, f"fold {i} has slate(s) on both sides: {sorted(shared)}"
+        assert train_idx.max() < valid_idx.min(), f"fold {i} is not chronological"
+
+
+def test_oof_positional_folds_would_have_straddled_a_slate():
+    """Pins the defect this guards against: the same frame under a bare
+    positional split does put one night on both sides."""
+    from sklearn.model_selection import TimeSeriesSplit
+
+    X = _slate_frame()
+    day = X["GAME_DATE"].dt.date
+    straddled = 0
+    for train_idx, valid_idx in TimeSeriesSplit(n_splits=3).split(np.arange(len(X))):
+        straddled += len(set(day.iloc[train_idx]) & set(day.iloc[valid_idx]))
+    assert straddled > 0, "fixture no longer reproduces the positional straddle"
+
+
+def test_oof_falls_back_when_it_cannot_group_by_day():
+    """No GAME_DATE, or too few days to fold, must still return usable folds
+    rather than raising — with a warning, not silence."""
+    from src.models.oof import _fold_indices
+
+    bare = pd.DataFrame({"f": np.arange(400, dtype=float)})
+    assert len(_fold_indices(bare, 400, 3, "X")) == 3
+
+    two_days = pd.DataFrame({
+        "GAME_DATE": pd.to_datetime(["2025-01-01"] * 200 + ["2025-01-02"] * 200),
+    })
+    assert len(_fold_indices(two_days, 400, 3, "X")) == 3
+
+
+def test_the_public_oof_pass_actually_uses_day_grouped_folds():
+    """The helper being correct is not enough — this proves the public entry
+    point routes through it. Reverting chronological_oof_probabilities to a
+    bare positional split leaves the helper untouched and its own test still
+    green, so without this the fix could be undone invisibly."""
+    from src.models.oof import chronological_oof_probabilities
+
+    X = _slate_frame()
+    y = np.tile([0.0, 1.0], len(X))[: len(X)]
+    seen: list[tuple[set, set]] = []
+
+    def _fit_predict(rows_tr, y_tr, rows_va):
+        seen.append((set(rows_tr["GAME_DATE"].dt.date),
+                     set(rows_va["GAME_DATE"].dt.date)))
+        return np.full(len(rows_va), 0.5)
+
+    chronological_oof_probabilities(_fit_predict, X, y, market="REB")
+
+    assert seen, "no fold ever called the fitter"
+    for i, (train_days, valid_days) in enumerate(seen, 1):
+        shared = train_days & valid_days
+        assert not shared, f"fold {i} trained and predicted on slate(s) {sorted(shared)}"
+        assert max(train_days) < min(valid_days), f"fold {i} is not chronological"
