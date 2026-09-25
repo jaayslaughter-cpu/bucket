@@ -231,6 +231,11 @@ def main(argv: list[str] | None = None) -> int:
             "fitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "panel": str(args.panel),
             "train_end": str(args.train_end),
+            # fit_fraction decides the holdout split as much as train_end does,
+            # so two runs at different fractions would otherwise be
+            # indistinguishable from their metadata while carrying different
+            # weights -- the same ambiguity this block exists to remove.
+            "fit_fraction": float(args.fit_fraction),
             "configured_at_fit_time": configured,
             "per_market": per_market,
             "pooled": pooled,
