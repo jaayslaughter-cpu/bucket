@@ -95,3 +95,50 @@ Layer 'pbp' under test: ['PBP_PACE_ON_COURT_L5', 'PBP_PACE_ON_COURT_L10', 'PBP_S
 
 Lower is better for every metric above. A mean delta smaller than the fold-to-fold sd is not evidence;
 neither is a single fold, which is why --folds defaults to a number you should raise.
+
+================================================================================
+PBP_GAME_PACE_L10 ON ITS OWN — 2026-09-25
+================================================================================
+
+Question: does game pace earn a place beside DEF_PACE_L10, the only other pace
+column any market reads? (r = 0.04 between them, so this is not a redundancy
+question. PACE_ROLL correlates 0.82 but NO model reads it, so the A/B I first
+proposed — pace against PACE_ROLL — was measuring nothing.)
+
+Setup: scripts/feature_ab.py --layer pbp_pace --markets REB,AST --folds 4,
+both arms restricted to the five seasons with event logs (129,059 rows),
+validation 2025-01-15 -> 2025-03-29. Each market reads exactly one of the two
+columns (PBP_GAME_PACE_L10), so this is a clean single-feature ablation.
+
+ANSWER: NO. It does not earn its place.
+
+Across 32 model/metric rows (excluding `distribution`, which reads no tree
+features and is unaffected by construction):
+
+  improving rows clearing their own fold spread : 0
+  worsening rows clearing their own fold spread : 2
+  best improvement seen                         : 0.84x sd  (not evidence)
+
+The only deltas that clear the threshold are HARM, both on CatBoost/AST:
+
+  AST catboost ECE cal  +0.00275  sd 0.00070  3.93x  worse in 4 of 4 folds
+  AST catboost ECE raw  +0.00220  sd 0.00159  1.38x  worse in 3 of 4 folds
+
+11 of 32 rows improved, 21 got worse or stayed flat — about what a coin would
+do, except that the one consistent signal points the wrong way.
+
+READ THIS AGAINST THE FULL-LAYER RESULT ABOVE. The whole pbp layer helps REB
+and AST at 4/4 folds. That gain is therefore coming from the SHOT-MIX columns
+(RIM_RATE, GARBAGE_SHOT_SHARE, ASSISTED_RATE), not from pace. Pace is the one
+member of the layer measured on its own, and it carries nothing.
+
+That is consistent with what the column is: PBP_GAME_PACE is a GAME constant —
+every player in a game shares the value — so after rolling it is close to a
+team-schedule feature, and the panel already gives the model opponent context
+through DEF_* and ELO_*.
+
+RECOMMENDED (not applied — this changes shipped model behaviour):
+drop PBP_GAME_PACE_L10 from _PBP_BY_MARKET["REB"] and ["AST"] in
+src/models/labels.py, exactly as PTS was set to () on measured evidence.
+Leave the column in the panel; it costs nothing there and is worth keeping
+for research.
