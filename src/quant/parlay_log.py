@@ -51,7 +51,7 @@ import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, get_args
 from uuid import uuid4
 
 import pandas as pd
@@ -297,6 +297,32 @@ def _same_value(before: Any, after: Any) -> bool:
     return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-15)
 
 
+def _string_columns() -> frozenset[str]:
+    """Columns that must be read back as text, taken from the record models.
+
+    A column is text if `str` appears anywhere in its annotation -- `str`,
+    `str | None`, or a Literal of strings. Deriving it here means a field added
+    to either record is covered without anyone remembering to update a list,
+    which is the failure this whole module keeps running into: two sides of one
+    contract maintained separately.
+    """
+    found: set[str] = set()
+    for model in (ParlayTicketRecord, ParlayLegRecord):
+        for name, field in model.model_fields.items():
+            annotation = field.annotation
+            if annotation is str:
+                found.add(name)
+                continue
+            args = get_args(annotation)
+            if args and any(
+                arg is str or isinstance(arg, str) for arg in args
+            ):
+                found.add(name)
+    # Written as JSON text; parsed back by the model's own validator.
+    found.update(_JSON_TICKET_FIELDS)
+    return frozenset(found)
+
+
 def _ticket_row(ticket: ParlayTicketRecord) -> dict[str, Any]:
     """A ticket as one CSV row, with its structured fields as JSON.
 
@@ -501,12 +527,34 @@ class ParlayLogStore:
     def _read(self, path: Path) -> pd.DataFrame:
         if not path.exists():
             return pd.DataFrame()
-        # float_precision="round_trip" is not a nicety here. pandas writes the
-        # full 17 significant digits but its default C parser reads back only
-        # 16, so 0.28017718715393136 became 0.2801771871539313 -- a stored
+        # Two reader settings, each fixing a way the CSV did not round-trip.
+        #
+        # float_precision="round_trip": pandas writes the full 17 significant
+        # digits but its default C parser reads back only 16, so
+        # 0.28017718715393136 became 0.2801771871539313 -- a stored
         # joint_probability that no longer equalled the one computed, and a
         # frozen-field check that saw every float as changed.
-        return pd.read_csv(path, float_precision="round_trip")
+        #
+        # dtype: an identifier column whose values happen to be all digits is
+        # inferred as int64. Two consequences, both silent:
+        #   * ticket_id is uuid4().hex[:16], which is all digits about 1 run in
+        #     433 ((10/16)**16). On such a run the stored id reads back as
+        #     int 6204641547604808, `ticket_id not in set(...)` is True for the
+        #     equal string, and update_settlement refuses with "not in the log".
+        #     This is why the suite passed 719/719 locally and failed in CI.
+        #   * game_id is worse because it is not probabilistic. NBA ids are
+        #     zero-padded and always numeric, so "0022500001" read back as
+        #     22500001 on EVERY row, losing the padding that joins a leg to its
+        #     box score.
+        # The dtype map is derived from the records themselves rather than
+        # hardcoded, so a field added to a model cannot drift away from it.
+        dtypes = {c: "string" for c in _string_columns()}
+        header = pd.read_csv(path, nrows=0).columns
+        return pd.read_csv(
+            path,
+            float_precision="round_trip",
+            dtype={c: t for c, t in dtypes.items() if c in header},
+        )
 
     def load_tickets(self) -> pd.DataFrame:
         return self._read(self.tickets_path)

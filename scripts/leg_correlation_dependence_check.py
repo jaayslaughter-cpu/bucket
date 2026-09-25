@@ -34,7 +34,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from src.quant.leg_correlation import realised_leg_outcomes
+from src.quant.leg_correlation import LegCorrelationError, realised_leg_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,14 @@ def main() -> int:
         return 2
 
     panel = pd.read_parquet(args.panel)
-    outcomes = realised_leg_outcomes(panel, markets=markets, as_of=args.as_of)
+    try:
+        outcomes = realised_leg_outcomes(panel, markets=markets, as_of=args.as_of)
+    except LegCorrelationError as exc:
+        # No games before --as-of, or neither market usable in this panel. That
+        # is a named absence, not a crash: this script is read by people
+        # checking a number, and a traceback tells them less than the reason.
+        print(f"DATA_NOT_AVAILABLE: {exc}")
+        return 2
 
     # One row per (game, player) carrying both markets' outcomes. Rows where
     # either market is missing or pushed are already dropped upstream.

@@ -376,3 +376,73 @@ def test_a_log_written_with_python_repr_still_reads():
     )
     assert reloaded.leg_ids == ["L1", "L2"]
     assert reloaded.model_logic == {"min_ev": 0.02}
+
+
+# --- the CSV must give back the types it was handed ----------------------
+
+
+def test_an_all_digit_ticket_id_survives_the_round_trip(tmp_path):
+    """
+    ticket_id is uuid4().hex[:16], which is ALL DIGITS about one run in 433
+    ((10/16)**16). pandas then infers int64 on read, `ticket_id not in
+    set(tickets["ticket_id"])` is True for the equal string, and
+    update_settlement refuses a real settlement with "is not in the log".
+
+    This is why the suite passed 719/719 locally and failed in CI on the draw
+    6204641547604808. Pinned with that exact id so it is no longer a coin flip.
+    """
+    store = ParlayLogStore(tmp_path)
+    ticket, legs = _ticket()
+    ticket.ticket_id = "6204641547604808"
+    for leg in legs:
+        leg.ticket_id = ticket.ticket_id
+    store.append(ticket, legs)
+
+    stored = store.load_tickets()
+    assert stored["ticket_id"].iloc[0] == ticket.ticket_id
+    assert ticket.ticket_id in set(stored["ticket_id"])
+
+    for leg in legs:
+        leg.leg_result = "WIN"
+    graded, graded_legs = grade_parlay(ticket, legs)
+    store.update_settlement(graded, graded_legs)
+    assert store.load_tickets().iloc[0]["ticket_result"] == "WIN"
+
+
+def test_a_zero_padded_game_id_keeps_its_padding(tmp_path):
+    """
+    Not probabilistic, unlike the id above: NBA game ids are zero-padded and
+    always numeric, so "0022500001" was inferred as int64 and read back as
+    22500001 on EVERY row — losing the padding that joins a leg to its box
+    score, in the one column the at-bet-time freeze was just extended to cover.
+    """
+    store = ParlayLogStore(tmp_path)
+    padded = [
+        ParlayLeg("L1", 0.60, -110, game_id="0022500001", line=24.5,
+                  market="PTS", side="over", player_name="A"),
+        ParlayLeg("L2", 0.55, -115, game_id="0022500002", line=7.5,
+                  market="AST", side="over", player_name="B"),
+    ]
+    evaluation = evaluate_parlay(padded)
+    assert evaluation.status == "OK", evaluation.reason
+    ticket, legs = ticket_from_evaluation(evaluation, padded, slate_date="2026-09-21")
+    store.append(ticket, legs)
+
+    read_back = store.load_legs().sort_values("leg_id")
+    assert list(read_back["game_id"]) == ["0022500001", "0022500002"]
+
+
+def test_the_text_columns_are_derived_from_the_records_not_a_list(tmp_path):
+    """The dtype map is built from the models, so a str field added to either
+    record is covered without anyone updating a hardcoded list. Pins that the
+    derivation actually reaches both records and the JSON-encoded fields."""
+    from src.quant.parlay_log import _string_columns
+
+    columns = _string_columns()
+    for field in ("ticket_id", "leg_id", "game_id", "player_id", "slate_date",
+                  "side", "market", "leg_result", "ticket_result",
+                  "leg_ids", "model_logic"):
+        assert field in columns, field
+    # Numeric fields must NOT be forced to text, or arithmetic downstream breaks.
+    for field in ("model_prob", "joint_probability", "unit_stake", "line"):
+        assert field not in columns, field
