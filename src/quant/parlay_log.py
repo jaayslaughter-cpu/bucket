@@ -537,11 +537,14 @@ class ParlayLogStore:
         #
         # dtype: an identifier column whose values happen to be all digits is
         # inferred as int64. Two consequences, both silent:
-        #   * ticket_id is uuid4().hex[:16], which is all digits about 1 run in
-        #     433 ((10/16)**16). On such a run the stored id reads back as
-        #     int 6204641547604808, `ticket_id not in set(...)` is True for the
-        #     equal string, and update_settlement refuses with "not in the log".
-        #     This is why the suite passed 719/719 locally and failed in CI.
+        #   * ticket_id is uuid4().hex[:16], which is all digits about 1 run
+        #     in 1,150. Only 15 of the 16 nibbles are random -- hex[12] is the
+        #     uuid4 version nibble, always "4" -- so the rate is (10/16)**15,
+        #     measured at 0.000866 over 4,000,000 draws. On such a run the
+        #     stored id reads back as int 6204641547604808, `ticket_id not in
+        #     set(...)` is True for the equal string, and update_settlement
+        #     refuses with "not in the log". This is why the suite passed
+        #     719/719 locally and failed in CI.
         #   * game_id is worse because it is not probabilistic. NBA ids are
         #     zero-padded and always numeric, so "0022500001" read back as
         #     22500001 on EVERY row, losing the padding that joins a leg to its

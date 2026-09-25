@@ -383,8 +383,13 @@ def test_a_log_written_with_python_repr_still_reads():
 
 def test_an_all_digit_ticket_id_survives_the_round_trip(tmp_path):
     """
-    ticket_id is uuid4().hex[:16], which is ALL DIGITS about one run in 433
-    ((10/16)**16). pandas then infers int64 on read, `ticket_id not in
+    ticket_id is uuid4().hex[:16], which is ALL DIGITS about one run in 1,150.
+    Only 15 of those 16 nibbles are random: hex[12] is the uuid4 version
+    nibble and is always "4", itself a digit. So the rate is (10/16)**15 =
+    1 in 1,153, not (10/16)**16. Measured directly over 4,000,000 draws:
+    0.000866, i.e. 1 in 1,155.
+
+    On such a draw pandas infers int64 on read, `ticket_id not in
     set(tickets["ticket_id"])` is True for the equal string, and
     update_settlement refuses a real settlement with "is not in the log".
 
