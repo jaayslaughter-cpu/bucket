@@ -52,9 +52,14 @@ jobs:
       - name: Lint (ruff)
         run: python -m ruff check .
 
-      # No network in CI, and nothing in the suite should need it: every test
-      # builds its own fixtures. A test that starts reaching out to
-      # stats.nba.com or kaggle.com should fail here rather than pass locally
-      # and behave unpredictably in review.
-      - name: Tests
-        run: python -m pytest tests/ -q
+      # Sockets are DENIED, not merely unused. This comment previously said
+      # "no network in CI" while the job left outbound networking wide open,
+      # so a test that started calling stats.nba.com or kaggle.com would have
+      # passed here and behaved unpredictably in review -- the claim was not
+      # enforced by anything. --disable-socket makes it true. Unix sockets
+      # stay allowed because they are local IPC, not the network.
+      #
+      # Verified before enabling rather than assumed: the whole suite passes
+      # with sockets blocked, so nothing in it reaches out today.
+      - name: Tests (network denied)
+        run: python -m pytest tests/ -q --disable-socket --allow-unix-socket

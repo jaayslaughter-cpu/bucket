@@ -37,4 +37,5 @@ rapidfuzz>=3.6.0
 
 # --- dev / test ---
 pytest>=8.0.0
+pytest-socket>=0.7.0     # CI runs with --disable-socket; see .github/workflows/tests.yml
 ruff>=0.5.0
