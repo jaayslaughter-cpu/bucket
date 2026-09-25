@@ -1057,6 +1057,7 @@ def test_a_fold_model_skips_the_mean_head_it_never_uses():
     CatBoostRegressor and ran the dispersion cross-validation — while
     predict_probability_over, the only thing the callback calls, reads
     self.model alone. Every fold paid for a mean head nothing then read."""
+    pytest.importorskip("catboost")
     from src.models.catboost_pipeline import CatBoostPropPipeline
 
     fold = CatBoostPropPipeline(
@@ -1079,6 +1080,7 @@ def test_a_fold_model_skips_the_mean_head_it_never_uses():
 def test_a_normal_fit_still_trains_the_mean_head():
     """The skip must be opt-in: a production fit needs the mean head and the
     dispersion for push mass."""
+    pytest.importorskip("catboost")
     from src.models.catboost_pipeline import CatBoostPropPipeline
 
     pipe = CatBoostPropPipeline(
