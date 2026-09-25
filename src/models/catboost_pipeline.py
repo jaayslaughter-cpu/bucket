@@ -63,6 +63,13 @@ class CatBoostPropPipeline:
         self.feature_cols = list(feature_cols)
         self.oof = None
         self._skip_oof = False
+        # A fold model exists only to produce out-of-fold classifier
+        # probabilities. _fit_mean_head trains a CatBoostRegressor and runs the
+        # dispersion cross-validation, and predict_probability_over -- the only
+        # thing the fold callback calls -- reads self.model alone. So every
+        # fold was paying for a mean head and a residual CV that nothing then
+        # read. Skipping it cannot change the out-of-fold values.
+        self._skip_mean_head = False
         self.target_market = target_market
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
@@ -212,7 +219,14 @@ class CatBoostPropPipeline:
             fit_kwargs["early_stopping_rounds"] = early
         self.model.fit(train_pool, **fit_kwargs)
 
-        self._fit_mean_head(train)
+        if getattr(self, "_skip_mean_head", False):
+            logger.info(
+                "catboost %s: fold model — mean head and dispersion CV skipped; "
+                "only the classifier is needed for out-of-fold probabilities.",
+                self.target_market,
+            )
+        else:
+            self._fit_mean_head(train)
 
         self._meta_extra = {
             "train_row_count": len(train),
@@ -351,6 +365,7 @@ class CatBoostPropPipeline:
                 hyperparameters={k: v for k, v in params.items()},
             )
             fold._skip_oof = True          # a fold model is a leaf
+            fold._skip_mean_head = True    # and needs only its classifier
             fold.fit(rows_tr)
             # The REAL line, not NaN. predict_probability_over abstains on an
             # unusable line by design, so a NaN placeholder made every fold
