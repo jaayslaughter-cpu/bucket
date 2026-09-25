@@ -6,8 +6,13 @@
 name: tests
 
 on:
+  # push is DEFAULT BRANCH ONLY. Triggering on every branch ran the suite
+  # twice for one commit once a PR was open -- github fires push and
+  # pull_request both, and their github.ref values differ
+  # (refs/heads/<branch> vs refs/pull/<n>/merge) so the concurrency group
+  # below could not dedupe them. Branch work is covered by pull_request.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
