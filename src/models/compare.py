@@ -236,6 +236,55 @@ def build_components(
     return components
 
 
+
+def apply_calibration(preds, p_over, calibrator) -> np.ndarray:
+    """
+    Calibrate P(over) and write the calibrated fields onto ``preds``.
+
+    FIT AND APPLY MUST SPEAK THE SAME PROBABILITY. The calibrator is fitted on
+    out-of-fold values from ``predict_proba_over``, which is the raw classifier
+    P(over) with no push mass removed -- CONDITIONAL on the line not pushing.
+    ``probability_over`` has already had push carved out, as
+    ``(1 - p_push) * p_raw``. Feeding that in handed the calibrator a different
+    quantity than it was fitted on, and scaling the result by ``open_mass``
+    then removed the push mass a SECOND time.
+
+    Not a dormant corner: RESEARCH_LINE is a ten-game rolling mean, so about
+    11% of its values are whole numbers, where the empirical push rate is 0.9%
+    (PTS), 2.0% (REB) and 3.1% (AST).
+
+    So: un-carve to the conditional quantity, calibrate, carve exactly once.
+    Returns the calibrated CONDITIONAL probabilities (NaN where unavailable),
+    which is what the scoring path compares against ``over_hit`` -- that label
+    drops pushes, so it is conditional too.
+    """
+    push_mass = np.array(
+        [float(p.probability_push or 0.0) for p in preds], dtype=float
+    )
+    open_mass = np.clip(1.0 - push_mass, 0.0, 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        conditional = np.where(open_mass > 0, np.asarray(p_over, dtype=float) / open_mass, np.nan)
+    conditional = np.clip(conditional, 0.0, 1.0)
+
+    p_cal = np.full(len(push_mass), np.nan, dtype=float)
+    if calibrator is None:
+        return p_cal
+
+    usable = np.isfinite(conditional)
+    if usable.any():
+        p_cal[usable] = calibrator.transform(conditional[usable])
+    for pred, value, mass in zip(preds, p_cal, open_mass):
+        if np.isfinite(value):
+            # The calibrated number is P(over | not a push); scale it into the
+            # non-push mass. Subtracting push from the calibrated over instead
+            # lets the under go negative whenever isotonic saturates at 1.0 on
+            # a whole line.
+            conditional_over = float(np.clip(value, 0.0, 1.0))
+            pred.probability_over_calibrated = round(conditional_over * mass, 6)
+            pred.probability_under_calibrated = round((1.0 - conditional_over) * mass, 6)
+    return p_cal
+
+
 def fit_calibrator_from_earlier_data(
     name: str,
     market: str,
@@ -513,24 +562,11 @@ def compare_models_on_panel(
                 name, market, feature_cols, xgb_cols, cfg, train,
                 fitted_model=model,
             )
-            p_cal = np.full_like(p_over, np.nan)
+            # Fit and apply must speak the same probability -- see
+            # apply_calibration, which un-carves push mass before transforming
+            # and carves it back exactly once.
+            p_cal = apply_calibration(preds, p_over, calibrator)
             if calibrator is not None:
-                usable = np.isfinite(p_over)
-                if usable.any():
-                    p_cal[usable] = calibrator.transform(p_over[usable])
-                for pred, value in zip(preds, p_cal):
-                    if np.isfinite(value):
-                        # Treat the calibrated number as P(over | not a push) and
-                        # scale it into the non-push mass. Subtracting push from
-                        # the calibrated over instead lets the under go negative
-                        # whenever isotonic saturates at 1.0 on a whole line.
-                        push = float(pred.probability_push or 0.0)
-                        open_mass = max(0.0, 1.0 - push)
-                        conditional_over = float(np.clip(value, 0.0, 1.0))
-                        pred.probability_over_calibrated = round(conditional_over * open_mass, 6)
-                        pred.probability_under_calibrated = round(
-                            (1.0 - conditional_over) * open_mass, 6
-                        )
                 calibration_meta[(market, name)] = calib_info
             else:
                 logger.info(
