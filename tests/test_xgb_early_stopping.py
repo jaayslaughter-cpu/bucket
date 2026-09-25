@@ -197,3 +197,63 @@ def test_fold_searches_stay_inside_the_training_rows(esr):
     assert pipe.cv_best_iterations_
     # Every fold's best iteration is bounded by the search ceiling.
     assert all(1 <= b <= pipe.tuning["n_estimators_max"] for b in pipe.cv_best_iterations_)
+
+
+# --- cubic review, PR #3: folds must inherit the configured tuning -----------
+
+
+def _labelled_rows(n: int = 300) -> pd.DataFrame:
+    rng = np.random.default_rng(0)
+    return pd.DataFrame({
+        "f": rng.normal(size=n),
+        "GAME_DATE": pd.date_range("2025-01-01", periods=n, freq="h"),
+        "over_hit": np.tile([0.0, 1.0], n // 2),
+    })
+
+
+def test_oof_folds_inherit_the_configured_tuning_and_split_count(monkeypatch):
+    """tuning and n_splits are separate constructor arguments, so building the
+    fold pipeline with model_params alone left every fold on DEFAULT_TUNING
+    (n_estimators_max=2000) and n_splits=5. Those out-of-fold probabilities are
+    what the calibrator is fitted on, so it was corrected against a
+    differently-tuned model than the one it later corrects."""
+    import src.models.xgb_adapter as adapter_module
+
+    seen: list[dict] = []
+    real = adapter_module.XGBoostPropPipeline
+
+    class _Spy(real):
+        def __init__(self, feature_cols, **kwargs):
+            seen.append({
+                "n_splits": kwargs.get("n_splits"),
+                "n_estimators_max": (kwargs.get("tuning") or {}).get("n_estimators_max"),
+            })
+            super().__init__(feature_cols, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "XGBoostPropPipeline", _Spy)
+
+    model = adapter_module.XGBoostAdapter(
+        ["f"], n_splits=3, tuning={"n_estimators_max": 300, "early_stopping_rounds": 10},
+    )
+    seen.clear()
+    model._fit_out_of_fold(_labelled_rows())
+
+    assert seen, "no fold pipeline was constructed"
+    for fold in seen:
+        assert fold["n_splits"] == 3, f"fold got n_splits={fold['n_splits']}, not 3"
+        assert fold["n_estimators_max"] == 300, (
+            f"fold got n_estimators_max={fold['n_estimators_max']}, not 300"
+        )
+
+
+def test_the_saved_sidecar_records_the_tuning_that_produced_it():
+    """The load path reconstructs the pipeline from the sidecar, so a sidecar
+    without tuning/n_splits silently reverted a reloaded artifact to the
+    defaults. effective_params records the tree count the search LANDED on;
+    these are the settings that produced it."""
+    from src.models.xgb_adapter import XGBoostAdapter
+
+    model = XGBoostAdapter(["f"], n_splits=4, tuning={"n_estimators_max": 250})
+
+    assert model._pipe.tuning["n_estimators_max"] == 250
+    assert model._pipe.n_splits == 4
