@@ -59,11 +59,17 @@ the pace of the game the player appeared in, which is real information the
 box score does not carry per game, and which becomes player-specific only
 once it is rolled over each player's own schedule.
 
-It is also NOT independent of the panel's existing pace columns:
-PBP_GAME_PACE_L10 correlates 0.82 with PACE_ROLL and 0.78 with
-PACE_MULTIPLIER. That is the collinearity this module warns about two
-paragraphs up, and it is the reason this column should be measured against
-PACE_ROLL rather than assumed additive.
+On collinearity, stated precisely because a looser version of this note was
+wrong. PBP_GAME_PACE_L10 does correlate 0.82 with PACE_ROLL and 0.78 with
+PACE_MULTIPLIER -- but NO market reads either of those (PACE_MULTIPLIER is
+omitted on purpose, see src/models/labels.py, and PACE_ROLL is simply not in
+any feature list). Correlation with a column no model sees is not the
+collinearity this module warns about two paragraphs up. Among the pace
+columns the models DO read, the only other one is DEF_PACE_L10, and
+PBP_GAME_PACE_L10 correlates 0.04 with it -- effectively independent. So
+there is no redundancy here to remove; whether the column earns its place is
+a question about its own signal, which is what feature_ab's "pbp_pace" layer
+measures.
 
 RESEARCH ONLY.
 """

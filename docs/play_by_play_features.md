@@ -52,10 +52,15 @@ All as **prior-game rolling means**, L5 and L10.
 > (verified at a within-game standard deviation of 0.0). It is now computed
 > and named as what it is. Two consequences worth knowing before using it:
 > its total was also un-halved, counting both teams' possessions and putting
-> "pace" near 200 instead of the league's ~100; and it is **not independent**
-> of the panel's existing pace columns — `PBP_GAME_PACE_L10` correlates 0.82
-> with `PACE_ROLL` and 0.78 with `PACE_MULTIPLIER`. It only becomes
+> "pace" near 200 instead of the league's ~100; and it only becomes
 > player-specific after being rolled over each player's own schedule.
+>
+> **On collinearity — the precise version.** `PBP_GAME_PACE_L10` correlates
+> 0.82 with `PACE_ROLL` and 0.78 with `PACE_MULTIPLIER`, but **no market reads
+> either column**, so that is not a modelling concern. Among pace columns the
+> models actually read, the only other is `DEF_PACE_L10`, at r = 0.04 —
+> effectively independent. An earlier revision of this note called the 0.82 a
+> redundancy to remove; it is not.
 
 ### On-court time is reconstructed and validated
 

@@ -129,6 +129,19 @@ LAYERS: dict[str, Layer] = {
             "both arms must sit inside those seasons."
         ),
     ),
+    # Only _L10 is read by any market (labels.py), so _L5 rides along in the
+    # panel but changes nothing when toggled. Both are listed so the arm
+    # removes the whole column family rather than half of it.
+    "pbp_pace": Layer(
+        ("PBP_GAME_PACE_L5", "PBP_GAME_PACE_L10"),
+        note=(
+            "Game pace from the event log, on its own. PBP_GAME_PACE is a GAME "
+            "constant -- every player in a game shares the value -- so this asks "
+            "whether game pace earns a place beside DEF_PACE_L10, which is the "
+            "only other pace column any market reads (r = 0.04 between them; "
+            "PACE_ROLL correlates 0.82 but no model reads it)."
+        ),
+    ),
     "market_context": Layer(
         (
             "MKT_OPENING_SPREAD",
