@@ -13,9 +13,13 @@ import pytest
 
 from src.quant.parlay import ParlayLeg, evaluate_parlay
 from src.quant.parlay_log import (
+    AT_BET_TIME_FIELDS,
     SCHEMA_VERSION,
+    TICKET_AT_BET_TIME_FIELDS,
+    ParlayLegRecord,
     ParlayLogError,
     ParlayLogStore,
+    ParlayTicketRecord,
     assert_export_safe,
     grade_parlay,
     leg_calibration_frame,
@@ -243,3 +247,132 @@ def test_payload_shape_is_complete():
     for key in ("ticket_result", "net_return_units", "n_legs_void"):
         assert key in payload["tracking"]
     assert payload["metadata"]["placement_mode"] == "MANUAL_ONLY"
+
+
+# --- the snapshot the freeze used to miss --------------------------------
+
+_LEG_SETTLEMENT_FIELDS = frozenset({
+    "leg_result", "actual_stat", "void_reason", "closing_line",
+    "closing_odds_american", "clv_line_points", "clv_prob_points",
+    "settled_at_utc", "schema_version",
+})
+_TICKET_SETTLEMENT_FIELDS = frozenset({
+    "ticket_result", "n_legs_won", "n_legs_lost", "n_legs_void",
+    "settled_decimal_price", "settled_american_price", "net_return_units",
+    "settled_at_utc", "notes",
+})
+
+
+def test_every_snapshot_field_on_both_records_is_frozen():
+    """The frozen sets are enumerated by hand, so a field added to a record
+    and not to its set is rewritable and nothing says so. game_id and
+    model_push_prob were exactly that: snapshot fields absent from
+    AT_BET_TIME_FIELDS."""
+    leg_gap = set(ParlayLegRecord.model_fields) - AT_BET_TIME_FIELDS - _LEG_SETTLEMENT_FIELDS
+    assert not leg_gap, f"leg snapshot fields not frozen: {sorted(leg_gap)}"
+
+    ticket_gap = (
+        set(ParlayTicketRecord.model_fields)
+        - TICKET_AT_BET_TIME_FIELDS
+        - _TICKET_SETTLEMENT_FIELDS
+    )
+    assert not ticket_gap, f"ticket snapshot fields not frozen: {sorted(ticket_gap)}"
+
+
+@pytest.mark.parametrize("field,value", [("game_id", "G999"), ("model_push_prob", 0.42)])
+def test_a_legs_game_and_push_mass_cannot_be_rewritten(tmp_path, field, value):
+    """game_id is what the same-game correlation was chosen for and what the
+    leg is joined to a box score by; model_push_prob is the mass the win/lose
+    model was allowed to ignore. A settlement write moved L1 from G1 to G999
+    and its push mass from 0.0 to 0.42 without complaint."""
+    store = ParlayLogStore(tmp_path)
+    ticket, legs = _ticket()
+    store.append(ticket, legs)
+
+    for leg in legs:
+        leg.leg_result = "WIN"
+    graded, graded_legs = grade_parlay(ticket, legs)
+    setattr(graded_legs[0], field, value)
+    with pytest.raises(ParlayLogError, match=f"{field} changed"):
+        store.update_settlement(graded, graded_legs)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("joint_probability", 0.95),
+    ("ev_at_bet_time", 4.2),
+    ("ticket_american_price", 5000),
+    ("unit_stake", 100.0),
+    ("model_logic", {"rewritten": True}),
+])
+def test_the_tickets_own_snapshot_cannot_be_rewritten(tmp_path, field, value):
+    """
+    update_settlement validated every leg and then replaced the ticket row
+    wholesale with no comparison at all — so the two numbers the log exists to
+    compare against outcomes were the easiest things in it to rewrite. A
+    settlement write moved joint_probability from 0.330515 to 0.95,
+    ev_at_bet_time from 0.179664 to 4.2, and the price from +257 to +5000.
+    """
+    store = ParlayLogStore(tmp_path)
+    ticket, legs = _ticket()
+    store.append(ticket, legs)
+
+    for leg in legs:
+        leg.leg_result = "WIN"
+    graded, graded_legs = grade_parlay(ticket, legs)
+    setattr(graded, field, value)
+    with pytest.raises(ParlayLogError, match=f"{field} changed"):
+        store.update_settlement(graded, graded_legs)
+
+
+def test_a_legitimate_settlement_is_not_blocked_by_float_precision(tmp_path):
+    """The guard above must not reject an UNCHANGED value. pandas writes 17
+    significant digits and its default parser reads back 16, so
+    breakeven_probability 0.28017718715393136 returned as 0.2801771871539313
+    and the frozen check saw every computed float as rewritten."""
+    store = ParlayLogStore(tmp_path)
+    ticket, legs = _ticket()
+    store.append(ticket, legs)
+
+    stored = store.load_tickets().iloc[0]
+    for field in ("joint_probability", "breakeven_probability", "ev_at_bet_time",
+                  "ticket_decimal_price"):
+        assert stored[field] == getattr(ticket, field), field
+
+    for leg in legs:
+        leg.leg_result = "WIN"
+    graded, graded_legs = grade_parlay(ticket, legs)
+    store.update_settlement(graded, graded_legs)
+    assert store.load_tickets().iloc[0]["ticket_result"] == "WIN"
+
+
+def test_a_logged_ticket_can_be_read_back_into_its_record(tmp_path):
+    """
+    pandas serialises a dict or list with str(), which is Python repr and not
+    JSON, so a round trip left leg_ids as "['L1', 'L2', 'L3']" and model_logic
+    as "{'min_ev': 0.02, ...}" — strings pydantic rejects with list_type and
+    dict_type. `notify-discord --source parlay` reconstructs exactly this way
+    and could not reload ANY ticket the store had written.
+    """
+    store = ParlayLogStore(tmp_path)
+    ticket, legs = _ticket()
+    store.append(ticket, legs)
+
+    row = store.load_tickets().tail(1).iloc[0].dropna().to_dict()
+    reloaded = ParlayTicketRecord(**row)
+    assert reloaded.leg_ids == ["L1", "L2", "L3"]
+    assert reloaded.model_logic == {"min_ev": 0.02, "dispersion_family": "negbin"}
+    assert reloaded.joint_probability == ticket.joint_probability
+
+    leg_rows = store.load_legs()
+    for _, r in leg_rows.iterrows():
+        ParlayLegRecord(**r.dropna().to_dict())
+
+
+def test_a_log_written_with_python_repr_still_reads():
+    """Logs written before the JSON fix carry repr. Refusing them would make
+    the fix lose the history it was protecting."""
+    reloaded = ParlayTicketRecord(
+        ticket_id="abc", leg_ids="['L1', 'L2']", model_logic="{'min_ev': 0.02}",
+    )
+    assert reloaded.leg_ids == ["L1", "L2"]
+    assert reloaded.model_logic == {"min_ev": 0.02}

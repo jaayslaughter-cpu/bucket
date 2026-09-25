@@ -44,8 +44,10 @@ an api key, token, password, connection string or email address.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,7 +55,7 @@ from typing import Any, Literal, Mapping, Sequence
 from uuid import uuid4
 
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.quant.odds_math import american_to_decimal, decimal_to_american
 from src.utils.timezones import DISPLAY_TZ_NAME, format_pacific_iso, now_pacific
@@ -71,12 +73,44 @@ TicketResult = Literal["WIN", "LOSS", "VOID", "PENDING"]
 # rewritten, or the backtest grades the model on information it never had.
 AT_BET_TIME_FIELDS: frozenset[str] = frozenset({
     "ticket_id", "leg_id", "created_at_utc", "slate_date",
+    # game_id and model_push_prob were missing here while being snapshot
+    # fields on the record. game_id is what the same-game correlation was
+    # chosen for and what a leg is joined to a box score by; model_push_prob
+    # is the mass the two-outcome model was allowed to ignore. Both were
+    # silently rewritable on settlement -- a settlement write moved L1 from
+    # G1 to G999 and its push mass from 0.0 to 0.42 without complaint.
+    "game_id", "model_push_prob",
     "player_name", "player_id", "market", "line", "side",
     "taken_odds_american", "model_prob", "fair_prob_at_bet",
     "ev_at_bet_time", "edge_vs_devig", "book_source", "bookmaker",
     "model_version", "feature_schema_version", "dispersion_family",
     "confidence_tier", "edge_letter_grade",
 })
+
+# The TICKET's own snapshot. update_settlement validated every leg and then
+# replaced the ticket row wholesale with no comparison at all, so the numbers
+# the log exists to compare against outcomes were the easiest things in it to
+# rewrite: a settlement write moved joint_probability from 0.330515 to 0.95,
+# ev_at_bet_time from 0.179664 to 4.2 and the price from +257 to +5000.
+TICKET_AT_BET_TIME_FIELDS: frozenset[str] = frozenset({
+    "ticket_id", "created_at_utc", "created_at_pt", "slate_date",
+    "timezone_display", "n_legs", "leg_ids",
+    "ticket_decimal_price", "ticket_american_price",
+    "joint_probability", "joint_probability_stderr",
+    "independent_probability", "correlation_effect", "correlation_method",
+    "correlation_matrix_json", "breakeven_probability", "ev_at_bet_time",
+    # Your stake is a decision made at bet time; ROI is computed against it.
+    "unit_stake",
+    "model_logic",
+    "placement_mode", "research_status", "schema_version",
+})
+
+# Structured fields that a CSV flattens. pandas writes a dict or list with
+# str(), which is Python repr and not JSON, so `ParlayTicketRecord(**row)`
+# raised list_type on leg_ids and dict_type on model_logic -- the CLI's
+# `discord --source parlay` could not reload ANY ticket it had written. They
+# are written as JSON and parsed back on construction.
+_JSON_TICKET_FIELDS: tuple[str, ...] = ("leg_ids", "model_logic")
 
 _SECRET_PATTERNS = (
     re.compile(r"api[_-]?key", re.I),
@@ -184,6 +218,30 @@ class ParlayTicketRecord(BaseModel):
     schema_version: str = SCHEMA_VERSION
     notes: str = ""
 
+    @field_validator(*_JSON_TICKET_FIELDS, mode="before")
+    @classmethod
+    def _parse_flattened(cls, value: Any) -> Any:
+        """Accept the string a CSV round trip leaves behind.
+
+        The store writes these as JSON, but logs written before that did so
+        carry Python repr (single quotes), which json.loads rejects. Both are
+        accepted here so an existing log stays readable; literal_eval parses
+        only literals and evaluates nothing.
+        """
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return value
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return ast.literal_eval(text)
+        except (TypeError, ValueError, SyntaxError):
+            return value
+
 
 # ---------------------------------------------------------------------------
 # export safety
@@ -213,6 +271,46 @@ def assert_export_safe(payload: Any, *, path: str = "payload") -> None:
                     f"{path}: value matches {pattern.pattern!r} — refusing to write a "
                     "credential, connection string or email address into the log."
                 )
+
+
+# ---------------------------------------------------------------------------
+# the CSV row form
+# ---------------------------------------------------------------------------
+
+
+def _same_value(before: Any, after: Any) -> bool:
+    """Whether two representations of one stored field agree.
+
+    Numbers are compared numerically, not as text: a CSV is a lossy text
+    format and a float that survives the trip to within a relative 1e-12 is
+    the same number, while refusing a settlement over the 17th digit would
+    make the freeze unusable. Everything else compares as its string form.
+    """
+    if isinstance(before, bool) or isinstance(after, bool):
+        return bool(before) == bool(after)
+    try:
+        left, right = float(before), float(after)
+    except (TypeError, ValueError):
+        return str(before) == str(after)
+    if math.isnan(left) and math.isnan(right):
+        return True
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-15)
+
+
+def _ticket_row(ticket: ParlayTicketRecord) -> dict[str, Any]:
+    """A ticket as one CSV row, with its structured fields as JSON.
+
+    pandas serialises a dict or list with ``str()``, which is Python repr, so
+    a round trip left ``leg_ids`` as "['L1', 'L2']" and ``model_logic`` as
+    "{'dispersion': ...}" — strings pydantic rejects with list_type and
+    dict_type. JSON survives the trip, and the model's own validator parses it
+    back (and still accepts the repr in logs written before this).
+    """
+    row = ticket.model_dump(mode="json")
+    for field in _JSON_TICKET_FIELDS:
+        if field in row and not isinstance(row[field], str):
+            row[field] = json.dumps(row[field], default=str, sort_keys=True)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +501,12 @@ class ParlayLogStore:
     def _read(self, path: Path) -> pd.DataFrame:
         if not path.exists():
             return pd.DataFrame()
-        return pd.read_csv(path)
+        # float_precision="round_trip" is not a nicety here. pandas writes the
+        # full 17 significant digits but its default C parser reads back only
+        # 16, so 0.28017718715393136 became 0.2801771871539313 -- a stored
+        # joint_probability that no longer equalled the one computed, and a
+        # frozen-field check that saw every float as changed.
+        return pd.read_csv(path, float_precision="round_trip")
 
     def load_tickets(self) -> pd.DataFrame:
         return self._read(self.tickets_path)
@@ -423,7 +526,7 @@ class ParlayLogStore:
                 f"Ticket {ticket.ticket_id} is already logged. Use update_settlement "
                 "to fill in outcomes; the at-bet-time snapshot never changes."
             )
-        payload = ticket.model_dump(mode="json")
+        payload = _ticket_row(ticket)
         assert_export_safe(payload, path="ticket")
         leg_rows = []
         for leg in legs:
@@ -439,6 +542,25 @@ class ParlayLogStore:
             ticket.joint_probability, ticket.ev_at_bet_time,
         )
         return ticket.ticket_id
+
+    @staticmethod
+    def _frozen_conflict(
+        stored: Mapping[str, Any], new: Mapping[str, Any], fields: frozenset[str],
+    ) -> tuple[str, Any, Any] | None:
+        """First at-bet-time field whose stored value differs, if any.
+
+        Both sides must be the SAME representation or every row looks changed:
+        ``new`` is the store's own row form, so a dict that the CSV holds as
+        JSON is compared against JSON and not against ``str(dict)``.
+        """
+        for field in sorted(fields & set(new)):
+            before, after = stored.get(field), new[field]
+            if (before is None or pd.isna(before)) and after is None:
+                continue
+            if _same_value(before, after):
+                continue
+            return field, before, after
+        return None
 
     def _write(self, path: Path, frame: pd.DataFrame) -> None:
         prior = self._read(path)
@@ -460,30 +582,43 @@ class ParlayLogStore:
         if tickets.empty or ticket.ticket_id not in set(tickets["ticket_id"]):
             raise ParlayLogError(f"Ticket {ticket.ticket_id} is not in the log")
 
+        # The ticket's own snapshot, which used to be replaced unchecked. It
+        # holds joint_probability and ev_at_bet_time — the two numbers the
+        # whole log exists to compare against outcomes.
+        stored_ticket = tickets[tickets["ticket_id"] == ticket.ticket_id].iloc[0]
+        conflict = self._frozen_conflict(
+            stored_ticket, _ticket_row(ticket), TICKET_AT_BET_TIME_FIELDS,
+        )
+        if conflict:
+            field, before, after = conflict
+            raise ParlayLogError(
+                f"Ticket {ticket.ticket_id}: {field} changed from {before!r} to "
+                f"{after!r}. At-bet-time fields are frozen — re-running the model "
+                "and overwriting them grades it on information it never had."
+            )
+
         stored_legs = self.load_legs()
         stored_for_ticket = stored_legs[stored_legs["ticket_id"] == ticket.ticket_id]
         for leg in legs:
             match = stored_for_ticket[stored_for_ticket["leg_id"] == leg.leg_id]
             if match.empty:
                 raise ParlayLogError(f"Leg {leg.leg_id} is not in the log")
-            stored = match.iloc[0]
-            new = leg.model_dump(mode="json")
-            for field in AT_BET_TIME_FIELDS & set(new):
-                before, after = stored.get(field), new[field]
-                if pd.isna(before) and after is None:
-                    continue
-                if str(before) != str(after):
-                    raise ParlayLogError(
-                        f"Leg {leg.leg_id}: {field} changed from {before!r} to "
-                        f"{after!r}. At-bet-time fields are frozen — re-running the "
-                        "model and overwriting them grades it on information it "
-                        "never had."
-                    )
+            conflict = self._frozen_conflict(
+                match.iloc[0], leg.model_dump(mode="json"), AT_BET_TIME_FIELDS,
+            )
+            if conflict:
+                field, before, after = conflict
+                raise ParlayLogError(
+                    f"Leg {leg.leg_id}: {field} changed from {before!r} to "
+                    f"{after!r}. At-bet-time fields are frozen — re-running the "
+                    "model and overwriting them grades it on information it "
+                    "never had."
+                )
 
         # Replace whole rows rather than assigning across a mask: an in-place
         # assignment has to match pandas' per-column dtypes, and a settlement
         # write legitimately turns None columns into floats.
-        updated_ticket = pd.DataFrame([ticket.model_dump(mode="json")])
+        updated_ticket = pd.DataFrame([_ticket_row(ticket)])
         tickets = pd.concat(
             [tickets[tickets["ticket_id"] != ticket.ticket_id], updated_ticket],
             ignore_index=True,
