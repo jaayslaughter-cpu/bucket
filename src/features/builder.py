@@ -171,6 +171,29 @@ _ADDITIVE_FEATURE_LAYERS = _additive_feature_layers()
 
 
 
+def _records_a_layer(before: "set[str]", df: "pd.DataFrame", name: str) -> bool:
+    """
+    Did this layer actually add columns?
+
+    The schema-version suffix exists so two runs with different feature sets
+    cannot share a version. Recording a layer because it was ATTEMPTED broke
+    that in both directions: attach_elo_features returns the panel unchanged
+    on an empty Elo frame, and a disabled layer returns it untouched, so a run
+    whose layer silently no-opped was indistinguishable from one where it
+    worked -- while a run that skipped the layer entirely, with the identical
+    feature set, got a DIFFERENT version. attach_market_context was already
+    checked this way; the other sites were not.
+    """
+    added = set(df.columns) - before
+    if added:
+        return True
+    logger.info(
+        "Layer %s ran but added no columns, so it is NOT recorded in the feature "
+        "schema version — the run's feature set is the same as without it.", name,
+    )
+    return False
+
+
 def _group_shift_roll(
     df: pd.DataFrame,
     col: str,
@@ -393,8 +416,10 @@ def build_feature_matrix(
     if team_games is not None and not team_games.empty:
         # Elo is computed over the full team history in date order, then
         # joined by pre-game value only. elo_post never reaches the panel.
+        before_elo = set(df.columns)
         df = attach_elo_features(df, compute_team_elo(team_games))
-        market_layers.append("team_elo")
+        if _records_a_layer(before_elo, df, "team_elo"):
+            market_layers.append("team_elo")
 
         # Opponent defence, from TEAM totals rather than from sums over the
         # player panel. A panel sum measures roster coverage as much as it
@@ -403,8 +428,10 @@ def build_feature_matrix(
         try:
             from src.features.defense import attach_defense_features, build_team_defense
 
+            before_def = set(df.columns)
             df = attach_defense_features(df, build_team_defense(team_games))
-            market_layers.append("opponent_defense")
+            if _records_a_layer(before_def, df, "opponent_defense"):
+                market_layers.append("opponent_defense")
         except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
             logger.warning(
                 "Opponent-defence layer skipped (%s) — its columns are absent, "
@@ -494,8 +521,10 @@ def build_feature_matrix(
     attached: list[str] = list(market_layers)
     for layer_name, attach in _ADDITIVE_FEATURE_LAYERS:
         try:
+            before_layer = set(df.columns)
             df = attach(df)
-            attached.append(layer_name)
+            if _records_a_layer(before_layer, df, layer_name):
+                attached.append(layer_name)
         except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
             logger.warning(
                 "Feature layer %s skipped (%s) — its columns are absent, not "
