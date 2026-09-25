@@ -137,10 +137,26 @@ does not follow, and the reference was wrong as well. Three corrections:
     is not in this file. "Read this against the result above" pointed at the
     wrong table.
 
-  - Neither run shows the layer helping both markets cleanly. In the 3-fold
-    table above, REB improves at 3/3 on every model, but AST is MIXED:
-    catboost Brier raw +0.00003 (worse, 1/3) and line_aware 2/3, while
-    ensemble and xgboost manage 3/3.
+  - Neither run shows the layer helping both markets cleanly, and "REB
+    improves at 3/3 on every model" — what an earlier version of THIS
+    correction said — is itself wrong on two counts. Read off the 3-fold
+    table above:
+
+      REB, Brier raw and cal: 3/3 for all four tree models. Good.
+      REB, ECE:               MIXED. catboost worse on both (+0.00090 raw,
+                              +0.00100 cal, 1/3 each), ensemble ECE cal
+                              marginally worse (+0.00023), xgboost 2/3, and
+                              only line_aware improves at 3/3.
+      distribution:           UNCHANGED at +0.00000 on every metric. It reads
+                              no tree features, so it is structurally
+                              unaffected and was never going to move.
+
+      AST: catboost Brier raw +0.00003 (worse, 1/3), line_aware 2/3, while
+           ensemble and xgboost manage 3/3.
+
+    So the defensible summary of that run is narrower than "the layer helps":
+    it improves tree-model BRIER on REB consistently, and does something less
+    tidy everywhere else.
 
   - Subtracting a one-column result from a three-column result does not
     attribute the remainder. Each market reads THREE pbp columns; the layer
