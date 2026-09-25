@@ -113,14 +113,35 @@ def test_a_changed_schema_is_caught_not_absorbed():
 
 def test_optional_fields_absent_from_a_game_become_null_columns():
     """A game with no three-pointers carries no shotValue; the column must
-    still exist so a season concatenates to a stable shape."""
+    still exist so a season concatenates to a stable shape.
+
+    This used to use shotDistance as its example. shotDistance is now REQUIRED:
+    every real game has field-goal attempts, so its absence means a broken
+    payload rather than a quiet game, and filling it with NA made every shot
+    metric silently NaN. shotValue is genuinely optional -- a game with no
+    three-pointers really does omit it -- so the stable-shape contract is
+    tested on that instead.
+    """
     payload = _payload()
     for action in payload["game"]["actions"]:
-        action.pop("shotDistance")
+        action.pop("shotValue", None)
         action.pop("area", None)
     frame = parse_playbyplay_payload(payload)
-    assert "shotDistance" in frame.columns
-    assert frame["shotDistance"].isna().all()
+    assert "shotValue" in frame.columns
+    assert frame["shotValue"].isna().all()
+
+
+def test_a_payload_without_player_ids_or_shot_results_is_refused():
+    """personId drives player grouping and shotResult/shotDistance drive every
+    shot metric. Filled with NA they produce a frame that parses cleanly and
+    yields no player rows or all-NaN rates, which is the failure this schema
+    check exists to prevent."""
+    for field in ("personId", "shotDistance", "shotResult", "possession"):
+        payload = _payload()
+        for action in payload["game"]["actions"]:
+            action.pop(field, None)
+        with pytest.raises(PlayByPlayError, match=field):
+            parse_playbyplay_payload(payload)
 
 
 # --- fetching ---------------------------------------------------------------

@@ -61,15 +61,23 @@ DEFAULT_PAUSE_SECONDS = 0.6
 # The columns src/features/pbp.py reads. Listed so a payload that silently
 # stops carrying one is caught here rather than surfacing as a feature that
 # quietly became all-NaN.
+# personId, shotDistance, shotResult and possession were EXPECTED (absent ->
+# filled with pd.NA). The rationale for that tier -- "a game with no
+# three-pointers carries no shotValue" -- does not cover them: no real NBA game
+# has zero player actions or zero field-goal attempts. Absent, personId yields
+# no player rows at all, shotDistance/shotResult make every shot metric NaN,
+# and possession makes PBP_GAME_PACE NaN. Each is a shipped feature quietly
+# becoming empty, which is exactly what this list exists to prevent.
 REQUIRED_ACTION_FIELDS: tuple[str, ...] = (
     "actionNumber", "clock", "period", "actionType",
+    "personId", "shotDistance", "shotResult", "possession",
 )
 
 # Everything else pbp.py or the completeness check uses when present.
 EXPECTED_ACTION_FIELDS: tuple[str, ...] = (
-    "orderNumber", "subType", "personId", "playerName", "playerNameI",
-    "teamId", "teamTricode", "possession", "scoreHome", "scoreAway",
-    "shotDistance", "shotResult", "shotValue", "isFieldGoal",
+    "orderNumber", "subType", "playerName", "playerNameI",
+    "teamId", "teamTricode", "scoreHome", "scoreAway",
+    "shotValue", "isFieldGoal",
     "assistPersonId", "area", "areaDetail", "x", "y", "description",
     "periodType", "timeActual",
 )

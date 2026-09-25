@@ -73,7 +73,14 @@ def load_event_parts(pbp_dir: Path, pattern: str = "*.csv") -> pd.DataFrame:
             f"DATA_NOT_AVAILABLE: event log missing {missing}. Found: "
             f"{sorted(header)[:20]}..."
         )
-    frames = [pd.read_csv(p, usecols=list(EVENT_COLS), low_memory=False)
+    # gameId as TEXT. This archive's ids carry no leading zero, so inference
+    # gives int64 and everything matches -- but an export that zero-pads
+    # ("0022500001") would infer int, strip the zeros, and stop matching the
+    # panel. check_log_completeness casts defensively and would raise rather
+    # than pass quietly, so this is hardening, not a live fault; it removes
+    # the dtype question from the read instead of catching it downstream.
+    frames = [pd.read_csv(p, usecols=list(EVENT_COLS), dtype={"gameId": str},
+                          low_memory=False)
               for p in parts]
     events = pd.concat(frames, ignore_index=True)
     del frames

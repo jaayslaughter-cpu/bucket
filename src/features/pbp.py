@@ -380,6 +380,14 @@ def check_log_completeness(
     roughly half of each game -- while still naming every game, so nothing
     about its shape said "partial" except this check.
 
+    A game the log does not mention at all counts as ZERO attempts, not as
+    absent. Scoring only the games both sides carry was a hole big enough to
+    drive the whole failure mode through: supplying 234 of 2021-22's 1,230
+    games, each one individually complete, returned ``failing: []``. Every
+    game the panel knows about is therefore scored, and ``games_absent``
+    reports how many contributed nothing, because "short by half" and "not
+    there at all" are different faults with the same cure.
+
     Returns one row of numbers per season. Seasons that fail are named in
     ``failing`` so a caller can exclude them rather than average over them.
     """
@@ -402,8 +410,13 @@ def check_log_completeness(
     season = work["SEASON"] if "SEASON" in work.columns else pd.Series("all", index=work.index)
     box = work.groupby(["gameId", season])["FGA"].sum().rename("box_fga").reset_index()
     box.columns = ["gameId", "season", "box_fga"]
-    joined = box.merge(shots, left_on="gameId", right_index=True, how="inner")
-    if joined.empty:
+    # LEFT from the panel, so a game the log never mentions is scored as zero
+    # attempts instead of vanishing from the comparison. An inner join here
+    # meant a log could omit four fifths of a season and still pass.
+    joined = box.merge(shots, left_on="gameId", right_index=True, how="left")
+    joined["absent"] = joined["pbp_fga"].isna()
+    joined["pbp_fga"] = joined["pbp_fga"].fillna(0.0)
+    if bool(joined["absent"].all()):
         raise PbpFeatureError(
             "DATA_NOT_AVAILABLE: no game appears in both the event log and the panel"
         )
@@ -414,24 +427,27 @@ def check_log_completeness(
     for name, block in joined.groupby("season"):
         exact = float((block["gap"] == 0).mean())
         median_gap = float(block["gap"].median())
+        absent = int(block["absent"].sum())
         report[str(name)] = {
             "games": float(len(block)),
+            "games_absent": float(absent),
             "exact_share": exact,
             "median_gap": median_gap,
         }
-        if exact < min_exact_share or median_gap > max_median_gap:
+        if exact < min_exact_share or median_gap > max_median_gap or absent:
             failing.append(str(name))
             logger.warning(
                 "pbp log for %s is INCOMPLETE: %.1f%% of %d games match the box "
-                "score exactly, median shortfall %.0f attempts. Rates built from "
-                "it are biased by whatever is missing. Supply the remaining "
-                "parts before using this season.",
-                name, 100 * exact, len(block), median_gap,
+                "score exactly, median shortfall %.0f attempts, %d game(s) absent "
+                "from the log entirely. Rates built from it are biased by whatever "
+                "is missing. Supply the remaining parts before using this season.",
+                name, 100 * exact, len(block), median_gap, absent,
             )
         else:
             logger.info(
                 "pbp log for %s: %.1f%% of %d games match the box score exactly, "
-                "median gap %.0f.", name, 100 * exact, len(block), median_gap,
+                "median gap %.0f, no game absent.",
+                name, 100 * exact, len(block), median_gap,
             )
     return {"seasons": report, "failing": failing}
 

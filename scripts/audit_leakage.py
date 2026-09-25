@@ -95,6 +95,23 @@ def check_deletion(panel: pd.DataFrame, raw_builder, cut_quantile: float = 0.7) 
         c for c in full.select_dtypes(include=[np.number]).columns
         if c not in NON_FEATURE
     ]
+    # An inner join alone would hide two ways a feature can react to the
+    # deletion without any number moving: a row disappearing, and a value
+    # turning into NaN. Both are checked before the numeric comparison.
+    surviving = full[full["GAME_DATE"] < cut]
+    keys_before = set(map(tuple, surviving[key].to_numpy().tolist()))
+    keys_after = set(map(tuple, truncated[key].to_numpy().tolist()))
+    vanished = keys_before - keys_after
+    appeared = keys_after - keys_before
+    if vanished or appeared:
+        raise LeakageFound(
+            f"the row set before {cut.date()} changed when later games were "
+            f"deleted: {len(vanished)} row(s) vanished, {len(appeared)} "
+            f"appeared. A feature that reads later games can drop or add a row "
+            f"as easily as it can move a number, and a key-set change makes "
+            f"every per-column comparison below meaningless."
+        )
+
     joined = full.merge(truncated[key + numeric], on=key, suffixes=("_f", "_t"))
     if joined.empty:
         raise LeakageFound("deletion test compared zero rows — the rebuild failed")
@@ -102,13 +119,18 @@ def check_deletion(panel: pd.DataFrame, raw_builder, cut_quantile: float = 0.7) 
     moved: list[tuple[str, int, float]] = []
     for col in numeric:
         a, b = joined[f"{col}_f"], joined[f"{col}_t"]
+        # A value that became NaN, or a NaN that became a value, is a leak
+        # signature in its own right: the feature had something to say only
+        # while it could see the deleted games. Skipping those rows and
+        # comparing the rest was the evasion.
+        flipped = int((a.notna() != b.notna()).sum())
         both = a.notna() & b.notna()
-        if not both.any():
-            continue
-        delta = (a[both] - b[both]).abs()
-        n = int((delta > 1e-9).sum())
-        if n:
-            moved.append((col, n, float(delta.max())))
+        delta = (a[both] - b[both]).abs() if both.any() else None
+        n = int((delta > 1e-9).sum()) if delta is not None else 0
+        if flipped or n:
+            worst = float(delta.max()) if delta is not None and len(delta) else float("nan")
+            moved.append((f"{col} ({flipped} null-flip)" if flipped else col,
+                          n + flipped, worst))
     if moved:
         worst = sorted(moved, key=lambda t: -t[1])[:6]
         lines = "\n".join(f"      {c}: {n} rows moved, max |delta| {d:.6g}"

@@ -159,3 +159,62 @@ def test_postgame_efficiency_columns_do_not_survive_onto_the_feature_frame():
     for postgame in ("TS_PCT", "SHOT_VOLUME", "FT_RATE"):
         assert postgame not in out.columns
     assert "TS_PCT_L5" in out.columns
+
+
+# --- cubic review, PR #3 (2026-09-25) ---------------------------------------
+
+
+def _deletion_panel() -> pd.DataFrame:
+    """Forty player-games over forty days, one row per day."""
+    return pd.DataFrame({
+        "PLAYER_ID": ["p1"] * 40,
+        "GAME_ID": [f"g{i:03d}" for i in range(40)],
+        "GAME_DATE": pd.date_range("2025-01-01", periods=40, freq="D"),
+        "SAFE_FEATURE": [float(i) for i in range(40)],
+    })
+
+
+def _builder_factory(mode: str):
+    """A raw_builder whose truncated rebuild misbehaves in one chosen way."""
+    def build(cut):
+        df = _deletion_panel()
+        if cut is None:
+            return df
+        out = df[df["GAME_DATE"] < cut].copy()
+        if mode == "drops_a_row":
+            out = out.iloc[1:].copy()
+        elif mode == "null_flips":
+            # The feature had a value only while later games were visible.
+            out.loc[out.index[:5], "SAFE_FEATURE"] = float("nan")
+        return out
+    return build
+
+
+def test_deletion_test_catches_a_vanishing_row():
+    """An inner merge hid rows that disappeared from the truncated rebuild, so
+    a feature could react to the deletion by dropping a row rather than by
+    moving a number."""
+    from scripts.audit_leakage import LeakageFound, check_deletion
+
+    panel = _deletion_panel()
+    with pytest.raises(LeakageFound, match="row set before"):
+        check_deletion(panel, _builder_factory("drops_a_row"))
+
+
+def test_deletion_test_catches_a_value_becoming_null():
+    """`a.notna() & b.notna()` skipped exactly the leak signature where a
+    feature had something to say only while it could see the deleted games."""
+    from scripts.audit_leakage import LeakageFound, check_deletion
+
+    panel = _deletion_panel()
+    with pytest.raises(LeakageFound, match="null-flip"):
+        check_deletion(panel, _builder_factory("null_flips"))
+
+
+def test_deletion_test_still_passes_an_honest_rebuild():
+    """The two new guards must not fail a rebuild that behaves correctly."""
+    from scripts.audit_leakage import check_deletion
+
+    panel = _deletion_panel()
+    result = check_deletion(panel, _builder_factory("honest"))
+    assert "unchanged after deleting" in result

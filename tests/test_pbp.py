@@ -392,3 +392,34 @@ def test_game_pace_is_per_team_not_both_teams():
 
     assert pace == pytest.approx(expected), f"{pace} != {expected}"
     assert pace == pytest.approx(both_teams * 2880.0 / game_seconds / 2.0)
+
+
+def test_a_log_missing_whole_games_is_caught():
+    """Scoring only the games both sides carried was a hole big enough to drive
+    the whole failure mode through: 234 of 2021-22's 1,230 games, each one
+    individually complete, returned failing: []. A game the log never mentions
+    counts as zero attempts, not as absent."""
+    from src.features.pbp import check_log_completeness
+
+    events, panel = _log_and_panel(n_games=40)
+    kept = sorted(panel["GAME_ID"])[:8]
+    partial = events[events["gameId"].isin(kept)]
+
+    report = check_log_completeness(prepare_events(partial), panel)
+
+    assert report["failing"] == ["2025-26"]
+    assert report["seasons"]["2025-26"]["games"] == 40.0, "all panel games must be scored"
+    assert report["seasons"]["2025-26"]["games_absent"] == 32.0
+    assert report["seasons"]["2025-26"]["exact_share"] == pytest.approx(8 / 40)
+
+
+def test_a_whole_log_reports_no_absent_games():
+    """The fix must not turn a complete log into a failure."""
+    from src.features.pbp import check_log_completeness
+
+    events, panel = _log_and_panel(n_games=40)
+    report = check_log_completeness(prepare_events(events), panel)
+
+    assert report["failing"] == []
+    assert report["seasons"]["2025-26"]["games_absent"] == 0.0
+    assert report["seasons"]["2025-26"]["exact_share"] == 1.0
