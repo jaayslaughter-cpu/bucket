@@ -195,7 +195,31 @@ correlation of the 0/1 outcomes.
 
 It also refuses a leg on a whole line: a push voids that leg and re-prices
 the whole ticket at the remaining legs' odds, which a win/lose model does
-not represent.
+not represent. And it refuses a leg with **no `game_id`** — an unknown game
+cannot be shown not to share one, so skipping such a leg would route it onto
+the independent path; two legs from one game with `game_id` omitted priced at
+0.3305 and carried the warning "legs are in different games".
+
+**A same-game ticket needs its quoted price.** The product of the legs'
+individual odds is the cross-game parlay payout, but a book re-prices a
+same-game parlay for exactly the correlation modelled above, so that product
+is a number nobody offers — and on positively correlated legs it is the
+higher one. On two legs at rho 0.25, EV/unit is **0.341** at the
+product-equivalent +264 against **0.252** at a quoted +240. So
+`evaluate_parlay` takes `ticket_american` (or `ticket_decimal`), requires one
+for a same-game ticket, and reports `price_source` so a logged EV can be
+re-derived. The cross-game product is kept, labelled `product_of_legs`, and
+warned about as an upper bound.
+
+**The Monte Carlo estimate is refused at its edges.** Every leg has
+`model_prob < 1`, so P(all win) < 1 is arithmetic — but a sample in which
+every draw wins reports 1.0, and the Wald standard error is exactly 0 there,
+so a relative-noise guard waved it through. Two legs at 0.9999 over 2,000
+draws returned `OK` with joint probability 1.0 and +0.44/unit of EV. A
+saturated sample now abstains, its standard error is the Agresti-Coull width
+rather than zero, and a joint above the smallest leg's probability by more
+than sampling noise abstains too: an intersection cannot be likelier than any
+one of its members.
 
 `calibration_amplification` is the number worth reading before any of this
 is used. At a 5% per-leg optimism:
@@ -233,10 +257,22 @@ one Bernoulli draw from a joint distribution; the model's probabilities are
 per leg. `leg_calibration_frame()` returns the `(model_prob, hit)` pairs and
 excludes voided and pushed legs, which are not evidence about a probability.
 
-**At-bet-time fields are frozen.** `AT_BET_TIME_FIELDS` is checked on every
-settlement write: outcomes may be filled in, the snapshot may not be
-rewritten. Re-running the model later and overwriting `model_prob` grades it
-on information it never had.
+**At-bet-time fields are frozen.** `AT_BET_TIME_FIELDS` (legs) and
+`TICKET_AT_BET_TIME_FIELDS` (the ticket) are checked on every settlement
+write: outcomes may be filled in, the snapshot may not be rewritten.
+Re-running the model later and overwriting `model_prob` grades it on
+information it never had. The ticket's own set covers `joint_probability`,
+`ev_at_bet_time`, the price and `unit_stake` — the numbers the log exists to
+compare against outcomes, and the ones a wholesale row replacement used to
+leave unguarded. A test enumerates both records' fields against their frozen
+and settlement sets, so a field added to a record and not to a set fails
+rather than becoming quietly rewritable.
+
+Structured fields (`leg_ids`, `model_logic`) are written as **JSON**, not the
+Python repr `pandas` produces from `str()`, and reads use
+`float_precision="round_trip"` — the default C parser returns 16 of the 17
+significant digits written, so a stored `joint_probability` did not equal the
+one computed.
 
 Also: CLV is stored per leg (`clv_line_points`, `clv_prob_points`) and is
 never summed into `net_return_units` — EV asks whether the model was right,
@@ -272,11 +308,47 @@ PYTHONPATH=. python scripts/nba_model_cli.py fit-leg-correlations     --as-of 20
 on the game being predicted leaks into it, exactly as a season-wide mean
 does.
 
-A bucket that does not clear `--min-pairs` is written out **marked
-unusable, not dropped**. `correlation_for_legs` then names that pair in its
-`unresolved` list and leaves the entry at 0, so the caller can refuse:
-"we could not fit this" and "these legs are independent" are different
-statements, and only one of them is safe to act on.
+**The line each leg is graded against is per market.** The default was a
+single shared `RESEARCH_LINE` column, which the panel does not carry —
+`labels.attach_research_line` derives it per market from `{stat}_L10` and
+attaches it to one market's training frame. So the default fit skipped every
+market and raised "No usable markets" on the real 214,381-row panel: the
+layer `evaluate_parlay` depends on could not run at its own defaults. The
+default is now `{market}_L10`, `RESEARCH_LINE` is accepted only for a
+single-market fit where it is unambiguous, and `line_source` records the
+columns actually read (`PTS=PTS_L10, REB=REB_L10, …`) rather than the ones
+requested.
+
+**Two gates, not one.** A bucket is fitted only when it clears `--min-pairs`
+AND `--min-games` (default 50). These are not redundant: pairs inside one game
+share that night's blowout, pace and officiating and reuse the same outcomes,
+so 25 leg rows from a **single** game produce 2,700 "pairs" out of 25
+observations — six buckets cleared a 200-pair gate on that alone, with rho
+between −0.059 and +0.053. The independent unit is the game, and `n_games` is
+carried on every bucket and in the CSV export.
+
+A bucket that does not clear either gate is written out **marked unusable,
+not dropped**, and the reason names which gate failed. `correlation_for_legs`
+then names that pair in its `unresolved` list and leaves the entry at 0, so
+the caller can refuse: "we could not fit this" and "these legs are
+independent" are different statements, and only one of them is safe to act on.
+
+On the real 214,381-row panel at `--as-of 2025-01-01` (8,153 games) all
+fifteen buckets fit, and they order as the mechanism predicts: `same_player`
+PTS×REB **0.385** and PTS×AST **0.247** (one player's own markets share his
+minutes and usage), `same_team` **0.015–0.066**, `opposing_team`
+**0.013–0.032**.
+
+Checked against the outcomes by a path independent of the fitter: over the
+165,742 `same_player` PTS×REB pairs, P(PTS over) = 0.4597 and P(REB over) =
+0.4564, and they land together **0.2693** of the time against a product of
+**0.2098**. The copula at the fitted rho returns 0.2721 — within 0.0029 of
+observed — where independence returns 0.2099, off by 0.0593, about 92 Monte
+Carlo standard errors. So the fitted number is doing real work. Its
+**resolution is about ±0.02 in rho**: `estimate_tetrachoric_correlation`
+bisects against a 40,000-draw estimate whose own standard error is ~0.0022 of
+joint probability, which is where that residual 0.0029 comes from. Treat the
+buckets as good to two decimal places, not four.
 
 On the synthetic demo panel the fitter returns `same_player` ~0.19 (shared
 minutes drive a player's own markets together) and `same_team` /

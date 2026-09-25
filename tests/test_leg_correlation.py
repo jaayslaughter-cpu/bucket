@@ -204,7 +204,11 @@ def test_summary_carries_provenance():
     assert summary["as_of"] == "2026-01-01"
     assert summary["n_games"] == 900
     assert summary["research_status"] == "RESEARCH_ONLY"
-    assert summary["line_source"] == "RESEARCH_LINE"
+    # The provenance names the column ACTUALLY read, per market. This asserted
+    # the literal "RESEARCH_LINE" while the field reported the requested
+    # default, so it could not tell the two apart -- and the default itself was
+    # a column the real panel does not have.
+    assert summary["line_source"] == "PTS=RESEARCH_LINE"
     assert not priors.as_frame().empty
 
 
@@ -300,3 +304,100 @@ def test_side_spellings_are_recognised():
     assert _side_sign(_Leg("u")) == -1
     for unknown in (None, "", "whatever"):
         assert _side_sign(_Leg(unknown)) is None
+
+
+# --- the two gates that decide whether a bucket is evidence --------------
+
+
+def _one_game_panel(n_players: int = 25, n_games: int = 1) -> pd.DataFrame:
+    """Many leg rows from FEW games — lots of pairs, almost no independence."""
+    rng = np.random.default_rng(1)
+    rows = []
+    for g in range(n_games):
+        for p in range(n_players):
+            row = {
+                "GAME_ID": f"G{g}", "GAME_DATE": "2024-12-01",
+                "PLAYER_ID": f"p{p}", "PLAYER_NAME": f"p{p}",
+                "TEAM_ABBREVIATION": "AAA", "OPPONENT_ABBREVIATION": "BBB",
+            }
+            for market, base in (("PTS", 20.0), ("REB", 6.0), ("AST", 4.0)):
+                row[market] = base + rng.normal(scale=3.0)
+                row[f"{market}_L10"] = base
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_pairs_from_one_game_are_not_enough_however_many_there_are():
+    """
+    n_pairs counts pairs, and pairs inside one game reuse the same outcomes
+    under that night's blowout, pace and officiating. 25 leg rows from a SINGLE
+    game produce 2,700 pairs, and six buckets cleared the 200-pair gate on that
+    alone with rho between -0.059 and +0.053 — noise wearing an n of 600. The
+    independent unit is the game.
+    """
+    priors = fit_leg_correlations(_one_game_panel(), as_of="2025-01-01")
+    assert priors.n_games == 1
+
+    bucket = priors.get(SAME_TEAM, "PTS", "PTS")
+    assert bucket is not None
+    assert bucket.n_pairs > 200, "fixture no longer clears the pair gate"
+    assert bucket.n_games == 1
+    assert bucket.usable is False
+    assert "distinct game" in bucket.reason
+    assert "not 'independent'" in bucket.reason
+    assert not any(b.usable for b in priors.buckets.values())
+
+
+def test_the_games_gate_clears_once_there_are_enough_games():
+    """The gate must not be unpassable: the same shape over 60 games fits."""
+    priors = fit_leg_correlations(
+        _one_game_panel(n_players=6, n_games=60), as_of="2025-01-01",
+    )
+    bucket = priors.get(SAME_TEAM, "PTS", "PTS")
+    assert bucket is not None and bucket.usable, bucket.reason
+    assert bucket.n_games == 60
+
+
+def test_both_gates_are_reported_and_each_names_which_one_failed():
+    thin_games = fit_leg_correlations(_one_game_panel(), as_of="2025-01-01")
+    thin_pairs = fit_leg_correlations(
+        _one_game_panel(n_players=3, n_games=60), as_of="2025-01-01", min_pairs=10_000,
+    )
+    assert "distinct game" in thin_games.get(SAME_TEAM, "PTS", "PTS").reason
+    assert "realised pairs" in thin_pairs.get(SAME_TEAM, "PTS", "PTS").reason
+    assert thin_games.summary()["min_games"] == 50
+    assert thin_games.as_frame()["n_games"].max() == 1
+
+
+def test_the_default_line_column_is_the_one_the_panel_actually_has():
+    """
+    This defaulted to a single shared "RESEARCH_LINE". The panel does not carry
+    it — labels.attach_research_line derives it per market from {stat}_L10 and
+    attaches it to ONE market's training frame — so the default fit skipped
+    every market and raised "No usable markets" on the real 214,381-row panel:
+    the layer evaluate_parlay depends on could not run at its own defaults. And
+    one shared column cannot be the line for three markets anyway; it would
+    grade REB legs against PTS's line.
+    """
+    panel = _one_game_panel(n_players=6, n_games=60)
+    assert "RESEARCH_LINE" not in panel.columns
+
+    priors = fit_leg_correlations(panel, as_of="2025-01-01")
+    assert priors.line_source == "AST=AST_L10, PTS=PTS_L10, REB=REB_L10"
+    assert any(b.usable for b in priors.buckets.values())
+
+    # An explicit mapping still wins, and RESEARCH_LINE is still accepted for a
+    # single market, where it is unambiguous.
+    single = fit_leg_correlations(
+        _planted_panel(n_games=200), as_of="2026-01-01", markets=("PTS",),
+    )
+    assert single.line_source == "PTS=RESEARCH_LINE"
+
+
+def test_research_line_is_refused_for_a_multi_market_fit():
+    """One column cannot be three markets' lines. Grading REB against PTS's
+    line is a silently wrong outcome, so the market is skipped instead."""
+    panel = _planted_panel(n_games=200)
+    panel["REB"] = 6.0 + (panel["PTS"] - 20.0) / 4.0
+    with pytest.raises(LegCorrelationError, match="No usable markets"):
+        fit_leg_correlations(panel, as_of="2026-01-01", markets=("PTS", "REB"))

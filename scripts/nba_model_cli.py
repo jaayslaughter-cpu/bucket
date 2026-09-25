@@ -931,7 +931,13 @@ def fit_leg_correlations_cmd(
         help="Column per market to use as the line, e.g. PTS_L10. The research "
              "stand-in until real posted lines are archived.",
     ),
-    min_pairs: int = typer.Option(200, "--min-pairs", help="Per-bucket minimum"),
+    min_pairs: int = typer.Option(200, "--min-pairs", help="Per-bucket minimum pairs"),
+    min_games: int = typer.Option(
+        50, "--min-games",
+        help="Per-bucket minimum DISTINCT GAMES. Not redundant with --min-pairs: "
+             "pairs inside one game reuse its outcomes, so 25 leg rows from a "
+             "single game make 2,700 'pairs' out of 25 observations.",
+    ),
     out: Path = typer.Option(
         Path("outputs/demo/leg_correlations.csv"), "--out",
     ),
@@ -941,8 +947,9 @@ def fit_leg_correlations_cmd(
     """Fit parlay leg correlations from realised games (step 3 of 3).
 
     evaluate_parlay refuses a same-game ticket without these. Buckets that
-    do not clear --min-pairs are written out marked unusable rather than
-    dropped: "not fitted" is a different statement from "independent".
+    do not clear --min-pairs AND --min-games are written out marked unusable
+    rather than dropped: "not fitted" is a different statement from
+    "independent".
 
     --as-of is required and excludes the slate itself. A correlation fitted
     on the game being predicted leaks into it.
@@ -967,7 +974,7 @@ def fit_leg_correlations_cmd(
     try:
         priors = fit_leg_correlations(
             panel, as_of=as_of, markets=mkt, min_pairs=min_pairs,
-            line_col_for=line_col_for,
+            min_games=min_games, line_col_for=line_col_for,
         )
     except LegCorrelationError as exc:
         typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)

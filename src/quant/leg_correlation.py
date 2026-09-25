@@ -43,6 +43,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from src.models.labels import RESEARCH_LINE_COL, RESEARCH_LINE_SOURCE
 from src.quant.parlay import ParlayError, ParlayLeg, estimate_tetrachoric_correlation
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,14 @@ DIFFERENT_GAME = "different_game"
 # small sample is noise, and noise here flatters the ticket.
 MIN_PAIRS_PER_BUCKET = 200
 
+# And below THIS, independently. Pairs within one game are not independent
+# observations -- they are drawn from a single night's blowout, pace and
+# officiating, and they reuse the same handful of outcomes. 25 leg rows from
+# ONE game produce 2,700 pairs, and six buckets cleared the 200-pair gate on
+# that alone with rho between -0.059 and +0.053, which is noise wearing an
+# n of 600. The independent unit is the GAME, so buckets are gated on both.
+MIN_GAMES_PER_BUCKET = 50
+
 
 class LegCorrelationError(RuntimeError):
     """Raised when correlations cannot be fitted from what was supplied."""
@@ -76,6 +85,10 @@ class CorrelationBucket:
     n_pairs: int
     usable: bool
     reason: str | None = None
+    # Distinct GAMES contributing. Pairs within one game reuse the same
+    # outcomes, so n_pairs alone overstates the evidence by a factor of the
+    # per-game pair count -- see MIN_GAMES_PER_BUCKET.
+    n_games: int = 0
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -93,6 +106,7 @@ class CorrelationPriors:
     n_player_games: int = 0
     line_source: str | None = None
     min_pairs: int = MIN_PAIRS_PER_BUCKET
+    min_games: int = MIN_GAMES_PER_BUCKET
     research_status: str = RESEARCH_STATUS
 
     def get(self, relationship: str, market_a: str, market_b: str) -> CorrelationBucket | None:
@@ -107,6 +121,7 @@ class CorrelationPriors:
                 "market_b": b.market_b,
                 "rho": b.rho,
                 "n_pairs": b.n_pairs,
+                "n_games": b.n_games,
                 "usable": b.usable,
                 "reason": b.reason,
             }
@@ -122,10 +137,12 @@ class CorrelationPriors:
             "n_player_games": self.n_player_games,
             "line_source": self.line_source,
             "min_pairs": self.min_pairs,
+            "min_games": self.min_games,
             "n_buckets": len(self.buckets),
             "n_usable": len(usable),
             "usable": sorted(
-                ({"key": "/".join(b.key), "rho": round(b.rho, 4), "n": b.n_pairs}
+                ({"key": "/".join(b.key), "rho": round(b.rho, 4),
+                  "n_pairs": b.n_pairs, "n_games": b.n_games}
                  for b in usable),
                 key=lambda d: -abs(d["rho"]),
             ),
@@ -135,6 +152,31 @@ class CorrelationPriors:
 # ---------------------------------------------------------------------------
 # realised outcomes
 # ---------------------------------------------------------------------------
+
+
+def _default_line_col(
+    market: str, columns: Sequence[str], markets: Sequence[str],
+) -> str | None:
+    """Which column grades ``market``'s legs when the caller named none.
+
+    This defaulted to the single shared column ``RESEARCH_LINE``, which the
+    panel does not carry -- labels.attach_research_line derives it per market
+    from ``{stat}_L10`` and attaches it to ONE market's training frame. So the
+    default fit skipped every market and raised "No usable markets", measured
+    on the real 214,381-row panel: the layer evaluate_parlay depends on could
+    not run at its own defaults. And a single shared column cannot be the line
+    for three markets anyway -- it would grade REB legs against PTS's line.
+
+    So the per-market ``{stat}_L10`` comes first. RESEARCH_LINE is accepted
+    only when exactly one market is being fitted, where it is unambiguous.
+    """
+    available = set(columns)
+    per_market = f"{market}_{RESEARCH_LINE_SOURCE}"
+    if per_market in available:
+        return per_market
+    if len(markets) == 1 and RESEARCH_LINE_COL in available:
+        return RESEARCH_LINE_COL
+    return None
 
 
 def realised_leg_outcomes(
@@ -184,11 +226,11 @@ def realised_leg_outcomes(
         if market not in work.columns:
             logger.warning("leg_correlation: market %s absent from the panel", market)
             continue
-        line_col = lines.get(market, "RESEARCH_LINE")
-        if line_col not in work.columns:
+        line_col = lines.get(market) or _default_line_col(market, work.columns, markets)
+        if line_col is None or line_col not in work.columns:
             logger.warning(
-                "leg_correlation: no line column %r for %s; market skipped",
-                line_col, market,
+                "leg_correlation: no line column for %s (looked for %r); market "
+                "skipped", market, line_col or f"{market}_{RESEARCH_LINE_SOURCE}",
             )
             continue
         block = work[[
@@ -199,7 +241,7 @@ def realised_leg_outcomes(
 
         stat = pd.to_numeric(block[market], errors="coerce")
         line = pd.to_numeric(block[line_col], errors="coerce")
-        block = block.assign(market=market, stat=stat, line=line)
+        block = block.assign(market=market, stat=stat, line=line, line_col=line_col)
         block = block[block["stat"].notna() & block["line"].notna()]
 
         # A push is neither a win nor a loss. Coercing it to either biases
@@ -209,7 +251,7 @@ def realised_leg_outcomes(
         block["outcome"] = over if side == "over" else 1.0 - over
         frames.append(block[[
             "GAME_ID", "GAME_DATE", player_key, "TEAM_ABBREVIATION",
-            "OPPONENT_ABBREVIATION", "market", "outcome",
+            "OPPONENT_ABBREVIATION", "market", "line_col", "outcome",
         ]].rename(columns={player_key: "player_key"}))
 
     if not frames:
@@ -256,27 +298,38 @@ def fit_leg_correlations(
     markets: Sequence[str] = ("PTS", "REB", "AST"),
     line_col_for: Mapping[str, str] | None = None,
     min_pairs: int = MIN_PAIRS_PER_BUCKET,
-    max_pairs_per_game: int = 200,
+    min_games: int = MIN_GAMES_PER_BUCKET,
+    max_rows_per_game: int = 200,
 ) -> CorrelationPriors:
     """
     Fit tetrachoric correlations per (relationship, market, market) bucket.
 
     Every pair of legs that co-occurred in a game before ``as_of`` is pooled
-    into its bucket, and each bucket is fitted only when it clears
-    ``min_pairs``. Buckets that do not clear it are RETURNED, marked unusable
-    with a reason, rather than dropped — "we could not fit this" is a
-    different statement from "these legs are independent", and the caller
-    needs to be able to tell them apart.
+    into its bucket, and each bucket is fitted only when it clears BOTH
+    ``min_pairs`` and ``min_games``. Buckets that do not clear them are
+    RETURNED, marked unusable with a reason, rather than dropped — "we could
+    not fit this" is a different statement from "these legs are independent",
+    and the caller needs to be able to tell them apart.
+
+    ``min_games`` is not redundant with ``min_pairs``. Pairs inside one game
+    share that night's blowout, pace and officiating and reuse the same
+    outcomes, so they are not independent observations: 25 leg rows from a
+    SINGLE game produce 2,700 pairs, and six buckets cleared a 200-pair gate
+    on that alone. The game is the independent unit.
+
+    ``max_rows_per_game`` caps the LEG ROWS taken from one game, not the pairs
+    they generate — 200 rows still yield up to 19,900 pairs.
     """
     outcomes = realised_leg_outcomes(
         panel, markets=markets, line_col_for=line_col_for, as_of=as_of,
     )
 
     pairs: dict[tuple[str, str, str], list[tuple[float, float]]] = {}
-    for _game_id, block in outcomes.groupby("GAME_ID", sort=False):
+    games: dict[tuple[str, str, str], set[str]] = {}
+    for game_id, block in outcomes.groupby("GAME_ID", sort=False):
         rows = block.to_dict("records")
-        if len(rows) > max_pairs_per_game:
-            rows = rows[:max_pairs_per_game]
+        if len(rows) > max_rows_per_game:
+            rows = rows[:max_rows_per_game]
         for a, b in combinations(rows, 2):
             relationship = classify_relationship(a, b)
             if relationship == DIFFERENT_GAME:
@@ -286,22 +339,29 @@ def fit_leg_correlations(
             if market_b < market_a:
                 market_a, market_b = market_b, market_a
                 outcome_a, outcome_b = outcome_b, outcome_a
-            pairs.setdefault((relationship, market_a, market_b), []).append(
+            bucket_key = (relationship, market_a, market_b)
+            pairs.setdefault(bucket_key, []).append(
                 (float(outcome_a), float(outcome_b))
             )
+            games.setdefault(bucket_key, set()).add(str(game_id))
 
     buckets: dict[tuple[str, str, str], CorrelationBucket] = {}
     for key, observed in pairs.items():
         relationship, market_a, market_b = key
         n = len(observed)
-        if n < int(min_pairs):
+        n_games = len(games.get(key, ()))
+        if n < int(min_pairs) or n_games < int(min_games):
+            short = (
+                f"only {n} realised pairs, need {min_pairs}"
+                if n < int(min_pairs)
+                else f"only {n_games} distinct game{'' if n_games == 1 else 's'}, "
+                     f"need {min_games} (the {n} pairs reuse those games' "
+                     "outcomes and are not independent observations)"
+            )
             buckets[key] = CorrelationBucket(
                 relationship=relationship, market_a=market_a, market_b=market_b,
-                rho=None, n_pairs=n, usable=False,
-                reason=(
-                    f"only {n} realised pairs, need {min_pairs}. Not fitted — this "
-                    "is 'unknown', not 'independent'."
-                ),
+                rho=None, n_pairs=n, n_games=n_games, usable=False,
+                reason=f"{short}. Not fitted — this is 'unknown', not 'independent'.",
             )
             continue
         arr = np.asarray(observed, dtype=float)
@@ -312,12 +372,12 @@ def fit_leg_correlations(
         except ParlayError as exc:
             buckets[key] = CorrelationBucket(
                 relationship=relationship, market_a=market_a, market_b=market_b,
-                rho=None, n_pairs=n, usable=False, reason=str(exc),
+                rho=None, n_pairs=n, n_games=n_games, usable=False, reason=str(exc),
             )
             continue
         buckets[key] = CorrelationBucket(
             relationship=relationship, market_a=market_a, market_b=market_b,
-            rho=float(rho), n_pairs=n, usable=True,
+            rho=float(rho), n_pairs=n, n_games=n_games, usable=True,
         )
 
     priors = CorrelationPriors(
@@ -325,8 +385,17 @@ def fit_leg_correlations(
         as_of=str(pd.Timestamp(as_of).date()),
         n_games=int(outcomes["GAME_ID"].nunique()),
         n_player_games=int(len(outcomes)),
-        line_source=str(dict(line_col_for or {}) or "RESEARCH_LINE"),
+        # The columns ACTUALLY used, not the requested default. This label is
+        # the record of what bias the fitted correlations inherit, and one that
+        # names a column the fit did not read is worse than none.
+        line_source=", ".join(
+            f"{m}={c}" for m, c in sorted(
+                outcomes.drop_duplicates("market")
+                .set_index("market")["line_col"].astype(str).items()
+            )
+        ),
         min_pairs=int(min_pairs),
+        min_games=int(min_games),
     )
     logger.info("leg_correlation: %s", priors.summary())
     return priors
