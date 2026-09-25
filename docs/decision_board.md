@@ -343,11 +343,32 @@ Two things were measured on those buckets. They are different in kind and an
 earlier version of this section conflated them, so they are separated here.
 
 **The dependence is real (a statement about the data).** Over the 165,742
-`same_player` PTS×REB pairs, P(PTS over) = 0.4597 and P(REB over) = 0.4564, and
-they land together **0.2693** of the time against an independent product of
-**0.2098**. Independence is wrong by 0.0595 — roughly 92 Monte Carlo standard
-errors. That gap does not depend on the fitted rho at all, and it is the reason
-a same-game ticket cannot be priced as a product.
+`same_player` PTS×REB pairs from 8,153 games, P(PTS over) = 0.4597 and
+P(REB over) = 0.4564, and they land together **0.2693** of the time against an
+independent product of **0.2098**. The gap is **0.05948**, with a
+**game-clustered bootstrap SE of 0.00061** (400 resamples of whole games) and a
+95% CI of **[0.0583, 0.0606]** — about 97 clustered standard errors from zero.
+That gap does not depend on the fitted rho at all, and it is the reason a
+same-game ticket cannot be priced as a product.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=. python scripts/leg_correlation_dependence_check.py     --as-of 2025-01-01 --markets PTS,REB
+```
+
+The clustering was checked rather than assumed: resampling whole games gives
+essentially the same SE as resampling individual pairs (**design effect
+1.00x**). That is not a coincidence — the gap is a *difference* between the
+joint rate and the product of the marginals, so a game-level shock such as pace
+or a blowout moves both terms together and cancels. Clustering would matter for
+the joint rate on its own; it does not for this difference.
+
+An earlier version of this paragraph justified the same conclusion with
+"roughly 92 Monte Carlo standard errors". That was the wrong statistic — it was
+the precision of the copula *simulation* at rho = 0, which says nothing about
+sampling error in an observed rate. It happened to land near the correct figure,
+which is worse than being plainly wrong, not better.
 
 **The bisection converged (an IN-SAMPLE diagnostic, not evidence of
 generalisation).** The copula at the fitted rho returns 0.2721, within 0.0029
