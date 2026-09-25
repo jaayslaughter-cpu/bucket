@@ -521,7 +521,15 @@ def normalize_player_box_scores(
         ),
     }
     if team_crosswalk is not None and not team_crosswalk.empty:
-        lookup = {_norm(c): c for c in df.columns}
+        # Align the SOURCE frame to the rows that survived. out started as
+        # pd.DataFrame(index=df.index) and then dropped unparseable dates
+        # WITHOUT resetting the index, so out.index is a subset of df's labels.
+        # Reading team ids straight from df while pairing them with
+        # out["SEASON"] raised "Length of values (3) does not match length of
+        # index (4)" -- the documented date-drop path crashed outright whenever
+        # a crosswalk was supplied.
+        src = df.loc[out.index]
+        lookup = {_norm(c): c for c in src.columns}
 
         def _find(candidates: tuple[str, ...]) -> str | None:
             return next(
@@ -533,7 +541,7 @@ def normalize_player_box_scores(
             resolved = pd.Series(pd.NA, index=out.index, dtype="string")
             if id_source is not None:
                 ids = (
-                    df[id_source].astype("string").str.strip()
+                    src[id_source].astype("string").str.strip()
                     .str.replace(r"\.0$", "", regex=True)
                 )
                 resolved = _map_team_ids(ids, out["SEASON"], team_crosswalk)
@@ -546,7 +554,7 @@ def normalize_player_box_scores(
                 gaps = resolved.isna()
                 if gaps.any():
                     by_name = _map_team_names(
-                        df.loc[gaps, city_source], df.loc[gaps, name_source],
+                        src.loc[gaps, city_source], src.loc[gaps, name_source],
                         out.loc[gaps, "SEASON"], team_crosswalk,
                     )
                     resolved.loc[gaps] = by_name

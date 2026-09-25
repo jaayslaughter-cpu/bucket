@@ -157,14 +157,20 @@ def attach_market_context(
     a game the market never priced is unknown, and filling it would assert a
     forecast nobody made.
     """
+    # BEFORE the no-market fast path, not after. This guard is about what the
+    # PANEL already carries, which has nothing to do with whether market lines
+    # were supplied -- and returning early skipped it, so a panel arriving with
+    # a closing-line column passed straight through unchecked whenever
+    # market_lines was absent. The one route that most needs the guard is the
+    # one that used to bypass it.
+    assert_no_closing_lines(panel.columns)
+
     if market_lines is None or market_lines.empty:
         logger.info(
             "market_context: no market lines supplied, so no market features. The "
             "run is narrower rather than silently filled."
         )
         return panel
-
-    assert_no_closing_lines(panel.columns)
 
     keys = ("GAME_ID", "TEAM_ABBREVIATION")
     missing = [k for k in keys if k not in panel.columns]

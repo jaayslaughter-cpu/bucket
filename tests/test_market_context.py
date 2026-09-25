@@ -191,3 +191,43 @@ def test_the_builder_still_runs_its_lookahead_assertion_with_market_columns():
     built = build_feature_matrix(_panel(), market_lines=_market_lines())
     assert_no_lookahead(built)     # raises if anything postgame slipped in
     assert np.isfinite(built["MKT_OPENING_TOTAL"]).all()
+
+
+# --- cubic review, PR #3 ------------------------------------------------------
+
+
+def test_closing_line_guard_runs_even_with_no_market_lines():
+    """attach_market_context returned early when market_lines was absent, before
+    assert_no_closing_lines ran — so a panel already carrying a closing-line
+    column passed through unchecked on exactly the route that most needs the
+    guard. What the panel carries has nothing to do with whether lines were
+    supplied."""
+    from src.features.market_context import (
+        CLOSING_ONLY_COLS,
+        ClosingLineLeakageError,
+        attach_market_context,
+    )
+
+    leaky = pd.DataFrame({
+        "GAME_ID": ["1"],
+        "TEAM_ABBREVIATION": ["BOS"],
+        sorted(CLOSING_ONLY_COLS)[0]: [-3.5],
+    })
+
+    for market_lines in (None, pd.DataFrame()):
+        with pytest.raises(ClosingLineLeakageError, match="CLOSING"):
+            attach_market_context(leaky, market_lines)
+
+
+def test_a_clean_panel_with_no_market_lines_is_still_returned_unchanged():
+    """Moving the guard must not break the legitimate no-market route."""
+    from src.features.market_context import attach_market_context
+
+    clean = pd.DataFrame({
+        "GAME_ID": ["1"], "TEAM_ABBREVIATION": ["BOS"], "OPENING_SPREAD": [-3.5],
+    })
+
+    out = attach_market_context(clean, None)
+
+    assert len(out) == 1
+    assert list(out.columns) == list(clean.columns)
