@@ -246,14 +246,31 @@ def test_oof_folds_inherit_the_configured_tuning_and_split_count(monkeypatch):
         )
 
 
-def test_the_saved_sidecar_records_the_tuning_that_produced_it():
+def test_tuning_and_split_count_survive_a_save_load_round_trip(tmp_path):
     """The load path reconstructs the pipeline from the sidecar, so a sidecar
     without tuning/n_splits silently reverted a reloaded artifact to the
     defaults. effective_params records the tree count the search LANDED on;
-    these are the settings that produced it."""
+    these are the settings that produced it.
+
+    An earlier version of this test only asserted that the CONSTRUCTOR stored
+    the values, so it passed even with the sidecar change reverted -- a test
+    that could not fail. It has to actually save and reload.
+    """
     from src.models.xgb_adapter import XGBoostAdapter
 
-    model = XGBoostAdapter(["f"], n_splits=4, tuning={"n_estimators_max": 250})
+    original = XGBoostAdapter(
+        ["f"], n_splits=4, tuning={"n_estimators_max": 250, "early_stopping_rounds": 7},
+    )
+    original.fit(_labelled_rows(200))
+    assert original._pipe.tuning["n_estimators_max"] == 250
 
-    assert model._pipe.tuning["n_estimators_max"] == 250
-    assert model._pipe.n_splits == 4
+    artifact = tmp_path / "xgb_model"
+    original.save(artifact)
+
+    reloaded = XGBoostAdapter(["f"]).load(artifact)
+
+    assert reloaded._pipe.tuning["n_estimators_max"] == 250, (
+        "reloaded artifact reverted to DEFAULT_TUNING"
+    )
+    assert reloaded._pipe.tuning["early_stopping_rounds"] == 7
+    assert reloaded._pipe.n_splits == 4, "reloaded artifact reverted to n_splits=5"
