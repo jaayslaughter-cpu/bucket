@@ -208,6 +208,17 @@ sports_ev:
 # Half-life in days, so the value says what it means. null disables
 # weighting entirely; fit_half_life_by_holdout() can choose it instead.
 # Check effective_sample_size before trusting an aggressive value.
+#
+# THIS BLOCK WAS DEAD until compare.recency_sample_weights() was written to read
+# it: recency.py produced the weights, both pipelines accepted a sample_weight,
+# and nothing passed one, so a game from 2018 and a game from last week carried
+# identical influence in every fit.
+#
+# STILL DISABLED, and not for lack of wiring. Weighting discards information --
+# the Kish effective sample size is logged and returned under
+# `recency_weighting` on every run that enables it -- and no A/B has been run
+# yet. Turn it on when a measurement supports it, the way the blowout layer
+# stays off on measured evidence.
 recency:
   half_life_days: 240
   enabled: false

@@ -71,7 +71,23 @@ class XGBoostAdapter:
         # an input; once it is, masking would throw away the answer.
         self.line_aware: bool = False
 
-    def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "XGBoostAdapter":
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        validation_data: pd.DataFrame | None = None,
+        sample_weight: "pd.Series | None" = None,
+    ) -> "XGBoostAdapter":
+        """
+        Fit the wrapped pipeline.
+
+        ``sample_weight`` is forwarded, not consumed here. XGBoostPropPipeline
+        has accepted recency weights since it was written and aligns them by
+        index; this adapter simply had no parameter to pass them through, so
+        nothing could reach it. The mean head and the out-of-fold pass below are
+        left UNWEIGHTED on purpose: they exist to produce a calibration signal
+        and a conditional mean, and weighting one but not the other would make
+        the two disagree about which rows matter.
+        """
         # Existing pipeline fits on train only (validation unused — preserved).
         if validation_data is not None and not validation_data.empty:
             logger.info(
@@ -79,7 +95,7 @@ class XGBoostAdapter:
                 "XGBoostPropPipeline.fit uses train only (unchanged behavior).",
                 len(validation_data),
             )
-        self._pipe.fit(train_data, target_col="over_hit")
+        self._pipe.fit(train_data, target_col="over_hit", sample_weight=sample_weight)
         self._fitted = True
         self._fit_mean_head(train_data)
         self._fit_out_of_fold(train_data)

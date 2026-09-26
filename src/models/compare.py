@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,78 @@ def resolve_feature_cols(df: pd.DataFrame, cols: list[str]) -> tuple[list[str], 
             len(absent), absent,
         )
     return present, absent
+
+
+def recency_sample_weights(
+    train: pd.DataFrame, cfg: dict[str, Any], market: str
+) -> "tuple[pd.Series | None, dict[str, Any] | None]":
+    """
+    Recency weights for this training window, or ``(None, None)`` when off.
+
+    WHY THIS FUNCTION EXISTS. src/models/recency.py computed these weights and
+    xgboost_pipeline.py and catboost_pipeline.py both accepted a
+    ``sample_weight`` — and nothing in the repository passed one, so a game from
+    2018 and a game from last week carried identical influence in every fit.
+    This is the missing middle.
+
+    OFF BY DEFAULT, like the blowout layer, because weighting is not free: it
+    discards information, and how much is measurable rather than arguable. The
+    Kish effective sample size is logged on every run that enables it, so a
+    half-life that quietly reduces 80,000 rows to 9,000 says so before it shows
+    up as an unstable model.
+
+    NO ``as_of`` IS PASSED. exponential_recency_weights then anchors on the
+    newest date in ``train`` — the training window's own end. Handing it the
+    validation end would leak the split boundary into the fit, and the function
+    refuses a reference date outside the window rather than allowing it.
+    """
+    recency_cfg = cfg.get("recency") or {}
+    if not recency_cfg.get("enabled", False):
+        return None, None
+    if "GAME_DATE" not in train.columns:
+        logger.warning(
+            "recency.enabled is true but the training frame has no GAME_DATE — "
+            "fitting UNWEIGHTED rather than inventing an ordering."
+        )
+        return None, None
+
+    from src.models.recency import (
+        DEFAULT_HALF_LIFE_DAYS,
+        RecencyWeightError,
+        exponential_recency_weights,
+        recency_weight_report,
+    )
+
+    half_life = float(recency_cfg.get("half_life_days", DEFAULT_HALF_LIFE_DAYS))
+    try:
+        weights = exponential_recency_weights(
+            train["GAME_DATE"], half_life_days=half_life
+        )
+        report = recency_weight_report(train["GAME_DATE"], half_life_days=half_life)
+    except RecencyWeightError as exc:
+        logger.warning(
+            "Market %s: recency weighting refused (%s) — fitting UNWEIGHTED.",
+            market, exc,
+        )
+        return None, None
+
+    report["market"] = market
+    logger.info(
+        "Market %s: recency weights half_life=%.0fd, %d rows -> effective %s "
+        "(%.1f%%), max/min weight %s",
+        market, half_life, int(report["n_rows"]),
+        report["effective_sample_size"], report["effective_fraction"] * 100.0,
+        report["weight_ratio"],
+    )
+    return weights, report
+
+
+def _accepts_sample_weight(fit_callable: Any) -> bool:
+    """Does this component's fit take a ``sample_weight`` keyword?"""
+    try:
+        return "sample_weight" in inspect.signature(fit_callable).parameters
+    except (TypeError, ValueError):  # builtins, C extensions
+        return False
 
 
 def prepare_market_panel(panel: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -420,6 +493,10 @@ def compare_models_on_panel(
     weights = cfg.get("ensemble_weights") or {}
     summary_rows: list[dict[str, Any]] = []
     fit_failures: list[dict[str, Any]] = []
+    # Returned rather than only logged: a run whose weighting collapsed the
+    # effective sample size is not distinguishable from an unweighted one by
+    # its metrics alone, and the caller has to be able to see which it was.
+    recency_reports: list[dict[str, Any]] = []
     ensemble_composition: list[dict[str, Any]] = []
     detail_rows: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
@@ -480,10 +557,21 @@ def compare_models_on_panel(
                 continue
 
         components = build_components(market, feature_cols, cfg, xgb_feature_cols=xgb_cols)
+        weights_series, recency_report = recency_sample_weights(train, cfg, market)
+        if recency_report is not None:
+            recency_reports.append(recency_report)
+
         fitted: dict[str, Any] = {}
         for name, model in components.items():
             try:
-                model.fit(train, val)
+                # Passed only to components whose fit declares it. Inspected
+                # rather than hardcoded: DistributionPropModel estimates a
+                # dispersion and takes no weights, and a component added later
+                # must not start raising TypeError here.
+                if weights_series is not None and _accepts_sample_weight(model.fit):
+                    model.fit(train, val, sample_weight=weights_series)
+                else:
+                    model.fit(train, val)
                 fitted[name] = model
             except Exception as exc:  # noqa: BLE001
                 # A component that cannot fit is skipped so the run continues,
@@ -736,5 +824,6 @@ def compare_models_on_panel(
         # Exported so a run that quietly lost half its configured weight
         # leaves a record instead of an unremarkable-looking summary row.
         "fit_failures": fit_failures,
+        "recency_weighting": recency_reports,
         "ensemble_composition": ensemble_composition,
     }
