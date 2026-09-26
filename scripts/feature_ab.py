@@ -161,7 +161,8 @@ LAYERS: dict[str, Layer] = {
             "minutes shape, true-shooting. Every column here correlates below "
             "0.45 with each feature its market already reads -- the redundant "
             "members of these layers are listed in labels._EXCLUDED_AS_REDUNDANT "
-            "and are NOT under test."
+            "and are NOT under test. These columns ARE wired, so this arm runs "
+            "without --wire-under-test."
         ),
     ),
     "halflife": Layer(
@@ -177,7 +178,9 @@ LAYERS: dict[str, Layer] = {
             "redundant: r = 0.96-0.99 against {M}_SEASON, {M}_L2 and MIN_SEASON. "
             "Listed so the prediction can be tested rather than asserted -- a "
             "shrunk estimate can still behave better than the raw mean it "
-            "mirrors, which correlation alone cannot rule out."
+            "mirrors, which correlation alone cannot rule out. NEEDS "
+            "--wire-under-test: these columns are deliberately absent from every "
+            "feature list, so without it the run refuses by design."
         ),
     ),
     "usage_volume": Layer(
@@ -188,7 +191,7 @@ LAYERS: dict[str, Layer] = {
         note=(
             "Usage proxy and shot volume. Predicted redundant for PTS "
             "(r = 0.955-0.969 against PTS_L10 and PTS_BASELINE) and moderate "
-            "for REB/AST (0.835-0.848 against MIN_L10)."
+            "for REB/AST (0.835-0.848 against MIN_L10). NEEDS --wire-under-test."
         ),
     ),
     "opp_allowed_per_game": Layer(
@@ -199,7 +202,8 @@ LAYERS: dict[str, Layer] = {
         note=(
             "Opponent allowed per GAME, against the listed DEF_* columns which "
             "are per 100 POSSESSIONS. Per-game allowed confounds defensive "
-            "quality with tempo, the confound DEF_PACE_L10 exists to separate."
+            "quality with tempo, the confound DEF_PACE_L10 exists to separate. "
+            "NEEDS --wire-under-test."
         ),
     ),
     "market_context": Layer(
@@ -217,6 +221,11 @@ LAYERS: dict[str, Layer] = {
         ),
     ),
 }
+
+
+# The stat prefixes that make a column market-specific. Used only by
+# --wire-under-test, to keep one market's columns out of another's arm.
+_STAT_PREFIXES = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA")
 
 
 METRICS = (
@@ -286,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seasons-only", default=None,
                     help="Restrict BOTH arms to these seasons, comma separated. "
                          "Required when a layer exists for only part of the panel.")
+    ap.add_argument("--wire-under-test", action="store_true",
+                    help="Add the toggled columns to each market's feature list "
+                         "FOR THIS RUN ONLY, so a column that is not yet wired "
+                         "can be measured before it is shipped. Without this, a "
+                         "layer no market reads cannot be compared at all.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -329,18 +343,57 @@ def main(argv: list[str] | None = None) -> int:
     # measured evidence, so `--layer pbp` with the default `--markets PTS`
     # produced a table of exact zeros -- a correct answer to a question
     # nobody meant to ask. Say so instead of printing it.
+    import src.models.compare as compare_module
     from src.models.labels import default_feature_cols
 
-    read_by = {
-        m: sorted(set(under_test) & set(default_feature_cols(m))) for m in markets
-    }
+    if args.wire_under_test:
+        # compare.py binds default_feature_cols at import, so the patch has to
+        # land on ITS name, not on labels'. Both arms get the widened list: the
+        # control frame does not carry these columns, and resolve_feature_cols
+        # drops what the frame lacks, so the control trains without them exactly
+        # as a subtractive arm does.
+        _base = compare_module.default_feature_cols
+
+        # PER MARKET, not every column to every market. A first version appended
+        # all of them to all of them, so a PTS run was handed AST_HL and
+        # REB_HL_SHRINK -- which is not the question being asked, and is not what
+        # labels.py does either: every dict there is keyed by market. A column
+        # carrying another market's stat prefix is skipped; MIN_*, MINUTES_*,
+        # TS_PCT_*, USAGE_PROXY_* and the rest are market-neutral and go to all.
+        def _for_market(column: str, market: str) -> bool:
+            for stat in _STAT_PREFIXES:
+                if stat == market:
+                    continue
+                if column.startswith(f"{stat}_") or column.startswith(f"OPP_{stat}_"):
+                    return False
+            return True
+
+        def _widened(market, _base=_base, _extra=tuple(under_test)):
+            cols = list(_base(market))
+            for c in _extra:
+                if c not in cols and _for_market(c, market.upper()):
+                    cols.append(c)
+            return cols
+
+        compare_module.default_feature_cols = _widened  # type: ignore[assignment]
+        print(f"--wire-under-test: up to {len(under_test)} column(s) added to "
+              f"each market's feature list for this run only, skipping any that "
+              f"carry another market's stat prefix. Nothing is written to "
+              f"src/models/labels.py.")
+
+    resolver = (
+        compare_module.default_feature_cols if args.wire_under_test
+        else default_feature_cols
+    )
+    read_by = {m: sorted(set(under_test) & set(resolver(m))) for m in markets}
     if not any(read_by.values()):
         print(
             f"ERROR: no market in {markets} reads any '{args.layer}' column. The "
             f"layer is in the panel, but default_feature_cols() selects none of "
             f"{under_test} for these markets, so both arms would train on "
             f"identical features and every delta would be exactly zero. Pick "
-            f"markets that read this layer, or wire it in src/models/labels.py.",
+            f"markets that read this layer, wire it in src/models/labels.py, or "
+            f"pass --wire-under-test to measure it without shipping it.",
             file=sys.stderr,
         )
         return 2

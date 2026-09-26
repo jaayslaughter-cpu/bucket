@@ -298,12 +298,23 @@ def build_features_and_verify_fatigue(
     features = build_feature_matrix(
         player_panel, team_games=team_games, market_lines=market_lines
     )
-    if team_games is None or market_lines is None:
+    # EMPTY counts as absent, because that is how the builder treats it:
+    # build_feature_matrix gates both layers on `is not None and not .empty`,
+    # so a workbook that parsed to zero rows skips them exactly as a missing
+    # frame does. Warning only on None left that case silent, which is the
+    # defect this function exists to fix.
+    def _absent(frame: pd.DataFrame | None) -> bool:
+        return frame is None or frame.empty
+
+    if _absent(team_games) or _absent(market_lines):
         logger.warning(
-            "No workbook frames supplied — team Elo, market context, opponent "
-            "defence and blowout columns will be ABSENT from this matrix. The "
-            "run is narrower, not wrong; supply the BigDataBall workbook to "
-            "match what scripts/nba_model_cli.py builds."
+            "Workbook frames missing or EMPTY (team_games=%s, market_lines=%s) — "
+            "team Elo, market context, opponent defence and blowout columns will "
+            "be ABSENT from this matrix. The run is narrower, not wrong; supply "
+            "the BigDataBall workbook to match what scripts/nba_model_cli.py "
+            "builds.",
+            "absent" if team_games is None else f"{len(team_games)} rows",
+            "absent" if market_lines is None else f"{len(market_lines)} rows",
         )
 
     if FATIGUE_COL not in features.columns:
@@ -348,10 +359,25 @@ def score_prob_over(
     Score P(Over) with a PREVIOUSLY FITTED model.
 
     XGBoostPropPipeline requires feature_cols at construction and a fitted
-    booster for predict_proba_over. Training is a separate offline job
-    (``python scripts/nba_model_cli.py train-stats --market PTS``, which
-    writes its artifacts under model_runs/); this stage only scores and
-    returns an all-null Series with a named reason when it cannot.
+    booster for predict_proba_over. Training is a separate offline job and this
+    stage only scores, returning an all-null Series with a named reason when it
+    cannot.
+
+    THE TWO DO NOT SHARE A DEFAULT PATH. train-stats needs three flags and
+    writes elsewhere::
+
+        python scripts/nba_model_cli.py train-stats --market PTS \
+            --start-date 2024-11-01 --end-date 2025-03-01
+
+    writes ``xgboost_PTS.json`` (plus its ``.meta.json``) under
+    ``data/external/model_runs/comparison/``, set by ``artifacts_dir`` in
+    config/model_comparison.yaml. This stage reads ``models/xgb_prop_over.json``
+    by default, so a freshly trained model has to be named explicitly::
+
+        python main.py --model data/external/model_runs/comparison/xgboost_PTS.json
+
+    Following the command without those flags fails, and following it without
+    ``--model`` trains successfully and still skips scoring.
     """
     null = pd.Series([None] * len(features), index=features.index, dtype="object")
 
@@ -360,9 +386,11 @@ def score_prob_over(
         return null
     if not model_path.exists():
         logger.warning(
-            "P(Over) skipped: no fitted model at %s. Train one first with "
-            "`scripts/nba_model_cli.py train-stats --market PTS` — this stage "
-            "does not fit models.",
+            "P(Over) skipped: no fitted model at %s. This stage does not fit "
+            "models. Train one with `scripts/nba_model_cli.py train-stats "
+            "--market PTS --start-date ... --end-date ...`, which writes to "
+            "data/external/model_runs/comparison/, then pass that artifact as "
+            "--model — the two paths do not coincide.",
             model_path,
         )
         return null

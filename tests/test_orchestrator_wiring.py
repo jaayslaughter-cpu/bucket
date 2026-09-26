@@ -92,6 +92,66 @@ def test_omitting_the_frames_is_reported_rather_than_silent(monkeypatch, caplog)
     )
 
 
+@pytest.mark.parametrize("which", ["team_games", "market_lines", "both"])
+def test_an_empty_frame_is_reported_the_same_as_a_missing_one(
+    monkeypatch, caplog, which
+):
+    """EMPTY is absent, because that is how the builder treats it.
+
+    build_feature_matrix gates both layers on ``is not None and not .empty``, so
+    a workbook that parsed to zero rows skips Elo and market context exactly as
+    a missing frame does. Warning only on None left that case silent — the very
+    thing this function was changed to prevent.
+    """
+    import src.features.builder as builder
+
+    monkeypatch.setattr(
+        builder, "build_feature_matrix",
+        lambda panel, *, team_games=None, market_lines=None: _matrix(panel),
+    )
+    monkeypatch.setattr(builder, "assert_no_lookahead", lambda df: None)
+
+    full = pd.DataFrame({"nba_game_id": ["0021700001"], "PTS": [100]})
+    empty = pd.DataFrame(columns=["nba_game_id", "PTS"])
+    frames = {
+        "team_games": (empty, full),
+        "market_lines": (full, empty),
+        "both": (empty, empty),
+    }[which]
+
+    with caplog.at_level("WARNING"):
+        orchestrator.build_features_and_verify_fatigue(
+            _panel(), team_games=frames[0], market_lines=frames[1]
+        )
+    assert any("ABSENT from this matrix" in r.message for r in caplog.records), (
+        f"an empty {which} frame built a narrower matrix without saying so"
+    )
+
+
+def test_the_training_pointer_names_the_flags_the_command_actually_requires():
+    """train-stats has three required options and writes somewhere the scorer
+    does not read. A pointer naming only --market fails when followed, and a
+    pointer omitting the artifact path trains successfully and still skips
+    scoring. Both halves are asserted against the command's real signature."""
+    import inspect
+
+    from scripts.nba_model_cli import train_stats
+
+    required = {
+        name for name, param in inspect.signature(train_stats).parameters.items()
+        if getattr(param.default, "default", None) is ...
+    }
+    assert {"market", "start_date", "end_date"} <= required, required
+
+    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    for flag in ("--start-date", "--end-date"):
+        assert flag in source, f"{flag} is required by train-stats and unmentioned"
+    assert "model_runs/comparison" in source, (
+        "the artifact directory train-stats writes to is not named, so a reader "
+        "cannot point --model at it"
+    )
+
+
 def test_ingest_market_lines_returns_both_frames(monkeypatch):
     """Both, not just the market one: the team frame is an input to the feature
     build and was being parsed and then dropped on the floor."""
