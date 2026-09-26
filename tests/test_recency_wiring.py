@@ -147,3 +147,52 @@ def test_the_xgboost_adapter_forwards_the_weights_to_its_pipeline(monkeypatch):
     adapter.fit(train, None, sample_weight=weights)
 
     assert seen["sample_weight"] is weights, "the adapter swallowed the weights"
+
+
+# --- what the A/B rounds decided -----------------------------------------
+
+
+def test_only_measured_markets_carry_form_columns():
+    """_FORM_BY_MARKET is populated from measurement, not from the correlation
+    screen that preceded it.
+
+    AST is the reason this test exists: its entry was shipped on the screen
+    alone, and when the A/B ran, every Brier delta sat at or below its own fold
+    spread and line_aware got worse. A column can be genuinely new -- r < 0.45
+    against everything the market already reads -- and still not help. Any market
+    added back here needs its numbers in the comment beside it.
+    """
+    from src.models.labels import _FORM_BY_MARKET, default_feature_cols
+
+    measured_winners = {"PTS", "REB"}
+    for market, cols in _FORM_BY_MARKET.items():
+        if market in measured_winners:
+            assert cols, f"{market} won its A/B and should carry form columns"
+        else:
+            assert cols == (), (
+                f"{market} has no A/B result supporting these columns: {cols}. "
+                "Measure it with scripts/feature_ab.py --layer form before "
+                "wiring it."
+            )
+
+    # And the decision reaches the feature list the models actually use.
+    assert "AST_HOT_Z" not in default_feature_cols("AST")
+    assert "PTS_HOT_Z" in default_feature_cols("PTS")
+    assert "REB_HOT_Z" in default_feature_cols("REB")
+
+
+def test_the_redundant_families_stay_out_of_every_feature_list():
+    """halflife and usage_volume were measured with --wire-under-test and made
+    Brier worse on every fold. Nothing should re-list them without new numbers.
+    """
+    from src.models.labels import default_feature_cols
+
+    banned = {
+        "PTS_HL", "PTS_HL_SHRINK", "PTS_L2_HL", "MIN_HL", "MIN_HL_SHRINK",
+        "REB_HL", "AST_HL", "USAGE_PROXY_L10",
+        "SHOT_VOLUME_L5", "SHOT_VOLUME_L10", "FGA_L5", "FGA_L10",
+        "OPP_PTS_ALLOWED_L10", "OPP_REB_ALLOWED_L10", "OPP_AST_ALLOWED_L10",
+    }
+    for market in ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA"):
+        listed = set(default_feature_cols(market)) & banned
+        assert not listed, f"{market} re-lists measured-redundant column(s) {listed}"
