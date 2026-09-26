@@ -398,3 +398,23 @@ def test_v3_rows_keep_their_team_when_mixed_with_v2_fallback_rows():
     assert by_game.loc["21700548", "BBS_TEAMMATES_OUT"] == 1   # the v3 game
     assert by_game.loc["21700777", "BBS_TEAMMATES_OUT"] == 1   # the v2 game
     assert (out["BBS_INACTIVE_SOURCE"] == "official_inactive_list").all()
+
+
+def test_an_unrecognised_schema_is_refused_whether_or_not_it_has_rows():
+    """
+    The shape check sat INSIDE the non-empty branch, so a zero-row table with
+    unrecognised columns became a coverage sentinel — recorded as a verified
+    "nobody out", turning that game's counts into 0 — while the SAME broken
+    schema carrying one row was refused. A schema break decided by row count
+    converts a changed response into false evidence precisely when there is
+    nothing to cross-check it against.
+    """
+    garbage = ["who", "what", "eh"]
+    for rows in ([], [["a", "b", "c"]]):
+        payload = {"InactivePlayers": {"headers": garbage, "data": rows}}
+        with pytest.raises(InactiveListError, match="neither the v2 nor the v3 shape"):
+            parse_inactive_players(payload, "0021700548")
+
+    # And a RECOGNISED schema still sentinels when empty and parses when not.
+    assert len(parse_inactive_players(_v3_payload(rows=[]), "0021700548")) == 1
+    assert len(parse_inactive_players(_v3_payload(), "0021700548")) == 2

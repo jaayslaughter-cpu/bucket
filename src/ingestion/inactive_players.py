@@ -96,6 +96,23 @@ def _frame_from_dataset(dataset: Mapping[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=headers)
 
 
+def _detect_version(columns: Iterable[str], game_id: str) -> str:
+    """Which endpoint version an InactivePlayers table came from.
+
+    Raises on anything else, so a changed response is a named refusal rather
+    than a silently empty or mis-mapped frame.
+    """
+    present = set(columns)
+    if {"personId", "firstName", "familyName"} & present:
+        return "v3"
+    if {"PLAYER_ID", "FIRST_NAME", "LAST_NAME"} & present:
+        return "v2"
+    raise InactiveListError(
+        f"DATA_NOT_AVAILABLE: game {game_id} InactivePlayers columns "
+        f"{sorted(present)} match neither the v2 nor the v3 shape."
+    )
+
+
 def parse_inactive_players(
     data_sets: Mapping[str, Any], game_id: str | int
 ) -> pd.DataFrame:
@@ -117,6 +134,16 @@ def parse_inactive_players(
         )
 
     frame = _frame_from_dataset(data_sets["InactivePlayers"])
+
+    # The shape is checked BEFORE the empty branch, not inside it. Checked only
+    # on the non-empty path, a zero-row table with unrecognised columns became a
+    # sentinel — recorded as a verified "nobody out" and turning that game's
+    # counts into 0 — while the SAME broken schema carrying one row was refused.
+    # A schema break decided by row count is the worst of both: it converts a
+    # changed response into false evidence exactly when there is nothing to
+    # cross-check it against.
+    version = _detect_version(frame.columns, gid)
+
     if frame.empty:
         # A game where everyone dressed still has to record that it WAS fetched.
         # Returning zero rows loses that: the game vanishes from the concatenated
@@ -133,26 +160,20 @@ def parse_inactive_players(
         out["TEAM_ID"] = out["TEAM_ID"].astype("string")
         return out
 
-    columns = set(frame.columns)
-    if {"personId", "firstName", "familyName"} & columns:
+    if version == "v3":
         work = frame.rename(columns=_V3_RENAMES)
         work["PLAYER_NAME"] = (
             work.get("firstName", "").astype(str).str.strip()
             + " "
             + work.get("familyName", "").astype(str).str.strip()
         ).str.strip()
-    elif {"PLAYER_ID", "FIRST_NAME", "LAST_NAME"} & columns:
+    else:
         work = frame.rename(columns=_V2_RENAMES)
         work["PLAYER_NAME"] = (
             work.get("FIRST_NAME", "").astype(str).str.strip()
             + " "
             + work.get("LAST_NAME", "").astype(str).str.strip()
         ).str.strip()
-    else:
-        raise InactiveListError(
-            f"DATA_NOT_AVAILABLE: game {gid} InactivePlayers columns "
-            f"{sorted(columns)} match neither the v2 nor the v3 shape."
-        )
 
     # The row's own gameId is not trusted over the one we asked for: v2 does not
     # carry it at all, and a mismatch would silently file rows under the wrong
