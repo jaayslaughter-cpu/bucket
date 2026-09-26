@@ -147,6 +147,8 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
             )
 
     for module_path, func_name, label in (
+        # absences BEFORE teammate_cascade: the cascade reads BBS_TEAMMATES_OUT.
+        ("src.features.absences", "attach_absence_features_layer", "absences"),
         ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
         ("src.features.sports_ev_features", "attach_sports_ev_features", "sports_ev"),
         ("src.features.scoring_efficiency", "attach_box_ts_features", "scoring_efficiency"),

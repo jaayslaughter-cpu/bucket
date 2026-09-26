@@ -22,7 +22,7 @@ import pytest
 from src.ingestion.inactive_players import (
     INACTIVE_COLUMNS,
     InactiveListError,
-    attach_teammate_out_counts,
+    attach_absence_features,
     fetch_inactive_players,
     fetch_many_inactive_players,
     load_cached_inactive_players,
@@ -213,7 +213,7 @@ def test_the_join_survives_the_game_id_padding_mismatch():
     would keep abstaining while holding the data.
     """
     inactives = parse_inactive_players(_v3_payload(game_id="0021700548"), "0021700548")
-    out = attach_teammate_out_counts(_panel(), inactives, team_map=TEAM_MAP)
+    out = attach_absence_features(_panel(), inactives, team_map=TEAM_MAP)
 
     lal = out[(out["GAME_ID"] == "21700548") & (out["TEAM_ABBREVIATION"] == "LAL")]
     gsw = out[(out["GAME_ID"] == "21700548") & (out["TEAM_ABBREVIATION"] == "GSW")]
@@ -226,7 +226,7 @@ def test_a_game_absent_from_the_pull_is_unknown_not_zero():
     """"We did not fetch this game" and "nobody was out" are different
     statements, and only one is evidence."""
     inactives = parse_inactive_players(_v3_payload(game_id="0021700548"), "0021700548")
-    out = attach_teammate_out_counts(_panel(), inactives, team_map=TEAM_MAP)
+    out = attach_absence_features(_panel(), inactives, team_map=TEAM_MAP)
 
     other = out[out["GAME_ID"] == "21700999"]
     assert other["BBS_TEAMMATES_OUT"].isna().all()
@@ -244,7 +244,7 @@ def test_a_fetched_game_with_nobody_out_is_a_real_zero():
         "0021700999",
     )
     inactives = pd.concat([pulled, also_pulled], ignore_index=True)
-    out = attach_teammate_out_counts(_panel(), inactives, team_map=TEAM_MAP)
+    out = attach_absence_features(_panel(), inactives, team_map=TEAM_MAP)
 
     bos = out[out["TEAM_ABBREVIATION"] == "BOS"]
     assert bos["BBS_TEAMMATES_OUT"].tolist() == [0, 0]
@@ -260,14 +260,14 @@ def test_the_count_is_per_team_not_per_game():
         ["0021700548", 1610612744, 2001, "D", "Four", "4"],
     ]
     inactives = parse_inactive_players(_v3_payload(rows=rows), "0021700548")
-    out = attach_teammate_out_counts(_panel(), inactives, team_map=TEAM_MAP)
+    out = attach_absence_features(_panel(), inactives, team_map=TEAM_MAP)
     assert out[out["TEAM_ABBREVIATION"] == "LAL"]["BBS_TEAMMATES_OUT"].tolist() == [3, 3]
     assert out[out["TEAM_ABBREVIATION"] == "GSW"]["BBS_TEAMMATES_OUT"].tolist() == [1, 1]
 
 
 def test_a_panel_without_the_join_keys_is_refused():
     with pytest.raises(InactiveListError, match="missing"):
-        attach_teammate_out_counts(pd.DataFrame({"PLAYER_ID": ["1"]}), pd.DataFrame())
+        attach_absence_features(pd.DataFrame({"PLAYER_ID": ["1"]}), pd.DataFrame())
 
 
 def test_the_team_map_is_injectable_so_it_needs_no_nba_api():
@@ -290,7 +290,7 @@ def test_the_cascade_layer_stops_abstaining_once_the_counts_are_attached():
     from src.features.teammate_cascade import attach_teammate_cascade_stub
 
     inactives = parse_inactive_players(_v3_payload(game_id="0021700548"), "0021700548")
-    panel = attach_teammate_out_counts(_panel(), inactives, team_map=TEAM_MAP)
+    panel = attach_absence_features(_panel(), inactives, team_map=TEAM_MAP)
     out = attach_teammate_cascade_stub(panel)
 
     played = out[out["GAME_ID"] == "21700548"]
@@ -350,7 +350,7 @@ def test_a_game_whose_whole_inactive_list_is_empty_is_zero_not_unknown():
         "TEAM_ABBREVIATION": ["LAL", "GSW", "BOS"],
         "PLAYER_ID": ["1", "2", "3"],
     })
-    out = attach_teammate_out_counts(panel, frame, team_map=TEAM_MAP)
+    out = attach_absence_features(panel, frame, team_map=TEAM_MAP)
     by_game = out.set_index("GAME_ID")
 
     # Fetched, nobody out -> a real 0.
@@ -393,7 +393,7 @@ def test_v3_rows_keep_their_team_when_mixed_with_v2_fallback_rows():
         "TEAM_ABBREVIATION": ["LAL", "GSW"],
         "PLAYER_ID": ["1", "2"],
     })
-    out = attach_teammate_out_counts(panel, mixed, team_map=TEAM_MAP)
+    out = attach_absence_features(panel, mixed, team_map=TEAM_MAP)
     by_game = out.set_index("GAME_ID")
     assert by_game.loc["21700548", "BBS_TEAMMATES_OUT"] == 1   # the v3 game
     assert by_game.loc["21700777", "BBS_TEAMMATES_OUT"] == 1   # the v2 game
@@ -418,3 +418,143 @@ def test_an_unrecognised_schema_is_refused_whether_or_not_it_has_rows():
     # And a RECOGNISED schema still sentinels when empty and parses when not.
     assert len(parse_inactive_players(_v3_payload(rows=[]), "0021700548")) == 1
     assert len(parse_inactive_players(_v3_payload(), "0021700548")) == 2
+
+
+# --- vacated usage: the sum, not the count -------------------------------
+
+
+def _usage_panel():
+    """Star 900 and bench 901 build a usage history, then miss game 3.
+
+    Player 902 has never appeared, so he has no prior usage to contribute.
+    500/501 are the two who DID play game 3, i.e. the rows a prop model scores.
+    """
+    return pd.DataFrame({
+        "GAME_ID": ["21700001", "21700001", "21700002", "21700002",
+                    "21700003", "21700003"],
+        "GAME_DATE": pd.to_datetime([
+            "2018-01-01", "2018-01-01", "2018-01-03", "2018-01-03",
+            "2018-01-05", "2018-01-05",
+        ]),
+        "TEAM_ABBREVIATION": ["LAL"] * 6,
+        "PLAYER_ID": ["900", "901", "900", "901", "500", "501"],
+        "USAGE_PROXY_L10": [0.30, 0.05, 0.28, 0.06, 0.20, 0.21],
+    })
+
+
+def _three_out_of_game_three():
+    return parse_inactive_players(_v3_payload(game_id="0021700003", rows=[
+        ["0021700003", 1610612747, 900, "Star", "Player", "1"],
+        ["0021700003", 1610612747, 901, "Bench", "Guy", "2"],
+        ["0021700003", 1610612747, 902, "Never", "Played", "3"],
+    ]), "0021700003")
+
+
+def test_vacated_usage_sums_each_absent_players_prior_level():
+    """
+    A count cannot tell a team missing 30% of its usage from one missing two
+    end-of-bench players. The sum can, and it must take each absent player's
+    level from his last game BEFORE the one he missed: 0.28 + 0.06 from game 2,
+    not 0.30 + 0.05 from game 1.
+    """
+    out = attach_absence_features(
+        _usage_panel(), _three_out_of_game_three(), team_map={"1610612747": "LAL"},
+    )
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+
+    assert row["BBS_TEAMMATES_OUT"] == 3
+    assert row["BBS_VACATED_USAGE"] == pytest.approx(0.34)      # 0.28 + 0.06
+    # 902 never played, so there is no prior level to add. Counted, not filled:
+    # an invented default would put fabricated usage into the one feature whose
+    # purpose is measuring what is missing.
+    assert row["BBS_VACATED_USAGE_UNKNOWN"] == 1
+
+
+def test_vacated_usage_never_reaches_forward_for_a_later_appearance():
+    """The leakage property, stated as a difference. A player's usage AFTER the
+    game he missed must not enter that game's sum — the as-of join is backward
+    and excludes exact matches, so adding a huge later game changes nothing."""
+    panel = _usage_panel()
+    inactives = _three_out_of_game_three()
+    before = attach_absence_features(panel, inactives, team_map={"1610612747": "LAL"})
+    baseline = before[before["GAME_ID"] == "21700003"]["BBS_VACATED_USAGE"].iloc[0]
+
+    # Player 900 returns two days later with a wildly higher usage.
+    later = pd.concat([panel, pd.DataFrame({
+        "GAME_ID": ["21700004"],
+        "GAME_DATE": pd.to_datetime(["2018-01-07"]),
+        "TEAM_ABBREVIATION": ["LAL"],
+        "PLAYER_ID": ["900"],
+        "USAGE_PROXY_L10": [0.99],
+    })], ignore_index=True)
+    after = attach_absence_features(later, inactives, team_map={"1610612747": "LAL"})
+    assert after[after["GAME_ID"] == "21700003"]["BBS_VACATED_USAGE"].iloc[0] == (
+        pytest.approx(baseline)
+    )
+
+
+def test_vacated_usage_is_unknown_when_the_usage_column_is_absent():
+    """No usage column means the sum cannot be formed. It reports unknown rather
+    than a zero that would read as "nobody important was out"."""
+    panel = _usage_panel().drop(columns=["USAGE_PROXY_L10"])
+    out = attach_absence_features(
+        panel, _three_out_of_game_three(), team_map={"1610612747": "LAL"},
+    )
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+    assert row["BBS_TEAMMATES_OUT"] == 3            # the count still works
+    assert row["BBS_VACATED_USAGE"] == 0.0          # nothing could be summed
+    assert row["BBS_VACATED_USAGE_UNKNOWN"] == 3    # and all three say so
+
+
+def test_a_game_never_pulled_has_unknown_vacated_usage_too():
+    """The count and the sum must agree about coverage: an unfetched game is NA
+    for both, never 0.0 for one of them."""
+    out = attach_absence_features(
+        _usage_panel(), _three_out_of_game_three(), team_map={"1610612747": "LAL"},
+    )
+    other = out[out["GAME_ID"] == "21700001"]
+    assert other["BBS_TEAMMATES_OUT"].isna().all()
+    assert other["BBS_VACATED_USAGE"].isna().all()
+    assert (other["BBS_INACTIVE_SOURCE"] == "DATA_NOT_AVAILABLE").all()
+
+
+# --- the layer that puts it in the pipeline -------------------------------
+
+
+def test_the_absence_layer_is_registered_before_the_cascade_that_reads_it():
+    """Order is load-bearing: teammate_cascade consumes BBS_TEAMMATES_OUT, so a
+    layer producing it must run first. Registered the other way round, the
+    cascade would abstain on every build no matter what was fetched."""
+    from src.features.builder import _additive_feature_layers
+
+    labels = [label for label, _ in _additive_feature_layers()]
+    assert "absences" in labels, labels
+    assert "teammate_cascade" in labels, labels
+    assert labels.index("absences") < labels.index("teammate_cascade")
+
+
+def test_the_layer_abstains_with_named_columns_when_no_cache_exists(tmp_path):
+    """Until the pull has run there is nothing to join. The columns still appear
+    — a MISSING column and a NULL column send the cascade down different paths,
+    and only one of them means "no absence input exists at all"."""
+    from src.features.absences import ABSENCE_COLUMNS, attach_absence_features_layer
+
+    panel = _usage_panel()
+    out = attach_absence_features_layer(panel, cache_root=tmp_path)
+    for column in ABSENCE_COLUMNS:
+        assert column in out.columns
+        assert out[column].isna().all()
+    assert (out["BBS_INACTIVE_SOURCE"] == "DATA_NOT_AVAILABLE").all()
+
+
+def test_the_layer_uses_a_cache_once_one_exists(tmp_path):
+    """And once the pull has run, the same layer produces real numbers from the
+    parquet without any further wiring."""
+    from src.features.absences import attach_absence_features_layer
+
+    save_inactive_players(_three_out_of_game_three(), "2017-18", root=tmp_path)
+    out = attach_absence_features_layer(_usage_panel(), cache_root=tmp_path)
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+    assert row["BBS_TEAMMATES_OUT"] == 3
+    assert row["BBS_VACATED_USAGE"] == pytest.approx(0.34)
+    assert row["BBS_INACTIVE_SOURCE"] == "official_inactive_list"

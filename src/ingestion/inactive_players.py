@@ -365,14 +365,73 @@ def team_id_to_abbreviation(
     }
 
 
-def attach_teammate_out_counts(
+DEFAULT_USAGE_COLUMN = "USAGE_PROXY_L10"
+
+
+def _prior_usage_per_absence(
+    absences: pd.DataFrame, panel: pd.DataFrame, usage_col: str
+) -> pd.DataFrame:
+    """Each absent player's usage level as known BEFORE the game he missed.
+
+    An absent player has no row for the game he missed, so his usage has to come
+    from his most recent EARLIER appearance. That is an as-of join, and the
+    direction is the whole leakage argument: ``allow_exact_matches=False`` with
+    ``direction="backward"`` takes a row strictly before this game's timestamp,
+    never the game itself and never a later one.
+
+    ``USAGE_PROXY_L10`` is itself built from shift(1) rolling values, so the
+    level taken from an earlier game reflects only games before THAT one — two
+    steps removed from the game being predicted. Rows with no earlier
+    appearance (a rookie, or the first game in the window) come back NaN and are
+    COUNTED rather than filled: an invented default would put fabricated usage
+    into a feature whose whole point is measuring what is missing.
+    """
+    timeline = (
+        panel[["PLAYER_ID", "GAME_DATE", usage_col]]
+        .dropna(subset=["PLAYER_ID", "GAME_DATE", usage_col])
+        .copy()
+    )
+    timeline["PLAYER_ID"] = timeline["PLAYER_ID"].astype("string")
+    timeline = timeline.rename(columns={usage_col: "_prior_usage"})
+    timeline = timeline.sort_values("GAME_DATE", kind="mergesort")
+
+    left = absences.dropna(subset=["GAME_DATE"]).copy()
+    left["PLAYER_ID"] = left["PLAYER_ID"].astype("string")
+    left = left.sort_values("GAME_DATE", kind="mergesort")
+    if left.empty or timeline.empty:
+        left["_prior_usage"] = float("nan")
+        return left
+
+    return pd.merge_asof(
+        left,
+        timeline,
+        on="GAME_DATE",
+        by="PLAYER_ID",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+
+
+def attach_absence_features(
     panel: pd.DataFrame,
     inactives: pd.DataFrame,
     *,
     team_map: Mapping[str, str] | None = None,
+    usage_col: str = DEFAULT_USAGE_COLUMN,
 ) -> pd.DataFrame:
     """
-    Add ``BBS_TEAMMATES_OUT`` — inactive teammates per (team, game).
+    Add the absence features the cascade layer consumes, per (team, game):
+
+    ``BBS_TEAMMATES_OUT``          how many teammates were inactive
+    ``BBS_VACATED_USAGE``          the sum of their prior usage share
+    ``BBS_VACATED_USAGE_UNKNOWN``  how many of them had no prior usage to sum
+    ``BBS_INACTIVE_SOURCE``        whether this game was pulled at all
+
+    WHY BOTH A COUNT AND A SUM. A count cannot tell a team missing 30% of its
+    usage from one missing two end-of-bench players, and those are different
+    situations for every remaining player's line. The count is kept because it
+    is the honest fallback when a prior usage level is unavailable, and because
+    the two disagree in a way worth seeing.
 
     WHY A COUNT AND NOT A PER-ROW FLAG. The panel holds only players who
     APPEARED: median 10 rows per team-game, and not one row with MIN == 0. An
@@ -397,6 +456,8 @@ def attach_teammate_out_counts(
     out = panel.copy()
     if inactives.empty:
         out["BBS_TEAMMATES_OUT"] = pd.NA
+        out["BBS_VACATED_USAGE"] = pd.NA
+        out["BBS_VACATED_USAGE_UNKNOWN"] = pd.NA
         out["BBS_INACTIVE_SOURCE"] = "DATA_NOT_AVAILABLE"
         return out
 
@@ -433,23 +494,61 @@ def attach_teammate_out_counts(
         )
         work = work[work["TEAM_ABBREVIATION"].notna()]
 
-    counts = (
-        work.groupby(["GAME_ID", "TEAM_ABBREVIATION"], sort=False)["PLAYER_ID"]
-        .nunique()
-        .rename("BBS_TEAMMATES_OUT")
-        .reset_index()
-        if not work.empty
-        else pd.DataFrame(columns=["GAME_ID", "TEAM_ABBREVIATION", "BBS_TEAMMATES_OUT"])
-    )
+    if work.empty:
+        counts = pd.DataFrame(columns=[
+            "GAME_ID", "TEAM_ABBREVIATION", "BBS_TEAMMATES_OUT",
+            "BBS_VACATED_USAGE", "BBS_VACATED_USAGE_UNKNOWN",
+        ])
+    else:
+        # Each absence needs the date of the game it missed before its prior
+        # usage can be looked up as-of. The date comes from the panel, keyed on
+        # the padded game id like every other join here.
+        game_dates = (
+            panel.assign(_gid=panel["GAME_ID"].astype(str).map(normalize_game_id))
+            .groupby("_gid", sort=False)["GAME_DATE"]
+            .min()
+            .rename("GAME_DATE")
+            .reset_index()
+            if "GAME_DATE" in panel.columns
+            else pd.DataFrame(columns=["_gid", "GAME_DATE"])
+        )
+        work["_gid"] = work["GAME_ID"].astype(str).map(normalize_game_id)
+        dated = work.merge(game_dates, on="_gid", how="left")
+
+        if usage_col in panel.columns and not game_dates.empty:
+            dated = _prior_usage_per_absence(dated, panel, usage_col)
+        else:
+            logger.warning(
+                "inactive_players: %r absent from the panel — vacated usage cannot "
+                "be summed and is reported unknown", usage_col,
+            )
+            dated["_prior_usage"] = float("nan")
+
+        counts = (
+            dated.groupby(["GAME_ID", "TEAM_ABBREVIATION"], sort=False)
+            .agg(
+                BBS_TEAMMATES_OUT=("PLAYER_ID", "nunique"),
+                BBS_VACATED_USAGE=("_prior_usage", "sum"),
+                BBS_VACATED_USAGE_UNKNOWN=("_prior_usage", lambda s: int(s.isna().sum())),
+            )
+            .reset_index()
+        )
 
     # Both sides padded to the NBA's 10-character form before joining. The panel
     # stores GAME_ID unpadded ('21700548'); the API returns '0021700548'. Joined
     # as-is, nothing matches at all.
     out["_gid"] = out["GAME_ID"].astype(str).map(normalize_game_id)
-    counts["_gid"] = counts["GAME_ID"].astype(str).map(normalize_game_id)
+    counts["_gid"] = (
+        counts["GAME_ID"].astype(str).map(normalize_game_id)
+        if not counts.empty
+        else pd.Series(dtype="object")
+    )
 
+    value_columns = [
+        "BBS_TEAMMATES_OUT", "BBS_VACATED_USAGE", "BBS_VACATED_USAGE_UNKNOWN",
+    ]
     merged = out.merge(
-        counts[["_gid", "TEAM_ABBREVIATION", "BBS_TEAMMATES_OUT"]],
+        counts[["_gid", "TEAM_ABBREVIATION", *value_columns]],
         on=["_gid", "TEAM_ABBREVIATION"],
         how="left",
     )
@@ -458,10 +557,13 @@ def attach_teammate_out_counts(
     # from the pull stays NA. fetched_games was taken from every input row above,
     # sentinels included, so an empty inactive list still counts as covered.
     in_pull = merged["_gid"].isin(fetched_games)
-    merged.loc[in_pull, "BBS_TEAMMATES_OUT"] = (
-        merged.loc[in_pull, "BBS_TEAMMATES_OUT"].fillna(0)
-    )
+    for column in value_columns:
+        merged.loc[in_pull, column] = merged.loc[in_pull, column].fillna(0)
     merged["BBS_TEAMMATES_OUT"] = merged["BBS_TEAMMATES_OUT"].astype("Int64")
+    merged["BBS_VACATED_USAGE_UNKNOWN"] = merged["BBS_VACATED_USAGE_UNKNOWN"].astype("Int64")
+    merged["BBS_VACATED_USAGE"] = pd.to_numeric(
+        merged["BBS_VACATED_USAGE"], errors="coerce"
+    )
     merged["BBS_INACTIVE_SOURCE"] = pd.Series(
         ["official_inactive_list"] * len(merged), index=merged.index, dtype="object"
     )

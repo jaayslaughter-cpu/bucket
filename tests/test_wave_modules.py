@@ -109,9 +109,27 @@ def test_cascade_never_invents_a_usage_multiplier(feature_matrix):
 
 
 def test_cascade_abstains_when_injury_flags_are_absent(feature_matrix):
+    """Abstains and invents nothing when there is no absence data.
+
+    The REASON is now more specific than it was. src.features.absences runs
+    before this layer and always adds BBS_TEAMMATES_OUT, so on a panel with no
+    inactive list pulled the column is present and entirely null rather than
+    missing. Those are different states and the layer distinguishes them: a
+    missing column means no absence input exists at all, a null column means the
+    input exists and these games were not covered. Both abstain; only the note
+    differs, and the more precise one is the point of the layer.
+    """
     out = attach_teammate_cascade_stub(feature_matrix.copy())
     assert (out["CASCADE_STATUS"] == "DATA_NOT_AVAILABLE").all()
-    assert "never invents injuries" in out["CASCADE_NOTES"].iloc[0]
+    assert out["CASCADE_USAGE_MULT"].isna().all()
+    assert "not pulled for these games" in out["CASCADE_NOTES"].iloc[0]
+
+    # And with the column absent entirely, the older wording still applies.
+    bare = feature_matrix.drop(
+        columns=[c for c in ("BBS_TEAMMATES_OUT", "BBS_OUT_FLAG") if c in feature_matrix]
+    )
+    note = attach_teammate_cascade_stub(bare)["CASCADE_NOTES"].iloc[0]
+    assert "never invents injuries" in note
 
 
 # --------------------------------------------------------------------------

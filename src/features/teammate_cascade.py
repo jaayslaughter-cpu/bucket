@@ -20,7 +20,7 @@ def attach_teammate_cascade_stub(df: pd.DataFrame) -> pd.DataFrame:
     Requires ``TEAM_ABBREVIATION`` + ``GAME_ID``, and one of two absence inputs:
 
     ``BBS_TEAMMATES_OUT`` — inactive teammates per (team, game), produced by
-    ``src.ingestion.inactive_players.attach_teammate_out_counts`` from the
+    ``src.ingestion.inactive_players.attach_absence_features`` from the
     official pregame inactive list. PREFERRED, and the only one that works on
     this panel: the panel holds only players who APPEARED (median 10 rows per
     team-game, no row with MIN == 0), so an inactive player has no row here and
