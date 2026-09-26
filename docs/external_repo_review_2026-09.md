@@ -400,16 +400,18 @@ reimplementation only — which is the standing constraint regardless.
 
 ## Scope of this round
 
-A second list of 39 URLs was supplied. **38 of the 35 unique repositories in it
-were already reviewed above** (`clandgrebe/predicting-nba-games-ml` dropped off
-the list; it was reviewed and is coursework notebooks). Exactly one repository
-is new:
+A second list of **39 URLs** was supplied, which is **35 unique
+repositories**: `swar/nba_api`, `mitchelldawkinsjr/NBA-Stat-Spot`,
+`snandyala13/AIBall` and `adamrajkotwala/machine-learning-parlay-generator` each
+appear twice. **34 of those 35 were already reviewed above** — 37 of the 39 URLs
+point to them — and `clandgrebe/predicting-nba-games-ml` dropped off the list
+(it was reviewed; coursework notebooks). Exactly one repository is new:
 
 | Repository | Py files | LOC | Licence |
 |---|---|---|---|
 | `swar/nba_api` | 302 | 54,399 | **MIT** |
 
-Nothing below re-opens the 34; their entries above stand. This addendum covers
+Nothing below re-opens those 34; their entries above stand. This addendum covers
 only the new one, and what it changes about the recommendations.
 
 `nba_api` is a different kind of artifact from the other 34. It is not a
