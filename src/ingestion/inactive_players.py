@@ -118,8 +118,19 @@ def parse_inactive_players(
 
     frame = _frame_from_dataset(data_sets["InactivePlayers"])
     if frame.empty:
-        out = pd.DataFrame({c: pd.Series(dtype="object") for c in INACTIVE_COLUMNS})
-        out["GAME_ID"] = pd.Series(dtype="object")
+        # A game where everyone dressed still has to record that it WAS fetched.
+        # Returning zero rows loses that: the game vanishes from the concatenated
+        # frame and attach_teammate_out_counts can no longer tell it from a game
+        # nobody pulled, so a verified "nobody out" came back as
+        # DATA_NOT_AVAILABLE. One sentinel row carries the coverage instead, and
+        # it travels through concat, parquet and the CLI's resume set — which an
+        # out-of-band set of ids would not.
+        sentinel = {c: [pd.NA] for c in INACTIVE_COLUMNS}
+        sentinel["GAME_ID"] = [gid]
+        out = pd.DataFrame(sentinel)
+        out["GAME_ID"] = out["GAME_ID"].astype("string")
+        out["PLAYER_ID"] = out["PLAYER_ID"].astype("string")
+        out["TEAM_ID"] = out["TEAM_ID"].astype("string")
         return out
 
     columns = set(frame.columns)
@@ -369,9 +380,29 @@ def attach_teammate_out_counts(
         return out
 
     work = inactives.copy()
-    if "TEAM_ABBREVIATION" not in work.columns or work["TEAM_ABBREVIATION"].isna().all():
+
+    # Coverage is taken from EVERY row, before any filtering, and includes the
+    # sentinel rows that stand for a fetched game with nobody out.
+    fetched_games = set(work["GAME_ID"].astype(str).map(normalize_game_id))
+
+    # Sentinels carry no player and must not be counted as an absence.
+    real = work["PLAYER_ID"].notna() & (work["PLAYER_ID"].astype("string") != "")
+    work = work[real].copy()
+
+    # Per ROW, not all-or-nothing. fetch_many_inactive_players mixes versions:
+    # v3 rows carry only teamId while a v2 fallback row carries the abbreviation,
+    # so a frame holding both is neither "column absent" nor "all null". Testing
+    # it that way skipped the mapping entirely and every v3 game lost its count
+    # — reported as DATA_NOT_AVAILABLE, i.e. a game we fetched and where someone
+    # WAS out read as unknown.
+    if "TEAM_ABBREVIATION" not in work.columns:
+        work["TEAM_ABBREVIATION"] = pd.NA
+    needs_abbreviation = work["TEAM_ABBREVIATION"].isna()
+    if needs_abbreviation.any():
         mapping = dict(team_map) if team_map is not None else team_id_to_abbreviation()
-        work["TEAM_ABBREVIATION"] = work["TEAM_ID"].astype("string").map(mapping)
+        work.loc[needs_abbreviation, "TEAM_ABBREVIATION"] = (
+            work.loc[needs_abbreviation, "TEAM_ID"].astype("string").map(mapping)
+        )
 
     unresolved = int(work["TEAM_ABBREVIATION"].isna().sum())
     if unresolved:
@@ -386,6 +417,8 @@ def attach_teammate_out_counts(
         .nunique()
         .rename("BBS_TEAMMATES_OUT")
         .reset_index()
+        if not work.empty
+        else pd.DataFrame(columns=["GAME_ID", "TEAM_ABBREVIATION", "BBS_TEAMMATES_OUT"])
     )
 
     # Both sides padded to the NBA's 10-character form before joining. The panel
@@ -401,11 +434,8 @@ def attach_teammate_out_counts(
     )
 
     # A game present in the pull but with nobody out is a real 0. A game absent
-    # from the pull stays NA.
-    covered = set(counts["_gid"])
-    fetched_games = covered | set(
-        work["GAME_ID"].astype(str).map(normalize_game_id)
-    )
+    # from the pull stays NA. fetched_games was taken from every input row above,
+    # sentinels included, so an empty inactive list still counts as covered.
     in_pull = merged["_gid"].isin(fetched_games)
     merged.loc[in_pull, "BBS_TEAMMATES_OUT"] = (
         merged.loc[in_pull, "BBS_TEAMMATES_OUT"].fillna(0)

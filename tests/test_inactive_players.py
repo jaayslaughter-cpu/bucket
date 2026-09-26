@@ -91,12 +91,18 @@ def test_the_v2_shape_parses_too_and_keeps_its_abbreviation():
     assert frame["GAME_ID"].tolist() == ["0021700548"]
 
 
-def test_an_empty_inactive_list_is_a_real_answer_not_an_error():
-    """A game where everyone dressed is a fact. It must not raise, or every such
-    game becomes a fetch failure."""
+def test_an_empty_inactive_list_keeps_its_game_as_a_coverage_sentinel():
+    """A game where everyone dressed is a fact, and it must not raise. It must
+    also not return ZERO rows: the game would then vanish from the concatenated
+    frame, and a verified "nobody out" would be indistinguishable from a game
+    nobody pulled. One sentinel row carries the coverage, with no player on it.
+    """
     frame = parse_inactive_players(_v3_payload(rows=[]), "0021700548")
-    assert frame.empty
+    assert len(frame) == 1
     assert list(frame.columns) == list(INACTIVE_COLUMNS)
+    assert frame["GAME_ID"].tolist() == ["0021700548"]
+    # No player, so nothing can count it as an absence.
+    assert frame["PLAYER_ID"].isna().all()
 
 
 def test_a_missing_data_set_raises_rather_than_reading_as_nobody_out():
@@ -311,3 +317,84 @@ def test_a_per_row_flag_panel_of_appearances_only_still_abstains():
     out = attach_teammate_cascade_stub(panel)
     assert (out["CASCADE_TEAMMATE_OUTS"] == 0).all()
     assert (out["CASCADE_STATUS"] == "NO_TEAMMATE_OUTS").all()
+
+
+# --- the two cases my first pass only appeared to cover --------------------
+
+
+def test_a_game_whose_whole_inactive_list_is_empty_is_zero_not_unknown():
+    """
+    The case test_a_fetched_game_with_nobody_out_is_a_real_zero did NOT cover.
+    That one gave the game an inactive row for the OTHER team, so the game was
+    present in the frame and the merge produced 0 for the team without outs. It
+    passed while this was broken.
+
+    Here the game's inactive list is empty ENTIRELY. Before the sentinel row it
+    contributed nothing to the frame, so a game fetched successfully with nobody
+    out came back as DATA_NOT_AVAILABLE — destroying the one distinction this
+    module is built around.
+    """
+    def _fetch(game_id, endpoint):
+        if game_id == "0021700777":
+            return _v3_payload(rows=[])          # nobody out, fetched fine
+        return _v3_payload(game_id=game_id)
+
+    frame, failures = fetch_many_inactive_players(
+        ["0021700548", "0021700777"], fetch=_fetch, pause_seconds=0,
+    )
+    assert not failures
+    assert set(frame["GAME_ID"]) == {"0021700548", "0021700777"}
+
+    panel = pd.DataFrame({
+        "GAME_ID": ["21700548", "21700777", "21799999"],
+        "TEAM_ABBREVIATION": ["LAL", "GSW", "BOS"],
+        "PLAYER_ID": ["1", "2", "3"],
+    })
+    out = attach_teammate_out_counts(panel, frame, team_map=TEAM_MAP)
+    by_game = out.set_index("GAME_ID")
+
+    # Fetched, nobody out -> a real 0.
+    assert by_game.loc["21700777", "BBS_TEAMMATES_OUT"] == 0
+    assert by_game.loc["21700777", "BBS_INACTIVE_SOURCE"] == "official_inactive_list"
+    # Fetched, somebody out -> counted.
+    assert by_game.loc["21700548", "BBS_TEAMMATES_OUT"] == 1
+    # Never fetched -> still unknown. The sentinel must not make everything 0.
+    assert pd.isna(by_game.loc["21799999", "BBS_TEAMMATES_OUT"])
+    assert by_game.loc["21799999", "BBS_INACTIVE_SOURCE"] == "DATA_NOT_AVAILABLE"
+
+
+def test_v3_rows_keep_their_team_when_mixed_with_v2_fallback_rows():
+    """
+    fetch_many_inactive_players mixes endpoint versions across games — v3 for
+    most, v2 where v3 failed. v3 rows carry only teamId; v2 rows carry the
+    abbreviation. A frame holding both is neither "column absent" nor "all
+    null", so an all-or-nothing mapping test skipped the mapping entirely: every
+    v3 row lost its team, was dropped from the count, and its game reported
+    DATA_NOT_AVAILABLE — a game we fetched, where a player WAS out, reading as
+    unknown.
+    """
+    v3 = parse_inactive_players(
+        _v3_payload(game_id="0021700548",
+                    rows=[["0021700548", 1610612747, 201566, "Russell", "Westbrook", "0"]]),
+        "0021700548",
+    )
+    v2 = parse_inactive_players(
+        _v2_payload(rows=[[201939, "Stephen", "Curry", "30", 1610612744,
+                           "San Francisco", "Warriors", "GSW"]]),
+        "0021700777",
+    )
+    mixed = pd.concat([v3, v2], ignore_index=True)
+    # The precondition that defeats an all-or-nothing check.
+    assert mixed["TEAM_ABBREVIATION"].isna().any()
+    assert mixed["TEAM_ABBREVIATION"].notna().any()
+
+    panel = pd.DataFrame({
+        "GAME_ID": ["21700548", "21700777"],
+        "TEAM_ABBREVIATION": ["LAL", "GSW"],
+        "PLAYER_ID": ["1", "2"],
+    })
+    out = attach_teammate_out_counts(panel, mixed, team_map=TEAM_MAP)
+    by_game = out.set_index("GAME_ID")
+    assert by_game.loc["21700548", "BBS_TEAMMATES_OUT"] == 1   # the v3 game
+    assert by_game.loc["21700777", "BBS_TEAMMATES_OUT"] == 1   # the v2 game
+    assert (out["BBS_INACTIVE_SOURCE"] == "official_inactive_list").all()
