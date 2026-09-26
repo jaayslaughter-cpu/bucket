@@ -1436,11 +1436,23 @@ def fetch_inactives_cmd(
         typer.echo(f"ERROR: {exc}", err=True)
         raise SystemExit(2) from exc
 
+    if existing is not None and not existing.empty:
+        inactives = pd.concat([existing, inactives], ignore_index=True)
+        inactives = inactives.drop_duplicates(
+            subset=["GAME_ID", "PLAYER_ID"], keep="first"
+        )
+
     # Resolve team abbreviations HERE, where nba_api is installed by necessity
     # (the pull needs it). v3 returns only teamId, and the panel joins on
     # TEAM_ABBREVIATION, so a cache of raw team ids makes the absence feature
-    # layer abstain on any machine lacking the optional 'stats' extra. Written
-    # once, the cache is then self-contained.
+    # layer abstain on any machine lacking the optional 'stats' extra.
+    #
+    # AFTER the resume concat, not before. Run before it, this resolved only the
+    # rows fetched THIS time: a cache written by an earlier run kept raw ids,
+    # keep="first" preferred those stale rows over a freshly resolved duplicate,
+    # and one unmappable row is enough to make the whole layer abstain. Resolving
+    # the combined frame repairs the older rows as a side effect of any later
+    # resume, and is a no-op on rows that already carry an abbreviation.
     try:
         inactives = resolve_team_abbreviations(inactives)
     except InactiveListError as exc:
@@ -1449,11 +1461,6 @@ def fetch_inactives_cmd(
             "the feature layer will need a team map.", exc,
         )
 
-    if existing is not None and not existing.empty:
-        inactives = pd.concat([existing, inactives], ignore_index=True)
-        inactives = inactives.drop_duplicates(
-            subset=["GAME_ID", "PLAYER_ID"], keep="first"
-        )
     out.parent.mkdir(parents=True, exist_ok=True)
     inactives.to_parquet(out, index=False)
 

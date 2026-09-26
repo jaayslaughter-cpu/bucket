@@ -598,26 +598,30 @@ def test_a_cache_written_by_the_pull_needs_no_nba_api(tmp_path, monkeypatch):
     assert row["BBS_INACTIVE_SOURCE"] == "official_inactive_list"
 
 
-def test_an_unresolved_cache_abstains_by_name_rather_than_reading_as_healthy():
-    """The other half of the same contract: a cache that kept only team ids, on a
-    machine with no way to map them, must say DATA_NOT_AVAILABLE — never 0 outs.
-    """
-    from src.features.absences import ABSENCE_COLUMNS
+def test_an_unresolved_cache_abstains_by_name_rather_than_reading_as_healthy(
+    tmp_path, monkeypatch
+):
+    """The other half of the same contract, checked through the LAYER.
 
-    saved = {k: sys.modules.get(k) for k in
-             ("nba_api", "nba_api.stats", "nba_api.stats.static")}
-    try:
-        for name in saved:
-            sys.modules[name] = None
-        with pytest.raises(InactiveListError, match="nba_api is not installed"):
-            attach_absence_features(_usage_panel(), _three_out_of_game_three())
-    finally:
-        for name, module in saved.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
-    assert ABSENCE_COLUMNS  # the layer above turns that refusal into null columns
+    A cache that kept only team ids, read on a machine with no way to map them,
+    must produce null features and say DATA_NOT_AVAILABLE — never zero outs. An
+    earlier version of this test only asserted that the lower-level helper
+    raised, then asserted a module constant was truthy, which is not the
+    behaviour its name claims.
+    """
+    from src.features.absences import ABSENCE_COLUMNS, attach_absence_features_layer
+
+    unresolved = _three_out_of_game_three()
+    assert "TEAM_ABBREVIATION" not in unresolved.columns
+    save_inactive_players(unresolved, "2017-18", root=tmp_path)
+    for name in ("nba_api", "nba_api.stats", "nba_api.stats.static"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+    out = attach_absence_features_layer(_usage_panel(), cache_root=tmp_path)
+    for column in ABSENCE_COLUMNS:
+        assert column in out.columns
+        assert out[column].isna().all(), f"{column} was filled from an unmappable cache"
+    assert (out["BBS_INACTIVE_SOURCE"] == "DATA_NOT_AVAILABLE").all()
 
 
 def test_the_usage_proxy_layer_runs_before_the_absence_layer_that_sums_it():
@@ -706,7 +710,9 @@ def test_the_cache_directory_can_be_relocated_by_environment(tmp_path, monkeypat
     feature build can run on different machines with different layouts."""
     from src.features.absences import ENV_CACHE_DIR, load_cached_absences
 
-    assert load_cached_absences() is None          # the isolated default is empty
+    # An explicit empty directory, not the configured default: the precondition
+    # should not depend on another file's autouse fixture to hold.
+    assert load_cached_absences(tmp_path / "empty") is None
     save_inactive_players(
         resolve_team_abbreviations(_three_out_of_game_three(), {"1610612747": "LAL"}),
         "2017-18", root=tmp_path,
@@ -758,3 +764,54 @@ def test_the_cli_writes_a_cache_with_abbreviations_already_resolved(
     written = pd.read_parquet(out_path)
     assert "TEAM_ABBREVIATION" in written.columns
     assert set(written["TEAM_ABBREVIATION"]) == {"LAL"}
+
+
+def test_resume_also_resolves_rows_a_previous_run_left_unmapped(tmp_path, monkeypatch):
+    """A resume must repair the cache it is extending, not only the games it just
+    fetched.
+
+    Resolving before the resume concat left every earlier row carrying raw team
+    ids, and ``keep="first"`` preferred those stale rows over a freshly resolved
+    duplicate. One unmappable row is enough to make the whole absence layer
+    abstain, so a cache built over several resumes stayed unusable without
+    nba_api however many times the pull was re-run.
+    """
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    import src.ingestion.inactive_players as module
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    panel_path = tmp_path / "panel.parquet"
+    pd.DataFrame({
+        "GAME_ID": ["0021700003", "0021700009"],
+        "GAME_DATE": pd.to_datetime(["2018-01-05", "2018-01-09"]),
+        "SEASON": ["2017-18", "2017-18"],
+    }).to_parquet(panel_path, index=False)
+
+    # What an earlier run of the old code left behind: game 3, no abbreviations.
+    out_path = tmp_path / "inactive.parquet"
+    stale = _three_out_of_game_three()
+    assert "TEAM_ABBREVIATION" not in stale.columns
+    stale.to_parquet(out_path, index=False)
+
+    fresh = parse_inactive_players(_v3_payload(game_id="0021700009", rows=[
+        ["0021700009", 1610612744, 700, "New", "Name", "7"],
+    ]), "0021700009")
+    monkeypatch.setattr(
+        module, "fetch_many_inactive_players", lambda ids, **kwargs: (fresh.copy(), [])
+    )
+    monkeypatch.setattr(
+        module, "team_id_to_abbreviation",
+        lambda teams=None: {"1610612747": "LAL", "1610612744": "GSW"},
+    )
+
+    result = CliRunner().invoke(
+        app, ["fetch-inactives", "--panel", str(panel_path), "--out", str(out_path)]
+    )
+    assert result.exit_code == 0, result.stdout
+    written = pd.read_parquet(out_path)
+    assert len(written) == 4                       # three stale rows plus the new one
+    assert written["TEAM_ABBREVIATION"].notna().all(), written
+    assert set(written["TEAM_ABBREVIATION"]) == {"LAL", "GSW"}
