@@ -393,3 +393,122 @@ native reimplementation; nothing is vendored.
 **Licence summary:** 26 of 35 carry no licence (all rights reserved by
 default), 8 are MIT, 1 has an unidentified `LICENSE` file. Concept-level
 reimplementation only — which is the standing constraint regardless.
+
+---
+
+# Addendum — 2026-09-26: `swar/nba_api`
+
+## Scope of this round
+
+A second list of 39 URLs was supplied. **38 of the 35 unique repositories in it
+were already reviewed above** (`clandgrebe/predicting-nba-games-ml` dropped off
+the list; it was reviewed and is coursework notebooks). Exactly one repository
+is new:
+
+| Repository | Py files | LOC | Licence |
+|---|---|---|---|
+| `swar/nba_api` | 302 | 54,399 | **MIT** |
+
+Nothing below re-opens the 34; their entries above stand. This addendum covers
+only the new one, and what it changes about the recommendations.
+
+`nba_api` is a different kind of artifact from the other 34. It is not a
+competing model — it is the canonical Python client for the NBA's own stats
+endpoints, and it is **MIT-licensed**, so unlike the 26 unlicensed repos it can
+be used as a dependency rather than only read for ideas. It is also the library
+`tredaman5/src/common/injury_context.py` uses, i.e. the concrete path behind
+P0.1 above.
+
+## Where we stand with it today
+
+- **`nba_api>=1.4` is already declared** in `pyproject.toml:37` — in the
+  optional `stats` extra, not the core dependencies.
+- It is **not installed** in this environment, and **nothing imports it**:
+  `grep -rE "^\s*(from|import)\s+nba_api"` across `src/`, `scripts/` and
+  `tests/` returns nothing. The only occurrences are three mentions in
+  comments and docstrings.
+- Instead we hand-roll HTTP: `src/ingestion/boxscores.py` builds
+  `stats.nba.com/stats/leaguegamelog` calls with its own headers and throttling,
+  and `src/ingestion/nba_playbyplay.py` plus `src/settlement/boxscore_fetcher.py`
+  call `cdn.nba.com/static/json/liveData/...` directly.
+
+So the decision is not "adopt a new dependency" — it is "use the one already
+declared, in place of two hand-rolled clients that cover a fraction of the
+surface."
+
+## What it provides that we do not have
+
+139 stats endpoints plus 4 live ones. These are the ones that map onto gaps
+this review already identified, with the columns read from the endpoint
+definitions in `src/nba_api/stats/endpoints/`:
+
+| Endpoint | Gives us | Which gap |
+|---|---|---|
+| `boxscoresummaryv2` → `InactivePlayers` (`boxscoresummaryv2.py:45,165`) | The official pregame inactive list per game | **P0.1** — unblocks `teammate_cascade.py`, which abstains on all 214,381 rows |
+| `leaguedashptdefend` | `PLAYER_POSITION`, plus `D_FGA`, `D_FG_PCT`, `NORMAL_FG_PCT`, `PCT_PLUSMINUS` — how much worse shooters shoot against this defender than they normally do. **One call per season** | **Supersedes P1.4.** Gives POSITION directly *and* a better defender feature than position-bucketed DvP |
+| `leagueseasonmatchups` | Season-aggregated offensive-player × defensive-player rows: `MATCHUP_MIN`, `PARTIAL_POSS`, `PLAYER_PTS`, `MATCHUP_FGA`, `MATCHUP_FG_PCT`, `MATCHUP_FG3_PCT`, `MATCHUP_AST`, `MATCHUP_TOV` | **Genuinely new.** Nothing in the other 34 repos and nothing in our panel has defender-level matchup history. This is what position-bucketed DvP is a proxy for |
+| `leaguedashplayerbiostats` | Real `USG_PCT`, plus `AGE`, `PLAYER_HEIGHT_INCHES`, `PLAYER_WEIGHT`, `OREB_PCT`, `DREB_PCT`, `TS_PCT`, `AST_PCT`. One call per season | We have no age, height or weight, and only `USAGE_PROXY` (see below) |
+| `leaguehustlestatsplayer`, `boxscorehustlev2` | `CONTESTED_SHOTS`, `DEFLECTIONS`, `SCREEN_ASSISTS`, `OFF_BOXOUTS`/`DEF_BOXOUTS`, `BOX_OUT_PLAYER_REBS`, `LOOSE_BALLS_RECOVERED` | We have **zero** hustle columns. `DEF_BOXOUTS` and `BOX_OUT_PLAYER_REBS` are mechanistically close to rebounding opportunity, which is the REB market |
+| `boxscorematchupsv3` | Per-game matchup rows with `positionDef`, `matchupMinutes`, `partialPossessions`, `playerPoints`, `switchesOn` | The per-game form of the above; the raw material for fitting a matchup prior |
+| `scheduleleaguev2` | Full schedule: `gameDateTimeUTC`, `weekNumber`, `arenaCity`, `arenaState` | Schedule density directly rather than inferred from box scores; timezone-crossing direction, which our travel feature does not model |
+| `gamerotation` | Substitution/rotation detail | Minutes-pattern modelling beyond rolling MIN |
+
+### On `USAGE_PROXY` vs real `USG_PCT` — a precise difference
+
+`src/features/sports_ev_features.py:39` documents our formula as
+`(FGA + 0.44*FTA + TOV) / team possessions`. The NBA's `USG_PCT` additionally
+normalises by the player's **share of minutes**. So ours conflates usage
+*intensity* with playing time: a 40-minute player scores higher than a
+20-minute player at the same per-minute usage. Since the panel already carries
+`MIN_L5`/`MIN_L10`/`MIN_HL` separately, the minutes-normalised version is the
+less redundant feature of the two. Both are defensible; they are not the same
+quantity, and the proxy is not a stand-in for the real one.
+
+## Where we are already ahead
+
+`src/features/schedule.py:37,69` carries a hardcoded table of current home
+venues with latitude and longitude and computes `TRAVEL_MILES` by haversine.
+That is strictly better than the Kalshi repo's travel model, whose
+`_get_travel_direction` returns `LOCAL` unconditionally (§4.2). `scheduleleaguev2`
+would add only the **direction** of timezone crossing — which the Kalshi
+docstring claims is asymmetric (west-to-east worse) — not the distance we
+already have.
+
+## The blocker, measured
+
+**No NBA endpoint is reachable from this environment.** Both hosts fail at the
+proxy:
+
+```
+stats.nba.com    CONNECT tunnel failed, response 403
+cdn.nba.com      CONNECT tunnel failed, response 403
+```
+
+This is the same denial that makes `fetch-pbp` unable to make a live call, and
+it is already documented on our side: `src/ingestion/boxscores.py:16-17`
+("Some sandboxed environments deny nba.com outright at the proxy") and its
+runtime message at `:166-167` ("run the ingest on a machine with direct network
+access"). So any nba_api ingestion
+can be **written and unit-tested against fixtures here, but not validated
+against the live API in this session** — the fetch has to run somewhere with
+direct access, and the artifact cached to parquet as `tredaman5` does.
+
+## How this changes the recommendations above
+
+- **P0.1 stands and gets cheaper.** The library is already a declared extra;
+  the work is `pip install` of the `stats` extra, one endpoint call per game,
+  and a parquet cache. No new dependency decision.
+- **P1.4 is superseded.** Do **not** build the FG3M/REB position heuristic from
+  `rissicay/src/props.py:132`. `leaguedashptdefend` supplies `PLAYER_POSITION`
+  directly in one call per season, and supplies a better feature alongside it.
+  (Coverage of that column cannot be verified offline — check it on first pull
+  before relying on it.)
+- **One new P1:** `leagueseasonmatchups` as a defender-level matchup prior.
+  This is the only idea in either round that neither our panel nor any of the
+  34 model repos has. It needs a projection step — you cannot know tonight's
+  defensive assignment in advance — so the honest version is a prior on the
+  opposing team's likely primary defender at the player's position, not a
+  claimed matchup. Gate it through the A/B harness like any other layer.
+- **One new P2:** hustle stats for the REB market specifically
+  (`DEF_BOXOUTS`, `BOX_OUT_PLAYER_REBS`), and real `USG_PCT` to sit beside or
+  replace `USAGE_PROXY`.
