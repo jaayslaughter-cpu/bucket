@@ -146,11 +146,19 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
                 "no blowout columns this run."
             )
 
+    # ORDER IS LOAD-BEARING, twice over:
+    #   sports_ev BEFORE absences  — it creates USAGE_PROXY_L10, which absences
+    #       sums into BBS_VACATED_USAGE. Registered the other way round the
+    #       column did not exist yet, so every absent player's prior usage read
+    #       as unknown and BBS_VACATED_USAGE was 0.0 on every row of every
+    #       covered game: the feature was inert without ever saying so.
+    #   absences BEFORE teammate_cascade — the cascade reads BBS_TEAMMATES_OUT.
+    # sports_ev depends on box-score columns only, so moving it earlier changes
+    # nothing it computes.
     for module_path, func_name, label in (
-        # absences BEFORE teammate_cascade: the cascade reads BBS_TEAMMATES_OUT.
+        ("src.features.sports_ev_features", "attach_sports_ev_features", "sports_ev"),
         ("src.features.absences", "attach_absence_features_layer", "absences"),
         ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
-        ("src.features.sports_ev_features", "attach_sports_ev_features", "sports_ev"),
         ("src.features.scoring_efficiency", "attach_box_ts_features", "scoring_efficiency"),
     ):
         if _module_has(module_path, func_name):

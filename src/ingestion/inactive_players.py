@@ -368,6 +368,39 @@ def team_id_to_abbreviation(
 DEFAULT_USAGE_COLUMN = "USAGE_PROXY_L10"
 
 
+def resolve_team_abbreviations(
+    frame: pd.DataFrame, team_map: Mapping[str, str] | None = None
+) -> pd.DataFrame:
+    """Fill ``TEAM_ABBREVIATION`` from ``TEAM_ID`` on the rows that lack it.
+
+    Per ROW, not all-or-nothing. ``fetch_many_inactive_players`` mixes versions:
+    v3 rows carry only ``teamId`` while a v2 fallback row carries the
+    abbreviation, so a frame holding both is neither "column absent" nor "all
+    null". Deciding it that way skipped the mapping entirely and every v3 game
+    lost its count — reported as DATA_NOT_AVAILABLE, i.e. a game we fetched, and
+    where someone WAS out, reading as unknown.
+
+    CALLED AT PULL TIME TOO, by ``fetch-inactives`` before it writes the parquet,
+    so the cache is self-contained. The fallback map comes from ``nba_api``,
+    which is installed wherever the pull runs and need not be wherever the
+    feature build runs; a cache holding raw team ids made the whole absence layer
+    abstain on a machine without the optional extra.
+    """
+    work = frame.copy()
+    if "TEAM_ABBREVIATION" not in work.columns:
+        work["TEAM_ABBREVIATION"] = pd.NA
+    needs = work["TEAM_ABBREVIATION"].isna()
+    if not needs.any():
+        return work
+    if "TEAM_ID" not in work.columns:
+        return work
+    mapping = dict(team_map) if team_map is not None else team_id_to_abbreviation()
+    work.loc[needs, "TEAM_ABBREVIATION"] = (
+        work.loc[needs, "TEAM_ID"].astype("string").map(mapping)
+    )
+    return work
+
+
 def _prior_usage_per_absence(
     absences: pd.DataFrame, panel: pd.DataFrame, usage_col: str
 ) -> pd.DataFrame:
@@ -385,6 +418,14 @@ def _prior_usage_per_absence(
     appearance (a rookie, or the first game in the window) come back NaN and are
     COUNTED rather than filled: an invented default would put fabricated usage
     into a feature whose whole point is measuring what is missing.
+
+    AN ABSENCE WITH NO DATE IS STILL AN ABSENCE. ``merge_asof`` cannot place a
+    row carrying no timestamp, so undated rows are set aside and appended back
+    with ``_prior_usage`` NaN. Dropping them instead lost them from the COUNT as
+    well, and the count is the one number that never needed a date: a game the
+    pull covered, whose date the panel happened not to carry, then reported zero
+    teammates out — a fabricated healthy roster, which is the single failure this
+    module exists to avoid.
     """
     timeline = (
         panel[["PLAYER_ID", "GAME_DATE", usage_col]]
@@ -395,21 +436,27 @@ def _prior_usage_per_absence(
     timeline = timeline.rename(columns={usage_col: "_prior_usage"})
     timeline = timeline.sort_values("GAME_DATE", kind="mergesort")
 
-    left = absences.dropna(subset=["GAME_DATE"]).copy()
-    left["PLAYER_ID"] = left["PLAYER_ID"].astype("string")
-    left = left.sort_values("GAME_DATE", kind="mergesort")
-    if left.empty or timeline.empty:
-        left["_prior_usage"] = float("nan")
-        return left
+    work = absences.copy()
+    work["PLAYER_ID"] = work["PLAYER_ID"].astype("string")
+    dated = work[work["GAME_DATE"].notna()].sort_values("GAME_DATE", kind="mergesort")
+    undated = work[work["GAME_DATE"].isna()].copy()
 
-    return pd.merge_asof(
-        left,
+    if dated.empty or timeline.empty:
+        work["_prior_usage"] = float("nan")
+        return work
+
+    joined = pd.merge_asof(
+        dated,
         timeline,
         on="GAME_DATE",
         by="PLAYER_ID",
         direction="backward",
         allow_exact_matches=False,
     )
+    if undated.empty:
+        return joined
+    undated["_prior_usage"] = float("nan")
+    return pd.concat([joined, undated], ignore_index=True)
 
 
 def attach_absence_features(
@@ -471,20 +518,9 @@ def attach_absence_features(
     real = work["PLAYER_ID"].notna() & (work["PLAYER_ID"].astype("string") != "")
     work = work[real].copy()
 
-    # Per ROW, not all-or-nothing. fetch_many_inactive_players mixes versions:
-    # v3 rows carry only teamId while a v2 fallback row carries the abbreviation,
-    # so a frame holding both is neither "column absent" nor "all null". Testing
-    # it that way skipped the mapping entirely and every v3 game lost its count
-    # — reported as DATA_NOT_AVAILABLE, i.e. a game we fetched and where someone
-    # WAS out read as unknown.
-    if "TEAM_ABBREVIATION" not in work.columns:
-        work["TEAM_ABBREVIATION"] = pd.NA
-    needs_abbreviation = work["TEAM_ABBREVIATION"].isna()
-    if needs_abbreviation.any():
-        mapping = dict(team_map) if team_map is not None else team_id_to_abbreviation()
-        work.loc[needs_abbreviation, "TEAM_ABBREVIATION"] = (
-            work.loc[needs_abbreviation, "TEAM_ID"].astype("string").map(mapping)
-        )
+    # A cache written by fetch-inactives already carries this; a frame parsed
+    # in-process does not, and the same function fills both.
+    work = resolve_team_abbreviations(work, team_map)
 
     unresolved = int(work["TEAM_ABBREVIATION"].isna().sum())
     if unresolved:

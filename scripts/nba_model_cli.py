@@ -1400,6 +1400,7 @@ def fetch_inactives_cmd(
     from src.ingestion.inactive_players import (
         InactiveListError,
         fetch_many_inactive_players,
+        resolve_team_abbreviations,
     )
     from src.ingestion.nba_playbyplay import game_ids_from_panel
 
@@ -1434,6 +1435,19 @@ def fetch_inactives_cmd(
     except InactiveListError as exc:
         typer.echo(f"ERROR: {exc}", err=True)
         raise SystemExit(2) from exc
+
+    # Resolve team abbreviations HERE, where nba_api is installed by necessity
+    # (the pull needs it). v3 returns only teamId, and the panel joins on
+    # TEAM_ABBREVIATION, so a cache of raw team ids makes the absence feature
+    # layer abstain on any machine lacking the optional 'stats' extra. Written
+    # once, the cache is then self-contained.
+    try:
+        inactives = resolve_team_abbreviations(inactives)
+    except InactiveListError as exc:
+        logger.warning(
+            "Team abbreviations unresolved (%s) — the cache keeps TEAM_ID only and "
+            "the feature layer will need a team map.", exc,
+        )
 
     if existing is not None and not existing.empty:
         inactives = pd.concat([existing, inactives], ignore_index=True)

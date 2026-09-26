@@ -16,6 +16,8 @@ the fetch is injected rather than performed.
 
 from __future__ import annotations
 
+import sys
+
 import pandas as pd
 import pytest
 
@@ -27,6 +29,7 @@ from src.ingestion.inactive_players import (
     fetch_many_inactive_players,
     load_cached_inactive_players,
     parse_inactive_players,
+    resolve_team_abbreviations,
     save_inactive_players,
     team_id_to_abbreviation,
 )
@@ -549,12 +552,209 @@ def test_the_layer_abstains_with_named_columns_when_no_cache_exists(tmp_path):
 
 def test_the_layer_uses_a_cache_once_one_exists(tmp_path):
     """And once the pull has run, the same layer produces real numbers from the
-    parquet without any further wiring."""
+    parquet without any further wiring.
+
+    The cached frame is the one fetch-inactives writes, abbreviations already
+    resolved. That matters: v3 returns team ids only, and the layer has no team
+    map to pass, so a cache of raw ids sends it to nba_api — absent from the
+    optional 'stats' extra, hence absent in CI, where this abstained and
+    returned nulls while passing locally on a machine that had the extra.
+    """
     from src.features.absences import attach_absence_features_layer
 
-    save_inactive_players(_three_out_of_game_three(), "2017-18", root=tmp_path)
+    cached = resolve_team_abbreviations(
+        _three_out_of_game_three(), {"1610612747": "LAL"}
+    )
+    save_inactive_players(cached, "2017-18", root=tmp_path)
     out = attach_absence_features_layer(_usage_panel(), cache_root=tmp_path)
     row = out[out["GAME_ID"] == "21700003"].iloc[0]
     assert row["BBS_TEAMMATES_OUT"] == 3
     assert row["BBS_VACATED_USAGE"] == pytest.approx(0.34)
     assert row["BBS_INACTIVE_SOURCE"] == "official_inactive_list"
+
+
+def test_a_cache_written_by_the_pull_needs_no_nba_api(tmp_path, monkeypatch):
+    """The pull machine has the optional 'stats' extra; the machine building
+    features need not. Resolving abbreviations at write time is what makes the
+    cache self-contained — without it this abstained and returned nulls on any
+    box without nba_api, which is how CI read it.
+    """
+    from src.features.absences import attach_absence_features_layer
+
+    cached = resolve_team_abbreviations(
+        _three_out_of_game_three(), {"1610612747": "LAL"}
+    )
+    save_inactive_players(cached, "2017-18", root=tmp_path)
+
+    # A None entry makes `from nba_api.stats.static import teams` raise
+    # ImportError, exactly as a missing extra does.
+    for name in ("nba_api", "nba_api.stats", "nba_api.stats.static"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+    out = attach_absence_features_layer(_usage_panel(), cache_root=tmp_path)
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+    assert row["BBS_TEAMMATES_OUT"] == 3
+    assert row["BBS_VACATED_USAGE"] == pytest.approx(0.34)
+    assert row["BBS_INACTIVE_SOURCE"] == "official_inactive_list"
+
+
+def test_an_unresolved_cache_abstains_by_name_rather_than_reading_as_healthy():
+    """The other half of the same contract: a cache that kept only team ids, on a
+    machine with no way to map them, must say DATA_NOT_AVAILABLE — never 0 outs.
+    """
+    from src.features.absences import ABSENCE_COLUMNS
+
+    saved = {k: sys.modules.get(k) for k in
+             ("nba_api", "nba_api.stats", "nba_api.stats.static")}
+    try:
+        for name in saved:
+            sys.modules[name] = None
+        with pytest.raises(InactiveListError, match="nba_api is not installed"):
+            attach_absence_features(_usage_panel(), _three_out_of_game_three())
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+    assert ABSENCE_COLUMNS  # the layer above turns that refusal into null columns
+
+
+def test_the_usage_proxy_layer_runs_before_the_absence_layer_that_sums_it():
+    """BBS_VACATED_USAGE is a sum of USAGE_PROXY_L10, which src.features.
+    sports_ev_features creates. Registered after the absence layer, the column
+    did not exist when absences ran: every absent player's prior usage read as
+    unknown and the sum was 0.0 on every covered row — a feature that was inert
+    while reporting success.
+    """
+    from src.features.builder import _additive_feature_layers
+    from src.ingestion.inactive_players import DEFAULT_USAGE_COLUMN
+
+    labels = [label for label, _ in _additive_feature_layers()]
+    assert DEFAULT_USAGE_COLUMN == "USAGE_PROXY_L10"
+    assert "sports_ev" in labels, labels
+    assert labels.index("sports_ev") < labels.index("absences"), labels
+    assert labels.index("absences") < labels.index("teammate_cascade"), labels
+
+
+def test_the_usage_column_really_comes_from_the_layer_registered_first():
+    """Pins the dependency the ordering test asserts, so a rename of the column
+    or a move of its producer cannot leave that test passing vacuously."""
+    from src.features.sports_ev_features import attach_sports_ev_features
+    from src.ingestion.inactive_players import DEFAULT_USAGE_COLUMN
+
+    panel = pd.DataFrame({
+        "GAME_ID": ["21700001", "21700002"],
+        "GAME_DATE": pd.to_datetime(["2018-01-01", "2018-01-03"]),
+        "SEASON": ["2017-18", "2017-18"],
+        "TEAM_ABBREVIATION": ["LAL", "LAL"],
+        "PLAYER_ID": ["900", "900"],
+        "FGA": [20.0, 18.0], "FTA": [4.0, 2.0], "TOV": [3.0, 1.0],
+    })
+    assert DEFAULT_USAGE_COLUMN not in panel.columns
+    assert DEFAULT_USAGE_COLUMN in attach_sports_ev_features(panel).columns
+
+
+def test_an_absence_is_counted_even_when_the_panel_has_no_date_for_that_game():
+    """A date is needed to look up PRIOR usage. It is not needed to COUNT an
+    absence, and dropping undated rows lost them from both: a game the pull
+    covered came back with zero teammates out, which is a fabricated healthy
+    roster rather than an abstention.
+    """
+    panel = _usage_panel()
+    panel.loc[panel["GAME_ID"] == "21700003", "GAME_DATE"] = pd.NaT
+
+    out = attach_absence_features(
+        panel, _three_out_of_game_three(), team_map={"1610612747": "LAL"},
+    )
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+    assert row["BBS_TEAMMATES_OUT"] == 3
+    assert row["BBS_VACATED_USAGE_UNKNOWN"] == 3   # no date, so no prior level
+    assert row["BBS_VACATED_USAGE"] == 0.0
+    assert row["BBS_INACTIVE_SOURCE"] == "official_inactive_list"
+
+
+def test_one_game_written_twice_with_different_padding_stays_one_row(tmp_path):
+    """Two cache files, one holding '0021700003' and one whose ids were read back
+    as integers, are the same game. Deduped before padding they both survived,
+    then collapsed to a single join key and duplicated every panel row for that
+    game.
+    """
+    from src.features.absences import load_cached_absences
+
+    padded = resolve_team_abbreviations(
+        _three_out_of_game_three(), {"1610612747": "LAL"}
+    )
+    unpadded = padded.copy()
+    unpadded["GAME_ID"] = unpadded["GAME_ID"].str.lstrip("0")
+    save_inactive_players(padded, "2017-18", root=tmp_path)
+    save_inactive_players(unpadded, "2017-18-int", root=tmp_path)
+
+    combined = load_cached_absences(tmp_path)
+    assert len(combined) == 3, combined[["GAME_ID", "PLAYER_ID"]]
+    assert set(combined["GAME_ID"]) == {"0021700003"}
+
+    panel = _usage_panel()
+    out = attach_absence_features(panel, combined, team_map={"1610612747": "LAL"})
+    assert len(out) == len(panel)
+    row = out[out["GAME_ID"] == "21700003"].iloc[0]
+    assert row["BBS_TEAMMATES_OUT"] == 3
+
+
+def test_the_cache_directory_can_be_relocated_by_environment(tmp_path, monkeypatch):
+    """Where the cache lives is a setting, not a code edit — the pull and the
+    feature build can run on different machines with different layouts."""
+    from src.features.absences import ENV_CACHE_DIR, load_cached_absences
+
+    assert load_cached_absences() is None          # the isolated default is empty
+    save_inactive_players(
+        resolve_team_abbreviations(_three_out_of_game_three(), {"1610612747": "LAL"}),
+        "2017-18", root=tmp_path,
+    )
+    monkeypatch.setenv(ENV_CACHE_DIR, str(tmp_path))
+    found = load_cached_absences()
+    assert found is not None and len(found) == 3
+
+
+def test_the_cli_writes_a_cache_with_abbreviations_already_resolved(
+    tmp_path, monkeypatch
+):
+    """The claim the test above depends on, checked on the writer rather than
+    assumed. fetch-inactives runs where nba_api is installed; the feature build
+    need not. If the command wrote raw team ids, the layer would abstain on any
+    machine without the optional extra and the cache would be useless there.
+    """
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    import src.ingestion.inactive_players as module
+    from scripts.nba_model_cli import app
+
+    monkeypatch.chdir(tmp_path)
+    panel_path = tmp_path / "panel.parquet"
+    pd.DataFrame({
+        "GAME_ID": ["0021700003"],
+        "GAME_DATE": pd.to_datetime(["2018-01-05"]),
+        "SEASON": ["2017-18"],
+    }).to_parquet(panel_path, index=False)
+
+    # v3 shape: team ids, no abbreviation — what the real endpoint returns.
+    fetched = _three_out_of_game_three()
+    assert "TEAM_ABBREVIATION" not in fetched.columns
+    monkeypatch.setattr(
+        module, "fetch_many_inactive_players",
+        lambda ids, **kwargs: (fetched.copy(), []),
+    )
+    # A fixed map stands in for nba_api's static table, so this needs no extra.
+    monkeypatch.setattr(
+        module, "team_id_to_abbreviation", lambda teams=None: {"1610612747": "LAL"}
+    )
+
+    out_path = tmp_path / "inactive.parquet"
+    result = CliRunner().invoke(
+        app, ["fetch-inactives", "--panel", str(panel_path), "--out", str(out_path)]
+    )
+    assert result.exit_code == 0, result.stdout
+    written = pd.read_parquet(out_path)
+    assert "TEAM_ABBREVIATION" in written.columns
+    assert set(written["TEAM_ABBREVIATION"]) == {"LAL"}

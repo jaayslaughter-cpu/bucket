@@ -21,9 +21,12 @@ ORDERING. This must run BEFORE ``teammate_cascade``, which consumes
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
+
+from src.settlement.boxscore_fetcher import normalize_game_id
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,20 @@ DEFAULT_CACHE_PATHS = (
     Path("data/external/inactive_players/inactive_players.parquet"),
 )
 CACHE_GLOB_DIR = Path("data/external/inactive_players")
+
+# Relocating the cache is an environment setting, not a code edit: a pull done
+# on one machine and a feature build on another need not share a layout, and a
+# test needs a directory that is NOT the developer's data tree. Honoured only
+# when no explicit root is passed.
+ENV_CACHE_DIR = "PROPIQ_INACTIVE_CACHE_DIR"
+
+
+def _cache_dir(root: Path | None = None) -> Path:
+    if root is not None:
+        return Path(root)
+    configured = (os.environ.get(ENV_CACHE_DIR) or "").strip()
+    return Path(configured) if configured else CACHE_GLOB_DIR
+
 
 ABSENCE_COLUMNS = (
     "BBS_TEAMMATES_OUT",
@@ -49,7 +66,7 @@ def load_cached_absences(root: Path | None = None) -> pd.DataFrame | None:
     a padded game id read back as an integer joins to nothing, which is the
     defect this pipeline has already hit twice.
     """
-    directory = root or CACHE_GLOB_DIR
+    directory = _cache_dir(root)
     paths = sorted(directory.glob("*.parquet")) if directory.exists() else []
     if not paths:
         return None
@@ -67,6 +84,15 @@ def load_cached_absences(root: Path | None = None) -> pd.DataFrame | None:
     for column in ("GAME_ID", "PLAYER_ID", "TEAM_ID"):
         if column in combined.columns:
             combined[column] = combined[column].astype("string")
+    # Padded BEFORE the dedupe, not after. Parquet written by one writer and a
+    # file whose ids were read back as integers give '0021700548' and
+    # '21700548' for the same game: distinct here, so both survive the dedupe,
+    # and then both normalise to one key downstream and duplicate every panel
+    # row for that game in the merge. Same id, same row, once.
+    if "GAME_ID" in combined.columns:
+        combined["GAME_ID"] = (
+            combined["GAME_ID"].astype(str).map(normalize_game_id).astype("string")
+        )
     if {"GAME_ID", "PLAYER_ID"}.issubset(combined.columns):
         combined = combined.drop_duplicates(subset=["GAME_ID", "PLAYER_ID"])
     logger.info(
