@@ -142,6 +142,66 @@ LAYERS: dict[str, Layer] = {
             "PACE_ROLL correlates 0.82 but no model reads it)."
         ),
     ),
+    # The four layers that ran on every build while no market read a column
+    # they produce. Both arms are subtractive: the real panel already carries
+    # every column, so the control is the panel without them.
+    "form": Layer(
+        (
+            "PTS_HOT_Z", "REB_HOT_Z", "AST_HOT_Z", "FG3M_HOT_Z",
+            "STL_HOT_Z", "BLK_HOT_Z",
+            "PTS_STREAK_ABOVE", "PTS_STREAK_BELOW",
+            "REB_STREAK_ABOVE", "REB_STREAK_BELOW",
+            "AST_STREAK_ABOVE", "AST_STREAK_BELOW",
+            "FG3M_STREAK_ABOVE", "FG3M_STREAK_BELOW",
+            "MINUTES_TREND_RATIO", "MINUTES_STABLE",
+            "TS_PCT_L10", "TS_PCT_TREND", "FT_RATE_L10",
+        ),
+        note=(
+            "Recent form and shot quality: hot_hand z-scores, form streaks, "
+            "minutes shape, true-shooting. Every column here correlates below "
+            "0.45 with each feature its market already reads -- the redundant "
+            "members of these layers are listed in labels._EXCLUDED_AS_REDUNDANT "
+            "and are NOT under test."
+        ),
+    ),
+    "halflife": Layer(
+        (
+            "PTS_HL", "PTS_HL_SHRINK", "PTS_L2_HL",
+            "REB_HL", "REB_HL_SHRINK", "REB_L2_HL",
+            "AST_HL", "AST_HL_SHRINK", "AST_L2_HL",
+            "FG3M_HL", "FG3M_HL_SHRINK", "FG3M_L2_HL",
+            "MIN_HL", "MIN_HL_SHRINK",
+        ),
+        note=(
+            "Exponential half-life means and their shrunk forms. Predicted "
+            "redundant: r = 0.96-0.99 against {M}_SEASON, {M}_L2 and MIN_SEASON. "
+            "Listed so the prediction can be tested rather than asserted -- a "
+            "shrunk estimate can still behave better than the raw mean it "
+            "mirrors, which correlation alone cannot rule out."
+        ),
+    ),
+    "usage_volume": Layer(
+        (
+            "USAGE_PROXY_L10", "SHOT_VOLUME_L5", "SHOT_VOLUME_L10",
+            "FGA_L5", "FGA_L10",
+        ),
+        note=(
+            "Usage proxy and shot volume. Predicted redundant for PTS "
+            "(r = 0.955-0.969 against PTS_L10 and PTS_BASELINE) and moderate "
+            "for REB/AST (0.835-0.848 against MIN_L10)."
+        ),
+    ),
+    "opp_allowed_per_game": Layer(
+        (
+            "OPP_PTS_ALLOWED_L10", "OPP_REB_ALLOWED_L10", "OPP_AST_ALLOWED_L10",
+            "OPP_FG3M_ALLOWED_L10", "OPP_STL_ALLOWED_L10", "OPP_BLK_ALLOWED_L10",
+        ),
+        note=(
+            "Opponent allowed per GAME, against the listed DEF_* columns which "
+            "are per 100 POSSESSIONS. Per-game allowed confounds defensive "
+            "quality with tempo, the confound DEF_PACE_L10 exists to separate."
+        ),
+    ),
     "market_context": Layer(
         (
             "MKT_OPENING_SPREAD",

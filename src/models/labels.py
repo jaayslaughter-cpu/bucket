@@ -113,7 +113,83 @@ def default_feature_cols(market: str) -> list[str]:
         # elsewhere resolve_feature_cols drops them and compare_models_on_panel
         # refuses any that are empty across the training window.
         *_PBP_BY_MARKET.get(market, ()),
+        # Recent-form and shot-quality columns. Four feature layers
+        # (halflife, hot_hand, sports_ev, scoring_efficiency) ran on every
+        # build for months and no market read one of their 71 numeric
+        # columns. What goes in here is the subset that is not already
+        # carried by a listed feature -- see _FORM_BY_MARKET and
+        # _EXCLUDED_AS_REDUNDANT below for the measurement.
+        *_FORM_BY_MARKET.get(market, ()),
     ]
+
+
+# Within-season |r| against this market's already-listed features, measured on
+# the real 214,381-row panel across nine seasons, weighted by overlapping rows.
+# A column that reproduces a listed feature is not a second opinion: the model
+# receives one number twice and splits its attention between identical
+# candidates. This is the reasoning already applied to DEF_RATING_INDEX_L10
+# (r = 0.999) and it excludes the whole halflife family for the same reason.
+#
+#   column                  PTS    REB    AST   against
+#   {M}_HL                 0.971  0.963  0.970  {M}_SEASON
+#   {M}_HL_SHRINK          0.990  0.987  0.990  {M}_SEASON
+#   {M}_L2_HL              0.974  0.964  0.970  {M}_L2
+#   MIN_HL                 0.975  0.975  0.975  MIN_SEASON
+#   MIN_HL_SHRINK          0.990  0.990  0.990  MIN_SEASON
+#   USAGE_PROXY_L10        0.969  0.848  0.848  PTS_L10 / MIN_L10
+#   SHOT_VOLUME_L5         0.968  0.835  0.835  PTS_BASELINE / MIN_L5
+#   SHOT_VOLUME_L10        0.967  0.841  0.841  PTS_L10 / MIN_L10
+#   FGA_L5                 0.955  0.839  0.839  PTS_BASELINE / MIN_L5
+#   FGA_L10                0.956  0.846  0.846  PTS_L10 / MIN_L10
+#   OPP_{M}_ALLOWED_L10    0.836  0.892  0.942  DEF_* (per 100 poss)
+#
+# OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
+# POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which
+# is the exact confound DEF_PACE_L10 was published separately to avoid, so the
+# per-game column is the worse of two measurements of one thing.
+_EXCLUDED_AS_REDUNDANT = (
+    "{M}_HL", "{M}_HL_SHRINK", "{M}_L2_HL", "MIN_HL", "MIN_HL_SHRINK",
+    "USAGE_PROXY_L10", "SHOT_VOLUME_L5", "SHOT_VOLUME_L10", "FGA_L5", "FGA_L10",
+    "OPP_{M}_ALLOWED_L10",
+)
+
+
+# The columns that survived that screen: each correlates below 0.45 with every
+# feature this market already reads, so each is a genuinely new number rather
+# than a re-expression of an old one.
+#
+#   {M}_HOT_Z            0.26-0.27 vs {M}_L5     recent form vs season baseline
+#   {M}_STREAK_ABOVE     0.21-0.24 vs {M}_L5     consecutive prior games over
+#   {M}_STREAK_BELOW     0.20-0.22 vs {M}_L5     consecutive prior games under
+#   MINUTES_TREND_RATIO  0.158    vs MIN_SEASON  role trending up or down
+#   MINUTES_STABLE       0.408    vs MIN_SEASON  is the role settled
+#   TS_PCT_L10           0.21-0.27                shooting efficiency, not volume
+#   TS_PCT_TREND         0.02-0.11                efficiency direction
+#   FT_RATE_L10          0.05-0.25                how the points are earned
+#
+# TS_PCT_L5 is left out beside TS_PCT_L10 (r = 0.83 with each other); the
+# longer window is the less noisy of the pair and TS_PCT_TREND already carries
+# the short-run movement.
+_FORM_BY_MARKET: dict[str, tuple[str, ...]] = {
+    "PTS": ("PTS_HOT_Z", "PTS_STREAK_ABOVE", "PTS_STREAK_BELOW",
+            "MINUTES_TREND_RATIO", "MINUTES_STABLE",
+            "TS_PCT_L10", "TS_PCT_TREND", "FT_RATE_L10"),
+    "REB": ("REB_HOT_Z", "REB_STREAK_ABOVE", "REB_STREAK_BELOW",
+            "MINUTES_TREND_RATIO", "MINUTES_STABLE"),
+    "AST": ("AST_HOT_Z", "AST_STREAK_ABOVE", "AST_STREAK_BELOW",
+            "MINUTES_TREND_RATIO", "MINUTES_STABLE"),
+    "FG3M": ("FG3M_HOT_Z", "FG3M_STREAK_ABOVE", "FG3M_STREAK_BELOW",
+             "MINUTES_TREND_RATIO", "MINUTES_STABLE",
+             "TS_PCT_L10", "TS_PCT_TREND"),
+    "STL": ("STL_HOT_Z", "MINUTES_TREND_RATIO", "MINUTES_STABLE"),
+    "BLK": ("BLK_HOT_Z", "MINUTES_TREND_RATIO", "MINUTES_STABLE"),
+    # PRA has no HOT_Z or STREAK columns: hot_hand covers the six single
+    # stats and _STREAK_STATS covers four, neither of them the combo. Its
+    # halflife columns exist and are excluded above with the rest of that
+    # family.
+    "PRA": ("MINUTES_TREND_RATIO", "MINUTES_STABLE",
+            "TS_PCT_L10", "TS_PCT_TREND", "FT_RATE_L10"),
+}
 
 
 # Which shot-mix signal bears on which market. A rebound prop does not care
