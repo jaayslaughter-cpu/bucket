@@ -15,7 +15,7 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mea
 from src.models.distribution_adapter import DistributionPropModel
 from src.models.ensemble import EnsemblePropModel
 from src.models.labels import attach_research_over_labels, default_feature_cols
-from src.models.prob_calibration import reliability_table
+from src.models.prob_calibration import expected_calibration_error
 from src.models.walk_forward import fixed_cutoff_split, sort_by_game_date
 from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
 
@@ -144,6 +144,38 @@ def recency_sample_weights(
         report["weight_ratio"],
     )
     return weights, report
+
+
+def _winner_rank_key(scores: dict[str, Any]) -> tuple[float, float, int, float]:
+    """
+    Sort key for picking a market's winner: Brier, then log loss, then ECE.
+
+    TWO DEFECTS THIS REPLACES, both in `x or 9`:
+
+    1. ``0.0 or 9`` IS 9. A model whose ECE rounded to 0.0000 -- the best
+       possible calibration -- was ranked as though its calibration could not be
+       measured at all. Measured: `0.0 or 9` and `None or 9` both yield 9, so the
+       best and the unmeasurable were indistinguishable.
+
+    2. A GATE FAILURE IS NOT A BAD SCORE. Now that calibration_error comes from
+       the gated implementation, it is None whenever fewer than 80% of the
+       reliability bins are occupied. Collapsing that to 9 would penalise a model
+       for a sparse validation window rather than for being badly calibrated.
+
+    The deliberate rule: models WITH a gated ECE are ordered by it; models
+    without one sort after them. "We could not measure this model's calibration"
+    is not evidence that it is well calibrated, so it does not win a tie -- but
+    it is recorded as a missing measurement rather than as a score of 9.
+    """
+    brier = scores.get("brier_score")
+    log_loss_value = scores.get("log_loss")
+    ece = scores.get("calibration_error")
+    return (
+        float(brier) if brier is not None else float("inf"),
+        float(log_loss_value) if log_loss_value is not None else float("inf"),
+        0 if ece is not None else 1,
+        float(ece) if ece is not None else float("inf"),
+    )
 
 
 def _accepts_sample_weight(fit_callable: Any) -> bool:
@@ -678,6 +710,9 @@ def compare_models_on_panel(
                 "brier_score": bin_s.get("brier"),
                 "log_loss": bin_s.get("log_loss"),
                 "calibration_error": None,
+                "calibration_error_ungated": None,
+                "calibration_gate_passed": None,
+                "calibration_bin_coverage": None,
                 # The CALIBRATED counterparts. Without them the comparison
                 # fits a calibrator, applies it to the exported predictions,
                 # and then scores the raw number — so nothing in the harness
@@ -685,6 +720,8 @@ def compare_models_on_panel(
                 "brier_score_calibrated": None,
                 "log_loss_calibrated": None,
                 "calibration_error_calibrated": None,
+                "calibration_error_calibrated_ungated": None,
+                "calibration_gate_passed_calibrated": None,
                 "calibration_source": (calib_info or {}).get("source"),
                 "calibration_rows": (calib_info or {}).get("n_rows"),
                 "interval_coverage": None,
@@ -695,20 +732,40 @@ def compare_models_on_panel(
                 cal_s = score_binary(y_true[cal_mask], p_cal[cal_mask])
                 row["brier_score_calibrated"] = cal_s.get("brier")
                 row["log_loss_calibrated"] = cal_s.get("log_loss")
-                cal_table = reliability_table(y_true[cal_mask], p_cal[cal_mask])
-                if cal_table:
-                    gaps = [abs(t["calibration_gap"]) * t["n_predictions"] for t in cal_table]
-                    ntot = sum(t["n_predictions"] for t in cal_table)
-                    row["calibration_error_calibrated"] = round(sum(gaps) / max(ntot, 1), 4)
+                cal_ece = expected_calibration_error(y_true[cal_mask], p_cal[cal_mask])
+                row["calibration_error_calibrated"] = (
+                    round(cal_ece["ece"], 4) if cal_ece["ece"] is not None else None
+                )
+                row["calibration_error_calibrated_ungated"] = (
+                    round(cal_ece["ece_ungated"], 4)
+                    if cal_ece.get("ece_ungated") is not None else None
+                )
+                row["calibration_gate_passed_calibrated"] = bool(cal_ece["gate_passed"])
 
-            # Simple ECE proxy from reliability table
+            # ECE through the GATED implementation, not the inline proxy this
+            # replaced. The arithmetic is identical -- verified: on a dense
+            # sample both give 0.0179 -- so nothing already measured changes
+            # value. What changes is the sparse case: the proxy computed
+            # 0.0439 from 2 of 10 non-empty bins and reported it as if it
+            # meant something, while prob_calibration.expected_calibration_error
+            # returns None below 80% bin coverage and keeps the number under
+            # ece_ungated. A reliability diagram with two occupied bins is not
+            # a calibration measurement, and this harness's numbers feed model
+            # selection.
             mask = np.isfinite(p_over) & np.isfinite(y_true)
             if mask.sum() >= 20:
-                table = reliability_table(y_true[mask], p_over[mask])
+                raw_ece = expected_calibration_error(y_true[mask], p_over[mask])
+                table = raw_ece["table"]
+                row["calibration_error"] = (
+                    round(raw_ece["ece"], 4) if raw_ece["ece"] is not None else None
+                )
+                row["calibration_error_ungated"] = (
+                    round(raw_ece["ece_ungated"], 4)
+                    if raw_ece.get("ece_ungated") is not None else None
+                )
+                row["calibration_gate_passed"] = bool(raw_ece["gate_passed"])
+                row["calibration_bin_coverage"] = raw_ece["bin_coverage"]
                 if table:
-                    gaps = [abs(t["calibration_gap"]) * t["n_predictions"] for t in table]
-                    ntot = sum(t["n_predictions"] for t in table)
-                    row["calibration_error"] = round(sum(gaps) / max(ntot, 1), 4)
                     for t in table:
                         calib_rows.append(
                             {
@@ -776,7 +833,7 @@ def compare_models_on_panel(
             for n, s in market_scores.items()
             if s.get("brier_score") is not None and n != "ensemble"
         ]
-        ranked.sort(key=lambda t: (t[1]["brier_score"], t[1].get("log_loss") or 9, t[1].get("calibration_error") or 9))
+        ranked.sort(key=lambda t: _winner_rank_key(t[1]))
         if ranked:
             winners[market] = {
                 "winner": ranked[0][0],
