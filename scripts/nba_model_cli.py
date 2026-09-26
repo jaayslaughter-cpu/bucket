@@ -1365,8 +1365,99 @@ def fetch_pbp_cmd(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
-if __name__ == "__main__":
-    app()
+@app.command("fetch-inactives")
+def fetch_inactives_cmd(
+    panel: str = typer.Option(
+        "data/external/training_pack/panel.parquet", "--panel",
+        help="Panel whose games need inactive lists.",
+    ),
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
+    out: Path = typer.Option(
+        Path("data/external/inactive_players/inactive_players.parquet"), "--out"
+    ),
+    limit: int = typer.Option(0, "--limit", help="Fetch at most N games (0 = all)."),
+    pause: float = typer.Option(0.6, "--pause", help="Seconds between games."),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip games already present in --out.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Fetch official pregame inactive lists for a panel's games.
+
+    This is the input src/features/teammate_cascade.py abstains for want of. It
+    tries boxscoresummaryv3 first and falls back to v2: nba_api's own wrapper
+    warns v2 data may be missing for games on or after 2025-04-10, which covers
+    the whole 2025-26 season.
+
+    Requires the optional 'stats' extra (`pip install -e '.[stats]'`) and an
+    environment where stats.nba.com is reachable. Where it is denied at the
+    proxy, this reports DATA_NOT_AVAILABLE rather than writing a partial file
+    that would read as "nobody was injured".
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.ingestion.inactive_players import (
+        InactiveListError,
+        fetch_many_inactive_players,
+    )
+    from src.ingestion.nba_playbyplay import game_ids_from_panel
+
+    panel_path = Path(panel)
+    if not panel_path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {panel_path} missing", err=True)
+        raise SystemExit(2)
+    frame = pd.read_parquet(panel_path)
+    season_list = (
+        [s.strip() for s in seasons.split(",") if s.strip()] if seasons else None
+    )
+    wanted = game_ids_from_panel(frame, seasons=season_list)
+
+    existing = None
+    if resume and out.exists():
+        existing = pd.read_parquet(out)
+        have = set(existing["GAME_ID"].astype(str))
+        before = len(wanted)
+        wanted = [g for g in wanted if g not in have]
+        logger.info(
+            "Resuming: %d of %d game(s) already fetched.", before - len(wanted), before
+        )
+    if limit and limit > 0:
+        wanted = wanted[: int(limit)]
+    if not wanted:
+        typer.echo(json.dumps({"status": "nothing to fetch", "out": str(out)}, indent=2))
+        return
+
+    logger.info("Fetching inactive lists for %d game(s).", len(wanted))
+    try:
+        inactives, failures = fetch_many_inactive_players(wanted, pause_seconds=pause)
+    except InactiveListError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if existing is not None and not existing.empty:
+        inactives = pd.concat([existing, inactives], ignore_index=True)
+        inactives = inactives.drop_duplicates(
+            subset=["GAME_ID", "PLAYER_ID"], keep="first"
+        )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    inactives.to_parquet(out, index=False)
+
+    summary = {
+        "out": str(out),
+        "games_requested": len(wanted),
+        "games_failed": len(failures),
+        "inactive_rows_total": int(len(inactives)),
+        "games_covered": int(inactives["GAME_ID"].nunique()),
+        "note": (
+            "Pregame announcement, so not leakage for modelling. Read from the "
+            "post-game summary, so a LATE scratch is information a decision "
+            "timed at line-set could not have had."
+        ),
+    }
+    if failures:
+        summary["failures"] = failures[:10]
+    typer.echo(json.dumps(summary, indent=2, default=str))
 
 
 if __name__ == "__main__":
