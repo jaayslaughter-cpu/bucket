@@ -61,6 +61,15 @@ class CatBoostPropPipeline:
                 "Install with: pip install 'propiq-analytics[ml]'"
             )
         self.feature_cols = list(feature_cols)
+        self.oof = None
+        self._skip_oof = False
+        # A fold model exists only to produce out-of-fold classifier
+        # probabilities. _fit_mean_head trains a CatBoostRegressor and runs the
+        # dispersion cross-validation, and predict_probability_over -- the only
+        # thing the fold callback calls -- reads self.model alone. So every
+        # fold was paying for a mean head and a residual CV that nothing then
+        # read. Skipping it cannot change the out-of-fold values.
+        self._skip_mean_head = False
         self.target_market = target_market
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
@@ -152,7 +161,14 @@ class CatBoostPropPipeline:
     ) -> "CatBoostPropPipeline":
         if "over_hit" not in train_data.columns:
             raise ValueError("DATA_NOT_AVAILABLE: missing over_hit")
-        train = self._prepare(train_data).dropna(subset=self.feature_cols + ["over_hit"])
+        # Drop on the LABEL only. Dropping on every feature as well means one
+        # sparse column empties the whole training set: on the nine-season
+        # panel the MKT_* market columns are absent before 2025-26, and this
+        # dropna took 187,733 rows to zero, whereupon CatBoost failed with
+        # "Labels variable is empty" and the ensemble quietly ran without its
+        # highest-weighted component. CatBoost handles NaN in numeric
+        # features natively, exactly as XGBoost does.
+        train = self._prepare(train_data).dropna(subset=["over_hit"])
         if "GAME_DATE" in train.columns:
             train = train.sort_values("GAME_DATE")
 
@@ -203,7 +219,14 @@ class CatBoostPropPipeline:
             fit_kwargs["early_stopping_rounds"] = early
         self.model.fit(train_pool, **fit_kwargs)
 
-        self._fit_mean_head(train)
+        if getattr(self, "_skip_mean_head", False):
+            logger.info(
+                "catboost %s: fold model — mean head and dispersion CV skipped; "
+                "only the classifier is needed for out-of-fold probabilities.",
+                self.target_market,
+            )
+        else:
+            self._fit_mean_head(train)
 
         self._meta_extra = {
             "train_row_count": len(train),
@@ -223,6 +246,7 @@ class CatBoostPropPipeline:
             val_rows,
             self.categorical_features,
         )
+        self._fit_out_of_fold(train_data)
         return self
 
     def _fit_mean_head(self, train: pd.DataFrame) -> None:
@@ -275,9 +299,9 @@ class CatBoostPropPipeline:
             logger.warning("catboost: mean head unfitted — returning nulls, not a fallback column")
             return pd.Series([None] * len(features), index=features.index, dtype="object")
         work = self._prepare(features)
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = work[c].fillna(0.0)
+        # NaN stays NaN, as in predict_probability_over: the mean head learned
+        # its own split direction for missing values, and a zero fill would
+        # tell it a quantity was measured at zero rather than not measured.
         preds = np.clip(self.mean_model.predict(work[self.feature_cols]), 0, None)
         return pd.Series(preds, index=features.index, dtype=float)
 
@@ -304,6 +328,59 @@ class CatBoostPropPipeline:
             index=features.index,
         )
 
+    def _fit_out_of_fold(self, train_data: pd.DataFrame) -> None:
+        """
+        Out-of-fold P(over) for the calibrator — same folds, one pass.
+
+        The fold models are instances of this same class, so each of their
+        fits would re-enter here and recurse without bound. ``_skip_oof``
+        marks a fold model as a leaf.
+        """
+        from src.models.oof import chronological_oof_probabilities
+
+        if getattr(self, "_skip_oof", False):
+            self.oof = None
+            return
+        if "over_hit" not in train_data.columns:
+            self.oof = None
+            return
+        work = train_data
+        if "GAME_DATE" in work.columns:
+            work = work.sort_values("GAME_DATE")
+        y = pd.to_numeric(work["over_hit"], errors="coerce")
+        rows = work.loc[y.notna()]
+        if rows.empty:
+            self.oof = None
+            return
+
+        cls = type(self)
+        cols, cats, params = self.feature_cols, self.categorical_features, self.hyperparameters
+        line_col = "RESEARCH_LINE"
+
+        def _fit_predict(rows_tr, y_tr, rows_va):
+            fold = cls(
+                cols,
+                target_market=self.target_market,
+                categorical_features=cats,
+                hyperparameters={k: v for k, v in params.items()},
+            )
+            fold._skip_oof = True          # a fold model is a leaf
+            fold._skip_mean_head = True    # and needs only its classifier
+            fold.fit(rows_tr)
+            # The REAL line, not NaN. predict_probability_over abstains on an
+            # unusable line by design, so a NaN placeholder made every fold
+            # return nothing while reporting three successful folds.
+            line = (
+                rows_va[line_col] if line_col in rows_va.columns
+                else pd.Series(np.nan, index=rows_va.index)
+            )
+            return fold.predict_probability_over(rows_va, line).to_numpy()
+
+        self.oof = chronological_oof_probabilities(
+            _fit_predict, rows, y.loc[rows.index].to_numpy(),
+            market=self.target_market,
+        )
+
     def predict_probability_over(
         self,
         features: pd.DataFrame,
@@ -312,10 +389,13 @@ class CatBoostPropPipeline:
         if self.model is None:
             raise RuntimeError("CatBoost model is not fitted")
         work = self._prepare(features)
-        # Unseen categories → CatBoost handles; numeric NaNs filled with column median of train if needed
-        for c in self.feature_cols:
-            if c not in self.categorical_features:
-                work[c] = work[c].fillna(0.0)
+        # NaNs are left as NaN. CatBoost applies the same split direction it
+        # learned during training, which is the whole point of its nan_mode.
+        # The previous fillna(0.0) did two wrong things at once: it disagreed
+        # with training, where the value was absent rather than zero, and it
+        # turned "no market line for this game" into a total of zero points,
+        # which the model reads as a real measurement. The comment above it
+        # claimed a train-median fill that the code never performed.
         proba = self.model.predict_proba(work[self.feature_cols])[:, 1]
         if self.line_aware:
             return pd.Series(proba, index=features.index)

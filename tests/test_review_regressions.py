@@ -1032,3 +1032,62 @@ def test_roi_aggregates_are_scoped_to_settled_rows():
     sql = (Path(__file__).parent.parent / "migrations/002_prop_results.sql").read_text()
     unscoped = sql.count("FILTER (WHERE odds IS NOT NULL)")
     assert unscoped == 0, "a stake/profit aggregate is not filtered by settlement status"
+
+
+# --- cubic review, PR #3: fold models need only their classifier -------------
+
+
+def _small_labelled_panel(n: int = 400) -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    rows = pd.DataFrame({
+        "PLAYER_ID": [f"p{i % 20}" for i in range(n)],
+        "GAME_ID": [f"g{i}" for i in range(n)],
+        "GAME_DATE": pd.date_range("2025-01-01", periods=n, freq="6h"),
+        "PTS_L10": rng.normal(20, 4, n),
+        "MIN_L5": rng.normal(30, 5, n),
+        "RESEARCH_LINE": rng.normal(20, 4, n),
+        "PTS": rng.integers(5, 35, n),
+    })
+    rows["over_hit"] = (rows["PTS"] > rows["RESEARCH_LINE"]).astype(float)
+    return rows
+
+
+def test_a_fold_model_skips_the_mean_head_it_never_uses():
+    """Each out-of-fold callback called fold.fit, which trained a
+    CatBoostRegressor and ran the dispersion cross-validation — while
+    predict_probability_over, the only thing the callback calls, reads
+    self.model alone. Every fold paid for a mean head nothing then read."""
+    pytest.importorskip("catboost")
+    from src.models.catboost_pipeline import CatBoostPropPipeline
+
+    fold = CatBoostPropPipeline(
+        ["PTS_L10", "MIN_L5"], target_market="PTS",
+        hyperparameters={"iterations": 40, "verbose": False},
+    )
+    fold._skip_oof = True
+    fold._skip_mean_head = True
+    fold.fit(_small_labelled_panel(200))
+
+    assert fold.model is not None, "the classifier must still be trained"
+    assert fold.mean_model is None, "a fold model must not train a mean head"
+    assert fold.dispersion is None, "a fold model must not run the dispersion CV"
+    # And it can still answer the only question a fold is asked.
+    rows = _small_labelled_panel(50)
+    probs = fold.predict_probability_over(rows, rows["RESEARCH_LINE"])
+    assert len(probs) == 50
+
+
+def test_a_normal_fit_still_trains_the_mean_head():
+    """The skip must be opt-in: a production fit needs the mean head and the
+    dispersion for push mass."""
+    pytest.importorskip("catboost")
+    from src.models.catboost_pipeline import CatBoostPropPipeline
+
+    pipe = CatBoostPropPipeline(
+        ["PTS_L10", "MIN_L5"], target_market="PTS",
+        hyperparameters={"iterations": 40, "verbose": False},
+    )
+    pipe.fit(_small_labelled_panel(200))
+
+    assert pipe.model is not None
+    assert pipe.mean_model is not None, "a production fit must train the mean head"

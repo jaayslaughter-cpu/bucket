@@ -10,7 +10,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import uuid4
 
 import pandas as pd
@@ -119,11 +119,38 @@ class HistoricalStore:
         else:
             df.to_csv(self.csv_path, index=False)
 
+    @staticmethod
+    def _string_columns() -> set[str]:
+        """Field names the record declares as text.
+
+        Derived from the model rather than listed, so a new string field
+        cannot quietly miss the dtype pin below.
+        """
+        out: set[str] = set()
+        for name, field in BetLifecycleRecord.model_fields.items():
+            annotation = field.annotation
+            if annotation is str:
+                out.add(name)
+                continue
+            # Optional[str], Literal["WIN", ...] and similar.
+            args = get_args(annotation)
+            if args and all(a is str or isinstance(a, str) or a is type(None) for a in args):
+                out.add(name)
+        return out
+
     def load_frame(self) -> pd.DataFrame:
         if self._parquet_ok and self.parquet_path.exists():
             return pd.read_parquet(self.parquet_path)
         if self.csv_path.exists():
-            return pd.read_csv(self.csv_path)
+            # Identifiers MUST be read back as text. bet_id is uuid4().hex[:16],
+            # which is all digits about once in 1,100 ids; CSV has no types, so
+            # pandas infers such an id as an int64. That breaks more than
+            # validation: `df["bet_id"] == record.bet_id` compares an int to a
+            # str and silently matches nothing, so settling or updating that
+            # bet looks like it succeeded and changes no row.
+            header = pd.read_csv(self.csv_path, nrows=0).columns
+            dtypes = {c: str for c in self._string_columns() if c in header}
+            return pd.read_csv(self.csv_path, dtype=dtypes)
         return pd.DataFrame()
 
     def pending_identity_key(self, record: BetLifecycleRecord) -> tuple[Any, ...]:
@@ -438,7 +465,9 @@ def _pnl(result: BetResult, american: int, *, unit_stake: float) -> float:
     stake = float(unit_stake)
     if result == "LOSS":
         return -stake
-    # WIN
+    # WIN — American 0 is not a price (would divide by zero on favorite formula).
+    if american == 0:
+        raise ValueError("American odds of 0 are not a price")
     if american > 0:
         return stake * (american / 100.0)
     return stake * (100.0 / abs(american))

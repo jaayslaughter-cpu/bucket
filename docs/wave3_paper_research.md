@@ -11,7 +11,7 @@ grades outcomes so the model can be audited and improved.
 |------|----------|
 | Placement | **Never** calls a book / Kalshi / DFS order API |
 | Bankroll | **Never** auto-sizes stake (no Kelly from model) |
-| Odds | EV only when OddsPapi `MarketContext.status=VALID` |
+| Odds | EV only when `MarketContext.status=VALID` — **PropLine primary, OddsPapi fallback** (see [decision_board.md](decision_board.md)) |
 | Pick’em | Sleeper / Underdog / PrizePicks — lines only, not VALID two-way |
 | Purpose | Paper / shadow research for model improvement |
 

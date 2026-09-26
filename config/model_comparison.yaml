@@ -15,10 +15,44 @@ markets_post_launch:
   - BLK
   - PRA
 
+# FITTED, not chosen. scripts/fit_ensemble_weights.py splits the training
+# window again, fits every component on the earlier part, and optimises
+# non-negative weights on the simplex against log-loss on the later part. The
+# evaluation season is never read. Re-run it when the components change:
+#
+#   python -m scripts.fit_ensemble_weights --markets PTS,REB,AST
+#
+# Measured on 2018-2025 training rows (held-out log-loss, lower is better):
+#
+#            xgboost  catboost  line_aware  distribution   fitted   previous
+#   PTS        0.619     0.273       0.089         0.019  0.67228   0.67352
+#   REB        0.589     0.403       0.000         0.008  0.66933   0.67038
+#   AST        0.957     0.043       0.000         0.000  0.66162   0.66484
+#
+# Three things this says, none of them what the old defaults said:
+#
+#   line_aware belongs, but barely, and only for points. It is the most
+#   decorrelated of the tree models from xgboost (prediction correlation
+#   0.88/0.80/0.74 against catboost's 0.91/0.87/0.94), which is why it earns
+#   anything at all despite ranking third standalone. On REB and AST the
+#   optimiser gives it exactly zero.
+#
+#   distribution was configured at 0.20 and measures at 0.009. It is the
+#   weakest component and adds almost nothing to the blend. It is kept at a
+#   token weight rather than removed, because it is the only non-tree model
+#   here and the only one whose probabilities come from a fitted count
+#   distribution rather than a classifier.
+#
+#   the best weights differ by market -- catboost runs 0.273 / 0.403 / 0.043 --
+#   and this file holds one set for all of them. The pooled weights below are
+#   an average, and on assists in particular they are not what that market
+#   would choose on its own. Per-market weights are a change to the config
+#   contract, not just to these numbers.
 ensemble_weights:
-  catboost: 0.50
-  xgboost: 0.30
-  distribution: 0.20
+  xgboost: 0.72
+  catboost: 0.24
+  line_aware: 0.03
+  distribution: 0.01
 
 catboost:
   task_type: CPU          # GPU optional only — never default
@@ -33,6 +67,35 @@ catboost:
     - TEAM_ABBREVIATION
     - OPPONENT_ABBREVIATION
     - SEASON
+
+# ---------------------------------------------------------------------------
+# XGBoost
+# ---------------------------------------------------------------------------
+# There was no xgboost block here at all: its hyperparameters lived hardcoded
+# in src/models/xgboost_pipeline.py while CatBoost's sat in this file, and the
+# 400 trees were never tuned against anything.
+#
+# n_estimators is now LEARNED per fit. The TimeSeriesSplit loop that already
+# runs inside fit() now fits each fold with early stopping against that fold's
+# own later slice, and the final model uses the median best iteration scaled
+# for its larger training set. Measured against the old fixed 400:
+#
+#   real 2025-26 team panel    Brier 0.28579 -> 0.24592   ECE 0.16684 -> 0.05469
+#   planted-signal player panel Brier 0.23600 -> 0.21844  ECE 0.12413 -> 0.05153
+#
+# n_estimators below is the FALLBACK used when no fold can run (too few rows,
+# or a single class). It is not a tuned value and should not be read as one.
+xgboost:
+  n_estimators: 400
+  n_estimators_max: 2000
+  early_stopping_rounds: 40
+  min_trees: 5
+  scale_with_data: true
+  max_depth: 5
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
 
 minutes_model:
   iterations: 300
@@ -145,6 +208,68 @@ sports_ev:
 # Half-life in days, so the value says what it means. null disables
 # weighting entirely; fit_half_life_by_holdout() can choose it instead.
 # Check effective_sample_size before trusting an aggressive value.
+#
+# THIS BLOCK WAS DEAD until compare.recency_sample_weights() was written to read
+# it: recency.py produced the weights, both pipelines accepted a sample_weight,
+# and nothing passed one, so a game from 2018 and a game from last week carried
+# identical influence in every fit.
+#
+# STILL DISABLED, and not for lack of wiring. Weighting discards information --
+# the Kish effective sample size is logged and returned under
+# `recency_weighting` on every run that enables it -- and no A/B has been run
+# yet. Turn it on when a measurement supports it, the way the blowout layer
+# stays off on measured evidence.
 recency:
   half_life_days: 240
   enabled: false
+
+# ---------------------------------------------------------------------------
+# Line-aware classifier (src/models/line_aware.py)
+# ---------------------------------------------------------------------------
+# A line-blind classifier learns "does this player go over" and answers the
+# same number whatever line you ask about. Augmenting each player-game with
+# several candidate lines and giving the line to the model as a feature makes
+# it answer AT the line — which is what a prop model is for.
+#
+# The offsets are added to a PREGAME anchor, never to the realised stat. A
+# line derived from the outcome would post excellent validation numbers and
+# no metric computed afterwards would reveal why, so assert_lines_are_pregame
+# runs before fitting rather than after.
+#
+# Cost: training rows are multiplied by len(offsets). Nine offsets on a
+# 600-row market is 5,400 (line, label) pairs.
+line_aware:
+  enabled: true
+  # Which component to wrap. Numeric-only so the line features join cleanly.
+  base: xgboost
+  offsets: [-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0]
+  # Ceiling on (source rows x offsets). Augmentation multiplies the panel,
+  # and the out-of-fold pass then fits that frame several more times: on nine
+  # real seasons (184,682 training rows -> 1.66M pairs) this reached 13.9 GB
+  # resident and was killed by the OOM killer.
+  #
+  # The cap drops the OLDEST SOURCE ROWS, never offsets. Thinning the offsets
+  # would thin the line grid every retained game is trained across, which is
+  # the one thing this model exists to provide. Keeping the most recent rows
+  # also leaves them chronologically contiguous, which TimeSeriesSplit and the
+  # early-stopping folds both need.
+  #
+  # This is a real reduction in training data. Raise it if memory allows.
+  max_augmented_rows: 600000
+
+# ---------------------------------------------------------------------------
+# Blowout risk from the opening spread (src/features/blowout.py)
+# ---------------------------------------------------------------------------
+# OFF because it was measured, not because it was never tried. On 1,322 real
+# 2025-26 games the favourite/underdog fourth-quarter gap is real (t = 3.38)
+# and far too small to predict with (0.235 of one game's sd). For the tree
+# models this project uses it is empty by construction: a hinge is a monotone
+# transform of the spread, and XGBoost gave both hinges an importance of
+# exactly 0.0 while returning predictions identical to the spread-only arm.
+#
+# The full numbers are in src/features/blowout.py. Re-run the decision with
+#   python -m scripts.feature_ab --layer blowout --markets PTS
+# rather than by arguing with this comment.
+blowout:
+  enabled: false
+  spread_threshold: 9.0

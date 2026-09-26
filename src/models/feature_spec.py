@@ -50,14 +50,27 @@ class FeatureSpec(BaseModel):
                 f"(market={self.market} fingerprint={self.fingerprint()})"
             )
 
-    def select(self, df: pd.DataFrame, *, fill_value: float = 0.0) -> pd.DataFrame:
-        """Return frame with exactly ``features`` columns in frozen order."""
+    def select(
+        self,
+        df: pd.DataFrame,
+        *,
+        fill_value: float | None = None,
+    ) -> pd.DataFrame:
+        """Return frame with exactly ``features`` columns in frozen order.
+
+        Default leaves NaN in place (zero-inference). Pass an explicit
+        ``fill_value`` only when a booster requires finite inputs and the
+        imputation policy is logged upstream.
+        """
         self.assert_compatible(df.columns)
         out = df.loc[:, self.features].copy()
         for c in self.features:
             if c in self.categorical:
                 continue
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(fill_value)
+            series = pd.to_numeric(out[c], errors="coerce")
+            if fill_value is not None:
+                series = series.fillna(fill_value)
+            out[c] = series
         return out
 
     def to_meta(self) -> dict[str, Any]:
@@ -91,7 +104,7 @@ def build_prop_feature_spec(
     base = list(default_feature_cols(m if m in {"PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA"} else "PTS"))  # type: ignore[arg-type]
 
     extras: list[str] = [
-        "DAYS_REST",
+        "days_rest",
         "is_back_to_back",
     ]
     if include_wave5a:

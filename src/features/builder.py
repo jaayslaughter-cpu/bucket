@@ -89,6 +89,7 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
     cfg = _layer_config()
     halflife_cfg = cfg.get("halflife") or {}
     hot_hand_cfg = cfg.get("hot_hand") or {}
+    blowout_cfg = cfg.get("blowout") or {}
 
     def _halflife(df):
         from src.features.halflife import attach_halflife_shrink_features
@@ -108,6 +109,19 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
             minutes_stable_ratio=float(hot_hand_cfg.get("minutes_stable_ratio", 0.15)),
         )
 
+    def _blowout(df):
+        from src.features.blowout import (
+            DEFAULT_SPREAD_THRESHOLD,
+            attach_blowout_features,
+        )
+
+        return attach_blowout_features(
+            df,
+            spread_threshold=float(
+                blowout_cfg.get("spread_threshold", DEFAULT_SPREAD_THRESHOLD)
+            ),
+        )
+
     configured: list[tuple[str, object]] = []
     if _module_has("src.features.halflife", "attach_halflife_shrink_features"):
         configured.append(("halflife.shrink", _halflife))
@@ -118,9 +132,33 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
     if _module_has("src.features.hot_hand", "attach_hot_hand_features"):
         configured.append(("hot_hand", _hot_hand))
 
+    # Blowout risk is the one layer gated on config rather than on the
+    # module being present, because it is DISABLED BY DEFAULT on measured
+    # evidence -- see src/features/blowout.py. Its columns change the
+    # feature set, so a run with it on gets a different schema digest and
+    # cannot be mistaken for a run with it off.
+    if blowout_cfg.get("enabled", False):
+        if _module_has("src.features.blowout", "attach_blowout_features"):
+            configured.append(("blowout", _blowout))
+        else:
+            logger.warning(
+                "blowout.enabled is true but src.features.blowout is absent — "
+                "no blowout columns this run."
+            )
+
+    # ORDER IS LOAD-BEARING, twice over:
+    #   sports_ev BEFORE absences  — it creates USAGE_PROXY_L10, which absences
+    #       sums into BBS_VACATED_USAGE. Registered the other way round the
+    #       column did not exist yet, so every absent player's prior usage read
+    #       as unknown and BBS_VACATED_USAGE was 0.0 on every row of every
+    #       covered game: the feature was inert without ever saying so.
+    #   absences BEFORE teammate_cascade — the cascade reads BBS_TEAMMATES_OUT.
+    # sports_ev depends on box-score columns only, so moving it earlier changes
+    # nothing it computes.
     for module_path, func_name, label in (
-        ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
         ("src.features.sports_ev_features", "attach_sports_ev_features", "sports_ev"),
+        ("src.features.absences", "attach_absence_features_layer", "absences"),
+        ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
         ("src.features.scoring_efficiency", "attach_box_ts_features", "scoring_efficiency"),
     ):
         if _module_has(module_path, func_name):
@@ -141,6 +179,29 @@ def _module_has(module_path: str, func_name: str) -> bool:
 
 _ADDITIVE_FEATURE_LAYERS = _additive_feature_layers()
 
+
+
+def _records_a_layer(before: "set[str]", df: "pd.DataFrame", name: str) -> bool:
+    """
+    Did this layer actually add columns?
+
+    The schema-version suffix exists so two runs with different feature sets
+    cannot share a version. Recording a layer because it was ATTEMPTED broke
+    that in both directions: attach_elo_features returns the panel unchanged
+    on an empty Elo frame, and a disabled layer returns it untouched, so a run
+    whose layer silently no-opped was indistinguishable from one where it
+    worked -- while a run that skipped the layer entirely, with the identical
+    feature set, got a DIFFERENT version. attach_market_context was already
+    checked this way; the other sites were not.
+    """
+    added = set(df.columns) - before
+    if added:
+        return True
+    logger.info(
+        "Layer %s ran but added no columns, so it is NOT recorded in the feature "
+        "schema version — the run's feature set is the same as without it.", name,
+    )
+    return False
 
 
 def _group_shift_roll(
@@ -205,10 +266,43 @@ def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
     team["PACE_ROLL"] = _group_shift_roll(
         team, "POSSESSIONS_EST", team_keys, window=10, min_periods=3
     )
-    league = (
-        team.groupby(season_col)["PACE_ROLL"].transform("mean") if season_col
-        else team["PACE_ROLL"].mean()
-    )
+    # League mean must be as-of-date. A season-wide transform("mean") includes
+    # later games' pregame pace rolls and leaks future information into early
+    # PACE_MULTIPLIER values.
+    if season_col:
+        daily = (
+            team.groupby([season_col, "GAME_DATE"], as_index=False)["PACE_ROLL"]
+            .mean()
+            .rename(columns={"PACE_ROLL": "DAY_LEAGUE_PACE"})
+            .sort_values([season_col, "GAME_DATE"])
+            .reset_index(drop=True)
+        )
+        daily["LEAGUE_PACE_ASOF"] = daily.groupby(season_col, sort=False)[
+            "DAY_LEAGUE_PACE"
+        ].transform(lambda s: s.expanding(min_periods=3).mean().shift(1))
+        team = team.merge(
+            daily[[season_col, "GAME_DATE", "LEAGUE_PACE_ASOF"]],
+            on=[season_col, "GAME_DATE"],
+            how="left",
+        )
+        league = team["LEAGUE_PACE_ASOF"]
+    else:
+        daily = (
+            team.groupby("GAME_DATE", as_index=False)["PACE_ROLL"]
+            .mean()
+            .rename(columns={"PACE_ROLL": "DAY_LEAGUE_PACE"})
+            .sort_values("GAME_DATE")
+            .reset_index(drop=True)
+        )
+        daily["LEAGUE_PACE_ASOF"] = (
+            daily["DAY_LEAGUE_PACE"].expanding(min_periods=3).mean().shift(1)
+        )
+        team = team.merge(
+            daily[["GAME_DATE", "LEAGUE_PACE_ASOF"]],
+            on="GAME_DATE",
+            how="left",
+        )
+        league = team["LEAGUE_PACE_ASOF"]
     # Rows without enough prior games keep NaN rather than a neutral 1.0.
     team["PACE_MULTIPLIER"] = (team["PACE_ROLL"] / league).clip(0.7, 1.3)
 
@@ -251,6 +345,7 @@ def build_feature_matrix(
     player_panel: pd.DataFrame,
     *,
     team_games: pd.DataFrame | None = None,
+    market_lines: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix from a raw player game-log panel.
@@ -263,6 +358,11 @@ def build_feature_matrix(
     date, team and points). When supplied, pre-game Elo ratings are joined
     on; when absent, the team-strength columns are simply not created and
     the run is narrower rather than silently filled.
+
+    ``market_lines`` is the matching ``market_lines`` frame. Only its OPENING
+    spread and total are read, because those are posted before tip. Closing
+    lines are refused outright — see src/features/market_context.py — since
+    a number known only at tip is the market's final answer, not a feature.
     """
     if player_panel.empty:
         logger.warning("Empty player panel — returning it unchanged.")
@@ -305,11 +405,15 @@ def build_feature_matrix(
         )
     for stat in present:
         df[stat] = pd.to_numeric(df[stat], errors="coerce")
-        for window in (2, 5, 10):
+        for window in (5, 10):
             df[f"{stat}_L{window}"] = by_player[stat].transform(
                 _prior_window_mean, window=window
             )
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
+
+    # Layers that depend on an external frame being supplied, recorded so the
+    # schema version reflects what a run actually had.
+    market_layers: list[str] = []
 
     df = attach_team_pace(df)
     df = attach_fatigue_column(df)
@@ -322,11 +426,47 @@ def build_feature_matrix(
     if team_games is not None and not team_games.empty:
         # Elo is computed over the full team history in date order, then
         # joined by pre-game value only. elo_post never reaches the panel.
+        before_elo = set(df.columns)
         df = attach_elo_features(df, compute_team_elo(team_games))
+        if _records_a_layer(before_elo, df, "team_elo"):
+            market_layers.append("team_elo")
+
+        # Opponent defence, from TEAM totals rather than from sums over the
+        # player panel. A panel sum measures roster coverage as much as it
+        # measures defence — see src/features/defense.py. A failure here
+        # narrows the run rather than stopping it, like the other layers.
+        try:
+            from src.features.defense import attach_defense_features, build_team_defense
+
+            before_def = set(df.columns)
+            df = attach_defense_features(df, build_team_defense(team_games))
+            if _records_a_layer(before_def, df, "opponent_defense"):
+                market_layers.append("opponent_defense")
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Opponent-defence layer skipped (%s) — its columns are absent, "
+                "not filled with a league average.", exc,
+            )
     else:
         logger.info(
-            "Team Elo skipped: no team_games frame supplied, so no opponent-strength "
-            "features. Pass the BigDataBall team_game_stats frame to enable them."
+            "Team Elo and opponent defence skipped: no team_games frame supplied, "
+            "so no opponent-strength or defensive-matchup features. Pass the "
+            "BigDataBall team_game_stats frame to enable them."
+        )
+
+    if market_lines is not None and not market_lines.empty:
+        # OPENING spread and total only. attach_market_context raises on any
+        # closing column rather than quietly dropping it.
+        from src.features.market_context import attach_market_context
+
+        before = set(df.columns)
+        df = attach_market_context(df, market_lines)
+        if set(df.columns) - before:
+            market_layers.append("market_context")
+    else:
+        logger.info(
+            "Market context skipped: no market_lines frame supplied, so no "
+            "implied team totals. Pass the BigDataBall market_lines frame."
         )
 
     # PACE_MULTIPLIER is NOT materialized when absent. Writing 1.0 into the
@@ -388,11 +528,13 @@ def build_feature_matrix(
     # matrix down: these are enrichments, and losing one should narrow the
     # feature set, not stop the pipeline. assert_no_lookahead still runs
     # over whatever they produced.
-    attached: list[str] = []
+    attached: list[str] = list(market_layers)
     for layer_name, attach in _ADDITIVE_FEATURE_LAYERS:
         try:
+            before_layer = set(df.columns)
             df = attach(df)
-            attached.append(layer_name)
+            if _records_a_layer(before_layer, df, layer_name):
+                attached.append(layer_name)
         except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
             logger.warning(
                 "Feature layer %s skipped (%s) — its columns are absent, not "

@@ -231,3 +231,83 @@ def test_output_feeds_the_feature_builder():
     features = build_feature_matrix(panel)
     assert "PTS_L5" in features.columns
     assert "PRA" in features.columns
+
+# --- cubic review, PR #3 ------------------------------------------------------
+
+
+def _era_crosswalk() -> pd.DataFrame:
+    """The shape load_team_crosswalk produces."""
+    return pd.DataFrame({
+        "teamId": ["1610612737", "1610612738"],
+        "abbreviation": ["ATL", "BOS"],
+        "city": ["Atlanta", "Boston"],
+        "name": ["Hawks", "Celtics"],
+        "season_from": [1949.0, 1946.0],
+        "season_to": [2100.0, 2100.0],
+    })
+
+
+def _archive_rows(dates: list[str], *, with_ids: bool = True) -> pd.DataFrame:
+    n = len(dates)
+    frame = pd.DataFrame({
+        "firstName": list("ABCDEF")[:n],
+        "lastName": ["One", "Two", "Three", "Four", "Five", "Six"][:n],
+        "gameDate": dates,
+        "gameId": ["0022300001"] * n,
+        "playerteamCity": ["Atlanta"] * n,
+        "playerteamName": ["Hawks"] * n,
+        "opponentteamCity": ["Boston"] * n,
+        "opponentteamName": ["Celtics"] * n,
+        "points": list(range(10, 10 + n)),
+        "numMinutes": list(range(30, 30 + n)),
+    })
+    if with_ids:
+        frame["playerteamId"] = "1610612737"
+        frame["opponentteamId"] = "1610612738"
+    return frame
+
+
+def test_a_dropped_unparseable_date_does_not_break_team_resolution():
+    """out starts as pd.DataFrame(index=df.index) and drops unparseable dates
+    WITHOUT resetting the index, so out.index is a subset of df's labels.
+    Reading team ids straight from df while pairing them with out["SEASON"]
+    raised "Length of values (3) does not match length of index (4)" — the
+    documented date-drop path crashed outright whenever a crosswalk was given.
+    """
+    from src.ingestion.kaggle_nba import normalize_player_box_scores
+
+    out = normalize_player_box_scores(
+        _archive_rows(["2024-01-01", "NOT A DATE", "2024-01-03", "2024-01-04"]),
+        team_crosswalk=_era_crosswalk(),
+    )
+
+    assert len(out) == 3, "the bad-date row should be dropped, the rest kept"
+    assert out["TEAM_ABBREVIATION"].tolist() == ["ATL"] * 3
+    assert out["OPPONENT_ABBREVIATION"].tolist() == ["BOS"] * 3
+    assert out["PLAYER_NAME"].tolist() == ["A One", "C Three", "D Four"]
+
+
+def test_the_name_fallback_also_survives_a_dropped_date():
+    """The fallback indexed df with a mask built over out's rows, so it had the
+    same defect on the no-team-id route."""
+    from src.ingestion.kaggle_nba import normalize_player_box_scores
+
+    out = normalize_player_box_scores(
+        _archive_rows(["2024-01-01", "NOT A DATE", "2024-01-03"], with_ids=False),
+        team_crosswalk=_era_crosswalk(),
+    )
+
+    assert len(out) == 2
+    assert out["TEAM_ABBREVIATION"].tolist() == ["ATL", "ATL"]
+
+
+def test_a_clean_archive_is_unaffected_by_the_alignment_fix():
+    from src.ingestion.kaggle_nba import normalize_player_box_scores
+
+    out = normalize_player_box_scores(
+        _archive_rows(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
+        team_crosswalk=_era_crosswalk(),
+    )
+
+    assert len(out) == 4
+    assert out["TEAM_ABBREVIATION"].notna().all()

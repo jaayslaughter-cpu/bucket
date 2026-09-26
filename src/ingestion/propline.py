@@ -63,6 +63,25 @@ DEFAULT_MARKET_MAP: dict[str, str] = {
 # Books whose "price" is not a two-way sportsbook price. Their rows are
 # still ingested (they are real posted numbers) but flagged so the EV gate
 # abstains on them instead of de-vigging a payout multiplier.
+# /odds/history downsampling buckets. Anything else is rejected by the API,
+# so it is rejected here rather than spent as a request.
+HISTORY_INTERVALS: frozenset[str] = frozenset({"30s", "1m", "5m", "15m", "30m", "1h"})
+
+# Event-age cap by plan, in days. Documented limits, not guesses — an event
+# older than the cap comes back redacted rather than as an error.
+TIER_EVENT_AGE_DAYS: dict[str, int | None] = {
+    "hobby": 30,
+    "pro": 90,
+    "streaming_lite": 180,
+    "streaming": 365,
+    "enterprise": None,
+}
+
+# PropLine began recording in April 2026. Anything before that does not exist
+# at any tier, so asking for it wastes quota against a guaranteed miss.
+ARCHIVE_START = date(2026, 4, 1)
+
+
 DFS_BOOKS = frozenset({"prizepicks", "underdog"})
 
 
@@ -80,6 +99,17 @@ class PropLineRateLimited(PropLineError):
 
 class PropLineUnavailable(PropLineError):
     """The provider could not serve this request."""
+
+
+class PropLineTierLimited(PropLineError):
+    """
+    The event is older than the plan's event-age cap.
+
+    PropLine answers an over-cap request with a REDACTED body rather than an
+    error: market structure, ``redacted: true`` and an ``upgrade_url``. Read
+    naively that is an event with no odds, which is indistinguishable from a
+    game nobody priced. It is raised here so the two can never be confused.
+    """
 
 
 @dataclass(frozen=True)
@@ -299,9 +329,16 @@ class PropLineClient:
         except (TypeError, ValueError):
             return fallback
 
-    def _request(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        method: str = "GET",
+        json_body: Any = None,
+    ) -> Any:
         """
-        GET one path with bounded retries.
+        Call one path with bounded retries.
 
         Retries only what is genuinely transient: 429 (both the daily cap
         and the burst limiter), 503 (concurrency), and connection errors.
@@ -314,12 +351,26 @@ class PropLineClient:
 
         for attempt in range(1, self.config.max_attempts + 1):
             try:
-                response = self._session.get(
-                    url,
-                    headers=_auth_headers(self._api_key),
-                    params=params or {},
-                    timeout=self.config.timeout_seconds,
-                )
+                # GET stays on session.get. Every caller and every injected
+                # test double implements it; switching the common path to
+                # session.request would silently widen what a "session" must
+                # provide, and only POST actually needs the general form.
+                if method.upper() == "GET":
+                    response = self._session.get(
+                        url,
+                        headers=_auth_headers(self._api_key),
+                        params=params or {},
+                        timeout=self.config.timeout_seconds,
+                    )
+                else:
+                    response = self._session.request(
+                        method,
+                        url,
+                        headers=_auth_headers(self._api_key),
+                        params=params or {},
+                        json=json_body,
+                        timeout=self.config.timeout_seconds,
+                    )
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt == self.config.max_attempts:
@@ -440,6 +491,181 @@ class PropLineClient:
         return payload if isinstance(payload, dict) else {}
 
 
+    # ------------------------------------------------------------------
+    # historical endpoints
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assert_not_redacted(payload: Any, *, what: str) -> Any:
+        """
+        Turn a tier-redacted body into a named refusal.
+
+        An over-cap event returns market structure with ``redacted: true``
+        and an ``upgrade_url`` — a 200 that reads like "this game had no
+        odds". Left alone it would enter the archive as a genuine absence.
+        """
+        if isinstance(payload, dict) and payload.get("redacted"):
+            raise PropLineTierLimited(
+                f"{what} is older than this plan's event-age cap, so PropLine "
+                "returned the redacted shape rather than the data. This is NOT "
+                "an event without odds. Caps: hobby 30d, pro 90d, "
+                "streaming_lite 180d, streaming 365d. "
+                f"Upgrade path: {payload.get('upgrade_url') or 'see your plan page'}"
+            )
+        return payload
+
+    def fetch_closing_odds(
+        self,
+        event_id: str,
+        markets: list[str],
+    ) -> dict[str, Any]:
+        """
+        Opening and closing price for every outcome, in one call.
+
+        Closing is the last snapshot at or before ``commence_time`` — the
+        number CLV is measured against. Opening is the first snapshot in the
+        same 14-day pre-tip window.
+
+        READ ``opening_age_seconds`` BEFORE TRUSTING AN OPEN. PropLine's
+        archive starts April 2026, so for any book they began polling after a
+        line was posted, ``opening_*`` is first-observed-by-them rather than
+        the book's true open. Minutes rather than hours is the tell.
+        """
+        if not markets:
+            raise PropLineError("No market keys requested — refusing an unbounded pull")
+        self._check_quota_headroom()
+        payload = self._request(
+            f"sports/{NBA_SPORT_KEY}/events/{event_id}/odds/closing",
+            {"markets": ",".join(markets)},
+        )
+        payload = self._assert_not_redacted(payload, what=f"event {event_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    def fetch_odds_history(
+        self,
+        event_id: str,
+        markets: list[str],
+        *,
+        from_utc: datetime | None = None,
+        to_utc: datetime | None = None,
+        relative_from: str | None = None,
+        relative_to: str | None = None,
+        interval: str | None = None,
+        changes_only: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Full snapshot history per outcome, scoped and downsampled server-side.
+
+        ``relative_*`` are offsets from tip (``-3h``, ``-30m``, ``0``) and are
+        mutually exclusive with their absolute counterparts — sending both is
+        rejected here rather than spent as a request against a 4xx.
+
+        ``changes_only`` defaults True: a tick that repeats the previous
+        (price, point, liquidity) carries no information and a season of them
+        is most of the payload.
+        """
+        if not markets:
+            raise PropLineError("No market keys requested — refusing an unbounded pull")
+        if from_utc is not None and relative_from is not None:
+            raise PropLineError("from_utc and relative_from are mutually exclusive")
+        if to_utc is not None and relative_to is not None:
+            raise PropLineError("to_utc and relative_to are mutually exclusive")
+        if interval is not None and interval not in HISTORY_INTERVALS:
+            raise PropLineError(
+                f"interval {interval!r} is not one of {sorted(HISTORY_INTERVALS)}"
+            )
+
+        params: dict[str, Any] = {"markets": ",".join(markets)}
+        if from_utc is not None:
+            params["from"] = from_utc.isoformat()
+        if to_utc is not None:
+            params["to"] = to_utc.isoformat()
+        if relative_from is not None:
+            params["relative_from"] = relative_from
+        if relative_to is not None:
+            params["relative_to"] = relative_to
+        if interval is not None:
+            params["interval"] = interval
+        if changes_only:
+            params["changes_only"] = "true"
+
+        self._check_quota_headroom()
+        payload = self._request(
+            f"sports/{NBA_SPORT_KEY}/events/{event_id}/odds/history", params
+        )
+        payload = self._assert_not_redacted(payload, what=f"event {event_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    def fetch_event_results(self, event_id: str) -> Any:
+        """
+        Resolved prop outcomes for one event.
+
+        The response shape is NOT in the documentation this client was built
+        from, so the payload is returned as received. Normalise it with
+        ``describe_resolution_payload`` first, which reports the fields it
+        found instead of assuming which one holds the graded result.
+        """
+        self._check_quota_headroom()
+        payload = self._request(f"sports/{NBA_SPORT_KEY}/events/{event_id}/results")
+        return self._assert_not_redacted(payload, what=f"event {event_id}")
+
+    def fetch_player_history(self, player_name: str) -> Any:
+        """
+        One player's prop history with resolution.
+
+        Same caveat as ``fetch_event_results``: the response shape is not in
+        the documented set, so nothing about it is assumed here.
+        """
+        if not str(player_name).strip():
+            raise PropLineError("player_name is required")
+        self._check_quota_headroom()
+        payload = self._request(
+            f"sports/{NBA_SPORT_KEY}/players/{str(player_name).strip()}/history"
+        )
+        return self._assert_not_redacted(payload, what=f"player {player_name}")
+
+    def grade_clv(self, bets: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Grade placed bets against the close. Stateless — nothing is stored.
+
+        Each bet needs ``ref, sport_key, event_id, market, bookmaker,
+        selection, side, point, price`` and optionally ``stake``.
+
+        TWO CLV NUMBERS COME BACK AND THEY ARE NOT INTERCHANGEABLE.
+        ``clv_pct`` is price against price: quotable, and vig-blind, so it
+        flatters a bet taken on the juicy side of a wide market.
+        ``ev_vs_close_pct`` scores the price against the DE-VIGGED close and
+        is the honest one — the same rule this project already applies to
+        edge. Prefer it, and never sum either into a return.
+        """
+        if not bets:
+            raise PropLineError("No bets supplied to grade")
+        missing = [
+            b.get("ref") or f"#{i}"
+            for i, b in enumerate(bets)
+            if not {"event_id", "market", "selection", "side", "price"} <= set(b)
+        ]
+        if missing:
+            raise PropLineError(
+                f"Bets {missing} are missing required fields (event_id, market, "
+                "selection, side, price)"
+            )
+        self._check_quota_headroom()
+        payload = self._request("clv/grade", method="POST", json_body=bets)
+        return payload if isinstance(payload, dict) else {}
+
+    def export_resolved_props(self, params: dict[str, Any] | None = None) -> Any:
+        """
+        Bulk CSV of resolved props plus closing lines (Pro tier).
+
+        The single call that backfills an archive rather than accumulating
+        one slate at a time. Its columns are not in the documented set, so
+        the raw text comes back and the caller inspects it.
+        """
+        self._check_quota_headroom()
+        return self._request("exports/resolved-props", params or {})
+
+
 def _strip_player_namespace(player_id: Any) -> str | None:
     """
     ``nba:201939`` -> ``201939`` so it joins the panel's PLAYER_ID directly.
@@ -540,7 +766,10 @@ def normalize_event_props(
     mapping = market_map or DEFAULT_MARKET_MAP
     event_id = str(payload.get("id") or "") or None
     commence = _parse_iso(payload.get("commence_time"))
-    game_date = commence.date() if commence else None
+    from src.utils.timezones import pacific_calendar_date
+
+    # Pacific slate day, not UTC date — a 7pm PT tip is still that day's slate.
+    game_date = pacific_calendar_date(commence) if commence else None
 
     # (book, market, player, point) -> partially built row
     pending: dict[tuple, dict[str, Any]] = {}

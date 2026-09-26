@@ -147,8 +147,14 @@ def get_performance_summary(
                 PropResult.odds.is_(None),
                 PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH")),
             ).label("unpriced_graded_n"),
-            func.sum(PropResult.stake_units).filter(PropResult.odds.isnot(None)).label("staked"),
-            func.sum(PropResult.profit_units).filter(PropResult.odds.isnot(None)).label("profit"),
+            func.sum(PropResult.stake_units).filter(
+                PropResult.odds.isnot(None),
+                PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH")),
+            ).label("staked"),
+            func.sum(PropResult.profit_units).filter(
+                PropResult.odds.isnot(None),
+                PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH")),
+            ).label("profit"),
             func.avg(PropResult.clv_line_points).label("avg_clv_line"),
             func.avg(PropResult.clv_prob_points).label("avg_clv_prob"),
             count_where(PropResult.clv_line_points.isnot(None)).label("n_line_clv"),
@@ -179,7 +185,7 @@ def get_performance_summary(
     roi.unpriced_graded_n = row.unpriced_graded_n or 0
     roi.staked_units = _f(row.staked)
     roi.profit_units = _f(row.profit)
-    if roi.staked_units:
+    if roi.staked_units and roi.profit_units is not None:
         roi.roi_pct = round(roi.profit_units / roi.staked_units * 100, 2)
     if roi.unpriced_graded_n:
         roi.note = (
@@ -233,8 +239,14 @@ def get_performance_by_market(
             func.count().filter(PropResult.outcome_status == "WIN").label("wins"),
             func.count().filter(PropResult.outcome_status == "LOSS").label("losses"),
             func.count().filter(PropResult.outcome_status == "PUSH").label("pushes"),
-            func.sum(PropResult.stake_units).filter(PropResult.odds.isnot(None)).label("staked"),
-            func.sum(PropResult.profit_units).filter(PropResult.odds.isnot(None)).label("profit"),
+            func.sum(PropResult.stake_units).filter(
+                PropResult.odds.isnot(None),
+                PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH")),
+            ).label("staked"),
+            func.sum(PropResult.profit_units).filter(
+                PropResult.odds.isnot(None),
+                PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH")),
+            ).label("profit"),
         ).group_by(PropResult.market)
         if conditions:
             stmt = stmt.where(and_(*conditions))
@@ -251,7 +263,11 @@ def get_performance_by_market(
             "record": f"{r.wins or 0}-{r.losses or 0}-{r.pushes or 0}",
             "decided_n": decided,
             "strike_rate_pct": round((r.wins or 0) / decided * 100, 2) if decided else None,
-            "roi_pct": round(profit / staked * 100, 2) if staked else None,
+            "roi_pct": (
+                round(profit / staked * 100, 2)
+                if staked and profit is not None
+                else None
+            ),
             "low_sample": decided < MIN_SAMPLE_FOR_RATE,
         })
     return sorted(out, key=lambda x: x["decided_n"], reverse=True)

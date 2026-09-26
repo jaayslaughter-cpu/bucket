@@ -242,7 +242,9 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
     if slate_date:
         upper = _date.fromisoformat(slate_date)
     else:
-        upper = datetime.now(timezone.utc).date()
+        from src.utils.timezones import pacific_calendar_date
+
+        upper = pacific_calendar_date()
     lower = upper - timedelta(days=lookback_days)
 
     with session_scope() as session:

@@ -48,16 +48,19 @@ class XGBoostAdapter:
         n_splits: int = 5,
         random_state: int = 42,
         model_params: dict[str, Any] | None = None,
+        tuning: dict[str, Any] | None = None,
     ) -> None:
         self.target_market = target_market
         self.model_version = model_version
         self.feature_schema_version = feature_schema_version
         self.feature_cols = list(feature_cols)
+        self.oof = None
         self._pipe = XGBoostPropPipeline(
             self.feature_cols,
             n_splits=n_splits,
             random_state=random_state,
             model_params=model_params,
+            tuning=tuning,
         )
         self._meta_extra: dict[str, Any] = {}
         self._fitted = False
@@ -68,7 +71,23 @@ class XGBoostAdapter:
         # an input; once it is, masking would throw away the answer.
         self.line_aware: bool = False
 
-    def fit(self, train_data: pd.DataFrame, validation_data: pd.DataFrame | None = None) -> "XGBoostAdapter":
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        validation_data: pd.DataFrame | None = None,
+        sample_weight: "pd.Series | None" = None,
+    ) -> "XGBoostAdapter":
+        """
+        Fit the wrapped pipeline.
+
+        ``sample_weight`` is forwarded, not consumed here. XGBoostPropPipeline
+        has accepted recency weights since it was written and aligns them by
+        index; this adapter simply had no parameter to pass them through, so
+        nothing could reach it. The mean head and the out-of-fold pass below are
+        left UNWEIGHTED on purpose: they exist to produce a calibration signal
+        and a conditional mean, and weighting one but not the other would make
+        the two disagree about which rows matter.
+        """
         # Existing pipeline fits on train only (validation unused — preserved).
         if validation_data is not None and not validation_data.empty:
             logger.info(
@@ -76,9 +95,10 @@ class XGBoostAdapter:
                 "XGBoostPropPipeline.fit uses train only (unchanged behavior).",
                 len(validation_data),
             )
-        self._pipe.fit(train_data, target_col="over_hit")
+        self._pipe.fit(train_data, target_col="over_hit", sample_weight=sample_weight)
         self._fitted = True
         self._fit_mean_head(train_data)
+        self._fit_out_of_fold(train_data)
         self._meta_extra = {
             "train_row_count": int(len(train_data)),
             "validation_row_count": int(len(validation_data)) if validation_data is not None else 0,
@@ -134,6 +154,60 @@ class XGBoostAdapter:
 
         self.mean_model = XGBRegressor(objective="reg:squarederror", **params)
         self.mean_model.fit(X, y)
+
+    def _fit_out_of_fold(self, train_data: pd.DataFrame) -> None:
+        """
+        Out-of-fold P(over) over the training window, for the calibrator.
+
+        Produced here rather than by refitting the whole component later:
+        the calibrator then sees the WHOLE training window instead of its
+        last 30%, and on the same chronological folds the dispersion used.
+        """
+        from src.models.oof import chronological_oof_probabilities
+
+        if "over_hit" not in train_data.columns:
+            self.oof = None
+            return
+        work = train_data
+        if "GAME_DATE" in work.columns:
+            work = work.sort_values("GAME_DATE")
+        y = pd.to_numeric(work["over_hit"], errors="coerce")
+        rows = work.loc[y.notna()]
+        if rows.empty:
+            self.oof = None
+            return
+
+        pipe_cls = type(self._pipe)
+        # Carry the WHOLE configuration into each fold, not just model_params.
+        # tuning and n_splits are separate constructor arguments, so passing
+        # only model_params left every fold on DEFAULT_TUNING and n_splits=5:
+        # an adapter built with n_estimators_max=300 and n_splits=3 produced
+        # out-of-fold probabilities from models tuned to 2000 and 5. Those
+        # probabilities are what the calibrator is fitted on, so the
+        # calibrator was corrected against a differently-tuned model than the
+        # one it later corrects.
+        params = self._pipe.model_params
+        tuning = self._pipe.tuning
+        n_splits = self._pipe.n_splits
+
+        # Whole rows travel through the folds, not just the feature matrix:
+        # the pipeline reads GAME_DATE to verify its own splits are
+        # chronological, and handing it a bare X made it warn that it could
+        # not check the very property this pass exists to guarantee.
+        def _fit_predict(rows_tr, y_tr, rows_va):
+            fold = pipe_cls(
+                self.feature_cols,
+                model_params=params,
+                tuning=tuning,
+                n_splits=n_splits,
+            )
+            fold.fit(rows_tr, target_col="over_hit")
+            return fold.predict_proba_over(rows_va)
+
+        self.oof = chronological_oof_probabilities(
+            _fit_predict, rows, y.loc[rows.index].to_numpy(),
+            market=self.target_market,
+        )
 
     def predict_mean(self, features: pd.DataFrame) -> pd.Series:
         if self.mean_model is None:
@@ -281,7 +355,13 @@ class XGBoostAdapter:
             "target_market": self.target_market,
             "model_version": self.model_version,
             "feature_schema_version": self.feature_schema_version,
-            "model_params": self._pipe.model_params,
+            "model_params": self._pipe.effective_params(),
+            # Recorded so a reload reconstructs the same pipeline. effective_params
+            # reports the tree count the search LANDED on; these are the settings
+            # that produced it, and without them a reloaded artifact silently
+            # reverted to DEFAULT_TUNING and n_splits=5.
+            "tuning": dict(self._pipe.tuning),
+            "n_splits": int(self._pipe.n_splits),
             "dispersion": None if self.dispersion is None else self.dispersion.to_dict(),
             "has_mean_head": self.mean_model is not None,
             **self._meta_extra,
@@ -306,7 +386,16 @@ class XGBoostAdapter:
         self.feature_cols = list(meta["feature_cols"])
         self.target_market = meta.get("target_market", self.target_market)
         self.model_version = meta.get("model_version", self.model_version)
-        self._pipe = XGBoostPropPipeline(self.feature_cols, model_params=meta.get("model_params"))
+        # Same omission as the fold path above: tuning and n_splits are their
+        # own constructor arguments, so a reloaded artifact silently reverted to
+        # DEFAULT_TUNING. Persisted when present; absent in older sidecars,
+        # where the constructor default is the honest answer.
+        self._pipe = XGBoostPropPipeline(
+            self.feature_cols,
+            model_params=meta.get("model_params"),
+            tuning=meta.get("tuning"),
+            **({"n_splits": int(meta["n_splits"])} if meta.get("n_splits") else {}),
+        )
         import xgboost as xgb
 
         booster = xgb.XGBClassifier()
@@ -341,7 +430,7 @@ class XGBoostAdapter:
             model_version=self.model_version,
             target_market=self.target_market,
             feature_cols=self.feature_cols,
-            hyperparameters=dict(self._pipe.model_params),
+            hyperparameters=self._pipe.effective_params(),
             train_row_count=self._meta_extra.get("train_row_count"),
             validation_row_count=self._meta_extra.get("validation_row_count"),
             train_start_date=self._meta_extra.get("train_start_date"),

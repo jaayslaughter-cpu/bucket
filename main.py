@@ -138,11 +138,22 @@ def preflight(require_db: bool = True) -> dict[str, Any]:
 # [2] game market lines — GAME markets only, NOT prop EV
 # ---------------------------------------------------------------------------
 
-def ingest_market_lines(xlsx_path: Path, persist: bool = True) -> pd.DataFrame:
+def ingest_market_lines(
+    xlsx_path: Path, persist: bool = True
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load BigDataBall. IMPORTANT: supplies GAME spread/total/moneyline. It
     does NOT supply two-way player-prop American odds, so it cannot by
     itself satisfy market_ev_gate for player props.
+
+    Returns ``(team_games, market_lines)`` — BOTH frames, because both are
+    inputs to build_feature_matrix. This function used to return only the
+    market frame and discard the team one, while the feature build was called
+    with neither: the workbook was read, parsed, persisted, and then the Elo,
+    market-context, defence and blowout columns were left off the matrix
+    entirely, because the builder omits a layer whose input is absent rather
+    than inventing it. The orchestrator therefore produced a strictly narrower
+    feature set than scripts/nba_model_cli.py does from the same workbook.
     """
     from src.ingestion.bigdataball import load_bigdataball_workbook
 
@@ -157,7 +168,7 @@ def ingest_market_lines(xlsx_path: Path, persist: bool = True) -> pd.DataFrame:
 
         upsert_team_game_stats(stats_df)
         upsert_market_lines(market_df)
-    return market_df
+    return stats_df, market_df
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +278,12 @@ def _filter_to_slate(features: pd.DataFrame, slate: str) -> tuple[pd.DataFrame, 
     return on_slate, len(on_slate)
 
 
-def build_features_and_verify_fatigue(player_panel: pd.DataFrame) -> pd.DataFrame:
+def build_features_and_verify_fatigue(
+    player_panel: pd.DataFrame,
+    *,
+    team_games: pd.DataFrame | None = None,
+    market_lines: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix and VERIFY fatigue was applied.
 
@@ -279,7 +295,27 @@ def build_features_and_verify_fatigue(player_panel: pd.DataFrame) -> pd.DataFram
     """
     from src.features.builder import assert_no_lookahead, build_feature_matrix
 
-    features = build_feature_matrix(player_panel)
+    features = build_feature_matrix(
+        player_panel, team_games=team_games, market_lines=market_lines
+    )
+    # EMPTY counts as absent, because that is how the builder treats it:
+    # build_feature_matrix gates both layers on `is not None and not .empty`,
+    # so a workbook that parsed to zero rows skips them exactly as a missing
+    # frame does. Warning only on None left that case silent, which is the
+    # defect this function exists to fix.
+    def _absent(frame: pd.DataFrame | None) -> bool:
+        return frame is None or frame.empty
+
+    if _absent(team_games) or _absent(market_lines):
+        logger.warning(
+            "Workbook frames missing or EMPTY (team_games=%s, market_lines=%s) — "
+            "team Elo, market context, opponent defence and blowout columns will "
+            "be ABSENT from this matrix. The run is narrower, not wrong; supply "
+            "the BigDataBall workbook to match what scripts/nba_model_cli.py "
+            "builds.",
+            "absent" if team_games is None else f"{len(team_games)} rows",
+            "absent" if market_lines is None else f"{len(market_lines)} rows",
+        )
 
     if FATIGUE_COL not in features.columns:
         raise RuntimeError(
@@ -323,9 +359,25 @@ def score_prob_over(
     Score P(Over) with a PREVIOUSLY FITTED model.
 
     XGBoostPropPipeline requires feature_cols at construction and a fitted
-    booster for predict_proba_over. Training is a separate offline job
-    (scripts/train_model.py); this stage only scores and returns an
-    all-null Series with a named reason when it cannot.
+    booster for predict_proba_over. Training is a separate offline job and this
+    stage only scores, returning an all-null Series with a named reason when it
+    cannot.
+
+    THE TWO DO NOT SHARE A DEFAULT PATH. train-stats needs three flags and
+    writes elsewhere::
+
+        python scripts/nba_model_cli.py train-stats --market PTS \
+            --start-date 2024-11-01 --end-date 2025-03-01
+
+    writes ``xgboost_PTS.json`` (plus its ``.meta.json``) under
+    ``data/external/model_runs/comparison/``, set by ``artifacts_dir`` in
+    config/model_comparison.yaml. This stage reads ``models/xgb_prop_over.json``
+    by default, so a freshly trained model has to be named explicitly::
+
+        python main.py --model data/external/model_runs/comparison/xgboost_PTS.json
+
+    Following the command without those flags fails, and following it without
+    ``--model`` trains successfully and still skips scoring.
     """
     null = pd.Series([None] * len(features), index=features.index, dtype="object")
 
@@ -334,8 +386,11 @@ def score_prob_over(
         return null
     if not model_path.exists():
         logger.warning(
-            "P(Over) skipped: no fitted model at %s. Train one first "
-            "(scripts/train_model.py) — this stage does not fit models.",
+            "P(Over) skipped: no fitted model at %s. This stage does not fit "
+            "models. Train one with `scripts/nba_model_cli.py train-stats "
+            "--market PTS --start-date ... --end-date ...`, which writes to "
+            "data/external/model_runs/comparison/, then pass that artifact as "
+            "--model — the two paths do not coincide.",
             model_path,
         )
         return null
@@ -639,7 +694,9 @@ def main() -> int:
         stage_summary["preflight"] = preflight(require_db=persist)
         guideline = load_master_guideline()
 
-        market_df = ingest_market_lines(Path(args.bigdataball), persist=persist)
+        team_games_df, market_df = ingest_market_lines(
+            Path(args.bigdataball), persist=persist
+        )
         stage_summary["game_markets"] = {
             "rows": len(market_df),
             "valid": int((market_df["status"] == "VALID").sum()),
@@ -666,7 +723,9 @@ def main() -> int:
                 record_run(run_id, status="success_no_data", stage_summary=stage_summary)
             return 0
 
-        features = build_features_and_verify_fatigue(panel)
+        features = build_features_and_verify_fatigue(
+            panel, team_games=team_games_df, market_lines=market_df
+        )
 
         # The panel deliberately carries ~400 days so the shift-1 rolling
         # features have history to read. Those historical rows are INPUT,

@@ -23,6 +23,8 @@ originals.
 | `src/quant/contracts.py` | New. `MarketContext`, `market_ev_gate`, two-way de-vig |
 | `src/ingestion/boxscores.py` | New. Player game logs from the NBA stats API |
 | `src/ingestion/basketball_reference.py` | New. SR season tables. Prior-season only — refuses same-season joins |
+| `src/features/market_context.py` | New. Pregame opening spread/total + implied team totals. Refuses closing lines |
+| `src/models/line_aware.py` | **Now wired** into build_components as the `line_aware` component |
 
 **The XGBoost baseline is new code.** No earlier PropIQ baseline was
 available, so `xgboost_pipeline.py` was written from scratch. A comparison
@@ -260,7 +262,10 @@ player lines.
   timestamped before tip.
 - **`CLOSING SPREAD` / `CLOSING TOTAL`** are known only at tip. Using them
   as features for a projection made hours earlier is look-ahead. Opening
-  values are the safe choice.
+  values are the safe choice. **Now enforced**:
+  `src/features/market_context.py` raises `ClosingLineLeakageError` on any
+  closing column offered as a feature, and closing values are reachable only
+  through `closing_line_value()`, which is settlement.
 - **Basketball-Reference season tables** (per game, per 100 possessions,
   play-by-play, adjusted shooting) are SEASON AGGREGATES. Joined onto their own season they leak
   the future into every game: a season TS% is computed from the game being

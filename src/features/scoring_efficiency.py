@@ -132,6 +132,10 @@ def attach_box_ts_features(df: pd.DataFrame) -> pd.DataFrame:
     # Positive means a player has been converting above their own baseline.
     out["TS_PCT_TREND"] = out["TS_PCT_L5"] - out["TS_PCT_L10"]
 
+    # Same-game TS_PCT / SHOT_VOLUME / FT_RATE are postgame — drop after
+    # building shift-1 rolls so they cannot enter an "all numeric cols" path.
+    out = out.drop(columns=["TS_PCT", "SHOT_VOLUME", "FT_RATE"], errors="ignore")
+
     attached = [c for c in out.columns if c not in df.columns]
     logger.info(
         "scoring_efficiency: attached %d columns (%d rows have a prior TS%%)",
