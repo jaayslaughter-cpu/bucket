@@ -177,15 +177,43 @@ def test_calibrated_metrics_are_reported_alongside_the_raw_ones(comparison):
     The harness fitted a calibrator, applied it to the exported predictions,
     and then scored the RAW probability — so nothing could say whether
     calibration helped.
+
+    THE ECE IS WITHHELD ON THIS FIXTURE, DELIBERATELY. compare.py now computes
+    ECE through prob_calibration.expected_calibration_error, which returns None
+    below 80% bin coverage. The demo panel's validation window has 371
+    predictions occupying 7 of 10 bins (coverage 0.70), so both gated ECEs are
+    None here and the ungated figures (0.064 raw, 0.0287 calibrated) are kept
+    beside them. That is the gate doing its job on a small fixture, not a
+    regression: on the real 65,900-row validation window the gate passes and the
+    numbers are published.
+
+    So this test asserts the contract that survives either way — the calibrated
+    Brier and log loss are always reported, and calibration is measurably
+    helping — and reads the ECE from whichever field the gate left populated.
     """
     rows = {r["model_name"]: r for r in comparison["summary"]}
     xgb = rows["xgboost"]
-    for field in ("brier_score_calibrated", "log_loss_calibrated",
-                  "calibration_error_calibrated"):
-        assert xgb[field] is not None
+    for field in ("brier_score_calibrated", "log_loss_calibrated"):
+        assert xgb[field] is not None, field
+
+    # A withheld ECE must be distinguishable from a missing one: the gate flag
+    # and the coverage it was judged on are both reported.
+    assert xgb["calibration_gate_passed"] is not None
+    assert xgb["calibration_bin_coverage"] is not None
+    if xgb["calibration_gate_passed"]:
+        raw_ece = xgb["calibration_error"]
+        cal_ece = xgb["calibration_error_calibrated"]
+    else:
+        assert xgb["calibration_error"] is None, (
+            "the gate failed, so the gated ECE must be withheld rather than "
+            "published as a measurement"
+        )
+        raw_ece = xgb["calibration_error_ungated"]
+        cal_ece = xgb["calibration_error_calibrated_ungated"]
+    assert raw_ece is not None and cal_ece is not None, "the ECE vanished entirely"
 
     # On this panel calibration is doing real work on the boosted classifier.
-    assert xgb["calibration_error_calibrated"] < xgb["calibration_error"]
+    assert cal_ece < raw_ece
     assert xgb["brier_score_calibrated"] < xgb["brier_score"]
 
 
