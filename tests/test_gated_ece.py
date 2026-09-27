@@ -66,21 +66,27 @@ def test_a_sparse_window_reports_no_ece_instead_of_a_confident_one():
     assert _inline_proxy(y, p) == pytest.approx(round(gated["ece_ungated"], 4))
 
 
-def test_compare_publishes_the_gate_alongside_the_number():
-    """A withheld ECE has to be distinguishable from a missing column, so the
-    row carries the gate flag and the coverage it was judged on."""
-    import inspect
+def test_the_gate_diagnostics_reach_the_exported_summary():
+    """A withheld ECE must be distinguishable from a missing one in the file a
+    reader actually opens.
 
-    from src.models import compare
+    This replaces a check that grepped compare.py's source for the field names.
+    That passed if the names appeared only in a comment and failed on a harmless
+    rename — it tested the text, not the behaviour. The contract that matters is
+    that the diagnostics survive into the export, which is a column list.
+    """
+    from src.models.exports import SUMMARY_COLS
 
-    source = inspect.getsource(compare.compare_models_on_panel)
     for key in (
-        "calibration_error_ungated",
-        "calibration_gate_passed",
-        "calibration_bin_coverage",
+        "calibration_error", "calibration_error_ungated",
+        "calibration_gate_passed", "calibration_bin_coverage",
+        "calibration_error_calibrated", "calibration_error_calibrated_ungated",
+        "calibration_gate_passed_calibrated",
     ):
-        assert key in source, f"{key} is not reported"
-    assert "Simple ECE proxy" not in source, "the ungated proxy is still in place"
+        assert key in SUMMARY_COLS, (
+            f"{key} is computed but dropped from model_comparison_summary.csv, so "
+            "a null ECE in the export cannot be told from a withheld one"
+        )
 
 
 # --- the ranking tiebreak -------------------------------------------------

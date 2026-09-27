@@ -68,26 +68,112 @@ def test_enabling_it_produces_weights_and_reports_what_they_cost():
     assert report["weight_ratio"] > 1.0
 
 
-def test_the_newest_TRAINING_row_anchors_the_weights_not_the_validation_end():
-    """The leakage property, stated as a measurement.
+def test_no_reference_date_is_passed_so_the_anchor_is_the_training_window(
+    monkeypatch,
+):
+    """The leakage property, checked at the call rather than inferred from the
+    weights.
 
-    No ``as_of`` is passed, so exponential_recency_weights anchors on the newest
-    date in the TRAINING frame. Handing it a later date would leak the split
-    boundary into the fit. Checked by the shape of the result: the last training
-    row carries the largest weight and the first the smallest, and the ratio
-    matches the half-life rather than some later reference.
+    AN EARLIER VERSION OF THIS TEST PROVED NOTHING. It asserted that 60 days at a
+    30-day half-life gives the oldest row exactly 1/4 the newest, and called that
+    ratio the leakage check. It is not: the weights are normalised to mean 1, so a
+    later ``as_of`` multiplies every weight by the same constant and the
+    normalisation divides it straight back out. Measured — with the reference 45
+    days past the training end, the returned weights are IDENTICAL, element for
+    element. Ordering and the 4:1 ratio are invariant to the very thing the test
+    claimed to detect.
+
+    What actually protects against the leak is that recency_sample_weights passes
+    no ``as_of`` at all, leaving exponential_recency_weights to anchor on the
+    newest date in the frame it was handed — the training window's own end. So
+    that is what this asserts, by recording the call.
     """
-    train = _train(n=61)  # exactly 60 days from first row to last
+    # Patched on the recency MODULE, not on compare: recency_sample_weights
+    # imports the function locally on each call, so the name is resolved from
+    # src.models.recency at call time and a patch on compare's namespace would
+    # never be seen. A spy installed in the wrong place is a test that passes
+    # without observing anything.
+    import src.models.recency as recency_module
+
+    # EVERY call is recorded, not the last one. recency_weight_report calls the
+    # same function a second time with an explicit as_of=None, so a spy that
+    # overwrote a single slot reported that harmless call and never saw the one
+    # compare makes — the first version of this test passed even when compare was
+    # mutated to pass as_of=train.max(). Collect them all.
+    calls: list[dict[str, object]] = []
+    real = recency_module.exponential_recency_weights
+
+    def _spy(dates, **kwargs):
+        calls.append({
+            "kwargs": dict(kwargs),
+            "max_date": pd.to_datetime(pd.Series(dates)).max(),
+        })
+        return real(dates, **kwargs)
+
+    monkeypatch.setattr(recency_module, "exponential_recency_weights", _spy)
+
+    train = _train(n=61)
     weights, _ = recency_sample_weights(
         train, {"recency": {"enabled": True, "half_life_days": 30}}, "PTS"
     )
     assert weights is not None
-    assert weights.iloc[-1] == pytest.approx(weights.max())
-    assert weights.iloc[0] == pytest.approx(weights.min())
-    # 60 days at a 30-day half-life is two halvings: the oldest row is 1/4 the
-    # newest. Anchoring on anything LATER than the training end would compress
-    # this ratio, so the number is the leakage check.
-    assert weights.iloc[-1] / weights.iloc[0] == pytest.approx(4.0, rel=1e-6)
+
+    assert calls, "the weighting function was never called"
+    for i, call in enumerate(calls):
+        supplied = call["kwargs"].get("as_of")
+        assert supplied is None, (
+            f"call {i} supplied a reference date ({supplied}); the anchor must "
+            "come from the training frame, not from the caller"
+        )
+        # And every frame handed over ends where the training window ends, so the
+        # implicit anchor cannot see past it.
+        assert call["max_date"] == train["GAME_DATE"].max()
+
+
+def test_the_guard_in_recency_catches_an_EARLIER_reference_not_a_later_one():
+    """Which direction recency.py actually guards, read from the code rather than
+    assumed.
+
+    ``exponential_recency_weights`` raises when ``as_of`` is EARLIER than the
+    newest row, because that produces weights above 1 and means the reference came
+    from outside the window. A LATER reference is NOT refused — and does not need
+    to be, since mean-normalisation cancels it (the test below measures that).
+    I first wrote this test asserting the opposite direction and it failed, which
+    is the only reason the claim did not end up in a docstring.
+
+    So the leakage protection is not a guard against reaching forward: it is that
+    recency_sample_weights passes no reference at all.
+    """
+    from src.models.recency import RecencyWeightError, exponential_recency_weights
+
+    dates = _train(n=61)["GAME_DATE"]
+    with pytest.raises(RecencyWeightError, match="leaks the split boundary"):
+        exponential_recency_weights(
+            dates, half_life_days=30, as_of=dates.max() - pd.Timedelta(days=5)
+        )
+
+    # Later is accepted, and is a no-op on the returned weights.
+    anchored = exponential_recency_weights(dates, half_life_days=30)
+    later = exponential_recency_weights(
+        dates, half_life_days=30, as_of=dates.max() + pd.Timedelta(days=45)
+    )
+    assert list(anchored.round(12)) == list(later.round(12))
+
+
+def test_normalisation_is_why_the_old_ratio_assertion_was_vacuous():
+    """Pinned so the mistake is not repeated: a later anchor changes nothing
+    about the returned weights, because mean-normalisation cancels it."""
+    from src.models.recency import exponential_recency_weights
+
+    dates = _train(n=61)["GAME_DATE"]
+    anchored = exponential_recency_weights(dates, half_life_days=30)
+    # Reaching past the end is refused, so compare two windows that differ only
+    # in where their own last row falls: the SHAPE is identical either way.
+    shifted = exponential_recency_weights(
+        dates + pd.Timedelta(days=45), half_life_days=30
+    )
+    assert list(anchored.round(9)) == list(shifted.round(9))
+    assert anchored.iloc[-1] / anchored.iloc[0] == pytest.approx(4.0, rel=1e-6)
 
 
 def test_a_frame_with_no_dates_fits_unweighted_rather_than_inventing_an_order():

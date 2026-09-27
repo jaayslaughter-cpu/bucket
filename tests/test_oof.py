@@ -199,17 +199,31 @@ def test_calibrated_metrics_are_reported_alongside_the_raw_ones(comparison):
     # A withheld ECE must be distinguishable from a missing one: the gate flag
     # and the coverage it was judged on are both reported.
     assert xgb["calibration_gate_passed"] is not None
+    assert xgb["calibration_gate_passed_calibrated"] is not None
     assert xgb["calibration_bin_coverage"] is not None
-    if xgb["calibration_gate_passed"]:
-        raw_ece = xgb["calibration_error"]
-        cal_ece = xgb["calibration_error_calibrated"]
-    else:
-        assert xgb["calibration_error"] is None, (
-            "the gate failed, so the gated ECE must be withheld rather than "
+    # The raw and calibrated probabilities are gated INDEPENDENTLY — calibration
+    # moves the predictions, so it moves which bins they occupy. Selecting the
+    # calibrated ECE by the raw gate would read a correctly withheld None
+    # whenever the raw window passes and the calibrated one does not.
+    def _pick(gate_field: str, gated_field: str, ungated_field: str):
+        if xgb[gate_field]:
+            value = xgb[gated_field]
+            assert value is not None, f"{gate_field} passed but {gated_field} is None"
+            return value
+        assert xgb[gated_field] is None, (
+            f"{gate_field} failed, so {gated_field} must be withheld rather than "
             "published as a measurement"
         )
-        raw_ece = xgb["calibration_error_ungated"]
-        cal_ece = xgb["calibration_error_calibrated_ungated"]
+        return xgb[ungated_field]
+
+    raw_ece = _pick(
+        "calibration_gate_passed", "calibration_error", "calibration_error_ungated"
+    )
+    cal_ece = _pick(
+        "calibration_gate_passed_calibrated",
+        "calibration_error_calibrated",
+        "calibration_error_calibrated_ungated",
+    )
     assert raw_ece is not None and cal_ece is not None, "the ECE vanished entirely"
 
     # On this panel calibration is doing real work on the boosted classifier.

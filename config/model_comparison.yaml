@@ -216,8 +216,10 @@ sports_ev:
 #
 # STILL DISABLED, and not for lack of wiring. Weighting discards information --
 # the Kish effective sample size is logged and returned under
-# `recency_weighting` on every run that enables it -- and no A/B has been run
-# yet. Turn it on when a measurement supports it, the way the blowout layer
+# `recency_weighting` whenever valid weights are actually computed -- and no A/B
+# has been run yet. Enabling this does not guarantee a report:
+# recency_sample_weights() falls back to an UNWEIGHTED fit, with a warning and no
+# report, when GAME_DATE is absent or the half-life is rejected. Turn it on when a measurement supports it, the way the blowout layer
 # stays off on measured evidence.
 recency:
   half_life_days: 240

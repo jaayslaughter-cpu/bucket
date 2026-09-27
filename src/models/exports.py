@@ -26,7 +26,17 @@ SUMMARY_COLS = [
     # unmeasurable in the first place.
     "brier_score_calibrated", "log_loss_calibrated",
     "calibration_error_calibrated", "calibration_source", "calibration_rows",
-    "calibration_error", "interval_coverage", "notes",
+    "calibration_error",
+    # The GATE, beside the numbers it withholds. compare.py computes ECE through
+    # prob_calibration.expected_calibration_error, which returns None below 80%
+    # bin coverage. Exporting only the gated value made a withheld ECE
+    # indistinguishable from one that was never computed -- so a reader opening
+    # the CSV could not tell "too sparse to measure" from "missing". The ungated
+    # figure, the gate flag and the coverage it was judged on travel with it.
+    "calibration_error_ungated", "calibration_gate_passed",
+    "calibration_bin_coverage",
+    "calibration_error_calibrated_ungated", "calibration_gate_passed_calibrated",
+    "interval_coverage", "notes",
 ]
 
 DETAIL_COLS = [

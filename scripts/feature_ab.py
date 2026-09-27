@@ -227,6 +227,11 @@ LAYERS: dict[str, Layer] = {
 # --wire-under-test, to keep one market's columns out of another's arm.
 _STAT_PREFIXES = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA")
 
+# The two defence columns every market reads, from the universal block of
+# labels.default_feature_cols. Everything else DEF_* is assigned per market by
+# labels._DEFENSE_BY_MARKET and must not be handed to a market it is not for.
+_UNIVERSAL_DEFENSE_COLS = frozenset({"DEF_RATING_L10", "DEF_PACE_L10"})
+
 
 METRICS = (
     ("brier_score", "Brier raw"),
@@ -272,6 +277,24 @@ def _delta(on: Any, off: Any) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Wrapper that guarantees --wire-under-test cannot outlive its own run.
+
+    _run installs a widened default_feature_cols on src.models.compare. main() is
+    importable and callable more than once in a process, and a patch left in
+    place would silently widen the NEXT layer's arms with this layer's columns --
+    so every delta after the first would be measuring something else. Restored
+    here whether _run returns or raises.
+    """
+    import src.models.compare as compare_module
+
+    original_resolver = compare_module.default_feature_cols
+    try:
+        return _run(argv)
+    finally:
+        compare_module.default_feature_cols = original_resolver
+
+
+def _run(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--layer", required=True, choices=sorted(LAYERS),
@@ -344,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     # produced a table of exact zeros -- a correct answer to a question
     # nobody meant to ask. Say so instead of printing it.
     import src.models.compare as compare_module
-    from src.models.labels import default_feature_cols
+    from src.models.labels import _DEFENSE_BY_MARKET, default_feature_cols
 
     if args.wire_under_test:
         # compare.py binds default_feature_cols at import, so the patch has to
@@ -361,6 +384,17 @@ def main(argv: list[str] | None = None) -> int:
         # carrying another market's stat prefix is skipped; MIN_*, MINUTES_*,
         # TS_PCT_*, USAGE_PROXY_* and the rest are market-neutral and go to all.
         def _for_market(column: str, market: str) -> bool:
+            # A DEF_* column is not market-neutral just because it carries no
+            # stat prefix: labels._DEFENSE_BY_MARKET assigns each one to the
+            # markets it bears on, and DEF_REB_ALLOWED_PER100_L10 belongs to REB
+            # and PRA, not to PTS. Treating the whole family as neutral meant
+            # `--layer defense --wire-under-test --markets PTS` fed a points
+            # model the rebound and assist defence columns -- not the question
+            # being asked, and the same defect as the stat-prefix one below.
+            if column.startswith("DEF_"):
+                if column in _UNIVERSAL_DEFENSE_COLS:
+                    return True
+                return column in set(_DEFENSE_BY_MARKET.get(market, ()))
             for stat in _STAT_PREFIXES:
                 if stat == market:
                     continue
@@ -375,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
                     cols.append(c)
             return cols
 
+        # main() restores the original resolver in a finally, so this patch
+        # cannot outlive the run that installed it.
         compare_module.default_feature_cols = _widened  # type: ignore[assignment]
         print(f"--wire-under-test: up to {len(under_test)} column(s) added to "
               f"each market's feature list for this run only, skipping any that "
@@ -451,8 +487,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{market}: no models scored — skipped.\n")
             continue
         print(f"=== {market} ===")
-        rows = int(off["n_predictions"].sum()) if not off.empty else int(on["n_predictions"].sum())
-        print(f"    validation rows across {n_folds} fold(s): {rows}")
+        # SUMMED OVER MODELS, so this is a count of predictions and not of rows:
+        # each held-out observation appears once per model. Labelling it
+        # "validation rows" got the figure read as distinct rows in three commit
+        # messages and two docs headers before anyone noticed it was ~5x too
+        # high. Both numbers are printed now.
+        arm = off if not off.empty else on
+        predictions = int(arm["n_predictions"].sum())
+        models = max(int(arm["model_name"].nunique()), 1)
+        print(f"    model predictions across {n_folds} fold(s): {predictions} "
+              f"({models} model(s), so ~{predictions // models} distinct "
+              f"validation rows)")
         if n_folds > 1:
             header = (f"    {'model':<13}{'metric':<12}{'off':>9}{'on':>9}"
                       f"{'delta':>10}{'sd':>9}  folds better")

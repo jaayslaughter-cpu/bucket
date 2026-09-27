@@ -14,6 +14,7 @@ Nothing failed, because nothing asserted the frames arrived. These tests do.
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -133,8 +134,6 @@ def test_the_training_pointer_names_the_flags_the_command_actually_requires():
     does not read. A pointer naming only --market fails when followed, and a
     pointer omitting the artifact path trains successfully and still skips
     scoring. Both halves are asserted against the command's real signature."""
-    import inspect
-
     from scripts.nba_model_cli import train_stats
 
     required = {
@@ -143,13 +142,22 @@ def test_the_training_pointer_names_the_flags_the_command_actually_requires():
     }
     assert {"market", "start_date", "end_date"} <= required, required
 
-    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    # SCOPED to score_prob_over's own docstring. Searching the whole module
+    # passed for the wrong reason: the P(Over) warning further down repeats the
+    # flags and the artifact path, so deleting them from the runnable command
+    # above left the assertions green.
+    pointer = inspect.getdoc(orchestrator.score_prob_over) or ""
+    assert pointer, "score_prob_over has no docstring to carry the pointer"
     for flag in ("--start-date", "--end-date"):
-        assert flag in source, f"{flag} is required by train-stats and unmentioned"
-    assert "model_runs/comparison" in source, (
-        "the artifact directory train-stats writes to is not named, so a reader "
-        "cannot point --model at it"
+        assert flag in pointer, (
+            f"{flag} is required by train-stats and missing from the command in "
+            "score_prob_over's docstring"
+        )
+    assert "model_runs/comparison" in pointer, (
+        "the artifact directory train-stats writes to is not named in the "
+        "pointer, so a reader cannot point --model at it"
     )
+    assert "--model" in pointer, "the --model invocation is not shown"
 
 
 def test_ingest_market_lines_returns_both_frames(monkeypatch):

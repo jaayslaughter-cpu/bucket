@@ -1,8 +1,22 @@
 # A/B results: REB/AST form, halflife, usage_volume
 # scripts/feature_ab.py, 3 chronological folds, panel restricted to
 # 2022-23..2025-26 (103,233 rows). Both arms use exactly the same rows.
-# Lower is better for every metric. A mean delta smaller than the
-# fold-to-fold sd is not evidence. RESEARCH ONLY.
+#
+# READ THE "validation rows across 3 fold(s)" LINE WITH CARE. That figure is the
+# harness summing n_predictions over EVERY model row, so each held-out
+# observation is counted once per model, not once. With five models over three
+# folds, the printed 65,900 corresponds to roughly 13,180 distinct validation
+# rows. It is a count of model predictions, not of rows. The per-model deltas
+# below are unaffected -- each is computed within one model -- but the row count
+# was misread as distinct rows when these results were first written up.
+#
+# THE TARGET IS RESEARCH_LINE, the player's own trailing 10-game average, NOT a
+# sportsbook line. These Brier and ECE figures say how well a model predicts
+# going over that research threshold. They are NOT prop-market accuracy and
+# imply nothing about beating a book.
+#
+# Lower is better for every metric. A mean delta smaller than the fold-to-fold
+# sd is not evidence. RESEARCH ONLY.
 #
 ######## 1. form, REB+AST (already wired) ########
 Restricted to season(s) ['2022-23', '2023-24', '2024-25', '2025-26']: 214,381 -> 103,233 rows. Both arms use exactly these rows.

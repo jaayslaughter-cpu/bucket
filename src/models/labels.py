@@ -150,27 +150,31 @@ def default_feature_cols(market: str) -> list[str]:
 #
 # THE PREDICTION WAS THEN TESTED, not left as an argument from correlation.
 # scripts/feature_ab.py --layer halflife and --layer usage_volume, both with
-# --wire-under-test so nothing had to be shipped to measure it, PTS, 3 folds,
-# 65,900 validation rows:
+# --wire-under-test so nothing had to be shipped to measure it, PTS, 3 folds
+# (~13,180 distinct validation rows; see the note above on the printed 65,900):
 #
 #   halflife      xgboost Brier raw  +0.00022 (sd 0.00006)  0/3 folds better
 #                 ensemble Brier raw +0.00025 (sd 0.00012)  0/3
 #   usage_volume  catboost Brier cal +0.00057 (sd 0.00006)  0/3
 #                 catboost Brier raw +0.00060 (sd 0.00020)  0/3
 #
-# Adding them makes discrimination WORSE, on every fold, at 3-10x the fold
-# spread. The r = 0.955-0.990 reading was right: the model receives one number
-# twice and pays variance for it.
+# Adding them makes overall Brier WORSE, on every fold, at 3-10x the fold
+# spread, which is consistent with the r = 0.955-0.990 reading: the model
+# receives one number twice.
 #
 # ONE HONEST COMPLICATION. Both redundant sets consistently IMPROVED calibrated
 # ECE while leaving Brier flat or worse -- halflife: xgboost -0.00313 and
 # ensemble -0.00330, both 3/3; usage_volume: xgboost -0.00383 and ensemble
 # -0.00287, both 3/3. The same tension appears in the PTS form result pointing
-# the other way. The reading is that extra correlated columns add no
-# discrimination but smooth the probability estimates. Brier is the
-# discrimination metric and it decides these exclusions; the ECE column does not
-# agree, and pretending otherwise would be the kind of tidy summary this file
-# exists to avoid.
+# the other way.
+#
+# WHAT THAT DOES AND DOES NOT SHOW. Brier is not a discrimination metric: it
+# decomposes into calibration and resolution, so a worse Brier alongside a better
+# ECE does NOT establish that these columns cost resolution and bought
+# calibration. An earlier version of this comment claimed exactly that. Without a
+# Murphy decomposition the honest statement is the measurement itself -- worse
+# overall Brier despite lower ECE -- and Brier is the metric these exclusions are
+# decided on because it scores the probability as a whole.
 _EXCLUDED_AS_REDUNDANT = (
     "{M}_HL", "{M}_HL_SHRINK", "{M}_L2_HL", "MIN_HL", "MIN_HL_SHRINK",
     "USAGE_PROXY_L10", "SHOT_VOLUME_L5", "SHOT_VOLUME_L10", "FGA_L5", "FGA_L10",
@@ -195,9 +199,15 @@ _EXCLUDED_AS_REDUNDANT = (
 # longer window is the less noisy of the pair and TS_PCT_TREND already carries
 # the short-run movement.
 # MEASURED, not predicted. scripts/feature_ab.py --layer form, 3 chronological
-# folds, 103,233 rows across 2022-23..2025-26, ~65,000 validation rows per
-# market. Only the markets whose arms actually won are populated; the rest are
-# empty for the same reason _PBP_BY_MARKET["PTS"] is empty.
+# folds, 103,233 rows across 2022-23..2025-26. Only the markets whose arms
+# actually won are populated; the rest are empty for the same reason
+# _PBP_BY_MARKET["PTS"] is empty.
+#
+# ON THE ROW COUNT: the harness prints "validation rows across 3 fold(s): 65900",
+# but that sums n_predictions over every model row, counting each held-out
+# observation once per model. Five models over three folds means roughly 13,180
+# DISTINCT validation rows. The deltas below are per-model and unaffected; the
+# count was misread as distinct rows when this was first written up.
 _FORM_BY_MARKET: dict[str, tuple[str, ...]] = {
     # PTS: the strongest result in this file. Every tree model improved Brier on
     # 3/3 folds at 4-22x its own fold spread -- xgboost -0.00191 (sd 0.00021),

@@ -307,12 +307,18 @@ def build_features_and_verify_fatigue(
         return frame is None or frame.empty
 
     if _absent(team_games) or _absent(market_lines):
+        # NAMES THE FRAMES, not a fixed list of columns: build_feature_matrix
+        # gates team-strength/defence on team_games and market context on
+        # market_lines INDEPENDENTLY, so one can be present while the other is
+        # not. The earlier wording claimed all four groups went missing whenever
+        # either frame did.
         logger.warning(
             "Workbook frames missing or EMPTY (team_games=%s, market_lines=%s) — "
-            "team Elo, market context, opponent defence and blowout columns will "
-            "be ABSENT from this matrix. The run is narrower, not wrong; supply "
-            "the BigDataBall workbook to match what scripts/nba_model_cli.py "
-            "builds.",
+            "the features that depend on whichever frame is unavailable will be "
+            "ABSENT from this matrix (team Elo and opponent defence need "
+            "team_games; market context and blowout need market_lines). The run "
+            "is narrower, not wrong; supply the BigDataBall workbook to match "
+            "what scripts/nba_model_cli.py builds.",
             "absent" if team_games is None else f"{len(team_games)} rows",
             "absent" if market_lines is None else f"{len(market_lines)} rows",
         )
