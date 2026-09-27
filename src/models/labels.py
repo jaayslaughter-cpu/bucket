@@ -151,7 +151,7 @@ def default_feature_cols(market: str) -> list[str]:
 # THE PREDICTION WAS THEN TESTED, not left as an argument from correlation.
 # scripts/feature_ab.py --layer halflife and --layer usage_volume, both with
 # --wire-under-test so nothing had to be shipped to measure it, PTS, 3 folds
-# (~13,180 distinct validation rows; see the note above on the printed 65,900):
+# (~13,180 distinct validation rows; see the note below on the printed 65,900):
 #
 #   halflife      xgboost Brier raw  +0.00022 (sd 0.00006)  0/3 folds better
 #                 ensemble Brier raw +0.00025 (sd 0.00012)  0/3

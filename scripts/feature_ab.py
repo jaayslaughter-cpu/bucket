@@ -284,17 +284,26 @@ def main(argv: list[str] | None = None) -> int:
     place would silently widen the NEXT layer's arms with this layer's columns --
     so every delta after the first would be measuring something else. Restored
     here whether _run returns or raises.
+
+    NOTHING IS IMPORTED HERE. An earlier version imported src.models.compare at
+    the top of this function to capture the original resolver, which pulled the
+    whole model stack in before argparse had run -- so `feature_ab --help` needed
+    the optional [ml] extras installed. _run hands back what it patched instead,
+    and a run that never patched leaves the list empty and nothing to undo.
     """
-    import src.models.compare as compare_module
-
-    original_resolver = compare_module.default_feature_cols
+    patched: list[tuple[Any, Any]] = []
     try:
-        return _run(argv)
+        return _run(argv, _patched=patched)
     finally:
-        compare_module.default_feature_cols = original_resolver
+        for module, original in patched:
+            module.default_feature_cols = original
 
 
-def _run(argv: list[str] | None = None) -> int:
+def _run(
+    argv: list[str] | None = None,
+    *,
+    _patched: "list[tuple[Any, Any]] | None" = None,
+) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--layer", required=True, choices=sorted(LAYERS),
@@ -409,8 +418,10 @@ def _run(argv: list[str] | None = None) -> int:
                     cols.append(c)
             return cols
 
-        # main() restores the original resolver in a finally, so this patch
-        # cannot outlive the run that installed it.
+        # Recorded for main()'s finally, so this patch cannot outlive the run
+        # that installed it.
+        if _patched is not None:
+            _patched.append((compare_module, _base))
         compare_module.default_feature_cols = _widened  # type: ignore[assignment]
         print(f"--wire-under-test: up to {len(under_test)} column(s) added to "
               f"each market's feature list for this run only, skipping any that "
