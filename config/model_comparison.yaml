@@ -219,7 +219,16 @@ sports_ev:
 # `recency_weighting` whenever valid weights are actually computed -- and no A/B
 # has been run yet. Enabling this does not guarantee a report:
 # recency_sample_weights() falls back to an UNWEIGHTED fit, with a warning and no
-# report, when GAME_DATE is absent or the half-life is rejected. Turn it on when a measurement supports it, the way the blowout layer
+# report, when GAME_DATE is absent or the half-life is rejected.
+#
+# DO NOT SET THIS TRUE YET — a known inconsistency is open. XGBoostAdapter.fit
+# forwards the weights to the final classifier, but its out-of-fold pass and mean
+# head still fit UNWEIGHTED. The calibrator is fitted on those out-of-fold
+# probabilities and applied to the final model's, so enabling this calibrates a
+# model that was never trained the same way. Harmless while this stays false.
+# Fixing it means slicing the weights per fold and re-normalising within each
+# fold; done wrong it degrades calibration silently instead of failing. See the
+# open thread on src/models/xgb_adapter.py in PR #3. Turn it on when a measurement supports it, the way the blowout layer
 # stays off on measured evidence.
 recency:
   half_life_days: 240
