@@ -9,7 +9,8 @@ CatBoost had to beat". A comparison against it says which of two models
 written at the same time scores better on the same split — nothing about
 a pre-existing production system.
 
-Chronological by construction: validation uses ``TimeSeriesSplit``, never
+Chronological by construction: validation folds are grouped by calendar
+date so a slate is never split across a boundary, never
 a random K-fold, because shuffling game rows lets a model train on games
 that happen after the ones it is scored on.
 """
@@ -21,7 +22,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
+from src.models.oof import chronological_fold_indices
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ class XGBoostPropPipeline:
         target_col: str = "over_hit",
         sample_weight: "pd.Series | None" = None,
     ) -> "XGBoostPropPipeline":
-        """Fit on chronologically ordered rows, reporting TimeSeriesSplit scores."""
+        """Fit on chronologically ordered rows, reporting date-grouped CV scores."""
         if target_col not in train_data.columns:
             raise ValueError(f"DATA_NOT_AVAILABLE: missing target {target_col!r}")
 
@@ -162,7 +163,8 @@ class XGBoostPropPipeline:
         else:
             logger.warning(
                 "No GAME_DATE on the training frame — cannot guarantee chronological "
-                "order, so TimeSeriesSplit scores may not be honest."
+                "order, so CV folds fall back to positional and a slate may straddle a "
+                "boundary, which makes the reported scores optimistic."
             )
 
         y_full = pd.to_numeric(work[target_col], errors="coerce")
@@ -196,14 +198,26 @@ class XGBoostPropPipeline:
         if len(X) >= 100:
             from sklearn.metrics import log_loss
 
-            for fold, (tr, va) in enumerate(TimeSeriesSplit(n_splits=n_splits).split(X), 1):
+            # Date-grouped, not positional: a slate is ~150 rows, so a
+            # positional boundary leaves one calendar day partly training and
+            # partly validating, and the tree count then gets selected against
+            # rows from the same night the fold trained on. Measured on a
+            # 40-day synthetic panel: 5 days straddled, 424 validation rows.
+            cv_folds = chronological_fold_indices(
+                len(X), splits=n_splits, market=target_col,
+                dates=work["GAME_DATE"] if "GAME_DATE" in work.columns else None,
+            )
+            for fold, (tr, va) in enumerate(cv_folds, 1):
                 if y.iloc[tr].nunique() < 2 or y.iloc[va].nunique() < 2:
                     continue
                 # The eval set is this fold's own validation slice. It comes
-                # from inside the training data and, because TimeSeriesSplit is
-                # chronological, lies strictly AFTER the rows the fold trains
-                # on. Using the outer validation window instead would tune the
-                # tree count on the very rows the model is later scored against.
+                # from inside the training data and, because the folds are
+                # grouped by calendar date, every validation DAY lies strictly
+                # after every training day -- not merely every validation row
+                # after every training row, which is the weaker guarantee a
+                # positional split gives and which a slate straddle breaks.
+                # Using the outer validation window instead would tune the tree
+                # count on the very rows the model is later scored against.
                 fold_params = dict(self.model_params)
                 fit_kwargs: dict[str, Any] = {}
                 if esr > 0:
@@ -223,7 +237,7 @@ class XGBoostPropPipeline:
                 self.cv_scores_.append(score)
                 logger.debug("xgboost fold %d log_loss=%.4f", fold, score)
         else:
-            logger.info("Only %d rows — skipping TimeSeriesSplit scoring.", len(X))
+            logger.info("Only %d rows — skipping cross-validated scoring.", len(X))
 
         final_params = dict(self.model_params)
         learned = self._learn_n_estimators(self.cv_best_iterations_, fold_train_rows, len(X))

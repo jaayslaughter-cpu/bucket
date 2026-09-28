@@ -288,7 +288,11 @@ class CatBoostPropPipeline:
 
         # Dispersion comes from out-of-fold residuals on TRAINING rows only.
         self.dispersion = fit_dispersion_out_of_fold(
-            _train_predict, X, y.to_numpy(), market=target
+            _train_predict, X, y.to_numpy(), market=target,
+            # Dates so the folds group by calendar day. Without them a slate
+            # straddles the boundary and phi is fitted partly on residuals from
+            # a model that had already seen that night.
+            dates=fit_rows["GAME_DATE"] if "GAME_DATE" in fit_rows.columns else None,
         )
 
         self.mean_model = CatBoostRegressor(**params)

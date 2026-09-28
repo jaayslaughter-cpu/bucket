@@ -110,22 +110,51 @@ def _fold_indices(
     back to the positional split, with a warning, when there is no GAME_DATE
     to group by or too few dates to fold.
     """
-    from sklearn.model_selection import TimeSeriesSplit
-
     if "GAME_DATE" not in X.columns:
         logger.warning(
             "oof %s: no GAME_DATE column, so folds are positional and a slate "
             "may straddle a boundary. Pass whole rows, not a bare feature matrix.",
             market or "?",
         )
+        return chronological_fold_indices(n, splits=splits, market=market, dates=None)
+    return chronological_fold_indices(
+        n, splits=splits, market=market, dates=X["GAME_DATE"]
+    )
+
+
+def chronological_fold_indices(
+    n: int,
+    *,
+    splits: int,
+    market: str = "",
+    dates: pd.Series | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Chronological folds over ``n`` rows that never split a calendar slate.
+
+    Takes the dates explicitly instead of reading a column, so a caller holding
+    only a feature matrix -- the XGBoost early-stopping CV and the out-of-fold
+    dispersion fit both do -- gets the same guarantee ``_fold_indices`` gives
+    the OOF probabilities. ``dates`` must be positionally aligned with the rows
+    being folded.
+
+    ``dates=None`` is a plain positional split, which DOES straddle slates. The
+    caller warns about that rather than this function, because only the caller
+    knows whether dates were available to pass.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+
+    if dates is None:
         return list(TimeSeriesSplit(n_splits=splits).split(np.arange(n)))
 
     # normalize() drops the tip-off time. GAME_DATE is a full timestamp, so
     # grouping on it raw makes two games on the same night different groups
     # and leaves the slate split across the boundary -- measured at 2 of the
     # original 3 straddled days still straddling. A slate is a CALENDAR DAY.
-    dates = pd.to_datetime(X["GAME_DATE"], errors="coerce").dt.normalize()
-    codes, uniques = pd.factorize(dates, sort=True)
+    day = pd.to_datetime(
+        pd.Series(dates).reset_index(drop=True), errors="coerce"
+    ).dt.normalize()
+    codes, uniques = pd.factorize(day, sort=True)
     n_dates = len(uniques)
     if n_dates < splits + 1:
         logger.warning(
@@ -140,7 +169,8 @@ def _fold_indices(
     for tr_d, va_d in TimeSeriesSplit(n_splits=splits).split(np.arange(n_dates)):
         tr = positions[np.isin(codes, tr_d)]
         va = positions[np.isin(codes, va_d)]
-        folds.append((tr, va))
+        if len(tr) and len(va):
+            folds.append((tr, va))
     return folds
 
 

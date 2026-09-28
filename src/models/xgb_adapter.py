@@ -149,7 +149,11 @@ class XGBoostAdapter:
         # Out-of-fold residuals only: in-sample residuals from a boosted
         # tree are far too tight and produce an overconfident distribution.
         self.dispersion = fit_dispersion_out_of_fold(
-            _train_predict, X, y.to_numpy(), market=target
+            _train_predict, X, y.to_numpy(), market=target,
+            # Dates so the folds group by calendar day. Without them a slate
+            # straddles the boundary and phi is fitted partly on residuals from
+            # a model that had already seen that night.
+            dates=rows["GAME_DATE"] if "GAME_DATE" in rows.columns else None,
         )
 
         self.mean_model = XGBRegressor(objective="reg:squarederror", **params)
