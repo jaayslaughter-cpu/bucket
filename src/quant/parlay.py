@@ -212,34 +212,23 @@ def correlation_matrix(
     return matrix
 
 
-def copula_joint_probability(
-    legs: Sequence[ParlayLeg],
-    correlation: np.ndarray | None = None,
-    *,
-    n_sims: int = DEFAULT_SIMULATIONS,
-    seed: int = DEFAULT_SEED,
-) -> tuple[float, float]:
+def _validated_cholesky(
+    correlation: np.ndarray | None, n_legs: int, n_sims: int
+) -> np.ndarray:
     """
-    P(all legs win) under a Gaussian copula. Returns (probability, stderr).
+    Check a correlation matrix and return its Cholesky factor.
 
-    Leg i wins when Z_i <= Phi^-1(p_i) with Z ~ MVN(0, R). At R = I this
-    reproduces the product exactly, so independence is a point in the same
-    model rather than a separate code path.
-
-    The standard error is returned because this is Monte Carlo: a parlay
-    probability quoted to four decimals from 200k draws has real uncertainty
-    in the third, and a caller that cannot see it will over-read the number.
+    Extracted so ``copula_joint_probability`` and ``hit_count_distribution``
+    cannot drift apart on it. Every refusal below was measured, not assumed --
+    see the comments inline. A second copy of this validator would be a second
+    chance to get one of them wrong.
     """
-    for leg in legs:
-        leg.validate()
-    thresholds = norm.ppf([float(leg.model_prob) for leg in legs])
-
     if correlation is None:
-        correlation = np.eye(len(legs), dtype=float)
-    if correlation.shape != (len(legs), len(legs)):
+        correlation = np.eye(n_legs, dtype=float)
+    if correlation.shape != (n_legs, n_legs):
         raise ParlayError(
             f"Correlation matrix is {correlation.shape}, expected "
-            f"{(len(legs), len(legs))} for {len(legs)} legs"
+            f"{(n_legs, n_legs)} for {n_legs} legs"
         )
 
     # Cholesky is not a validator. It reads only the LOWER triangle, so an
@@ -285,7 +274,7 @@ def copula_joint_probability(
             "every leg's marginal and the joint probability stops answering the "
             "question asked."
         )
-    off_diagonal = correlation[~np.eye(len(legs), dtype=bool)]
+    off_diagonal = correlation[~np.eye(n_legs, dtype=bool)]
     if off_diagonal.size and np.abs(off_diagonal).max() > 1.0 + 1e-9:
         raise ParlayError(
             f"Correlation matrix has an off-diagonal entry of "
@@ -313,6 +302,33 @@ def copula_joint_probability(
             "cannot be estimated from zero draws."
         )
 
+    return chol
+
+
+def copula_joint_probability(
+    legs: Sequence[ParlayLeg],
+    correlation: np.ndarray | None = None,
+    *,
+    n_sims: int = DEFAULT_SIMULATIONS,
+    seed: int = DEFAULT_SEED,
+) -> tuple[float, float]:
+    """
+    P(all legs win) under a Gaussian copula. Returns (probability, stderr).
+
+    Leg i wins when Z_i <= Phi^-1(p_i) with Z ~ MVN(0, R). At R = I this
+    reproduces the product exactly, so independence is a point in the same
+    model rather than a separate code path.
+
+    The standard error is returned because this is Monte Carlo: a parlay
+    probability quoted to four decimals from 200k draws has real uncertainty
+    in the third, and a caller that cannot see it will over-read the number.
+    """
+    for leg in legs:
+        leg.validate()
+    thresholds = norm.ppf([float(leg.model_prob) for leg in legs])
+    chol = _validated_cholesky(correlation, len(legs), n_sims)
+    n = int(n_sims)
+
     rng = np.random.default_rng(seed)
     draws = rng.standard_normal((n, len(legs))) @ chol.T
     wins = np.all(draws <= thresholds, axis=1)
@@ -324,6 +340,47 @@ def copula_joint_probability(
 
 # 95% normal quantile, used only for the saturated-sample interval below.
 _AGRESTI_COULL_Z = 1.959963984540054
+
+
+def hit_count_distribution(
+    legs: Sequence[ParlayLeg],
+    correlation: np.ndarray | None = None,
+    *,
+    n_sims: int = DEFAULT_SIMULATIONS,
+    seed: int = DEFAULT_SEED,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    P(exactly k legs win) for k = 0..n, under the same Gaussian copula.
+
+    ``copula_joint_probability`` answers only P(ALL win), which is all an
+    all-or-nothing ticket needs. A DFS FLEX play pays on partial hits -- a
+    3-pick flex typically pays one multiple for 3/3 and a smaller one for 2/3 --
+    so its expected value needs the whole count distribution, not just its top
+    cell. Summing the wrong cells is how a flex gets priced as a power play.
+
+    Returns ``(probabilities, stderrs)``, each of length ``len(legs) + 1``
+    and indexed by hit count. The probabilities sum to 1 by construction.
+    Element ``-1`` equals ``copula_joint_probability``'s point estimate for the
+    same inputs, which a test pins.
+
+    The per-cell standard error is returned for the same reason the joint one
+    is: a flex EV assembled from Monte Carlo cells inherits their noise, and a
+    caller that cannot see it will over-read the total.
+    """
+    for leg in legs:
+        leg.validate()
+    thresholds = norm.ppf([float(leg.model_prob) for leg in legs])
+    chol = _validated_cholesky(correlation, len(legs), n_sims)
+    n = int(n_sims)
+
+    rng = np.random.default_rng(seed)
+    draws = rng.standard_normal((n, len(legs))) @ chol.T
+    hits = (draws <= thresholds).sum(axis=1)
+    counts = np.bincount(hits, minlength=len(legs) + 1).astype(float)
+
+    probabilities = counts / n
+    stderrs = np.array([_binomial_stderr(int(c), n) for c in counts], dtype=float)
+    return probabilities, stderrs
 
 
 def _binomial_stderr(n_wins: int, n_sims: int) -> float:
