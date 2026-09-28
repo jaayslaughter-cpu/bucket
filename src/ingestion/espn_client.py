@@ -8,8 +8,11 @@ NO CREDENTIALS. These endpoints are public and take none. If a future endpoint
 needs a key it belongs in an env var like ``PROPLINE_API_KEY``, never here.
 
 POLICY, and why each part is deliberate:
-  - a 4xx is NOT retried: the request itself is wrong, so a second identical
-    one wastes a call and hides the cause behind a timeout-shaped error.
+  - a 4xx is NOT retried, WITH ONE EXEMPTION: the request itself is wrong, so a
+    second identical one wastes a call and hides the cause behind a
+    timeout-shaped error. 429 is the exemption and IS retried, because there
+    the request is fine and there have merely been too many of them; an
+    integer Retry-After is honoured and capped at MAX_RETRY_AFTER_SECONDS.
   - a failed fetch RAISES. It never returns an empty dict, because a caller
     must be able to tell "no games tonight" from "the fetch failed".
   - the base host is overridable by env var so a test or mirror needs no code
