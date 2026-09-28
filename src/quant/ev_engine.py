@@ -38,7 +38,7 @@ from src.quant.contracts import (
 from src.quant.odds_math import (
     american_to_implied_probability,
     american_to_profit_multiple,
-    expected_value_per_unit,
+    expected_value_two_way,
     multiplicative_devig,
 )
 
@@ -230,18 +230,25 @@ class EvEngine:
                 game_id, total,
             )
 
+        # Each side is paired with the OTHER side's probability as its losing
+        # mass, rather than with its own complement. On a whole-number line
+        # the two differ by the push mass, and the complement form charges
+        # that mass a full stake although a push refunds it — understating
+        # both sides' EV by exactly P(push).
         pairs = (
-            (label_a, int(american_a), float(model_prob_a), fair.fair_prob_a, fair.implied_prob_a),
-            (label_b, int(american_b), float(model_prob_b), fair.fair_prob_b, fair.implied_prob_b),
+            (label_a, int(american_a), float(model_prob_a), float(model_prob_b),
+             fair.fair_prob_a, fair.implied_prob_a),
+            (label_b, int(american_b), float(model_prob_b), float(model_prob_a),
+             fair.fair_prob_b, fair.implied_prob_b),
         )
-        for side, american, model_p, fair_p, implied_p in pairs:
+        for side, american, model_p, lose_p, fair_p, implied_p in pairs:
             out.sides.append(EvSide(
                 side=side,
                 american=american,
                 model_prob=model_p,
                 fair_prob=fair_p,
                 implied_prob=implied_p,
-                ev=expected_value_per_unit(model_p, american),
+                ev=expected_value_two_way(model_p, lose_p, american),
                 # Edge against the DE-VIGGED price, not the posted one.
                 # Measuring against the posted price counts the book's hold
                 # as edge and makes every market look beatable.

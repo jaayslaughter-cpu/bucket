@@ -118,6 +118,36 @@ def expected_value_per_unit(probability: float, american: int) -> float:
     return p * american_to_profit_multiple(int(american)) - (1.0 - p)
 
 
+def expected_value_two_way(
+    probability_win: float, probability_lose: float, american: int
+) -> float:
+    """
+    EV per unit staked when a third outcome — a push — is possible.
+
+    ``expected_value_per_unit`` assumes the only alternative to winning is
+    losing, so it charges ``1 - p`` a full stake. On a whole-number line the
+    stat can land exactly on it: the wager is refunded, contributing 0 to EV,
+    not -1. Taking the losing mass explicitly keeps push mass out of the loss
+    branch::
+
+        EV = p_win * net_profit - p_lose        (push contributes 0)
+
+    The two agree exactly when ``p_lose == 1 - p_win``, which is why the
+    fractional-line path is unaffected.
+
+    A pair summing above one implies negative push mass and is computed as
+    given rather than rejected or rescaled. That is deliberate and matches
+    ``EvEngine.evaluate_two_way``, which warns about such a pair and reports
+    it: an over-unit pair is a miscalibration worth seeing, and dividing it
+    away would hide the fault behind a tidy number.
+    """
+    pw, pl = float(probability_win), float(probability_lose)
+    for name, value in (("probability_win", pw), ("probability_lose", pl)):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} out of range: {value!r}")
+    return pw * american_to_profit_multiple(int(american)) - pl
+
+
 def breakeven_probability(american: int) -> float:
     """The win rate at which a price is exactly break-even."""
     return 1.0 / american_to_decimal(int(american))
