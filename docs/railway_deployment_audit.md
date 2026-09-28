@@ -55,7 +55,13 @@ feature layers by *string module name*
 so static import analysis reports `absences`, `sports_ev_features`,
 `teammate_cascade` and `scoring_efficiency` as orphans when they are in
 fact wired. Any future orphan audit must resolve string references or it
-will delete live code. Counting those, 6 of 71 `src` modules are orphaned.
+will delete live code.
+
+Resolving string references, 6 of 72 `src` modules are unreferenced by the
+production graph, and one of those six — `settlement/cli.py` — is a
+`python -m` entrypoint rather than dead code, so **5 are genuinely
+orphaned**. It is listed below with the orphans because an import graph
+cannot tell the two apart; only reading it can.
 
 ### Wired end to end
 
@@ -65,7 +71,7 @@ will delete live code. Counting those, 6 of 71 `src` modules are orphaned.
 `assemble_projections` → `persist_projections` → `projections` table.
 Settlement runs separately via `python -m src.settlement.cli settle`.
 
-### Orphaned
+### Unreferenced by the production graph (5 orphans + 1 entrypoint)
 
 | Module | Lines | State |
 |---|---|---|
