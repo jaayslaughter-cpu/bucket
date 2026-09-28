@@ -126,11 +126,18 @@ a whole-number line's push mass is unrecoverable after the fact and
 
 ## Three conflicts to settle before building
 
-1. **The Odds API.** The proposed 06:00 PT slate initializer "fetches
-   baseline odds from The Odds API" and pulls the schedule from
-   BallDontLie or SportsData.io. Every doc in this project states *No The
-   Odds API*, with PropLine as primary. Not wiring a banned source on the
-   strength of a schedule sketch — confirm which source is intended.
+1. **Odds source: SETTLED — PropLine.** The proposed 06:00 PT slate
+   initializer named The Odds API; that is not used and must not be added.
+   PropLine is the odds source, as `decision_board.py:76` already encodes
+   (`SOURCE_PRECEDENCE = ("propline", "oddspapi")`, PropLine primary and
+   OddsPapi — a different product from The Odds API — as fallback). The
+   OddsPapi fallback is left in place because it is existing tested
+   architecture (`tests/test_decision_board.py` asserts the precedence);
+   say so if you want it removed outright.
+
+   Schedule source is still open: the sketch named BallDontLie or
+   SportsData.io, and neither is wired. PropLine supplies odds, not the
+   slate. Today `main.py` derives the slate from the feature panel.
 
 2. **Celery / Redis / Railway.** The repo has no scheduler at all, so this
    is three new infra dependencies rather than a change to an existing

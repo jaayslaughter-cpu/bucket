@@ -510,7 +510,7 @@ def evaluate_ev_gate(prop_lines: pd.DataFrame, game_markets: pd.DataFrame) -> di
         logger.info(
             "No prop EV computed. BigDataBall supplies GAME spread/total/ML, not "
             "two-way player-prop American odds — an approved two-way prop feed "
-            "(e.g. OddsPapi) is required to satisfy the gate."
+            "(PropLine primary, OddsPapi fallback) is required to satisfy the gate."
         )
     return {
         "status": "READY_FOR_EVALUATION" if ready else "DATA_NOT_AVAILABLE",
