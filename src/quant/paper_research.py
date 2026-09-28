@@ -23,8 +23,10 @@ from src.utils.timezones import DISPLAY_TZ_NAME, format_pacific_iso, now_pacific
 
 PLACEMENT_MODE = "MANUAL_ONLY"
 WAVE3_DISCLAIMER = (
-    "MANUAL_ONLY paper research — PropIQ does not place bets or size bankroll. "
-    "You wager outside the system; this layer logs, grades, and audits."
+    "MANUAL_ONLY — PropIQ recommends; it does not place the wager. You bet "
+    "outside the system; this layer logs, grades, and audits what you took. "
+    "(A recommended SIZE now exists, in quant.advisory_sizing. What stays true "
+    "is that nothing here places or auto-executes anything.)"
 )
 
 BetSide = Literal["over", "under"]

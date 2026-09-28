@@ -1,10 +1,9 @@
 """
-src/notify/discord.py — Discord webhook dispatch for research output.
+src/notify/discord.py — Discord webhook dispatch for recommendations.
 
-Status: RESEARCH_ONLY · MANUAL_ONLY. This delivers a message to a person.
-It is not a betting layer: nothing here places a wager, confirms one, or
-tells you how much to risk. Discord is the last step of a research pipeline,
-not the first step of an automated one.
+This delivers a message to a person. It does not place a wager or confirm one:
+Discord is the last step of this pipeline, not the first step of an automated
+one, and there is no order API behind it.
 
 THE WEBHOOK URL IS A CREDENTIAL. A Discord webhook URL ends in a token, and
 anyone holding it can post to that channel as you. So it is read from the
@@ -13,15 +12,24 @@ in an error message or a log line — ``redact_webhook`` is applied on every
 path that could surface it. ``artifact_registry`` already refuses to persist
 a key named "webhook"; this module is the other half of that rule.
 
-WHAT THE EMBED MAY SAY. The same vocabulary guard the decision board uses
-applies here: no "lock", no "best bet", no "guaranteed". A notification is
-the most quotable artifact the system produces — it is the thing that gets
-screenshotted — so it carries the research disclaimer and the abstention
-reasons rather than only the rows that cleared.
+WHAT THE EMBED MAY SAY. It may recommend a side and a size. It may NOT promise
+an outcome: the decision board's vocabulary guard applies here unchanged — no
+"lock", no "best bet", no "guaranteed". Recommending and promising are different
+acts and only the first is supportable. A notification is the most quotable
+artifact this system produces — it is the thing that gets screenshotted — so it
+carries the basis of each recommendation and the abstention reasons, not only
+the rows that cleared.
 
-NO STAKE IS EVER SUGGESTED. The embed shows a stake only when you logged one
-yourself, labelled as yours. PropIQ does not size bets, and an embed that
-implied otherwise would make it look as though it does.
+TWO KINDS OF STAKE, AND THE EMBED KEEPS THEM APART. A RECOMMENDED size comes
+from ``quant.advisory_sizing`` (fractional Kelly, capped) and is labelled as the
+recommendation. A LOGGED stake is what the reader actually staked, labelled as
+theirs. Collapsing the two would make a suggestion look like a record of a bet
+that happened.
+
+THE CALIBRATION GATE IS NOT BYPASSED HERE. ``build_dfs_entry_embed`` takes a
+``publication`` verdict and posts the gate's reason INSTEAD of the numbers when
+it withholds. A model-sourced recommendation with no graded results behind it is
+exactly the thing that reads, in a channel, as though it had some.
 
 DISCORD'S OWN LIMITS are enforced before sending, because exceeding them
 returns a 400 that reads like a bug in your data: 25 fields per embed, 256
@@ -46,8 +54,8 @@ PLACEMENT_MODE = "MANUAL_ONLY"
 RESEARCH_STATUS = "RESEARCH_ONLY"
 
 RESEARCH_FOOTER = (
-    "RESEARCH_ONLY · MANUAL_ONLY — research ranking, not a bet instruction. "
-    "PropIQ never places or sizes wagers."
+    "Recommendation, not a promise of an outcome — each row names the basis it "
+    "rests on. PropIQ does not place the wager."
 )
 
 # Discord's documented limits. Exceeding one returns a 400 that reads like a
@@ -257,26 +265,30 @@ def build_decision_board_embed(
     max_rows: int = 10,
 ) -> dict[str, Any]:
     """
-    One embed for a decision board.
+    One embed for a board of recommendations.
 
-    Shows the basis of every row, not just its number, so a `model_lean` is
-    never mistaken for a priced edge in a channel where the column headers
-    are gone.
+    Shows the BASIS of every row, not just its number. In a channel the column
+    headers are gone, and a recommendation resting on the model alone must not
+    read like one resting on a de-vigged price.
     """
-    considered = [c for c in candidates if getattr(c, "decision_status", "") == "CONSIDER"]
+    considered = [
+        c for c in candidates if getattr(c, "decision_status", "") == "RECOMMENDED"
+    ]
     priced = [c for c in considered if getattr(c, "decision_basis", "") == "book_ev"]
 
     lines: list[str] = []
     if not considered:
-        lines.append("No row met the threshold. Nothing to look at.")
+        lines.append("Nothing recommended on this slate.")
     elif not priced:
         lines.append(
-            f"{len(considered)} rows lean, **none priced** — no two-way odds "
-            "reached the gate, so no EV was computed for any of them."
+            f"**{len(considered)} recommended, none priced** — no two-way odds "
+            "reached the gate, so every one of these rests on the model alone "
+            "and none has a market price behind it."
         )
     else:
         lines.append(
-            f"{len(priced)} priced · {len(considered) - len(priced)} unpriced leans "
+            f"**{len(priced)} recommended on a price** · "
+            f"{len(considered) - len(priced)} on the model alone "
             f"· {len(candidates) - len(considered)} abstained"
         )
 
@@ -298,12 +310,12 @@ def build_decision_board_embed(
         else:
             value = (
                 f"`{basis}` — model {_prob(getattr(c, 'model_prob', None))}. "
-                "No priced market, so no EV."
+                "No priced market, so no EV and no market check on this one."
             )
         fields.append({"name": name, "value": value, "inline": False})
 
     embed = {
-        "title": f"Decision board — {slate_date or 'slate'}",
+        "title": f"Recommendations — {slate_date or 'slate'}",
         "description": "\n".join(lines),
         "color": COLOR_CONSIDER if priced else COLOR_ABSTAIN,
         "fields": fields,
@@ -314,10 +326,12 @@ def build_decision_board_embed(
 
 def build_parlay_embed(ticket: Any, legs: Sequence[Any]) -> dict[str, Any]:
     """
-    One embed for a logged parlay ticket.
+    One embed for a LOGGED parlay ticket — a record, not a recommendation.
 
-    A stake appears only when the user recorded one, labelled as theirs. The
-    model does not size bets and the embed must not read as though it does.
+    The stake shown here is the one the reader actually staked, labelled as
+    theirs. A recommended size is a different number from a different place
+    (``quant.advisory_sizing``), and this embed must not let the two be read as
+    one: a suggestion rendered like a record implies a bet that happened.
     """
     price = getattr(ticket, "ticket_american_price", None)
     joint = getattr(ticket, "joint_probability", None)
@@ -362,10 +376,10 @@ def build_parlay_embed(ticket: Any, legs: Sequence[Any]) -> dict[str, Any]:
     stake = getattr(ticket, "unit_stake", None)
     if stake is not None:
         fields.append({
-            "name": "Stake",
+            "name": "Stake logged",
             "value": (
-                f"{float(stake):g}u — **your** figure, recorded as logged. "
-                "PropIQ does not size bets."
+                f"{float(stake):g}u — **your** figure, as recorded in the ledger. "
+                "This is what was staked, not a recommended size."
             ),
             "inline": False,
         })
@@ -412,7 +426,9 @@ def build_dfs_entry_embed(
     source = getattr(evaluation, "probability_source", None)
     source_label = getattr(source, "value", None) or "UNSPECIFIED"
     structure = getattr(evaluation, "structure_label", None) or "entry"
-    title = f"DFS entry — {structure}" + (f" · {slate_date}" if slate_date else "")
+    title = f"Recommended DFS entry — {structure}" + (
+        f" · {slate_date}" if slate_date else ""
+    )
 
     if entry is None or status != "PAYOUT_EV_READY":
         return build_abstention_embed(
@@ -463,11 +479,13 @@ def build_dfs_entry_embed(
     if advisory_size is not None:
         units = getattr(advisory_size, "recommended_units", None)
         fields.append({
-            "name": "Advisory size",
+            "name": "Recommended stake",
             "value": _clip(
-                f"{float(units):g}u (percent of bankroll) — advisory only. "
-                "PropIQ does not place or size wagers, and Kelly is optimal only "
-                "if the probabilities are right.",
+                f"**{float(units):g}u** — percent of bankroll, fractional Kelly "
+                f"({getattr(advisory_size, 'kelly_fraction_applied', '?')} of full) "
+                "and capped. Kelly is optimal only if the probabilities are right, "
+                "so on a model-sourced entry this size inherits the model's "
+                "calibration error. PropIQ does not place it.",
                 MAX_FIELD_VALUE,
             ) if units is not None else "—",
             "inline": False,

@@ -189,9 +189,13 @@ def test_no_bankroll_is_an_input_anywhere():
         assert not offenders, f"{name} takes {offenders}, so it could return money"
 
 
-def test_the_output_is_labelled_advisory_and_carries_no_currency():
+def test_the_output_says_nothing_places_it_and_carries_no_currency():
+    """
+    The size is a recommendation now, so "advisory only" would be the wrong
+    hedge. What must still be stated is that nothing in this project places it.
+    """
     out = recommended_units_binary(0.58, 3.0).as_dict()
-    assert out["ADVISORY_ONLY"] is True
+    assert out["AUTO_PLACED"] is False
     assert not [
         k for k in out
         if any(w in k.upper() for w in ("DOLLAR", "USD", "AMOUNT", "BANKROLL"))

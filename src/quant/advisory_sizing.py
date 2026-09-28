@@ -1,10 +1,10 @@
-"""Advisory unit sizing from fractional Kelly. READ-ONLY, NEVER EXECUTION.
+"""Recommended stake from fractional Kelly. NEVER EXECUTION.
 
-WHAT THIS IS AND IS NOT. ``recommended_units`` is an INFORMATIONAL METADATA
-FIELD. Nothing here places a wager, reads a bankroll, returns a currency amount,
-or is imported by any execution or dispatch path. The number is a reference for a
-person deciding by hand, and the standing rule it respects is that PropIQ never
-auto-sizes a stake.
+WHAT THIS IS AND IS NOT. ``recommended_units`` is a RECOMMENDED SIZE — this
+module is allowed to say how much, and it does. What it is not is an executed
+order: nothing here places a wager, reads a bankroll, returns a currency amount,
+or is imported by any execution or dispatch path. Recommending a size and placing
+a bet are different acts, and this project does only the first.
 
 Three properties keep that true, and each is enforced by a test:
 
@@ -46,11 +46,15 @@ optimiser's floor, not a tolerance chosen for comfort: measured at xatol 1e-10,
 and then degrades on floating point. An earlier version of this docstring
 claimed 1e-9, which is wrong by a factor of about 1.3.
 
-NOT A PREDICTION OF PROFIT. Kelly is optimal only if the probabilities are
-right. On a model-sourced entry these numbers inherit the model's calibration
-error; on a benchmark-sourced one they inherit the benchmark's sharpness and the
-line match. ``dfs_payouts.ProbabilitySource`` records which, and a caller should
-carry it alongside any size it shows.
+A RECOMMENDED SIZE IS STILL NOT A PREDICTION OF PROFIT, and this is the caveat
+that survives the permission to recommend. Kelly is optimal only if the
+probabilities are right, and it is MOST sensitive to error exactly where the
+edge looks largest. On a model-sourced entry these numbers inherit the model's
+calibration error; on a benchmark-sourced one they inherit the benchmark's
+sharpness and the line match. ``dfs_payouts.ProbabilitySource`` records which,
+``quant.publication_gate`` refuses to publish the model-sourced case until there
+is graded evidence behind it, and a caller must carry the source alongside any
+size it shows.
 """
 
 from __future__ import annotations
@@ -99,7 +103,11 @@ class AdvisorySize:
             "CAPPED": self.capped,
             "SIZING_METHOD": self.method,
             "SIZING_NOTE": self.reason,
-            "ADVISORY_ONLY": True,
+            # A recommended size, not an order. "ADVISORY_ONLY" said the same
+            # thing but now reads as "do not take this seriously", which is the
+            # wrong hedge: the number IS the recommendation. What stays true is
+            # that nothing in this project places it.
+            "AUTO_PLACED": False,
         }
 
 

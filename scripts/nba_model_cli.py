@@ -832,7 +832,7 @@ def decision_board_cmd(
     preferred_model: str = typer.Option("distribution", "--preferred-model"),
     min_ev: float = typer.Option(
         0.0, "--min-ev",
-        help="CONSIDER only when VALID two-way book EV clears this (e.g. 0.02)",
+        help="Recommend only when VALID two-way book EV clears this (e.g. 0.02)",
     ),
     min_lean: float = typer.Option(
         0.0, "--min-lean",
@@ -843,7 +843,8 @@ def decision_board_cmd(
         help="Hide model-lean-only rows (no EV without a two-way price)",
     ),
     consider_only: bool = typer.Option(
-        False, "--consider-only", help="Drop ABSTAIN rows from the output"
+        False, "--recommended-only/--all-rows", "--consider-only/--no-consider-only",
+        help="Drop ABSTAIN rows from the output",
     ),
     top_n: Optional[int] = typer.Option(
         None, "--top-n", help="Keep only the top ranked candidates"
@@ -852,12 +853,18 @@ def decision_board_cmd(
     demo: bool = typer.Option(True, help="DEMO panel for wiring"),
     verbose: bool = False,
 ) -> None:
-    """Rank Over and Under so YOU can choose. RESEARCH_ONLY · MANUAL_ONLY.
+    """Recommend Over/Under sides for the slate.
 
-    Never places a wager, never contacts a book or DFS order API, and never
-    sizes a stake. EV appears only where a source posted genuine two-way
-    American odds — PropLine first, OddsPapi as the fallback. Everything
-    else abstains with a named reason.
+    Does not place a wager and contacts no book or DFS order API — the last
+    step is yours. EV appears only where a source posted genuine two-way
+    American odds (PropLine first, OddsPapi as the fallback); everything else
+    abstains with a named reason.
+
+    READ THE BASIS COLUMN. A row recommended on `book_ev` rests on a de-vigged
+    market price. One recommended on `model_lean` rests on the model alone, and
+    until that model has graded results behind it that is an opinion with a
+    confident label — `quant.publication_gate` is what stops such a row being
+    dispatched.
     """
     _setup_logging(verbose)
     from src.models.compare import compare_models_on_panel, load_comparison_config
@@ -911,8 +918,10 @@ def decision_board_cmd(
         "min_ev": min_ev,
         "require_valid_book": require_valid_book,
         "next_step": (
-            "Scan CONSIDER rows, place the wager YOURSELF outside PropIQ, then "
-            "log-manual-bet --side <side> --model-prob <P(side you took)>"
+            "Read the RECOMMENDED rows and their basis column, place what you "
+            "take yourself (PropIQ has no order API), then log it back with "
+            "log-manual-bet --side <side> --model-prob <P(side you took)> so it "
+            "grades and feeds the calibration evidence."
         ),
         "disclaimer": BOARD_DISCLAIMER,
     })
@@ -1252,9 +1261,11 @@ def dfs_entry_cmd(
         )
         result["ADVISORY_SIZE"] = size.as_dict()
         result["ADVISORY_SIZE"]["NOTE"] = (
-            "Advisory only, in percent of bankroll. Nothing here places or "
-            "sizes a wager, and Kelly is optimal only if the probabilities are "
-            "right — on a MODEL-sourced entry it compounds calibration error."
+            "Recommended stake, in percent of bankroll. Nothing here PLACES it. "
+            "Kelly is optimal only if the probabilities are right, so on a "
+            "MODEL-sourced entry this size compounds the model's calibration "
+            "error — which is why the publication gate withholds such an entry "
+            "until there is graded evidence behind it."
         )
 
     calibration: dict | None = None

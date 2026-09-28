@@ -81,9 +81,9 @@ MODEL_DEPENDENT_SOURCES = frozenset({
 })
 
 PUBLICATION_DISCLAIMER = (
-    "RESEARCH_ONLY — passing this gate means the model was not shown grossly "
-    "miscalibrated on recent graded results. It is not a profitability claim, "
-    "not a recommendation, and not a stake size."
+    "Passing this gate means only that the model was not shown grossly "
+    "miscalibrated on recent graded results. It is permission to publish a "
+    "recommendation, not evidence that the recommendation will win."
 )
 
 

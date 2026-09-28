@@ -1,7 +1,9 @@
 # Timestamped pick'em prop-line sources
 
-Status: **RESEARCH_ONLY** — timestamped prop-line **research capture only**.
-Does **not** place wagers or size bankroll.
+Status: timestamped prop-line **capture**. This document is about ingesting
+lines, not about acting on them. Nothing in the capture path places a wager;
+recommendations and sizing live in `quant.decision_board`, `quant.dfs_entry` and
+`quant.advisory_sizing`.
 
 **User approval (2026-09-15):** Sleeper, Underdog, and PrizePicks are approved as
 **timestamped prop-line sources for research capture only**.

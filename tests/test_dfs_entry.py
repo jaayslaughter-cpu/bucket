@@ -356,7 +356,7 @@ def test_the_entry_is_reachable_from_the_cli(tmp_path):
     assert payload["STATUS"] == PAYOUT_EV_READY
     assert payload["ENTRY"]["PROBABILITY_SOURCE"] == "SHARP_BENCHMARK"
     assert payload["RESEARCH_STATUS"] == "RESEARCH_ONLY"
-    assert payload["ADVISORY_SIZE"]["ADVISORY_ONLY"] is True
+    assert payload["ADVISORY_SIZE"]["AUTO_PLACED"] is False
     assert "as_of" in payload["STRUCTURE_SOURCE"]
 
 

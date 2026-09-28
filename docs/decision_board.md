@@ -1,21 +1,28 @@
-# Betting decision layer
+# Recommendation layer
 
-**Status: RESEARCH_ONLY · MANUAL_ONLY**
+**Status: MANUAL_ONLY — PropIQ recommends; you place.**
 
-When it is time to bet, PropIQ ranks Over and Under so **you** choose. You
-place the wager outside PropIQ. No auto-placement. No Kelly.
+PropIQ expands each market into Over and Under and **recommends** the side the
+evidence supports. You place the wager yourself: there is no order API in this
+project and none is planned.
+
+**Read the basis column before acting on a row.** A recommendation on `book_ev`
+rests on a real two-way price and a de-vigged fair probability. One on
+`model_lean` rests on the model alone — and until that model has graded results
+behind it, that is an opinion with a confident label.
+`src/quant/publication_gate.py` is what stops such a row being dispatched.
 
 ## Guarantees
 
 | Rule | Behavior |
 |------|----------|
-| Placement | **Never** calls a book / DFS order API |
-| Bankroll | **Never** auto-sizes stake |
+| Placement | **Never** calls a book / DFS order API — the last step is yours |
+| Sizing | This layer suggests no stake. A recommended size lives in `quant.advisory_sizing` (fractional Kelly, capped), and nothing auto-executes it |
 | EV | Only from `MarketContext.status=VALID` two-way American odds |
 | Source | **PropLine primary, OddsPapi fallback** — and the source is on every row |
-| Pick'em | Line / line-diff research only — never VALID EV |
+| Pick'em | No two-way EV; routed to `quant.dfs_entry` for payout-matrix EV instead |
 | Whole lines | Refuses silent `1 − P(over)` for the under when a push is possible |
-| Language | Refuses to emit "lock", "best bet", "guaranteed" and the like |
+| Language | Refuses to emit "lock", "best bet", "guaranteed" and the like — recommending a side and promising an outcome are different acts |
 
 The first three are enforced in code, not just documented:
 `test_layer_cannot_reach_a_book_or_size_a_stake` greps the module for
@@ -27,12 +34,12 @@ vocabulary before a row can be written.
 | Field | Meaning |
 |---|---|
 | `side` | `over` or `under` — **both sides always expanded** |
-| `decision_status` | `CONSIDER` or `ABSTAIN` |
+| `decision_status` | `RECOMMENDED` or `ABSTAIN` |
 | `decision_basis` | `book_ev` · `model_lean` · `pickem_line_only` · `unavailable` |
 | `book_ev` | Side EV, only when a source cleared the gate |
 | `preferred_side` | Higher-EV side, **only when both sides are priced** |
 | `why` | Short human-readable reason, including every refusal |
-| `rank` | CONSIDER first, then band, then score |
+| `rank` | RECOMMENDED first, then band, then score |
 | `book_source` | `propline` or `oddspapi` — which feed priced this row |
 | `book_fallback_used` | True when PropLine was present but unusable |
 | `book_sources_skipped` | What was passed over, and the gate's reason for each |
@@ -102,7 +109,7 @@ from the model's own over/under/push output.
 # 1. Build the board
 PYTHONPATH=. python scripts/nba_model_cli.py decision-board --demo
 
-# 2. Scan CONSIDER rows
+# 2. Read the RECOMMENDED rows and their basis column
 open outputs/demo/decision_board.csv
 
 # 3. Bet outside PropIQ (book / pick'em app) — by hand, at your own size
@@ -134,7 +141,7 @@ picked, so you can copy it straight across.
 
 | Flag | Effect |
 |---|---|
-| `--min-ev 0.02` | CONSIDER only when VALID book EV clears 2% |
+| `--min-ev 0.02` | Recommend only when VALID book EV clears 2% |
 | `--require-valid-book` | Demote every non-`book_ev` row to ABSTAIN |
 | `--min-lean 0.05` | For unpriced rows: how far past P=0.50 the lean must be |
 | `--consider-only` | Drop ABSTAIN rows |

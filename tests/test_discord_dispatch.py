@@ -118,28 +118,43 @@ def test_claim_words_are_refused_in_any_embed():
             build_abstention_embed(phrase)
 
 
-def test_the_research_footer_travels_with_every_embed():
+def test_the_footer_travels_with_every_embed():
+    """
+    A notification is the most screenshottable thing this system produces, so
+    every embed carries the qualifier. The wording changed when recommendations
+    were permitted; what must not change is that something qualifying rides
+    along and that it still says PropIQ does not place the bet.
+    """
     ticket, legs = _ticket()
     for embed in (
         build_parlay_embed(ticket, legs),
         build_decision_board_embed([], slate_date="2026-09-21"),
         build_abstention_embed("No two-way price reached the gate"),
     ):
-        assert "RESEARCH_ONLY" in embed["footer"]["text"]
-        assert "never places or sizes" in embed["footer"]["text"]
+        text = embed["footer"]["text"]
+        assert "not a promise of an outcome" in text.lower()
+        assert "does not place" in text.lower()
 
 
-def test_a_stake_is_labelled_as_the_users_own():
+def test_a_logged_stake_is_kept_distinct_from_a_recommended_one():
+    """
+    Two different numbers with the same unit. Collapsing them would make a
+    recommendation look like a record of a bet that happened.
+    """
     ticket, legs = _ticket()
     embed = build_parlay_embed(ticket, legs)
-    stake = next(f for f in embed["fields"] if f["name"] == "Stake")
+    stake = next(f for f in embed["fields"] if f["name"] == "Stake logged")
     assert "**your** figure" in stake["value"]
-    assert "does not size bets" in stake["value"]
+    assert "not a recommended size" in stake["value"]
 
 
 def test_an_unpriced_board_says_so_rather_than_looking_empty():
+    """
+    A recommendation with no market price behind it must not read like one that
+    has a de-vigged price behind it — in a channel the basis column is gone.
+    """
     class Row:
-        decision_status = "CONSIDER"
+        decision_status = "RECOMMENDED"
         decision_basis = "model_lean"
         player_name = "DEMO_A"
         target_market = "PTS"
@@ -152,6 +167,7 @@ def test_an_unpriced_board_says_so_rather_than_looking_empty():
 
     embed = build_decision_board_embed([Row(), Row()], slate_date="2026-09-21")
     assert "none priced" in embed["description"]
+    assert "model alone" in embed["description"]
     assert all("model_lean" in f["value"] for f in embed["fields"])
     assert all("No priced market" in f["value"] for f in embed["fields"])
 
@@ -199,7 +215,7 @@ def test_a_dfs_entry_states_where_its_probabilities_came_from():
     assert "SHARP_BENCHMARK" in embed["description"]
     assert "Market-grounded" in embed["description"]
     assert [f["name"].split()[0] for f in embed["fields"]] == ["a", "b"]
-    assert "RESEARCH_ONLY" in embed["footer"]["text"]
+    assert "not a promise of an outcome" in embed["footer"]["text"].lower()
 
 
 def test_a_model_sourced_dfs_entry_carries_the_calibration_caveat():
@@ -272,9 +288,14 @@ def test_an_advisory_size_on_a_dfs_card_is_labelled_advisory():
     embed = build_dfs_entry_embed(
         _dfs_entry(), advisory_size=recommended_units_binary(0.40, 3.0),
     )
-    field = next(f for f in embed["fields"] if f["name"] == "Advisory size")
-    assert "advisory only" in field["value"].lower()
-    assert "does not place or size" in field["value"]
+    field = next(f for f in embed["fields"] if f["name"] == "Recommended stake")
+    assert "fractional Kelly" in field["value"]
+    assert "does not place it" in field["value"], (
+        "the card may recommend a size; it must still say nothing places it"
+    )
+    assert "calibration" in field["value"], (
+        "a recommended size inherits the model's calibration error and must say so"
+    )
 
 
 # --- sending -------------------------------------------------------------
@@ -361,7 +382,7 @@ def test_discord_limits_are_enforced_before_sending():
 
     crowded = build_decision_board_embed(
         [type("R", (), {
-            "decision_status": "CONSIDER", "decision_basis": "book_ev",
+            "decision_status": "RECOMMENDED", "decision_basis": "book_ev",
             "player_name": f"P{i}", "target_market": "PTS", "side": "over",
             "line": 24.5, "model_prob": 0.6, "book_ev": 0.03,
             "american_odds": -110, "book_source": "propline",
