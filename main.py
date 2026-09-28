@@ -661,7 +661,13 @@ def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | Non
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Run one slate.
+
+    ``argv`` defaults to the process arguments, so the command line is
+    unchanged; the scheduled worker passes an explicit list instead, which is
+    also what makes this callable from a test without touching sys.argv.
+    """
     parser = argparse.ArgumentParser(description="PropIQ Analytics pipeline (NBA only)")
     parser.add_argument(
         "--date",
@@ -676,7 +682,7 @@ def main() -> int:
                             "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats__1_.xlsx"))
     parser.add_argument("--model", type=str, default=str(MODEL_ARTIFACT_DEFAULT))
     parser.add_argument("--no-db", action="store_true", help="Dry run, no persistence")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Run id stamp uses Pacific wall clock so operators reading logs see LA time.
     run_id = f"run_{now_pacific().strftime('%Y%m%dT%H%M%S%z')}_{uuid.uuid4().hex[:6]}"
@@ -771,9 +777,26 @@ def main() -> int:
         stage_summary["projections"] = {"rows": len(projections)}
 
         if persist and not projections.empty:
-            from src.db.repository import persist_projections, record_run
+            from src.db.repository import (
+                persist_projections,
+                record_pending_prop_results,
+                record_run,
+            )
+            from src.settlement.recorder import pending_prop_result_rows
 
             persist_projections(projections, run_id=run_id)
+
+            # The feedback loop's only writer. prop_results had a grader and a
+            # metrics layer and nothing that ever inserted a row, so every P/L,
+            # strike rate and CLV figure was an aggregate over zero rows.
+            # These are PREDICTIONS recorded for forward grading, not wagers:
+            # no stake is written and none can be.
+            recorded = pending_prop_result_rows(
+                projections, prop_df, run_id=run_id,
+            )
+            record_pending_prop_results(recorded.rows)
+            stage_summary["prop_results"] = recorded.as_dict()
+
             record_run(run_id, status="success", stage_summary=stage_summary)
 
         logger.info("=== Pipeline complete: %d projections ===", len(projections))

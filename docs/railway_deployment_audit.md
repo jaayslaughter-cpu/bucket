@@ -2,6 +2,26 @@
 
 Date: 2026-09-28. RESEARCH_ONLY. Nothing here places or sizes a wager.
 
+**Update, same day.** Three of the findings below have been addressed. The
+original text is kept as written, with each correction marked inline, so the
+audit still reads as the record of what was found rather than of what was
+later done.
+
+| Finding | State |
+|---|---|
+| Blocker 2 · `prop_results` has no writer (R2) | **fixed** — `settlement/recorder.py` + `repository.record_pending_prop_results`, called from `main.py` |
+| Blocker 1 · nothing to deploy (R3) | **fixed** — `Dockerfile`, `.dockerignore`, `scheduler_worker.py` (APScheduler, Pacific-anchored) |
+| R8 · unbounded concurrent fits | **fixed** — `max_instances=1` per job and `PROPIQ_MAX_THREADS` capping every thread pool |
+| Blocker 3 · nothing survives a restart (R1) | **partly** — the parlay ledger moved to Postgres (`PROPIQ_PARLAY_LEDGER=postgres`, migration 004). **The model artifacts did not.** |
+
+**The verdict is unchanged: DO NOT DEPLOY**, now on one blocker rather than
+three. `data/external/model_runs/comparison/` still lives on an ephemeral
+filesystem with no volume declared, so the first redeploy leaves
+`score_prob_over` with no model and every row abstains. A Railway volume
+mounted at `/app/data`, or artifacts fetched from object storage at boot,
+clears it — that is a deployment-configuration step this repository cannot
+take on its own behalf, and the Dockerfile says so where it would bite.
+
 Audited by tracing the import graph and the filesystem writes, not by
 reading status tables. Every claim below names the command or file that
 establishes it.
@@ -100,7 +120,7 @@ editing the YAML silently does nothing:
 - `paper_research`, `pocket_roi` — modules wired through the CLI; blocks
   have no reader.
 
-### Dead-ended write path
+### Dead-ended write path — **FIXED after this audit**
 
 `prop_results` has a table (`db/models.py:312`), a grader
 (`settlement/runner.py:141`, which selects `outcome_status == 'PENDING'`)
@@ -109,6 +129,23 @@ profit and both CLV columns) — and **no writer**. The six `pg_insert`
 targets are `TeamGameStat`, `PlayerGameLog`, `GameMarketLine`,
 `PropLineSnapshot`, `Projection`, `PipelineRun`. `PropResult(` never
 appears as a constructor anywhere.
+
+**Now written.** `settlement/recorder.py:pending_prop_result_rows` turns
+assembled projections into PENDING rows and
+`db/repository.py:record_pending_prop_results` inserts them, called from
+`main.py` right after `persist_projections`. Three things about it matter
+for a deployment:
+
+- The rows are **predictions, not wagers**: `stake_units` is never written
+  and there is no parameter to set it. Strike rate and CLV are therefore
+  available; ROI is not, and will not be until a stake is recorded by hand.
+- The upsert is `ON CONFLICT ... DO UPDATE ... WHERE outcome_status =
+  'PENDING'`. Without that `WHERE`, re-running a slate after settlement
+  would overwrite a graded row's pre-game numbers.
+- A row with no line, no probability, no source or no game id is **skipped
+  and counted by reason**, not guessed. A null `source` in particular is a
+  hard skip: Postgres treats NULLs in a unique index as distinct, so such a
+  row would be re-inserted on every run.
 
 ---
 
@@ -122,7 +159,7 @@ with **no volume declared anywhere**:
 |---|---|
 | `data/external/model_runs/comparison/` | **the trained model artifacts** — `score_prob_over` then finds no model and abstains for every row |
 | `data/external/market_store/` | the whole bet lifecycle ledger (`bet_lifecycle.csv`/`.parquet`/`.sqlite`) |
-| `data/external/parlay_log/` | `parlay_tickets.csv`, `parlay_legs.csv` — every tracked parlay |
+| ~~`data/external/parlay_log/`~~ | **Resolved** — the ledger moved to Postgres (`parlay_tickets`/`parlay_legs`, migration 004). Set `PROPIQ_PARLAY_LEDGER=postgres`; the CSV backend remains the local default |
 | `data/external/inactive_players/` | the scratch cache |
 | `data/external/training_pack/`, `player_logs/`, `bigdataball/` | ingested panels, re-downloaded each boot |
 
@@ -135,8 +172,21 @@ Every P/L, ROI and CLV figure `metrics.py` can produce is an aggregate over
 zero rows. A live test would generate no evaluable data — which is the
 entire point of running one.
 
+> **Resolved.** See "Dead-ended write path" above. One caveat survives: with
+> no stake recorded, `metrics.py`'s stake and profit aggregates stay empty by
+> design. Strike rate and CLV are the figures a shadow run now produces.
+
 **R3 — No scheduler.** Nothing triggers a slate. Deploying gives a
 container that starts, does nothing, and exits.
+
+> **Resolved.** `scheduler_worker.py` runs an APScheduler `BlockingScheduler`
+> on America/Los_Angeles: the slate at 09:00 PT (before any tip) and
+> settlement at 03:30 PT (after any finish), both overridable by env var.
+> Deploy it as a **worker** service — it binds no port, so a web service would
+> be marked unhealthy for never listening. It does NOT re-anchor to the day's
+> first tip-off: that needs a schedule feed, every data host is denied from
+> the environment this was written in, and timing logic never exercised
+> against real data would look adaptive while being untested.
 
 **R4 — Late scratches are not handled at tip time.**
 `ingestion/inactive_players.py` and `features/absences.py` are wired into
@@ -171,6 +221,14 @@ shared container this contends badly. (Observed in this session: three
 concurrent test suites turned a 126s run into >590s.) Cap thread counts per
 process or stagger the runs.
 
+> **Resolved, both ways.** Each scheduled job runs with `max_instances=1` and
+> `coalesce=True`, so an overrunning slate is never joined by a second copy and
+> a backlog of misfires collapses into one. `PROPIQ_MAX_THREADS` (2 in the
+> image) caps OMP, OpenBLAS, MKL, NumExpr and vecLib. Note the libraries
+> default to every VISIBLE core, which on a shared container is the host's
+> count and not this container's share — so the default is contention, not
+> parallelism. Set it to match the plan's CPU allocation.
+
 ---
 
 ## 4. Final Deployment Verdict
@@ -184,19 +242,26 @@ yet and, if there were, it would not retain its own output.
 
 Three blockers, each independently sufficient:
 
-1. **Nothing to deploy.** No Dockerfile, no start command, no scheduler
-   (R3). Railway has no build target and no trigger.
-2. **Nothing would be recorded.** `prop_results` has no writer (R2), so a
-   live test produces no gradeable picks and no P/L — the feedback loop the
-   deployment exists to serve would stay empty.
-3. **Nothing would survive a restart.** The trained model artifacts and the
-   entire bet ledger live on an ephemeral container filesystem with no
-   volume (R1). The first redeploy silently un-trains the models.
+1. ~~**Nothing to deploy.**~~ **CLEARED.** `Dockerfile` (worker service, no
+   port), `.dockerignore` (no `.env`, no `data/`), and `scheduler_worker.py`
+   as the start command.
+2. ~~**Nothing would be recorded.**~~ **CLEARED.** `prop_results` now has a
+   writer wired into `main.py`, so a shadow run produces gradeable picks and,
+   once settled, a strike rate and CLV. P/L still requires a stake the user
+   records by hand, which is intended.
+3. **Nothing would survive a restart — STILL THE BLOCKER, now narrower.** The
+   bet ledger is in Postgres. **The trained model artifacts are not.**
+   `data/external/model_runs/comparison/` is still on an ephemeral filesystem
+   with no volume (R1), so the first redeploy silently un-trains the models
+   and `score_prob_over` abstains on every row. Mount a volume at `/app/data`
+   or load the artifacts from object storage at boot.
 
 Minimum to reach WARNING (deployable for shadow testing):
-write `prop_results`; move the parlay ledger into Postgres; add a Dockerfile
-plus a PT-anchored schedule; and either declare a Railway volume for
-`data/external/model_runs/` or load model artifacts from object storage.
+~~write `prop_results`~~ (done); ~~move the parlay ledger into Postgres~~
+(done); ~~add a Dockerfile plus a PT-anchored schedule~~ (done); and **either
+declare a Railway volume for `data/external/model_runs/` or load model
+artifacts from object storage** — the one step left, and the only one that
+cannot be taken from inside this repository.
 
 Minimum to reach READY: the above, plus a pre-tip scratch filter (R4), the
 `FeatureSpec` fingerprint wired at train and serve (R5), and thread caps on

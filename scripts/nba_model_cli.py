@@ -1373,9 +1373,16 @@ def notify_discord_cmd(
             embeds = [build_decision_board_embed(rows, slate_date=slate, max_rows=max_rows)]
 
         elif source == "parlay":
-            from src.quant.parlay_log import ParlayLegRecord, ParlayLogStore, ParlayTicketRecord
+            from src.quant.parlay_log import (
+                ParlayLegRecord,
+                ParlayTicketRecord,
+                open_parlay_log,
+            )
 
-            store = ParlayLogStore(store_dir)
+            # Honours PROPIQ_PARLAY_LEDGER: 'csv' (the default, files under
+            # --store-dir) or 'postgres', which is what a container needs since
+            # its filesystem does not survive a redeploy.
+            store = open_parlay_log(store_dir)
             tickets = store.load_tickets()
             if tickets.empty:
                 typer.echo("DATA_NOT_AVAILABLE: no tickets logged yet", err=True)

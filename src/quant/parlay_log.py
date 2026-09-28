@@ -48,10 +48,11 @@ import ast
 import json
 import logging
 import math
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence, get_args
+from typing import Any, Literal, Mapping, Protocol, Sequence, get_args
 from uuid import uuid4
 
 import pandas as pd
@@ -505,24 +506,68 @@ def grade_parlay(
 
 
 # ---------------------------------------------------------------------------
-# the store
+# the store, and where its rows live
 # ---------------------------------------------------------------------------
 
+TICKETS = "tickets"
+LEGS = "legs"
 
-class ParlayLogStore:
-    """Append-only ticket + leg log. Refuses to rewrite the at-bet-time snapshot."""
+
+class ParlayLedgerBackend(Protocol):
+    """
+    Where the ledger's rows are kept. Three operations, no validation.
+
+    EVERY RULE STAYS IN THE STORE. A backend does not know that a ticket id
+    must be new or that at-bet-time fields are frozen; it moves DataFrames.
+    Putting a rule in one backend and not the other is how the two would come
+    to disagree about what the ledger means — the recurring defect in this
+    codebase, and the reason the split is drawn here rather than at
+    ``append``/``update_settlement``.
+    """
+
+    def load(self, table: str) -> pd.DataFrame:
+        """Every stored row for ``tickets`` or ``legs``, or an empty frame."""
+
+    def append(self, table: str, frame: pd.DataFrame) -> None:
+        """Add rows. The store has already established they are new."""
+
+    def replace(self, table: str, frame: pd.DataFrame) -> None:
+        """Write ``frame`` as the table's contents. Rows are never removed."""
+
+
+class CsvLedgerBackend:
+    """The original on-disk ledger: two CSVs under a directory.
+
+    EPHEMERAL ON A CONTAINER. Nothing under ``data/`` survives a Railway
+    redeploy, so a deployed run keeps this ledger only until it restarts. Use
+    ``PostgresLedgerBackend`` there; this remains the default for local work,
+    where a file you can open in a spreadsheet is worth more than durability.
+    """
 
     def __init__(self, root: str | Path = "data/external/parlay_log") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    @property
-    def tickets_path(self) -> Path:
-        return self.root / "parlay_tickets.csv"
+    def path_for(self, table: str) -> Path:
+        if table == TICKETS:
+            return self.root / "parlay_tickets.csv"
+        if table == LEGS:
+            return self.root / "parlay_legs.csv"
+        raise ParlayLogError(f"Unknown ledger table {table!r}")
 
-    @property
-    def legs_path(self) -> Path:
-        return self.root / "parlay_legs.csv"
+    def load(self, table: str) -> pd.DataFrame:
+        return self._read(self.path_for(table))
+
+    def append(self, table: str, frame: pd.DataFrame) -> None:
+        path = self.path_for(table)
+        prior = self._read(path)
+        combined = (
+            pd.concat([prior, frame], ignore_index=True) if not prior.empty else frame
+        )
+        combined.to_csv(path, index=False)
+
+    def replace(self, table: str, frame: pd.DataFrame) -> None:
+        frame.to_csv(self.path_for(table), index=False)
 
     def _read(self, path: Path) -> pd.DataFrame:
         if not path.exists():
@@ -559,11 +604,87 @@ class ParlayLogStore:
             dtype={c: t for c, t in dtypes.items() if c in header},
         )
 
+
+ENV_LEDGER_BACKEND = "PROPIQ_PARLAY_LEDGER"
+
+
+class PostgresLedgerBackend:
+    """
+    The same ledger in Postgres, so it survives a container restart.
+
+    WHY THIS EXISTS. ``data/**`` is gitignored and a Railway container's
+    filesystem is ephemeral, so the CSV ledger — every tracked ticket, its
+    at-bet-time probability and its EV — is destroyed by the next redeploy. The
+    tickets are the only record of what was predicted before a game, which is
+    the one thing that cannot be recomputed afterwards.
+
+    ``replace`` is an UPSERT, not a delete-and-reinsert. The store never removes
+    a row, so upserting every row of the frame it hands over is equivalent,
+    without a window in which the ledger is empty. Deletes are absent on
+    purpose: there is no operation here that should be able to lose a ticket.
+
+    Imports the repository lazily so importing ``parlay_log`` — which most of
+    the test suite does — does not require a database driver or a DATABASE_URL.
+    """
+
+    def _repo(self):
+        from src.db import repository
+
+        return repository
+
+    def load(self, table: str) -> pd.DataFrame:
+        self._check(table)
+        return self._repo().load_parlay_ledger(table)
+
+    def append(self, table: str, frame: pd.DataFrame) -> None:
+        self._check(table)
+        self._repo().upsert_parlay_ledger(table, frame)
+
+    def replace(self, table: str, frame: pd.DataFrame) -> None:
+        self._check(table)
+        self._repo().upsert_parlay_ledger(table, frame)
+
+    @staticmethod
+    def _check(table: str) -> None:
+        if table not in (TICKETS, LEGS):
+            raise ParlayLogError(f"Unknown ledger table {table!r}")
+
+
+class ParlayLogStore:
+    """Append-only ticket + leg log. Refuses to rewrite the at-bet-time snapshot.
+
+    ``root`` keeps the original signature — a directory of CSVs — so every
+    existing caller is unchanged. Pass ``backend=`` to put the ledger somewhere
+    that survives a container restart:
+
+        ParlayLogStore(backend=PostgresLedgerBackend())
+    """
+
+    def __init__(
+        self,
+        root: str | Path = "data/external/parlay_log",
+        *,
+        backend: ParlayLedgerBackend | None = None,
+    ) -> None:
+        self.backend: ParlayLedgerBackend = backend or CsvLedgerBackend(root)
+        # Kept for callers that still reach for the directory. None whenever
+        # the ledger does not live on disk, rather than a path that is not
+        # written to — a stale path reads as a file someone can go and open.
+        self.root = getattr(self.backend, "root", None)
+
+    @property
+    def tickets_path(self) -> Path | None:
+        return getattr(self.backend, "path_for", lambda _t: None)(TICKETS)
+
+    @property
+    def legs_path(self) -> Path | None:
+        return getattr(self.backend, "path_for", lambda _t: None)(LEGS)
+
     def load_tickets(self) -> pd.DataFrame:
-        return self._read(self.tickets_path)
+        return self.backend.load(TICKETS)
 
     def load_legs(self) -> pd.DataFrame:
-        return self._read(self.legs_path)
+        return self.backend.load(LEGS)
 
     def append(
         self,
@@ -585,8 +706,8 @@ class ParlayLogStore:
             assert_export_safe(row, path=f"leg.{leg.leg_id}")
             leg_rows.append(row)
 
-        self._write(self.tickets_path, pd.DataFrame([payload]))
-        self._write(self.legs_path, pd.DataFrame(leg_rows))
+        self.backend.append(TICKETS, pd.DataFrame([payload]))
+        self.backend.append(LEGS, pd.DataFrame(leg_rows))
         logger.info(
             "logged parlay %s: %d legs, price %s, P=%s, EV=%s",
             ticket.ticket_id, ticket.n_legs, ticket.ticket_american_price,
@@ -612,11 +733,6 @@ class ParlayLogStore:
                 continue
             return field, before, after
         return None
-
-    def _write(self, path: Path, frame: pd.DataFrame) -> None:
-        prior = self._read(path)
-        combined = pd.concat([prior, frame], ignore_index=True) if not prior.empty else frame
-        combined.to_csv(path, index=False)
 
     def update_settlement(
         self,
@@ -674,7 +790,7 @@ class ParlayLogStore:
             [tickets[tickets["ticket_id"] != ticket.ticket_id], updated_ticket],
             ignore_index=True,
         )
-        tickets.to_csv(self.tickets_path, index=False)
+        self.backend.replace(TICKETS, tickets)
 
         touched = {(leg.ticket_id, leg.leg_id) for leg in legs}
         keep = stored_legs[
@@ -683,14 +799,48 @@ class ParlayLogStore:
             )
         ]
         replacements = pd.DataFrame([leg.model_dump(mode="json") for leg in legs])
-        pd.concat([keep, replacements], ignore_index=True).to_csv(
-            self.legs_path, index=False
+        self.backend.replace(
+            LEGS, pd.concat([keep, replacements], ignore_index=True)
         )
 
 
 # ---------------------------------------------------------------------------
 # the payload and the feedback loop
 # ---------------------------------------------------------------------------
+
+
+def open_parlay_log(
+    root: str | Path = "data/external/parlay_log",
+    *,
+    ledger: str | None = None,
+) -> ParlayLogStore:
+    """
+    Open the ledger where this environment keeps it.
+
+    ``ledger`` is "csv" or "postgres"; absent, it comes from
+    ``PROPIQ_PARLAY_LEDGER`` and defaults to "csv" — the local default stays
+    what it was, and a deployment opts in rather than being switched under a
+    user who has files on disk.
+
+    SET IT TO "postgres" ON A CONTAINER. A container filesystem is ephemeral
+    and ``data/**`` is gitignored, so the CSV ledger is destroyed by the next
+    redeploy along with every ticket's at-bet-time probability and EV — the
+    only record of what was predicted before a game.
+
+    An unrecognised value raises rather than falling back. Falling back to CSV
+    on a typo would look like it worked and lose the ledger at the next
+    restart, which is the failure this exists to prevent.
+    """
+    choice = (ledger or os.environ.get(ENV_LEDGER_BACKEND) or "csv").strip().lower()
+    if choice == "csv":
+        return ParlayLogStore(root)
+    if choice == "postgres":
+        return ParlayLogStore(backend=PostgresLedgerBackend())
+    raise ParlayLogError(
+        f"{ENV_LEDGER_BACKEND}={choice!r} is not a ledger backend. Use 'csv' or "
+        "'postgres'; defaulting to csv on a typo would look like it worked and "
+        "lose the ledger at the next restart."
+    )
 
 
 def to_payload(
