@@ -206,6 +206,20 @@ LAYERS: dict[str, Layer] = {
             "NEEDS --wire-under-test."
         ),
     ),
+    "fatigue_load": Layer(
+        ("FATIGUE_LOAD_L7", "FATIGUE_LOAD_MIN_L7"),
+        note=(
+            "Exponential cumulative load: prior minutes decayed by recency, "
+            "scaled by flown miles and time-zone change. Tests whether one "
+            "continuous quantity beats the four unfitted constants in "
+            "fatigue_logic.py (B2B 0.97, 3-in-4 0.96, 4-in-5 0.94, altitude "
+            "0.98), which fatigue_multiplier already contributes to the "
+            "baseline arm. Run BOTH columns and then FATIGUE_LOAD_MIN_L7 "
+            "alone: a gain present in the full column and absent in the "
+            "minutes-only one is evidence about travel specifically, and a "
+            "gain in both is not. NEEDS --wire-under-test."
+        ),
+    ),
     "market_context": Layer(
         (
             "MKT_OPENING_SPREAD",

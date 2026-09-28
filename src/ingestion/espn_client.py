@@ -35,6 +35,46 @@ WEB_API_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/n
 ENV_SITE_BASE = "PROPIQ_ESPN_BASE_URL"
 
 
+TOO_MANY_REQUESTS = 429
+
+
+def _has_retry_after(response: Any) -> bool:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        return "Retry-After" in headers
+    except TypeError:
+        return False
+
+
+def _retry_after_seconds(response: Any, fallback: float) -> float:
+    """
+    The server's Retry-After in seconds, else ``fallback``.
+
+    Only a plain integer-seconds form is honoured; the HTTP-date form is
+    ignored rather than parsed approximately, because a wrong date parse would
+    sleep for either no time or a very long one.
+    """
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return float(fallback)
+    if raw is None:
+        return float(fallback)
+    try:
+        seconds = float(str(raw).strip())
+    except ValueError:
+        return float(fallback)
+    if seconds <= 0:
+        return float(fallback)
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+# A server asking us to wait an hour is not something to obey inside a slate
+# job; cap it and let the caller fail rather than hang.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
 class EspnError(RuntimeError):
     """An ESPN fetch failed. Never raised in place of legitimately empty data."""
 
@@ -71,6 +111,22 @@ def get_json(
                 headers={"Accept": "application/json", "User-Agent": cfg.user_agent},
             )
             status = getattr(response, "status_code", 200)
+            if status == TOO_MANY_REQUESTS:
+                # 429 is the one 4xx that IS transient: the request is fine,
+                # there have just been too many of them. Falling through to the
+                # generic 4xx raise would abandon a slate over rate limiting.
+                wait = _retry_after_seconds(response, cfg.retry_backoff ** attempt)
+                if attempt < cfg.retry_attempts:
+                    logger.warning(
+                        "espn: 429 for %s, attempt %d/%d; waiting %.1fs%s",
+                        url, attempt, cfg.retry_attempts, wait,
+                        " (Retry-After)" if _has_retry_after(response) else "",
+                    )
+                    time.sleep(wait)
+                    continue
+                raise EspnError(
+                    f"ESPN rate-limited {url} on all {cfg.retry_attempts} attempts"
+                )
             if 400 <= status < 500:
                 raise EspnError(
                     f"ESPN returned {status} for {url} params={params}; "

@@ -234,7 +234,13 @@ def parse_scoreboard(payload: dict[str, Any]) -> SlateResult:
         comp = comp if isinstance(comp, dict) else {}
 
         home = away = home_raw = away_raw = None
-        for competitor in comp.get("competitors") or []:
+        competitors = comp.get("competitors")
+        if competitors is not None and not isinstance(competitors, list):
+            # A truthy non-iterable here would raise TypeError and cost the
+            # whole slate for one malformed event.
+            skipped += 1
+            continue
+        for competitor in competitors or []:
             if not isinstance(competitor, dict):
                 continue
             team = competitor.get("team")

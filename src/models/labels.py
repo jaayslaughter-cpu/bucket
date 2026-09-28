@@ -55,6 +55,14 @@ def default_feature_cols(market: str) -> list[str]:
         # Player-level fatigue
         "fatigue_multiplier",
         "days_rest",
+        # Continuous cumulative load, beside the multiplier rather than
+        # replacing it: the multiplier is four unfitted constants applied as a
+        # haircut, the load is minutes-weighted and recency-decayed, and which
+        # carries signal is an empirical question (feature_ab --layer
+        # fatigue_load). resolve_feature_cols drops either when the panel
+        # lacks it, so a panel built without the layer is unaffected.
+        "FATIGUE_LOAD_L7",
+        "FATIGUE_LOAD_MIN_L7",
         # Team schedule context
         "TEAM_DAYS_REST_CAPPED",
         "REST_ADVANTAGE",

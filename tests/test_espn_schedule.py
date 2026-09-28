@@ -73,8 +73,14 @@ def test_parses_a_documented_event():
     assert game.venue_city == "San Francisco"
 
 
-def test_tipoff_parses_espn_s_trailing_z_format():
-    """2025-03-15T02:30Z is not a format fromisoformat accepts unmodified."""
+def test_tipoff_parses_espn_s_trailing_z_as_utc():
+    """An ESPN timestamp ending in Z must come back as an aware UTC datetime.
+
+    An earlier docstring claimed fromisoformat rejects a trailing Z. It does
+    not on 3.11 (verified: it returns a tzinfo=utc datetime). The Z-to-+00:00
+    rewrite in _parse_tipoff is kept because it also works on 3.10, but the
+    behaviour under test is the UTC result, not a parse failure.
+    """
     result = parse_scoreboard(_payload(_event(iso="2025-03-15T02:30Z")))
     tip = result.games[0].tipoff_utc
     assert tip == datetime(2025, 3, 15, 2, 30, tzinfo=timezone.utc)
@@ -251,3 +257,47 @@ def test_no_api_key_is_read_or_required():
     source = inspect.getsource(espn_schedule)
     for forbidden in ("API_KEY", "api_key", "SECRET", "token"):
         assert forbidden not in source, f"{forbidden!r} has no business here"
+
+
+def test_a_non_list_competitors_value_does_not_abort_the_slate():
+    """One malformed event must not cost every other game on the card."""
+    bad = _event("2")
+    bad["competitions"][0]["competitors"] = "not a list"
+    result = parse_scoreboard(_payload(_event("1"), bad, _event("3")))
+    assert [g.espn_event_id for g in result.games] == ["1", "3"]
+    assert any("skipped" in n for n in result.notes)
+
+
+def test_a_429_is_retried_rather_than_abandoned():
+    """Rate limiting is transient; the other 4xx codes are not."""
+    cfg = EspnScheduleConfig(retry_attempts=3, retry_backoff=1.0)
+    session = _Session(_Response(429), _Response(200, _payload(_event())))
+    out = load_slate(date(2025, 3, 14), config=cfg, session=session)
+    assert out.status == "OK"
+    assert len(session.calls) == 2, "the 429 was not retried"
+
+
+def test_a_429_on_every_attempt_raises_naming_rate_limiting():
+    cfg = EspnScheduleConfig(retry_attempts=2, retry_backoff=1.0)
+    session = _Session(_Response(429), _Response(429))
+    with pytest.raises(EspnScheduleError, match="rate-limited"):
+        fetch_scoreboard(date(2025, 3, 14), config=cfg, session=session)
+    assert len(session.calls) == 2
+
+
+def test_retry_after_is_honoured_and_capped():
+    from src.ingestion.espn_client import (
+        MAX_RETRY_AFTER_SECONDS,
+        _retry_after_seconds,
+    )
+
+    class _R:
+        def __init__(self, value):
+            self.headers = {"Retry-After": value} if value is not None else {}
+
+    assert _retry_after_seconds(_R("5"), 99.0) == 5.0
+    assert _retry_after_seconds(_R(None), 7.0) == 7.0
+    assert _retry_after_seconds(_R("not a number"), 7.0) == 7.0
+    assert _retry_after_seconds(_R("-3"), 7.0) == 7.0
+    # an hour is not something to obey inside a slate job
+    assert _retry_after_seconds(_R("3600"), 7.0) == MAX_RETRY_AFTER_SECONDS

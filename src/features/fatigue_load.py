@@ -111,13 +111,31 @@ def _params(cfg: dict[str, Any] | None) -> dict[str, float]:
 
 
 def _venue_team(df: pd.DataFrame) -> pd.Series | None:
-    """The team whose arena hosts each row's game, or None if undeterminable."""
+    """
+    The team whose arena hosts each row's game, or None if undeterminable.
+
+    A NEUTRAL-SITE game has no such team. Using the nominal home team's regular
+    arena would invent a trip that nobody took — an NBA Cup final or a global
+    game is not played in either team's building — so those rows are left NA
+    and their time-zone term drops out rather than being fabricated.
+    """
     if not {"IS_HOME", "TEAM_ABBREVIATION"}.issubset(df.columns):
         return None
     if "OPPONENT_ABBREVIATION" not in df.columns:
         return None
     home = df["IS_HOME"].fillna(False).astype(bool)
-    return df["TEAM_ABBREVIATION"].where(home, df["OPPONENT_ABBREVIATION"])
+    venue = df["TEAM_ABBREVIATION"].where(home, df["OPPONENT_ABBREVIATION"])
+    if "IS_NEUTRAL_SITE" in df.columns:
+        neutral = df["IS_NEUTRAL_SITE"].fillna(False).astype(bool)
+        if bool(neutral.any()):
+            logger.info(
+                "fatigue_load: %d neutral-site row(s) have no resolvable venue; "
+                "their time-zone term is dropped rather than charged to the "
+                "nominal home team's arena.",
+                int(neutral.sum()),
+            )
+        venue = venue.mask(neutral)
+    return venue
 
 
 def attach_fatigue_load(
@@ -143,10 +161,11 @@ def attach_fatigue_load(
 
     p = _params(cfg)
     out = df.copy()
-    order = out.index
-    work = out.reset_index(drop=False).rename(columns={"index": "_row"})
-    if "_row" not in work.columns:          # a RangeIndex reset names it 'level_0'
-        work = work.rename(columns={work.columns[0]: "_row"})
+    # A POSITIONAL id, not the index label: a caller's index may legitimately
+    # contain duplicates, and round-tripping through labels would then either
+    # misalign rows or raise on the duplicate axis.
+    work = out.reset_index(drop=True)
+    work["_row"] = range(len(work))
     work["_date"] = pd.to_datetime(work["GAME_DATE"], errors="coerce")
     work["_min"] = pd.to_numeric(work["MIN"], errors="coerce")
 
@@ -172,16 +191,35 @@ def attach_fatigue_load(
                 unmapped,
             )
         work["_venue_offset"] = offset
-        chronological = work.sort_values("_date", kind="mergesort")
-        prev_offset = chronological.groupby(
+        # A player-game panel repeats each TEAM-game once per player, so
+        # shifting within the team over player rows hands the venue change to
+        # whichever teammate happens to sort first and gives the rest zero.
+        # Measured on a two-player, three-game panel: teammates who travelled
+        # together got 48.36 and 44.67 for the same game. The shift belongs to
+        # the team-game, so it is computed on UNIQUE team-games and broadcast
+        # back to every player row of that game.
+        team_games = (
+            work[["TEAM_ABBREVIATION", "_date", "_venue_offset"]]
+            .drop_duplicates(subset=["TEAM_ABBREVIATION", "_date"])
+            .sort_values(["TEAM_ABBREVIATION", "_date"], kind="mergesort")
+        )
+        team_games["_prev_offset"] = team_games.groupby(
             "TEAM_ABBREVIATION", sort=False
         )["_venue_offset"].shift(1)
+        team_games["_tz_shift"] = (
+            team_games["_venue_offset"] - team_games["_prev_offset"]
+        ).abs()
         tz_shift = (
-            (chronological["_venue_offset"] - prev_offset)
-            .abs()
-            .reindex(work.index)
-            .fillna(0.0)
+            work[["TEAM_ABBREVIATION", "_date"]]
+            .merge(
+                team_games[["TEAM_ABBREVIATION", "_date", "_tz_shift"]],
+                on=["TEAM_ABBREVIATION", "_date"],
+                how="left",
+            )["_tz_shift"]
         )
+        # NA covers a first game, an unmapped venue and a neutral site alike:
+        # all three mean "no known change", which is 0 added load, not a guess.
+        tz_shift = pd.Series(tz_shift.to_numpy(), index=work.index).fillna(0.0)
         factor = factor + p["tz_phi"] * tz_shift
     else:
         logger.info(
@@ -226,9 +264,9 @@ def attach_fatigue_load(
 
     work[LOAD_COL] = load
     work[LOAD_MIN_COL] = load_min_only
-    restored = work.set_index("_row")
-    out[LOAD_COL] = restored[LOAD_COL].reindex(order)
-    out[LOAD_MIN_COL] = restored[LOAD_MIN_COL].reindex(order)
+    restored = work.sort_values("_row", kind="mergesort")
+    out[LOAD_COL] = restored[LOAD_COL].to_numpy()
+    out[LOAD_MIN_COL] = restored[LOAD_MIN_COL].to_numpy()
 
     logger.info(
         "fatigue_load attached: mean %s %.2f (min-only %.2f) over %d row(s); "

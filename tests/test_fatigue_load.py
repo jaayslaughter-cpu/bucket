@@ -152,15 +152,97 @@ def test_existing_column_is_not_overwritten():
 
 
 def test_players_do_not_contaminate_each_other():
-    frame = pd.concat([
-        _player_games([40.0, 40.0], [1]).assign(PLAYER_ID="p1"),
-        _player_games([0.0, 10.0], [1]).assign(PLAYER_ID="p2"),
-    ], ignore_index=True)
-    out = attach_fatigue_load(frame)
-    p2_second = out[(out["PLAYER_ID"] == "p2")].iloc[1]
-    assert p2_second[LOAD_MIN_COL] == pytest.approx(0.0), (
-        "p2's load picked up p1's minutes"
+    """p2's dates are staggered AFTER p1's, and p2's first row must be zero.
+
+    The earlier version gave p2 the same dates as p1 and a zero-minute prior
+    game, so the assertion held whether or not the shift was grouped by player
+    — it could not have failed. Now p1 has heavy minutes immediately before
+    p2's first game, so an ungrouped shift would hand p2 p1's load.
+    """
+    p1 = pd.DataFrame({
+        "PLAYER_ID": ["p1"] * 2,
+        "GAME_DATE": pd.to_datetime(["2025-01-01", "2025-01-02"]),
+        "MIN": [40.0, 40.0],
+    })
+    p2 = pd.DataFrame({
+        "PLAYER_ID": ["p2"] * 2,
+        "GAME_DATE": pd.to_datetime(["2025-01-03", "2025-01-04"]),
+        "MIN": [10.0, 10.0],
+    })
+    out = attach_fatigue_load(pd.concat([p1, p2], ignore_index=True))
+    p2_rows = out[out["PLAYER_ID"] == "p2"].reset_index(drop=True)
+
+    assert p2_rows.loc[0, LOAD_MIN_COL] == pytest.approx(0.0), (
+        "p2's first game has no prior game of its own, so any load is p1's"
     )
+    # and p2's second row sees only p2's own 10-minute game
+    assert p2_rows.loc[1, LOAD_MIN_COL] == pytest.approx(
+        10.0 * np.exp(-DEFAULTS["decay_lambda"])
+    )
+
+
+def test_teammates_on_the_same_team_game_get_the_same_travel_load():
+    """A player-game panel repeats each TEAM-game once per player.
+
+    Shifting the venue within the team over PLAYER rows credits the trip to
+    whichever teammate sorts first. Measured before the fix on this exact
+    frame: 48.355812 for one teammate and 44.671524 for the other.
+    """
+    rows = []
+    for day, opponent, is_home in (
+        ("2025-01-01", "NYK", True),
+        ("2025-01-02", "LAL", False),   # Boston -> Los Angeles, 3 hours
+        ("2025-01-03", "NYK", True),
+    ):
+        for player in ("p1", "p2"):
+            rows.append({
+                "PLAYER_ID": player,
+                "GAME_DATE": pd.Timestamp(day),
+                "MIN": 30.0,
+                "TEAM_ABBREVIATION": "BOS",
+                "OPPONENT_ABBREVIATION": opponent,
+                "IS_HOME": is_home,
+            })
+    out = attach_fatigue_load(pd.DataFrame(rows))
+
+    third = out[out["GAME_DATE"] == pd.Timestamp("2025-01-03")]
+    loads = third[LOAD_COL].round(9).unique()
+    assert len(loads) == 1, f"teammates travelled together but got {loads}"
+    # and the trip did register, so this is not passing by both being zero
+    assert third[LOAD_COL].iloc[0] > third[LOAD_MIN_COL].iloc[0]
+
+
+def test_a_neutral_site_game_does_not_invent_a_trip():
+    """The nominal home team's arena is not the venue of a neutral-site game."""
+    def frame(neutral: bool) -> pd.DataFrame:
+        return pd.DataFrame({
+            "PLAYER_ID": ["p1"] * 3,
+            "GAME_DATE": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
+            "MIN": [30.0, 30.0, 20.0],
+            "TEAM_ABBREVIATION": ["BOS"] * 3,
+            "OPPONENT_ABBREVIATION": ["NYK", "LAL", "NYK"],
+            "IS_HOME": [True, False, True],
+            "IS_NEUTRAL_SITE": [False, neutral, False],
+        })
+
+    real_trip = attach_fatigue_load(frame(neutral=False))
+    neutral_site = attach_fatigue_load(frame(neutral=True))
+
+    assert real_trip.loc[2, LOAD_COL] > real_trip.loc[2, LOAD_MIN_COL]
+    assert neutral_site.loc[2, LOAD_COL] == pytest.approx(
+        neutral_site.loc[2, LOAD_MIN_COL]
+    ), "a neutral-site game was charged the nominal home arena's time zone"
+
+
+def test_a_duplicated_index_is_handled_positionally():
+    """A caller's index may legitimately repeat; labels would misalign."""
+    frame = _player_games([30.0, 20.0, 10.0], [1, 1])
+    frame.index = [7, 7, 7]
+    out = attach_fatigue_load(frame)
+    assert list(out["MIN"]) == [30.0, 20.0, 10.0]
+    assert out[LOAD_COL].notna().all()
+    assert out[LOAD_COL].iloc[0] == 0.0
+    assert out[LOAD_COL].iloc[1] > 0.0
 
 
 def test_offset_table_covers_thirty_teams_and_spans_four_zones():
@@ -176,40 +258,57 @@ def test_row_order_is_preserved():
     assert out[LOAD_COL].notna().all()
 
 
-def test_the_builder_actually_runs_this_layer_with_travel_attached():
-    """Registration is a string in a tuple, so static reading cannot confirm it.
+def test_the_builder_runs_this_layer_after_travel_features_are_attached():
+    """Drives build_feature_matrix and asserts what the layer actually received.
 
-    Also confirms TRAVEL_MILES exists by the time the layer runs — the whole
-    reason it is registered after attach_team_schedule_features rather than
-    beside attach_fatigue_column.
+    The earlier version built a spy and then never installed it — it called the
+    registered callable directly on a frame it had pre-populated with
+    TRAVEL_MILES, so it could not have caught an ordering regression. This one
+    patches the module attribute the builder resolves at call time, runs the
+    real builder on the demo panel, and asserts TRAVEL_MILES was present when
+    the layer ran. Reordering fatigue_load before
+    attach_team_schedule_features makes it fail.
     """
-    from src.features import builder
-    from src.features import fatigue_load as fl
+    import src.features.fatigue_load as fl
+    from src.features.builder import build_feature_matrix
+    from src.models.data_audit import make_demo_panel
 
     seen: list[dict] = []
-    real = fl.attach_fatigue_load_layer
+    real = fl.attach_fatigue_load
 
-    def spy(df):
+    def spy(df, cfg=None):
         seen.append({
             "rows": len(df),
             "has_travel": "TRAVEL_MILES" in df.columns,
-            "has_min": "MIN" in df.columns,
+            "travel_non_null": (
+                int(pd.to_numeric(df["TRAVEL_MILES"], errors="coerce").notna().sum())
+                if "TRAVEL_MILES" in df.columns else 0
+            ),
         })
-        return real(df)
+        return real(df, cfg)
 
-    layers = builder._additive_feature_layers()
-    names = [name for name, _ in layers]
+    original = fl.attach_fatigue_load
+    fl.attach_fatigue_load = spy
+    try:
+        built = build_feature_matrix(make_demo_panel())
+    finally:
+        fl.attach_fatigue_load = original
+
+    assert seen, "the builder never invoked the fatigue_load layer"
+    assert seen[0]["has_travel"], (
+        "fatigue_load ran BEFORE attach_team_schedule_features, so its "
+        "distance term was silently zero"
+    )
+    assert seen[0]["travel_non_null"] > 0, (
+        "TRAVEL_MILES was present but entirely null when the layer ran"
+    )
+    assert LOAD_COL in built.columns and LOAD_MIN_COL in built.columns
+    assert built[LOAD_COL].notna().all()
+    assert float(built[LOAD_COL].sum()) > 0.0, "every load came out zero"
+
+
+def test_the_layer_is_registered_under_its_expected_label():
+    from src.features import builder
+
+    names = [name for name, _ in builder._additive_feature_layers()]
     assert "fatigue_load" in names, f"layer not registered; got {names}"
-
-    # drive the registered callable, not the module attribute, so a stale
-    # registration would be caught
-    registered = dict(layers)["fatigue_load"]
-    frame = pd.DataFrame({
-        "PLAYER_ID": ["p1", "p1"],
-        "GAME_DATE": pd.to_datetime(["2025-01-01", "2025-01-02"]),
-        "MIN": [30.0, 20.0],
-        "TRAVEL_MILES": [0.0, 1200.0],
-    })
-    out = registered(frame)
-    assert LOAD_COL in out.columns and LOAD_MIN_COL in out.columns
-    assert out.loc[1, LOAD_COL] > 0.0
