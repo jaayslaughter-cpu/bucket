@@ -78,25 +78,27 @@ def attach_halflife_shrink_features(
         else:
             out[f"{stat}_HL_SHRINK"] = out[f"{stat}_HL"]
 
-    # Additive L2 variant using shrink mean (does not overwrite {stat}_L2)
+    # Additive L2 variant using shrink mean (does not overwrite {stat}_L2).
+    # Do NOT fillna(1.0) on pace/fatigue — that fabricates neutral context
+    # when the builder intentionally left values null.
     for stat in ("PTS", "REB", "AST", "FG3M", "STL", "BLK"):
         shrink_col = f"{stat}_HL_SHRINK"
         if shrink_col not in out.columns:
             continue
-        pace = out.get("PACE_MULTIPLIER", pd.Series(1.0, index=out.index)).fillna(1.0)
-        fatigue = (
-            out["fatigue_multiplier"].fillna(1.0)
-            if "fatigue_multiplier" in out.columns
-            else pd.Series(1.0, index=out.index)
-        )
+        base = pd.to_numeric(out[shrink_col], errors="coerce")
+        if "fatigue_multiplier" in out.columns:
+            base = base * pd.to_numeric(out["fatigue_multiplier"], errors="coerce")
         if "MIN_L5" in out.columns and "MIN_SEASON" in out.columns:
-            minutes_ratio = (out["MIN_L5"] / out["MIN_SEASON"]).replace([np.inf, -np.inf], np.nan)
-            minutes_ratio = minutes_ratio.fillna(1.0).clip(0.5, 1.5)
-        else:
-            minutes_ratio = pd.Series(1.0, index=out.index)
-        out[f"{stat}_L2_HL"] = (
-            pd.to_numeric(out[shrink_col], errors="coerce") * pace * fatigue * minutes_ratio
-        )
+            minutes_ratio = (
+                pd.to_numeric(out["MIN_L5"], errors="coerce")
+                / pd.to_numeric(out["MIN_SEASON"], errors="coerce")
+            ).replace([np.inf, -np.inf], np.nan).clip(0.5, 1.5)
+            base = base * minutes_ratio
+        out[f"{stat}_L2_HL"] = base
+        if "PACE_MULTIPLIER" in out.columns:
+            out[f"{stat}_L2_HL_PACE"] = base * pd.to_numeric(
+                out["PACE_MULTIPLIER"], errors="coerce"
+            )
 
     out.attrs["halflife_games"] = float(halflife_games)
     out.attrs["halflife_shrink_k"] = float(shrink_k)

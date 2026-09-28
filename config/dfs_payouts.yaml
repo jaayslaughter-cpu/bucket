@@ -1,0 +1,46 @@
+# DFS pick'em payout matrices.
+#
+# PROVENANCE: user-supplied on 2026-09-28 and described by them as verified.
+# NOT independently verified by this repo — the environment's network policy
+# denies every operator host, so no run here has read a live payout page. Treat
+# these as the operator's terms AS RECORDED ON THAT DATE.
+#
+# THESE CHANGE. Operators alter multiples by market, promotion and region, and a
+# stale table misprices every entry built on it in whichever direction the
+# change went. Re-check before a live slate and update `as_of` when you do.
+#
+# `payouts` maps HITS -> total returned per 1 staked, GROSS (so 2-for-2 at 3.0
+# returns 3.0 and nets +2.0). A hit count that pays nothing is simply absent.
+#
+# Sleeper is deliberately absent: it prices per-leg dynamic odds rather than a
+# fixed tiered matrix, so it does not fit this shape. Its legs would go through
+# benchmark_fair_probability and the two-way path instead.
+
+as_of: "2026-09-28"
+source: "user-supplied 2026-09-28; not verified against a live operator page from this environment"
+
+platforms:
+  underdog:
+    power:
+      2: {2: 3.0}
+      3: {3: 6.0}
+      4: {4: 10.0}
+      5: {5: 20.0}
+      6: {6: 35.0}
+    flex:
+      3: {3: 3.25, 2: 1.09}
+      4: {4: 6.0, 3: 1.4}
+      5: {5: 10.0, 4: 2.5}
+      6: {6: 25.0, 5: 2.6, 4: 0.25}
+      7: {7: 40.0, 6: 2.75, 5: 0.5}
+      8: {8: 80.0, 7: 3.0, 6: 1.0}
+  prizepicks:
+    power:
+      2: {2: 3.0}
+      3: {3: 5.0}
+      4: {4: 10.0}
+    flex:
+      3: {3: 2.25, 2: 1.25}
+      4: {4: 5.0, 3: 1.5}
+      5: {5: 10.0, 4: 2.0, 3: 0.4}
+      6: {6: 25.0, 5: 2.0, 4: 0.4}

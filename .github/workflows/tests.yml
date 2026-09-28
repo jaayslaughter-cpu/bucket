@@ -1,0 +1,65 @@
+# Why this exists: until it did, nothing ran the test suite automatically.
+# The guards this repo leans on -- the play-by-play completeness check, the
+# leakage deletion test, the A/B no-op refusal, the out-of-fold slate
+# grouping -- were all enforced only when somebody remembered to run pytest
+# locally. A guard nobody runs is a guard that has already failed.
+name: tests
+
+on:
+  # push is DEFAULT BRANCH ONLY. Triggering on every branch ran the suite
+  # twice for one commit once a PR was open -- github fires push and
+  # pull_request both, and their github.ref values differ
+  # (refs/heads/<branch> vs refs/pull/<n>/merge) so the concurrency group
+  # below could not dedupe them. Branch work is covered by pull_request.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same ref. The suite takes a
+# few minutes and a stale result is worse than no result.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.11 matches the version the suite is developed against; pyproject
+      # sets ruff's target-version to py311 for the same reason.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Lint before tests: it takes seconds and a failure here is cheaper to
+      # read than a stack trace. The rule set is the narrow correctness one
+      # configured in pyproject, not the full default.
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      # Sockets are DENIED, not merely unused. This comment previously said
+      # "no network in CI" while the job left outbound networking wide open,
+      # so a test that started calling stats.nba.com or kaggle.com would have
+      # passed here and behaved unpredictably in review -- the claim was not
+      # enforced by anything. --disable-socket makes it true. Unix sockets
+      # stay allowed because they are local IPC, not the network.
+      #
+      # Verified before enabling rather than assumed: the whole suite passes
+      # with sockets blocked, so nothing in it reaches out today.
+      - name: Tests (network denied)
+        run: python -m pytest tests/ -q --disable-socket --allow-unix-socket

@@ -61,6 +61,10 @@ def test_research_slate_from_predictions(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0].placement_mode == "MANUAL_ONLY"
     assert rows[0].model_p_over == pytest.approx(0.58)
+    assert rows[0].model_p_under == pytest.approx(0.42)
+    assert rows[0].model_p_push == pytest.approx(0.0)
+    assert rows[0].preferred_side in {"over", "under"}
+    assert rows[0].edge_letter_grade_under is not None
     assert rows[0].confidence_tier in {"HIGH", "MODERATE", "LOW", "DISAGREE", "ABSTAIN"}
     out = tmp_path / "slate.csv"
     assert write_slate_csv(rows, out) == 1
@@ -90,7 +94,39 @@ def test_enrich_book_valid_computes_ev():
     enriched = enrich_row_with_book(row, market)
     assert enriched.book_status == "VALID"
     assert enriched.book_ev_over is not None
+    assert enriched.book_ev_under is not None
+    assert enriched.model_p_under == pytest.approx(0.40)
+    assert enriched.preferred_side in {"over", "under"}
     assert enriched.book_ev_over > 0
+
+
+def test_enrich_book_prices_under_side_explicitly():
+    from src.quant.paper_research import ResearchSlateRow
+
+    row = ResearchSlateRow(
+        slate_date="2025-01-16",
+        event_id="g1",
+        player_id="p1",
+        target_market="PTS",
+        research_line=27.0,
+        model_p_over=0.35,
+        model_p_under=0.55,
+        model_p_push=0.10,
+    )
+    market = PropMarketSnapshot(
+        game_id="g1",
+        bookmaker="demo",
+        market_id="m1",
+        line=27.0,
+        over_odds_american=-110,
+        under_odds_american=-110,
+        status="VALID",
+        captured_at_utc=datetime.now(timezone.utc),
+    )
+    enriched = enrich_row_with_book(row, market)
+    assert enriched.book_status == "VALID"
+    assert enriched.book_ev_under is not None
+    assert enriched.preferred_side == "under"
 
 
 def test_log_manual_bet_and_report(tmp_path: Path):

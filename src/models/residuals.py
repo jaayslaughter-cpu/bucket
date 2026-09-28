@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.stats import nbinom, norm, poisson
+
+from src.models.oof import chronological_fold_indices
+
+if TYPE_CHECKING:  # annotation only — this module needs no pandas at runtime
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +328,7 @@ def fit_dispersion_out_of_fold(
     *,
     market: str = "",
     n_folds: int = 3,
+    dates: "pd.Series | None" = None,
 ) -> CountDispersion:
     """
     Fit dispersion on OUT-OF-FOLD residuals from chronological folds.
@@ -334,10 +340,17 @@ def fit_dispersion_out_of_fold(
     selecting Poisson over Negative Binomial is the tell.
 
     ``train_predict`` takes (X_train, y_train, X_valid) and returns
-    predictions for X_valid. Folds are chronological, so every prediction
-    is made by a model that never saw that row or any later one.
+    predictions for X_valid.
+
+    Pass ``dates`` (positionally aligned with the rows) and the folds are
+    grouped by calendar date, so every prediction comes from a model that saw
+    no row from that day or any later day. WITHOUT ``dates`` the folds are
+    positional, and because an NBA slate is ~150 rows a boundary leaves one
+    day partly in train and partly in validation -- the fitted phi then comes
+    partly from residuals of a model that had seen the same night. That phi
+    drives P(over)/P(under)/P(push) for every caller, so the weaker guarantee
+    is worth avoiding: a caller with the dated frame in hand should pass it.
     """
-    from sklearn.model_selection import TimeSeriesSplit
 
     y = np.asarray(y, dtype=float)
     n = len(y)
@@ -371,7 +384,15 @@ def fit_dispersion_out_of_fold(
 
     splits = min(n_folds, max(2, n // MIN_ROWS_TO_FIT))
     oof_pred = np.full(n, np.nan)
-    for train_idx, valid_idx in TimeSeriesSplit(n_splits=splits).split(np.arange(n)):
+    if dates is None:
+        logger.warning(
+            "dispersion %s: no dates passed, so folds are positional and a "
+            "slate may straddle a boundary; phi is slightly optimistic.",
+            market or "?",
+        )
+    for train_idx, valid_idx in chronological_fold_indices(
+        n, splits=splits, market=market, dates=dates
+    ):
         X_tr = X.iloc[train_idx] if hasattr(X, "iloc") else X[train_idx]
         X_va = X.iloc[valid_idx] if hasattr(X, "iloc") else X[valid_idx]
         try:

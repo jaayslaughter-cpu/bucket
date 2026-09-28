@@ -191,7 +191,7 @@ def settle_pending_props(
                         minutes_played=player_stats.get("minutes_played"),
                         stake_units=stake_or_default(prop.stake_units),
                     )
-                except SettlementError as exc:
+                except (SettlementError, ValueError, TypeError, AttributeError) as exc:
                     report.errors.append(f"{game_id}/{prop.player_name}/{prop.market}: {exc}")
                     logger.warning("Could not grade %s %s: %s", prop.player_name, prop.market, exc)
                     continue

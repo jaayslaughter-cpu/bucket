@@ -152,7 +152,8 @@ def test_over_and_under_pair_into_one_row():
     assert row.under_odds_american == -105
     assert row.nba_player_id == "203999"
     assert row.nba_game_id == "nba-1"
-    assert row.game_date.isoformat() == "2026-01-15"
+    # commence 2026-01-15T03:10:00Z == 2026-01-14 19:10 America/Los_Angeles
+    assert row.game_date.isoformat() == "2026-01-14"
 
 
 def test_alternate_ladders_stay_separate_rows():

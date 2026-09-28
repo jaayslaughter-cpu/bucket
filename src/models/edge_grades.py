@@ -77,18 +77,25 @@ def research_edge_letter_grade(
     }
 
     side_l = str(side).lower()
+    prefer_under = side_l in {"under", "u", "less"}
+
     if fair_market_probability is not None and np.isfinite(fair_market_probability):
         if probability_over is None or not np.isfinite(probability_over):
             return base
-        model_p = float(probability_over) if side_l == "over" else 1.0 - float(probability_over)
+        # Edge for the *requested* side (not absolute magnitude of either side).
+        model_p = (
+            1.0 - float(probability_over) if prefer_under else float(probability_over)
+        )
         edge = model_p - float(fair_market_probability)
-        grade = _grade_from_abs_edge(edge)
+        grade = _grade_from_abs_edge(edge) if edge > 0 else "F"
         return {
             **base,
             "edge_letter_grade": grade,
             "edge_probability": round(edge, 4),
             "grade_basis": "model_minus_fair_market",
-            "side_lean": "over" if edge > 0 else "under",
+            "side_lean": ("under" if prefer_under else "over") if edge > 0 else (
+                "over" if prefer_under else "under"
+            ),
         }
 
     if (
@@ -101,25 +108,30 @@ def research_edge_letter_grade(
         and prediction_std > 1e-6
     ):
         z = (float(prediction_mean) - float(prop_line)) / float(prediction_std)
-        grade = _grade_from_abs_z(z)
+        signed = -z if prefer_under else z
+        grade = _grade_from_abs_z(signed) if signed > 0 else "F"
         return {
             **base,
             "edge_letter_grade": grade,
             "research_z": round(z, 4),
             "grade_basis": "research_z_vs_line",
-            "side_lean": "over" if z > 0 else "under",
+            "side_lean": ("under" if prefer_under else "over") if signed > 0 else (
+                "over" if prefer_under else "under"
+            ),
         }
 
     if probability_over is not None and np.isfinite(probability_over):
         p = float(probability_over)
-        edge = p - 0.5
-        grade = _grade_from_abs_edge(edge)
+        edge = (1.0 - p) - 0.5 if prefer_under else p - 0.5
+        grade = _grade_from_abs_edge(edge) if edge > 0 else "F"
         return {
             **base,
             "edge_letter_grade": grade,
             "edge_probability": round(edge, 4),
             "grade_basis": "research_p_over_vs_half",
-            "side_lean": "over" if edge > 0 else "under",
+            "side_lean": ("under" if prefer_under else "over") if edge > 0 else (
+                "over" if prefer_under else "under"
+            ),
         }
 
     return base

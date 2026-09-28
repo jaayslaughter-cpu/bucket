@@ -184,3 +184,35 @@ def test_ece_refuses_a_sparse_reliability_diagram():
     assert result["gate_passed"] is False
     assert result["ece"] is None, "a gated ECE must not be usable for selection"
     assert result["ece_ungated"] is not None, "the raw value should still be visible"
+
+
+# --- cubic review, PR #3: layers must be recorded only when they add columns --
+
+
+def test_a_layer_that_adds_nothing_is_not_recorded_in_the_schema_version():
+    """The suffix exists so two runs with different feature sets cannot share a
+    version. Recording a layer because it was ATTEMPTED broke that both ways:
+    attach_elo_features returns the panel unchanged on an empty Elo frame, and a
+    disabled layer returns it untouched, so a run whose layer silently no-opped
+    looked like one where it worked — while a run that skipped the layer, with
+    the identical feature set, got a DIFFERENT version."""
+    from src.features.builder import _records_a_layer
+
+    panel = pd.DataFrame({"GAME_ID": ["1"], "TEAM_ABBREVIATION": ["ATL"], "PTS": [10]})
+    before = set(panel.columns)
+
+    assert _records_a_layer(before, panel, "team_elo") is False
+    assert _records_a_layer(before, panel.assign(TEAM_ELO_PRE=1500.0), "team_elo") is True
+
+
+def test_identical_feature_sets_get_identical_schema_versions():
+    """A no-opped layer must land on the same version as never attempting it,
+    because the feature set is the same."""
+    from src.features.builder import resolved_feature_schema_version
+
+    no_op_not_recorded = resolved_feature_schema_version([])
+    never_attempted = resolved_feature_schema_version([])
+    worked = resolved_feature_schema_version(["team_elo"])
+
+    assert no_op_not_recorded == never_attempted
+    assert worked != never_attempted, "a layer that DID add columns must change the version"

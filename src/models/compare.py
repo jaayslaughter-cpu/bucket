@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mea
 from src.models.distribution_adapter import DistributionPropModel
 from src.models.ensemble import EnsemblePropModel
 from src.models.labels import attach_research_over_labels, default_feature_cols
-from src.models.prob_calibration import reliability_table
+from src.models.prob_calibration import expected_calibration_error
 from src.models.walk_forward import fixed_cutoff_split, sort_by_game_date
 from src.utils.timezones import format_pacific_iso, pacific_midnight_utc
 
@@ -81,6 +82,110 @@ def resolve_feature_cols(df: pd.DataFrame, cols: list[str]) -> tuple[list[str], 
     return present, absent
 
 
+def recency_sample_weights(
+    train: pd.DataFrame, cfg: dict[str, Any], market: str
+) -> "tuple[pd.Series | None, dict[str, Any] | None]":
+    """
+    Recency weights for this training window, or ``(None, None)`` when off.
+
+    WHY THIS FUNCTION EXISTS. src/models/recency.py computed these weights and
+    xgboost_pipeline.py and catboost_pipeline.py both accepted a
+    ``sample_weight`` — and nothing in the repository passed one, so a game from
+    2018 and a game from last week carried identical influence in every fit.
+    This is the missing middle.
+
+    OFF BY DEFAULT, like the blowout layer, because weighting is not free: it
+    discards information, and how much is measurable rather than arguable. The
+    Kish effective sample size is logged on every run that enables it, so a
+    half-life that quietly reduces 80,000 rows to 9,000 says so before it shows
+    up as an unstable model.
+
+    NO ``as_of`` IS PASSED. exponential_recency_weights then anchors on the
+    newest date in ``train`` — the training window's own end. Handing it the
+    validation end would leak the split boundary into the fit, and the function
+    refuses a reference date outside the window rather than allowing it.
+    """
+    recency_cfg = cfg.get("recency") or {}
+    if not recency_cfg.get("enabled", False):
+        return None, None
+    if "GAME_DATE" not in train.columns:
+        logger.warning(
+            "recency.enabled is true but the training frame has no GAME_DATE — "
+            "fitting UNWEIGHTED rather than inventing an ordering."
+        )
+        return None, None
+
+    from src.models.recency import (
+        DEFAULT_HALF_LIFE_DAYS,
+        RecencyWeightError,
+        exponential_recency_weights,
+        recency_weight_report,
+    )
+
+    half_life = float(recency_cfg.get("half_life_days", DEFAULT_HALF_LIFE_DAYS))
+    try:
+        weights = exponential_recency_weights(
+            train["GAME_DATE"], half_life_days=half_life
+        )
+        report = recency_weight_report(train["GAME_DATE"], half_life_days=half_life)
+    except RecencyWeightError as exc:
+        logger.warning(
+            "Market %s: recency weighting refused (%s) — fitting UNWEIGHTED.",
+            market, exc,
+        )
+        return None, None
+
+    report["market"] = market
+    logger.info(
+        "Market %s: recency weights half_life=%.0fd, %d rows -> effective %s "
+        "(%.1f%%), max/min weight %s",
+        market, half_life, int(report["n_rows"]),
+        report["effective_sample_size"], report["effective_fraction"] * 100.0,
+        report["weight_ratio"],
+    )
+    return weights, report
+
+
+def _winner_rank_key(scores: dict[str, Any]) -> tuple[float, float, int, float]:
+    """
+    Sort key for picking a market's winner: Brier, then log loss, then ECE.
+
+    TWO DEFECTS THIS REPLACES, both in `x or 9`:
+
+    1. ``0.0 or 9`` IS 9. A model whose ECE rounded to 0.0000 -- the best
+       possible calibration -- was ranked as though its calibration could not be
+       measured at all. Measured: `0.0 or 9` and `None or 9` both yield 9, so the
+       best and the unmeasurable were indistinguishable.
+
+    2. A GATE FAILURE IS NOT A BAD SCORE. Now that calibration_error comes from
+       the gated implementation, it is None whenever fewer than 80% of the
+       reliability bins are occupied. Collapsing that to 9 would penalise a model
+       for a sparse validation window rather than for being badly calibrated.
+
+    The deliberate rule: models WITH a gated ECE are ordered by it; models
+    without one sort after them. "We could not measure this model's calibration"
+    is not evidence that it is well calibrated, so it does not win a tie -- but
+    it is recorded as a missing measurement rather than as a score of 9.
+    """
+    brier = scores.get("brier_score")
+    log_loss_value = scores.get("log_loss")
+    ece = scores.get("calibration_error")
+    return (
+        float(brier) if brier is not None else float("inf"),
+        float(log_loss_value) if log_loss_value is not None else float("inf"),
+        0 if ece is not None else 1,
+        float(ece) if ece is not None else float("inf"),
+    )
+
+
+def _accepts_sample_weight(fit_callable: Any) -> bool:
+    """Does this component's fit take a ``sample_weight`` keyword?"""
+    try:
+        return "sample_weight" in inspect.signature(fit_callable).parameters
+    except (TypeError, ValueError):  # builtins, C extensions
+        return False
+
+
 def prepare_market_panel(panel: pd.DataFrame, market: str) -> pd.DataFrame:
     labeled = attach_research_over_labels(panel, stat=market)  # type: ignore[arg-type]
     return sort_by_game_date(labeled)
@@ -138,12 +243,16 @@ def build_components(
     if include_xgboost:
         try:
             from src.models.xgb_adapter import XGBoostAdapter
+            from src.models.xgboost_pipeline import split_xgboost_config
 
+            xgb_params, xgb_tuning = split_xgboost_config(cfg.get("xgboost") or {})
             components["xgboost"] = XGBoostAdapter(
                 xgb_cols,
                 target_market=market,
                 feature_schema_version=schema,
                 random_state=seed,
+                model_params=xgb_params or None,
+                tuning=xgb_tuning or None,
             )
         except ImportError as exc:
             logger.warning("XGBoost unavailable: %s", exc)
@@ -178,7 +287,107 @@ def build_components(
             )
         except ImportError as exc:
             logger.warning("CatBoost unavailable: %s", exc)
+
+    # Line-aware wrapper. It does not replace a model — it trains one of the
+    # components above on a frame whose features include the line, so two
+    # different lines on the same player-game genuinely produce two different
+    # probabilities. A line-blind classifier cannot do that by construction.
+    line_cfg = cfg.get("line_aware") or {}
+    if line_cfg.get("enabled"):
+        base_name = str(line_cfg.get("base", "xgboost"))
+        if base_name not in components:
+            logger.warning(
+                "line_aware base %r is not among the built components %s — "
+                "skipping rather than silently wrapping a different model.",
+                base_name, sorted(components),
+            )
+        else:
+            try:
+                from src.models.line_aware import (
+                    DEFAULT_LINE_OFFSETS,
+                    LineAwarePropModel,
+                )
+
+                offsets = tuple(
+                    float(o) for o in (line_cfg.get("offsets") or DEFAULT_LINE_OFFSETS)
+                )
+                # The factory is handed the augmented column list at fit time,
+                # which includes the line features — so the base model is built
+                # to see them rather than retrofitted afterwards.
+                base_cols = xgb_cols if base_name == "xgboost" else feature_cols
+
+                # The inner build must NOT re-enter this block: it would
+                # nest a wrapper inside the wrapper, and fitting it would
+                # recurse. Disable the layer for the inner call explicitly.
+                base_cfg = {**cfg, "line_aware": {"enabled": False}}
+
+                def _base_factory(cols: list[str], _name: str = base_name):
+                    return build_components(
+                        market, cols, base_cfg,
+                        include_catboost=(_name == "catboost"),
+                        include_xgboost=(_name == "xgboost"),
+                        xgb_feature_cols=cols,
+                    )[_name]
+
+                components["line_aware"] = LineAwarePropModel(
+                    _base_factory,
+                    stat=market,
+                    base_feature_cols=base_cols,
+                    offsets=offsets,
+                    max_augmented_rows=line_cfg.get("max_augmented_rows"),
+                )
+            except ImportError as exc:
+                logger.warning("line_aware unavailable: %s", exc)
     return components
+
+
+
+def apply_calibration(preds, p_over, calibrator) -> np.ndarray:
+    """
+    Calibrate P(over) and write the calibrated fields onto ``preds``.
+
+    FIT AND APPLY MUST SPEAK THE SAME PROBABILITY. The calibrator is fitted on
+    out-of-fold values from ``predict_proba_over``, which is the raw classifier
+    P(over) with no push mass removed -- CONDITIONAL on the line not pushing.
+    ``probability_over`` has already had push carved out, as
+    ``(1 - p_push) * p_raw``. Feeding that in handed the calibrator a different
+    quantity than it was fitted on, and scaling the result by ``open_mass``
+    then removed the push mass a SECOND time.
+
+    Not a dormant corner: RESEARCH_LINE is a ten-game rolling mean, so about
+    11% of its values are whole numbers, where the empirical push rate is 0.9%
+    (PTS), 2.0% (REB) and 3.1% (AST).
+
+    So: un-carve to the conditional quantity, calibrate, carve exactly once.
+    Returns the calibrated CONDITIONAL probabilities (NaN where unavailable),
+    which is what the scoring path compares against ``over_hit`` -- that label
+    drops pushes, so it is conditional too.
+    """
+    push_mass = np.array(
+        [float(p.probability_push or 0.0) for p in preds], dtype=float
+    )
+    open_mass = np.clip(1.0 - push_mass, 0.0, 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        conditional = np.where(open_mass > 0, np.asarray(p_over, dtype=float) / open_mass, np.nan)
+    conditional = np.clip(conditional, 0.0, 1.0)
+
+    p_cal = np.full(len(push_mass), np.nan, dtype=float)
+    if calibrator is None:
+        return p_cal
+
+    usable = np.isfinite(conditional)
+    if usable.any():
+        p_cal[usable] = calibrator.transform(conditional[usable])
+    for pred, value, mass in zip(preds, p_cal, open_mass):
+        if np.isfinite(value):
+            # The calibrated number is P(over | not a push); scale it into the
+            # non-push mass. Subtracting push from the calibrated over instead
+            # lets the under go negative whenever isotonic saturates at 1.0 on
+            # a whole line.
+            conditional_over = float(np.clip(value, 0.0, 1.0))
+            pred.probability_over_calibrated = round(conditional_over * mass, 6)
+            pred.probability_under_calibrated = round((1.0 - conditional_over) * mass, 6)
+    return p_cal
 
 
 def fit_calibrator_from_earlier_data(
@@ -190,6 +399,7 @@ def fit_calibrator_from_earlier_data(
     train: pd.DataFrame,
     *,
     calib_fraction: float = 0.3,
+    fitted_model: Any | None = None,
 ) -> tuple[Any | None, dict[str, Any]]:
     """
     Fit a probability calibrator using only data earlier than the evaluation.
@@ -208,6 +418,26 @@ def fit_calibrator_from_earlier_data(
     min_rows = int((cfg.get("calibration") or {}).get("min_oof_rows", 200))
     if len(train) < min_rows:
         return None, {"reason": f"only {len(train)} training rows, need {min_rows}"}
+
+    # FAST PATH: the fitted model already produced out-of-fold probabilities
+    # during its own fit, on the same chronological folds the dispersion
+    # used. Refitting the whole component on a separate 70/30 split both
+    # duplicates that work and disagrees with it — and it showed the
+    # calibrator only the last 30% of the training window.
+    oof = getattr(fitted_model, "oof", None) if fitted_model is not None else None
+    if oof is not None and getattr(oof, "usable", False):
+        y_oof, p_oof = oof.arrays()
+        try:
+            calibrator, scores = choose_calibrator(y_oof, p_oof)
+        except ValueError as exc:
+            return None, {"reason": f"shared out-of-fold calibration failed: {exc}"}
+        return calibrator, {
+            "method": calibrator.method,
+            "source": "shared_out_of_fold",
+            "n_rows": int(len(y_oof)),
+            "scores": scores,
+            **oof.as_metadata(),
+        }
 
     ordered = train.sort_values("GAME_DATE") if "GAME_DATE" in train.columns else train
     cut = int(len(ordered) * (1 - calib_fraction))
@@ -257,6 +487,11 @@ def fit_calibrator_from_earlier_data(
 
     info = {
         "method": calibrator.method,
+        # Name the path. Without this a model that fell back here exported
+        # calibration_source: null, which reads as "no calibration" rather
+        # than "calibrated the slower way" -- and the ensemble falls back
+        # whenever a component's out-of-fold frame describes different rows.
+        "source": "chronological_refit",
         "n_rows": int(ok.sum()),
         "scores": scores,
         "fit_start_date": str(pd.to_datetime(later["GAME_DATE"]).min().date())
@@ -289,6 +524,12 @@ def compare_models_on_panel(
     cfg = cfg or load_comparison_config()
     weights = cfg.get("ensemble_weights") or {}
     summary_rows: list[dict[str, Any]] = []
+    fit_failures: list[dict[str, Any]] = []
+    # Returned rather than only logged: a run whose weighting collapsed the
+    # effective sample size is not distinguishable from an unweighted one by
+    # its metrics alone, and the caller has to be able to see which it was.
+    recency_reports: list[dict[str, Any]] = []
+    ensemble_composition: list[dict[str, Any]] = []
     detail_rows: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
     calib_rows: list[dict[str, Any]] = []
@@ -317,22 +558,111 @@ def compare_models_on_panel(
         train = work.loc[split.train_idx]
         val = work.loc[split.validation_idx]
 
+        # A feature can be present in the panel and still be entirely empty
+        # inside the TRAINING window — the market columns only exist for the
+        # seasons a line feed covered, which here is the validation season and
+        # nothing before it. resolve_feature_cols cannot see this: it runs on
+        # the whole panel, where the column looks partially populated.
+        #
+        # Such a column teaches a model nothing and actively harms one that
+        # drops incomplete rows. Worse, a feature observed only in validation
+        # is exactly the shape of a leak, so it is refused rather than
+        # tolerated.
+        empty_in_train = [
+            c for c in feature_cols
+            if c in train.columns and not train[c].notna().any()
+        ]
+        if empty_in_train:
+            logger.warning(
+                "Market %s: dropping %d feature(s) with NO values in the "
+                "training window %s: %s. They are populated later in the panel, "
+                "so they would be visible only where the model is scored.",
+                market, len(empty_in_train), train_end, empty_in_train,
+            )
+            feature_cols = [c for c in feature_cols if c not in empty_in_train]
+            xgb_cols = [c for c in xgb_cols if c not in empty_in_train]
+            if not xgb_cols:
+                logger.error(
+                    "Market %s has no feature with training-window coverage — "
+                    "skipping.", market,
+                )
+                continue
+
         components = build_components(market, feature_cols, cfg, xgb_feature_cols=xgb_cols)
+        weights_series, recency_report = recency_sample_weights(train, cfg, market)
+        if recency_report is not None:
+            recency_reports.append(recency_report)
+
         fitted: dict[str, Any] = {}
         for name, model in components.items():
             try:
-                model.fit(train, val)
+                # Passed only to components whose fit declares it. Inspected
+                # rather than hardcoded: DistributionPropModel estimates a
+                # dispersion and takes no weights, and a component added later
+                # must not start raising TypeError here.
+                if weights_series is not None and _accepts_sample_weight(model.fit):
+                    model.fit(train, val, sample_weight=weights_series)
+                else:
+                    model.fit(train, val)
                 fitted[name] = model
             except Exception as exc:  # noqa: BLE001
+                # A component that cannot fit is skipped so the run continues,
+                # but it is RECORDED. Skipping silently is how catboost ran at
+                # 0.50 of the configured ensemble weight while contributing
+                # nothing, with no exported artifact saying so.
                 logger.warning("fit failed market=%s model=%s: %s", market, name, exc)
+                fit_failures.append({
+                    "target_market": market,
+                    "model_name": name,
+                    "configured_ensemble_weight": float(weights.get(name, 0.0)),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
 
         if len(fitted) >= 2:
+            component_weights = {k: weights.get(k, 0.0) for k in fitted}
             ens = EnsemblePropModel(
                 {k: fitted[k] for k in fitted},
-                weights={k: weights.get(k, 0.0) for k in fitted},
+                weights=component_weights,
                 target_market=market,
             )
             fitted["ensemble"] = ens
+
+            # What the blend ACTUALLY is, beside what was configured. A
+            # component that failed to fit never reaches component_weights at
+            # all, so it cannot appear in the ensemble's own dropped-models
+            # warning -- its absence is invisible without this record. A
+            # component that fitted but carries no configured weight is
+            # silently excluded too, which is worth seeing.
+            live = {k: v for k, v in component_weights.items() if v > 0}
+            total = sum(live.values())
+            effective = (
+                {k: round(v / total, 6) for k, v in live.items()} if total > 0 else {}
+            )
+            ensemble_composition.append({
+                "target_market": market,
+                "configured": dict(weights),
+                "effective": effective,
+                "failed_to_fit": sorted(
+                    set(weights) - set(fitted) - {"ensemble"}
+                ),
+                "fitted_but_unweighted": sorted(
+                    k for k, v in component_weights.items() if v <= 0
+                ),
+            })
+            unweighted = [k for k, v in component_weights.items() if v <= 0]
+            if unweighted:
+                logger.warning(
+                    "Market %s: %s fitted but carry no ensemble weight, so the "
+                    "blend excludes them. Add them to ensemble_weights or accept "
+                    "that they are model comparisons only.",
+                    market, unweighted,
+                )
+            if effective != {k: round(v / sum(weights.values()), 6)
+                             for k, v in weights.items() if v > 0}:
+                logger.warning(
+                    "Market %s: the ensemble is %s, NOT the configured %s.",
+                    market, effective, dict(weights),
+                )
 
         y_true = val["over_hit"].astype(float).to_numpy()
         actual = pd.to_numeric(val[market], errors="coerce").to_numpy() if market in val.columns else np.full(len(val), np.nan)
@@ -349,26 +679,14 @@ def compare_models_on_panel(
 
             # Calibrate using only data earlier than this evaluation window.
             calibrator, calib_info = fit_calibrator_from_earlier_data(
-                name, market, feature_cols, xgb_cols, cfg, train
+                name, market, feature_cols, xgb_cols, cfg, train,
+                fitted_model=model,
             )
-            p_cal = np.full_like(p_over, np.nan)
+            # Fit and apply must speak the same probability -- see
+            # apply_calibration, which un-carves push mass before transforming
+            # and carves it back exactly once.
+            p_cal = apply_calibration(preds, p_over, calibrator)
             if calibrator is not None:
-                usable = np.isfinite(p_over)
-                if usable.any():
-                    p_cal[usable] = calibrator.transform(p_over[usable])
-                for pred, value in zip(preds, p_cal):
-                    if np.isfinite(value):
-                        # Treat the calibrated number as P(over | not a push) and
-                        # scale it into the non-push mass. Subtracting push from
-                        # the calibrated over instead lets the under go negative
-                        # whenever isotonic saturates at 1.0 on a whole line.
-                        push = float(pred.probability_push or 0.0)
-                        open_mass = max(0.0, 1.0 - push)
-                        conditional_over = float(np.clip(value, 0.0, 1.0))
-                        pred.probability_over_calibrated = round(conditional_over * open_mass, 6)
-                        pred.probability_under_calibrated = round(
-                            (1.0 - conditional_over) * open_mass, 6
-                        )
                 calibration_meta[(market, name)] = calib_info
             else:
                 logger.info(
@@ -392,17 +710,62 @@ def compare_models_on_panel(
                 "brier_score": bin_s.get("brier"),
                 "log_loss": bin_s.get("log_loss"),
                 "calibration_error": None,
+                "calibration_error_ungated": None,
+                "calibration_gate_passed": None,
+                "calibration_bin_coverage": None,
+                # The CALIBRATED counterparts. Without them the comparison
+                # fits a calibrator, applies it to the exported predictions,
+                # and then scores the raw number — so nothing in the harness
+                # could say whether calibration helped or hurt.
+                "brier_score_calibrated": None,
+                "log_loss_calibrated": None,
+                "calibration_error_calibrated": None,
+                "calibration_error_calibrated_ungated": None,
+                "calibration_gate_passed_calibrated": None,
+                "calibration_source": (calib_info or {}).get("source"),
+                "calibration_rows": (calib_info or {}).get("n_rows"),
                 "interval_coverage": None,
                 "notes": "RESEARCH_ONLY; RESEARCH_LINE={stat}_L10; not sportsbook",
             }
-            # Simple ECE proxy from reliability table
+            cal_mask = np.isfinite(p_cal) & np.isfinite(y_true)
+            if cal_mask.sum() >= 20:
+                cal_s = score_binary(y_true[cal_mask], p_cal[cal_mask])
+                row["brier_score_calibrated"] = cal_s.get("brier")
+                row["log_loss_calibrated"] = cal_s.get("log_loss")
+                cal_ece = expected_calibration_error(y_true[cal_mask], p_cal[cal_mask])
+                row["calibration_error_calibrated"] = (
+                    round(cal_ece["ece"], 4) if cal_ece["ece"] is not None else None
+                )
+                row["calibration_error_calibrated_ungated"] = (
+                    round(cal_ece["ece_ungated"], 4)
+                    if cal_ece.get("ece_ungated") is not None else None
+                )
+                row["calibration_gate_passed_calibrated"] = bool(cal_ece["gate_passed"])
+
+            # ECE through the GATED implementation, not the inline proxy this
+            # replaced. The arithmetic is identical -- verified: on a dense
+            # sample both give 0.0179 -- so nothing already measured changes
+            # value. What changes is the sparse case: the proxy computed
+            # 0.0439 from 2 of 10 non-empty bins and reported it as if it
+            # meant something, while prob_calibration.expected_calibration_error
+            # returns None below 80% bin coverage and keeps the number under
+            # ece_ungated. A reliability diagram with two occupied bins is not
+            # a calibration measurement, and this harness's numbers feed model
+            # selection.
             mask = np.isfinite(p_over) & np.isfinite(y_true)
             if mask.sum() >= 20:
-                table = reliability_table(y_true[mask], p_over[mask])
+                raw_ece = expected_calibration_error(y_true[mask], p_over[mask])
+                table = raw_ece["table"]
+                row["calibration_error"] = (
+                    round(raw_ece["ece"], 4) if raw_ece["ece"] is not None else None
+                )
+                row["calibration_error_ungated"] = (
+                    round(raw_ece["ece_ungated"], 4)
+                    if raw_ece.get("ece_ungated") is not None else None
+                )
+                row["calibration_gate_passed"] = bool(raw_ece["gate_passed"])
+                row["calibration_bin_coverage"] = raw_ece["bin_coverage"]
                 if table:
-                    gaps = [abs(t["calibration_gap"]) * t["n_predictions"] for t in table]
-                    ntot = sum(t["n_predictions"] for t in table)
-                    row["calibration_error"] = round(sum(gaps) / max(ntot, 1), 4)
                     for t in table:
                         calib_rows.append(
                             {
@@ -470,7 +833,7 @@ def compare_models_on_panel(
             for n, s in market_scores.items()
             if s.get("brier_score") is not None and n != "ensemble"
         ]
-        ranked.sort(key=lambda t: (t[1]["brier_score"], t[1].get("log_loss") or 9, t[1].get("calibration_error") or 9))
+        ranked.sort(key=lambda t: _winner_rank_key(t[1]))
         if ranked:
             winners[market] = {
                 "winner": ranked[0][0],
@@ -514,4 +877,10 @@ def compare_models_on_panel(
         "edge_buckets": bucket_rows,
         "confidence_verdicts": confidence_rows,
         "winners": winners,
+        # Which components failed to fit, and what the ensemble actually is.
+        # Exported so a run that quietly lost half its configured weight
+        # leaves a record instead of an unremarkable-looking summary row.
+        "fit_failures": fit_failures,
+        "recency_weighting": recency_reports,
+        "ensemble_composition": ensemble_composition,
     }

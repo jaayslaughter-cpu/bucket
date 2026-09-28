@@ -28,35 +28,49 @@ def _setup_logging(verbose: bool = False) -> None:
 
 
 def _load_team_games():
-    """Team-level results for Elo, from the licensed workbook when configured.
+    """Team results and market lines from the licensed workbook.
 
-    Returns None when unavailable — the builder then skips team-strength
-    features and says so, rather than inventing ratings.
+    Returns ``(team_games, market_lines)``, or ``(None, None)`` when the
+    workbook is unavailable — the builder then skips team-strength and
+    market features and says so, rather than inventing ratings or lines.
     """
     import os
 
     path = os.environ.get("BIGDATABALL_XLSX")
     if not path or not Path(path).exists():
+        # Fall back to the documented drop-in location so the workbook works
+        # the moment it is placed there, without a second configuration step.
+        found = sorted(Path("data/external/bigdataball").glob("*.xlsx"))
+        path = str(found[0]) if found else None
+    if not path:
         logger.info(
-            "BIGDATABALL_XLSX unset or missing — no team Elo features this run. "
-            "Point it at the licensed workbook to enable them."
+            "BIGDATABALL_XLSX unset and no workbook in data/external/bigdataball — "
+            "no team Elo or market context this run. Drop the licensed workbook "
+            "there, or point BIGDATABALL_XLSX at it."
         )
-        return None
+        return None, None
     try:
         from src.ingestion.bigdataball import load_bigdataball_workbook
 
-        team_games, _market = load_bigdataball_workbook(path)
-        logger.info("Loaded %d team-game rows for Elo from %s", len(team_games), path)
-        return team_games
+        team_games, market_lines = load_bigdataball_workbook(path)
+        logger.info(
+            "Loaded %d team-game rows and %d market-line rows from %s",
+            len(team_games), len(market_lines), path,
+        )
+        return team_games, market_lines
     except Exception as exc:  # noqa: BLE001 — degrade with a reason, never fake it
-        logger.warning("Could not load team games (%s) — proceeding without Elo", exc)
-        return None
+        logger.warning(
+            "Could not load the workbook (%s) — proceeding without Elo or market "
+            "context", exc,
+        )
+        return None, None
 
 
 def _load_real_or_demo(
     demo: bool,
     seasons: str | None = None,
     season_type: str | None = None,
+    panel_path: str | None = None,
 ):
     """
     Build the feature matrix from real logs, or a synthetic demo panel.
@@ -70,12 +84,33 @@ def _load_real_or_demo(
     from src.features.builder import build_feature_matrix
     from src.models.data_audit import make_demo_panel
 
-    team_games = _load_team_games()
+    # An already-built feature matrix, e.g. from scripts.ingest_training_pack.
+    # Loaded as-is: rebuilding it here would apply a second pass of rolling
+    # features over columns that already carry them.
+    if panel_path:
+        import pandas as pd
+
+        path = Path(panel_path)
+        if not path.exists():
+            logger.error("Panel %s not found. Run scripts.ingest_training_pack first.", path)
+            raise SystemExit(2)
+        panel = pd.read_parquet(path)
+        panel["GAME_DATE"] = pd.to_datetime(panel["GAME_DATE"])
+        logger.info(
+            "Loaded prebuilt panel %s: %d rows x %d cols, %s -> %s",
+            path, len(panel), panel.shape[1],
+            panel["GAME_DATE"].min().date(), panel["GAME_DATE"].max().date(),
+        )
+        return panel, False
+
+    team_games, market_lines = _load_team_games()
 
     if demo:
         logger.warning("DEMO MODE — synthetic panel; do not treat metrics as real")
         raw = make_demo_panel()
-        # Real team ratings must never be joined onto synthetic players.
+        # Real team ratings and real market lines must never be joined onto
+        # synthetic players. The demo teams reuse real NBA abbreviations, so
+        # the join would SUCCEED and produce numbers that mean nothing.
         return build_feature_matrix(raw), True
     try:
         from src.ingestion.boxscores import BoxScoreLoadConfig, load_player_game_logs
@@ -98,7 +133,9 @@ def _load_real_or_demo(
         raw = load_player_game_logs(config)
         if raw is None or raw.empty:
             raise RuntimeError("empty player logs")
-        return build_feature_matrix(raw, team_games=team_games), False
+        return build_feature_matrix(
+            raw, team_games=team_games, market_lines=market_lines,
+        ), False
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Real panel unavailable (%s). Re-run with --demo for wiring tests, "
@@ -183,6 +220,12 @@ def ingest_kaggle(
         None, "--file",
         help="Which file inside the Kaggle dataset to load (required for --dataset)",
     ),
+    team_crosswalk: Optional[str] = typer.Option(
+        None, "--team-crosswalk",
+        help="TeamHistories.csv from the archive. Required for this export: "
+             "it has team ids and nicknames but no abbreviations, and the rest "
+             "of the pipeline joins on codes like LAL.",
+    ),
     describe: bool = typer.Option(
         False, "--describe",
         help="Report the discovered column mapping and exit without writing",
@@ -205,6 +248,7 @@ def ingest_kaggle(
         describe_schema,
         load_from_kagglehub,
         load_local_export,
+        load_team_crosswalk,
         normalize_player_box_scores,
     )
 
@@ -224,8 +268,16 @@ def ingest_kaggle(
         # scripted check cannot read "column not recognised" as success.
         raise SystemExit(0 if report.usable else 3)
 
+    crosswalk = None
+    if team_crosswalk:
+        try:
+            crosswalk = load_team_crosswalk(team_crosswalk)
+        except KaggleNbaError as exc:
+            typer.echo(f"Ingest failed: {exc}", err=True)
+            raise SystemExit(2) from exc
+
     try:
-        panel = normalize_player_box_scores(raw, report)
+        panel = normalize_player_box_scores(raw, report, team_crosswalk=crosswalk)
     except KaggleNbaError as exc:
         typer.echo(f"Ingest failed: {exc}", err=True)
         raise SystemExit(3) from exc
@@ -236,7 +288,12 @@ def ingest_kaggle(
         "first_game_date": str(panel["GAME_DATE"].min().date()),
         "last_game_date": str(panel["GAME_DATE"].max().date()),
         "mapped_columns": report.mapped,
+        "composed_columns": {k: list(v) for k, v in report.composed.items()},
         "missing_optional": report.missing_optional,
+        "regular_season_rows": (
+            int(panel["IS_REGULAR_SEASON"].sum())
+            if "IS_REGULAR_SEASON" in panel.columns else None
+        ),
     }
 
     if persist:
@@ -485,6 +542,10 @@ def compare_models(
         help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
     ),
     season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
+    panel: str = typer.Option(
+        None, "--panel",
+        help="A prebuilt feature matrix (parquet) from scripts.ingest_training_pack.",
+    ),
     verbose: bool = False,
 ) -> None:
     """Chronological comparison across models; writes outputs/ CSVs."""
@@ -493,7 +554,7 @@ def compare_models(
     from src.models.data_audit import audit_player_panel
     from src.models.exports import write_comparison_exports
 
-    panel, is_demo = _load_real_or_demo(demo or False, seasons, season_type)
+    panel, is_demo = _load_real_or_demo(demo or False, seasons, season_type, panel)
     demo = demo or is_demo
     mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
     cfg = load_comparison_config()
@@ -763,6 +824,352 @@ def research_slate(
     )
 
 
+@app.command("decision-board")
+def decision_board_cmd(
+    markets: str = typer.Option("PTS,REB,AST", "--markets"),
+    train_end: str = typer.Option("2025-01-15", "--train-end"),
+    validation_end: str = typer.Option("2025-02-15", "--validation-end"),
+    preferred_model: str = typer.Option("distribution", "--preferred-model"),
+    min_ev: float = typer.Option(
+        0.0, "--min-ev",
+        help="CONSIDER only when VALID two-way book EV clears this (e.g. 0.02)",
+    ),
+    min_lean: float = typer.Option(
+        0.0, "--min-lean",
+        help="For unpriced rows: how far past P=0.50 the model must lean",
+    ),
+    require_valid_book: bool = typer.Option(
+        False, "--require-valid-book",
+        help="Hide model-lean-only rows (no EV without a two-way price)",
+    ),
+    consider_only: bool = typer.Option(
+        False, "--consider-only", help="Drop ABSTAIN rows from the output"
+    ),
+    top_n: Optional[int] = typer.Option(
+        None, "--top-n", help="Keep only the top ranked candidates"
+    ),
+    out: Path = typer.Option(Path("outputs/demo/decision_board.csv"), "--out"),
+    demo: bool = typer.Option(True, help="DEMO panel for wiring"),
+    verbose: bool = False,
+) -> None:
+    """Rank Over and Under so YOU can choose. RESEARCH_ONLY · MANUAL_ONLY.
+
+    Never places a wager, never contacts a book or DFS order API, and never
+    sizes a stake. EV appears only where a source posted genuine two-way
+    American odds — PropLine first, OddsPapi as the fallback. Everything
+    else abstains with a named reason.
+    """
+    _setup_logging(verbose)
+    from src.models.compare import compare_models_on_panel, load_comparison_config
+    from src.quant.decision_board import (
+        BOARD_DISCLAIMER,
+        build_decision_board,
+        decision_board_summary,
+        write_decision_board_csv,
+    )
+    from src.quant.paper_research import research_slate_from_predictions
+    from src.utils.timezones import pacific_calendar_date
+
+    panel, is_demo = _load_real_or_demo(demo)
+    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    result = compare_models_on_panel(
+        panel,
+        markets=mkt,
+        train_end=train_end,
+        validation_end=validation_end,
+        cfg=load_comparison_config(),
+    )
+    slate = str(pacific_calendar_date())
+    slate_rows = research_slate_from_predictions(
+        result.get("predictions") or [],
+        slate_date=slate,
+        preferred_model=preferred_model or None,
+    )
+
+    # No archived PropLine pull exists in this repository yet, so no market
+    # candidates are attached and nothing is priced. Every row therefore
+    # lands on model_lean or unavailable — the truthful state, not a bug.
+    # Once a pull is archived, enrich each row with
+    # decision_board.enrich_row_with_resolved_market(row, candidates), which
+    # applies the PropLine-primary / OddsPapi-fallback precedence.
+    board = build_decision_board(
+        slate_rows,
+        min_ev=min_ev,
+        min_lean=min_lean,
+        require_valid_book=require_valid_book,
+        consider_only=consider_only,
+        top_n=top_n,
+    )
+    n = write_decision_board_csv(board, out)
+
+    summary = decision_board_summary(board)
+    summary.update({
+        "slate_date": slate,
+        "written_rows": n,
+        "out": str(out),
+        "demo": demo or is_demo,
+        "min_ev": min_ev,
+        "require_valid_book": require_valid_book,
+        "next_step": (
+            "Scan CONSIDER rows, place the wager YOURSELF outside PropIQ, then "
+            "log-manual-bet --side <side> --model-prob <P(side you took)>"
+        ),
+        "disclaimer": BOARD_DISCLAIMER,
+    })
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("fit-leg-correlations")
+def fit_leg_correlations_cmd(
+    as_of: str = typer.Option(
+        ..., "--as-of",
+        help="Slate date YYYY-MM-DD. Only games STRICTLY BEFORE it are fitted on.",
+    ),
+    markets: str = typer.Option("PTS,REB,AST", "--markets"),
+    line_suffix: str = typer.Option(
+        "_L10", "--line-suffix",
+        help="Column per market to use as the line, e.g. PTS_L10. The research "
+             "stand-in until real posted lines are archived.",
+    ),
+    min_pairs: int = typer.Option(200, "--min-pairs", help="Per-bucket minimum pairs"),
+    min_games: int = typer.Option(
+        50, "--min-games",
+        help="Per-bucket minimum DISTINCT GAMES. Not redundant with --min-pairs: "
+             "pairs inside one game reuse its outcomes, so 25 leg rows from a "
+             "single game make 2,700 'pairs' out of 25 observations.",
+    ),
+    out: Path = typer.Option(
+        Path("outputs/demo/leg_correlations.csv"), "--out",
+    ),
+    demo: bool = typer.Option(True, help="DEMO panel for wiring"),
+    verbose: bool = False,
+) -> None:
+    """Fit parlay leg correlations from realised games (step 3 of 3).
+
+    evaluate_parlay refuses a same-game ticket without these. Buckets that
+    do not clear --min-pairs AND --min-games are written out marked unusable
+    rather than dropped: "not fitted" is a different statement from
+    "independent".
+
+    --as-of is required and excludes the slate itself. A correlation fitted
+    on the game being predicted leaks into it.
+    """
+    _setup_logging(verbose)
+    from src.quant.leg_correlation import LegCorrelationError, fit_leg_correlations
+
+    panel, is_demo = _load_real_or_demo(demo)
+    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    # The line each leg is graded against. Real posted lines are not archived
+    # yet, so this is the research stand-in ({stat}_L10, a shift-1 prior-ten
+    # mean) and the fitted correlations inherit whatever bias it carries.
+    line_col_for = {m: f"{m}{line_suffix}" for m in mkt}
+    absent = [c for c in line_col_for.values() if c not in panel.columns]
+    if absent:
+        typer.echo(
+            f"DATA_NOT_AVAILABLE: no line columns {absent} in the panel. Pass a "
+            "--line-suffix that exists, or archive real posted lines.",
+            err=True,
+        )
+        raise SystemExit(2)
+    # Both gates are lower bounds a bucket must CLEAR, so a value below 1
+    # disables the gate rather than loosening it: --min-games 0 or -1 lets a
+    # single game's 2,700 reused pairs mark six buckets usable.
+    for name, value in (("--min-pairs", min_pairs), ("--min-games", min_games)):
+        if value < 1:
+            typer.echo(
+                f"{name} must be at least 1, got {value}. A value below 1 turns "
+                "the gate off instead of relaxing it.",
+                err=True,
+            )
+            raise SystemExit(2)
+
+    try:
+        priors = fit_leg_correlations(
+            panel, as_of=as_of, markets=mkt, min_pairs=min_pairs,
+            min_games=min_games, line_col_for=line_col_for,
+        )
+    except LegCorrelationError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    frame = priors.as_frame()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+
+    summary = priors.summary()
+    summary.update({"out": str(out), "demo": demo or is_demo})
+    if is_demo or demo:
+        summary["warning"] = (
+            "Fitted on the SYNTHETIC demo panel. These correlations describe "
+            "generated data, not the NBA."
+        )
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("game-clv")
+def game_clv_cmd(
+    out: Path = typer.Option(Path("outputs/game_clv.csv"), "--out"),
+    taken_col: str = typer.Option(
+        "opening_spread", "--taken-col",
+        help="The price you are measuring FROM (the opener, by default)",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Closing-line value on game spreads, from the licensed workbook.
+
+    CLV asks whether the PRICE was right; EV asks whether the model was.
+    They are reported separately and never summed into a return.
+    """
+    _setup_logging(verbose)
+    from src.features.market_context import MarketContextError, closing_line_value
+
+    _team_games, market_lines = _load_team_games()
+    if market_lines is None or market_lines.empty:
+        typer.echo(
+            "DATA_NOT_AVAILABLE: no market lines. Drop the licensed workbook in "
+            "data/external/bigdataball, or set BIGDATABALL_XLSX.",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    try:
+        clv = closing_line_value(market_lines, taken_col=taken_col)
+    except MarketContextError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    clv.to_csv(out, index=False)
+
+    graded = clv[clv["status"] == "OK"]
+    moves = graded["clv_line_points"]
+    typer.echo(json.dumps({
+        "research_status": "RESEARCH_ONLY",
+        "rows": int(len(clv)),
+        "priced_both_ends": int(len(graded)),
+        "unpriced": int((clv["status"] != "OK").sum()),
+        "mean_move_points": round(float(moves.mean()), 4) if len(graded) else None,
+        "mean_abs_move_points": round(float(moves.abs().mean()), 4) if len(graded) else None,
+        "moved_at_least_1pt": int((moves.abs() >= 1).sum()) if len(graded) else 0,
+        "out": str(out),
+        "note": (
+            "Line CLV on game spreads. Zero-sum across the two sides of a game, "
+            "so a non-zero mean would indicate a parsing error, not an edge. "
+            "Never added into ROI."
+        ),
+    }, indent=2))
+
+
+@app.command("notify-discord")
+def notify_discord_cmd(
+    source: str = typer.Option(
+        "decision-board", "--source",
+        help="decision-board | parlay | abstention",
+    ),
+    board_csv: Path = typer.Option(
+        Path("outputs/demo/decision_board.csv"), "--board-csv",
+        help="Decision board CSV written by the decision-board command",
+    ),
+    ticket_id: Optional[str] = typer.Option(
+        None, "--ticket-id", help="Parlay ticket id from the parlay log"
+    ),
+    store_dir: Path = typer.Option(
+        Path("data/external/parlay_log"), "--store-dir"
+    ),
+    message: Optional[str] = typer.Option(
+        None, "--message", help="Text for --source abstention"
+    ),
+    max_rows: int = typer.Option(10, "--max-rows"),
+    send: bool = typer.Option(
+        False, "--send",
+        help="Actually POST. Without it the payload is printed and nothing is sent.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Post research output to Discord. Dry run unless --send is passed.
+
+    A notification, never a bet instruction: no stake is suggested, claim
+    words are refused, and the research disclaimer rides on every embed.
+    The webhook URL is read from DISCORD_WEBHOOK_URL and is never printed.
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.notify.discord import (
+        DiscordConfig,
+        DiscordDispatchError,
+        build_abstention_embed,
+        build_decision_board_embed,
+        build_parlay_embed,
+        preview_json,
+        send_embeds,
+    )
+
+    config = DiscordConfig(dry_run=not send)
+
+    try:
+        if source == "decision-board":
+            if not board_csv.exists():
+                typer.echo(
+                    f"DATA_NOT_AVAILABLE: {board_csv} missing — run decision-board first",
+                    err=True,
+                )
+                raise SystemExit(2)
+            frame = pd.read_csv(board_csv)
+            rows = [
+                type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
+                for r in frame.to_dict("records")
+            ]
+            slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
+            embeds = [build_decision_board_embed(rows, slate_date=slate, max_rows=max_rows)]
+
+        elif source == "parlay":
+            from src.quant.parlay_log import ParlayLegRecord, ParlayLogStore, ParlayTicketRecord
+
+            store = ParlayLogStore(store_dir)
+            tickets = store.load_tickets()
+            if tickets.empty:
+                typer.echo("DATA_NOT_AVAILABLE: no tickets logged yet", err=True)
+                raise SystemExit(2)
+            row = (
+                tickets[tickets["ticket_id"] == ticket_id]
+                if ticket_id else tickets.tail(1)
+            )
+            if row.empty:
+                typer.echo(f"DATA_NOT_AVAILABLE: ticket {ticket_id} not found", err=True)
+                raise SystemExit(2)
+            ticket = ParlayTicketRecord(**row.iloc[0].dropna().to_dict())
+            legs_frame = store.load_legs()
+            legs = [
+                ParlayLegRecord(**r.dropna().to_dict())
+                for _, r in legs_frame[
+                    legs_frame["ticket_id"] == ticket.ticket_id
+                ].iterrows()
+            ]
+            embeds = [build_parlay_embed(ticket, legs)]
+
+        elif source == "abstention":
+            if not message:
+                typer.echo("DATA_NOT_AVAILABLE: --message is required", err=True)
+                raise SystemExit(2)
+            embeds = [build_abstention_embed(message)]
+
+        else:
+            typer.echo(f"DATA_NOT_AVAILABLE: unknown --source {source!r}", err=True)
+            raise SystemExit(2)
+
+        result = send_embeds(embeds, config=config)
+    except DiscordDispatchError as exc:
+        typer.echo(f"REFUSED: {exc}", err=True)
+        raise SystemExit(3) from exc
+
+    if result.status == "DRY_RUN":
+        typer.echo(preview_json(result))
+    typer.echo(json.dumps(result.as_dict() | {"payload_preview": "omitted"}, indent=2))
+    if result.status in {"FAILED", "REFUSED"}:
+        raise SystemExit(4)
+
+
 @app.command("log-manual-bet")
 def log_manual_bet_cmd(
     game_id: str = typer.Option(..., "--game-id"),
@@ -770,7 +1177,10 @@ def log_manual_bet_cmd(
     line: float = typer.Option(..., "--line"),
     side: str = typer.Option(..., "--side", help="over|under"),
     odds: int = typer.Option(..., "--odds", help="American odds you took"),
-    model_prob: float = typer.Option(..., "--model-prob", help="Model P(over)"),
+    model_prob: float = typer.Option(
+        ..., "--model-prob",
+        help="Model P(THE SIDE YOU TOOK) — P(over) for an over, P(under) for an under",
+    ),
     player_id: Optional[str] = typer.Option(None, "--player-id"),
     player_name: Optional[str] = typer.Option(None, "--player-name"),
     bookmaker: Optional[str] = typer.Option(None, "--bookmaker"),
@@ -787,6 +1197,13 @@ def log_manual_bet_cmd(
     if side_l not in {"over", "under"}:
         typer.echo("DATA_NOT_AVAILABLE: --side must be over|under", err=True)
         raise SystemExit(2)
+    if not 0.0 <= float(model_prob) <= 1.0:
+        typer.echo(
+            f"DATA_NOT_AVAILABLE: --model-prob must be a probability, got {model_prob!r}",
+            err=True,
+        )
+        raise SystemExit(2)
+
     store = HistoricalStore(HistoricalStoreConfig(root=store_dir))
     bet = ManualBetInput(
         game_id=game_id,
@@ -796,7 +1213,7 @@ def log_manual_bet_cmd(
         line=line,
         bet_side=side_l,  # type: ignore[arg-type]
         taken_odds_american=odds,
-        model_prob=model_prob,
+        model_prob=float(model_prob),
         bookmaker=bookmaker,
         unit_stake=unit_stake,
     )
@@ -859,8 +1276,209 @@ def paper_calibration_cmd(
     typer.echo(json.dumps(summary, indent=2, default=str))
 
 
-if __name__ == "__main__":
-    app()
+@app.command("fetch-pbp")
+def fetch_pbp_cmd(
+    panel: str = typer.Option(
+        "data/external/training_pack/panel.parquet", "--panel",
+        help="Panel whose games need event logs.",
+    ),
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
+    out: Path = typer.Option(
+        Path("data/external/training_pack/pbp_fetched.parquet"), "--out"
+    ),
+    limit: int = typer.Option(0, "--limit", help="Fetch at most N games (0 = all)."),
+    pause: float = typer.Option(0.6, "--pause", help="Seconds between games."),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume",
+        help="Skip games already present in --out.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Fetch play-by-play from the NBA CDN for a panel's games.
+
+    Writes the same frame shape the uploaded CSVs carry, so the result feeds
+    src/features/pbp.py unchanged. Completeness is checked against the box
+    score afterwards, exactly as it is for a CSV ingest.
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.ingestion.nba_playbyplay import (
+        PlayByPlayError,
+        fetch_many_playbyplay,
+        game_ids_from_panel,
+    )
+
+    panel_path = Path(panel)
+    if not panel_path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {panel_path} missing", err=True)
+        raise SystemExit(2)
+    frame = pd.read_parquet(panel_path)
+    season_list = (
+        [s.strip() for s in seasons.split(",") if s.strip()] if seasons else None
+    )
+    wanted = game_ids_from_panel(frame, seasons=season_list)
+
+    existing = None
+    if resume and out.exists():
+        existing = pd.read_parquet(out)
+        have = set(existing["gameId"].astype(str))
+        before = len(wanted)
+        wanted = [g for g in wanted if g not in have]
+        logger.info("Resuming: %d of %d game(s) already fetched.", before - len(wanted), before)
+    if limit and limit > 0:
+        wanted = wanted[: int(limit)]
+    if not wanted:
+        typer.echo(json.dumps({"status": "nothing to fetch", "out": str(out)}, indent=2))
+        return
+
+    logger.info("Fetching play-by-play for %d game(s).", len(wanted))
+    try:
+        events, failures = fetch_many_playbyplay(wanted, pause_seconds=pause)
+    except PlayByPlayError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if existing is not None and not existing.empty:
+        events = pd.concat([existing, events], ignore_index=True)
+        events = events.drop_duplicates(subset=["gameId", "actionNumber"], keep="first")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    events.to_parquet(out, index=False)
+
+    summary = {
+        "out": str(out),
+        "games_requested": len(wanted),
+        "games_failed": len(failures),
+        "events_total": int(len(events)),
+        "games_total": int(events["gameId"].nunique()),
+    }
+    try:
+        from src.features.pbp import check_log_completeness, prepare_events
+
+        report = check_log_completeness(prepare_events(events), frame)
+        summary["completeness"] = report["seasons"]
+        summary["seasons_incomplete"] = report["failing"]
+    except Exception as exc:  # noqa: BLE001 — the fetch still succeeded
+        summary["completeness"] = f"not checked: {exc}"
+    if failures:
+        summary["failures"] = failures[:10]
+    typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("fetch-inactives")
+def fetch_inactives_cmd(
+    panel: str = typer.Option(
+        "data/external/training_pack/panel.parquet", "--panel",
+        help="Panel whose games need inactive lists.",
+    ),
+    seasons: str = typer.Option(None, "--seasons", help="Comma-separated, e.g. 2024-25,2025-26"),
+    out: Path = typer.Option(
+        Path("data/external/inactive_players/inactive_players.parquet"), "--out"
+    ),
+    limit: int = typer.Option(0, "--limit", help="Fetch at most N games (0 = all)."),
+    pause: float = typer.Option(0.6, "--pause", help="Seconds between games."),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Skip games already present in --out.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Fetch official pregame inactive lists for a panel's games.
+
+    This is the input src/features/teammate_cascade.py abstains for want of. It
+    tries boxscoresummaryv3 first and falls back to v2: nba_api's own wrapper
+    warns v2 data may be missing for games on or after 2025-04-10, which covers
+    the whole 2025-26 season.
+
+    Requires the optional 'stats' extra (`pip install -e '.[stats]'`) and an
+    environment where stats.nba.com is reachable. Where it is denied at the
+    proxy, this reports DATA_NOT_AVAILABLE rather than writing a partial file
+    that would read as "nobody was injured".
+    """
+    _setup_logging(verbose)
+    import pandas as pd
+
+    from src.ingestion.inactive_players import (
+        InactiveListError,
+        fetch_many_inactive_players,
+        resolve_team_abbreviations,
+    )
+    from src.ingestion.nba_playbyplay import game_ids_from_panel
+
+    panel_path = Path(panel)
+    if not panel_path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {panel_path} missing", err=True)
+        raise SystemExit(2)
+    frame = pd.read_parquet(panel_path)
+    season_list = (
+        [s.strip() for s in seasons.split(",") if s.strip()] if seasons else None
+    )
+    wanted = game_ids_from_panel(frame, seasons=season_list)
+
+    existing = None
+    if resume and out.exists():
+        existing = pd.read_parquet(out)
+        have = set(existing["GAME_ID"].astype(str))
+        before = len(wanted)
+        wanted = [g for g in wanted if g not in have]
+        logger.info(
+            "Resuming: %d of %d game(s) already fetched.", before - len(wanted), before
+        )
+    if limit and limit > 0:
+        wanted = wanted[: int(limit)]
+    if not wanted:
+        typer.echo(json.dumps({"status": "nothing to fetch", "out": str(out)}, indent=2))
+        return
+
+    logger.info("Fetching inactive lists for %d game(s).", len(wanted))
+    try:
+        inactives, failures = fetch_many_inactive_players(wanted, pause_seconds=pause)
+    except InactiveListError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if existing is not None and not existing.empty:
+        inactives = pd.concat([existing, inactives], ignore_index=True)
+        inactives = inactives.drop_duplicates(
+            subset=["GAME_ID", "PLAYER_ID"], keep="first"
+        )
+
+    # Resolve team abbreviations HERE, where nba_api is installed by necessity
+    # (the pull needs it). v3 returns only teamId, and the panel joins on
+    # TEAM_ABBREVIATION, so a cache of raw team ids makes the absence feature
+    # layer abstain on any machine lacking the optional 'stats' extra.
+    #
+    # AFTER the resume concat, not before. Run before it, this resolved only the
+    # rows fetched THIS time: a cache written by an earlier run kept raw ids,
+    # keep="first" preferred those stale rows over a freshly resolved duplicate,
+    # and one unmappable row is enough to make the whole layer abstain. Resolving
+    # the combined frame repairs the older rows as a side effect of any later
+    # resume, and is a no-op on rows that already carry an abbreviation.
+    try:
+        inactives = resolve_team_abbreviations(inactives)
+    except InactiveListError as exc:
+        logger.warning(
+            "Team abbreviations unresolved (%s) — the cache keeps TEAM_ID only and "
+            "the feature layer will need a team map.", exc,
+        )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    inactives.to_parquet(out, index=False)
+
+    summary = {
+        "out": str(out),
+        "games_requested": len(wanted),
+        "games_failed": len(failures),
+        "inactive_rows_total": int(len(inactives)),
+        "games_covered": int(inactives["GAME_ID"].nunique()),
+        "note": (
+            "Pregame announcement, so not leakage for modelling. Read from the "
+            "post-game summary, so a LATE scratch is information a decision "
+            "timed at line-set could not have had."
+        ),
+    }
+    if failures:
+        summary["failures"] = failures[:10]
+    typer.echo(json.dumps(summary, indent=2, default=str))
 
 
 if __name__ == "__main__":

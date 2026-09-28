@@ -278,3 +278,90 @@ def test_exports_carry_no_odds_columns_when_none_were_supplied():
         pytest.skip("no demo exports generated yet")
     for banned in ("american_odds", "over_odds_american", "under_odds_american", "ev_per_dollar"):
         assert banned not in detail.columns
+
+
+# --- cubic review, PR #3: calibration probability representation ------------
+
+
+class _Pred:
+    """Minimal stand-in for ModelPrediction's calibration-relevant fields."""
+
+    def __init__(self, probability_push=None):
+        self.probability_push = probability_push
+        self.probability_over_calibrated = None
+        self.probability_under_calibrated = None
+
+
+class _Identity:
+    """A calibrator that returns exactly what it is given, so any difference
+    between input and output is the carve arithmetic and nothing else."""
+
+    method = "identity"
+
+    def transform(self, p):
+        return np.asarray(p, dtype=float)
+
+
+def test_calibration_removes_push_mass_exactly_once():
+    """The calibrator is fitted on predict_proba_over, which is the raw
+    classifier P(over) with no push carve-out — conditional on no push.
+    probability_over has already had push removed, so feeding it in fed the
+    calibrator a different quantity than it was fitted on AND scaling the
+    output by open_mass removed push a second time.
+    """
+    from src.models.compare import apply_calibration
+
+    p_raw, push = 0.60, 0.10
+    open_mass = 1.0 - push
+    preds = [_Pred(probability_push=push)]
+    # what the model exports: push already carved out
+    p_over = np.array([p_raw * open_mass])
+
+    apply_calibration(preds, p_over, _Identity())
+
+    # With an identity calibrator the calibrated over must come back to the
+    # raw conditional probability scaled by the non-push mass exactly once.
+    assert preds[0].probability_over_calibrated == pytest.approx(p_raw * open_mass, abs=1e-6)
+    # The double carve would have produced p_raw * open_mass**2.
+    assert preds[0].probability_over_calibrated != pytest.approx(
+        p_raw * open_mass**2, abs=1e-6
+    )
+    # over + under must fill the non-push mass, not overshoot or undershoot it.
+    total = (preds[0].probability_over_calibrated
+             + preds[0].probability_under_calibrated)
+    assert total == pytest.approx(open_mass, abs=1e-6)
+
+
+def test_calibration_is_unchanged_when_no_push_is_possible():
+    """A half-point line cannot push, so the fix must be a no-op there — which
+    is why the defect stayed invisible on most rows."""
+    from src.models.compare import apply_calibration
+
+    preds = [_Pred(probability_push=0.0), _Pred(probability_push=None)]
+    p_over = np.array([0.42, 0.73])
+
+    apply_calibration(preds, p_over, _Identity())
+
+    assert preds[0].probability_over_calibrated == pytest.approx(0.42)
+    assert preds[1].probability_over_calibrated == pytest.approx(0.73)
+
+
+def test_calibration_returns_nulls_without_a_calibrator():
+    from src.models.compare import apply_calibration
+
+    preds = [_Pred(probability_push=0.05)]
+    out = apply_calibration(preds, np.array([0.5]), None)
+
+    assert np.isnan(out).all()
+    assert preds[0].probability_over_calibrated is None
+
+
+def test_calibration_survives_a_line_that_is_certain_to_push():
+    """open_mass == 0 must not divide by zero or emit a probability."""
+    from src.models.compare import apply_calibration
+
+    preds = [_Pred(probability_push=1.0)]
+    out = apply_calibration(preds, np.array([0.0]), _Identity())
+
+    assert np.isnan(out).all()
+    assert preds[0].probability_over_calibrated is None

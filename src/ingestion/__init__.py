@@ -24,6 +24,14 @@ from src.ingestion.boxscores import (
     BoxScoreLoadConfig,
     load_player_game_logs,
 )
+from src.ingestion.propline_history import (
+    bets_to_grade_payload,
+    clv_from_closing,
+    describe_resolution_payload,
+    normalize_closing_odds,
+    normalize_clv_grade,
+    plan_history_window,
+)
 
 __all__ = [
     "BasketballReferenceError",
@@ -32,11 +40,17 @@ __all__ = [
     "SR_ATTRIBUTION",
     "SeasonAggregateLeakageError",
     "attach_prior_season_features",
+    "bets_to_grade_payload",
+    "clv_from_closing",
+    "describe_resolution_payload",
     "describe_sr_csv",
     "describe_sr_table",
     "load_bigdataball_workbook",
     "load_player_game_logs",
     "load_team_map",
+    "normalize_closing_odds",
+    "normalize_clv_grade",
+    "plan_history_window",
     "prior_season_features",
     "read_sr_season_csv",
     "season_totals",

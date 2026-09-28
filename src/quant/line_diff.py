@@ -35,9 +35,10 @@ def _book_line_and_odds(
     market: MarketContext | PropMarketSnapshot,
 ) -> tuple[float | None, int | None, int | None]:
     if isinstance(market, PropMarketSnapshot):
-        return market.line, market.over_odds_american, market.under_odds_american
-    # MarketContext stores prop line in ``total`` for prop snapshots
-    return market.total, market.over_odds_american, market.under_odds_american
+        # Prefer ``line``; some older snapshots also populate ``total``.
+        line = market.line if market.line is not None else market.total
+        return line, market.over_odds_american, market.under_odds_american
+    return market.line, market.over_odds_american, market.under_odds_american
 
 
 def _line_adjust_fair_prob(

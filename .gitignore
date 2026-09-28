@@ -41,6 +41,11 @@ data/external/bigdataball/*.xlsx
 !data/external/basketball_reference/README.md
 # Sports Reference CSVs are licensed third-party data - local only.
 data/external/basketball_reference/*.csv
+!data/external/nba_archive/
+!data/external/nba_archive/README.md
+# Kaggle archive exports are large third-party data - local only.
+data/external/nba_archive/**/*.csv
+data/external/nba_archive/**/*.parquet
 data/cache/
 
 # Model comparison exports (keep README + gitkeep only)

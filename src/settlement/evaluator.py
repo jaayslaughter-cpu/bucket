@@ -183,7 +183,12 @@ def settle_prop(
     W/L/P — only ROI abstains.
     """
     line = _to_decimal(predicted_line, "predicted_line")
-    side = Side(predicted_side.upper().strip())
+    try:
+        side = Side(str(predicted_side).upper().strip())
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise SettlementError(
+            f"predicted_side must be OVER/UNDER, got {predicted_side!r}"
+        ) from exc
 
     if did_not_play or player_stats is None:
         return Settlement(
@@ -286,7 +291,12 @@ def compute_clv(
     if closing_line is not None:
         line = _to_decimal(predicted_line, "predicted_line")
         close = _to_decimal(closing_line, "closing_line")
-        side = Side(predicted_side.upper().strip())
+        try:
+            side = Side(str(predicted_side).upper().strip())
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise SettlementError(
+                f"predicted_side must be OVER/UNDER, got {predicted_side!r}"
+            ) from exc
         # Over wants the line to rise after you take it; Under wants it to fall.
         out["clv_line_points"] = (close - line) if side is Side.OVER else (line - close)
 

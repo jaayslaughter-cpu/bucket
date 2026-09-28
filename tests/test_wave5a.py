@@ -151,3 +151,33 @@ def test_pocket_roi_board(tmp_path: Path):
     out = write_pocket_roi_csv(store, tmp_path / "pocket.csv")
     assert Path(out["out"]).exists()
     assert out["rows_written"] >= 1
+
+
+def test_an_all_digit_bet_id_survives_the_csv_round_trip(tmp_path):
+    """uuid4().hex[:16] is all digits about once in 1,100 ids. CSV carries no
+    types, so pandas reads such an id back as an int64 — which fails
+    validation and, worse, makes `df["bet_id"] == bet_id` match nothing, so
+    settling that bet silently changes no row."""
+    from src.quant.historical_store import (
+        BetLifecycleRecord,
+        HistoricalStore,
+        HistoricalStoreConfig,
+    )
+
+    store = HistoricalStore(
+        HistoricalStoreConfig(root=tmp_path, prefer_parquet=False, use_sqlite=False)
+    )
+    record = BetLifecycleRecord(
+        bet_id="1552069807104277",
+        game_id="g1",
+        bet_side="over",
+        taken_odds_american=-110,
+        model_prob=0.55,
+    )
+    store.append(record)
+
+    pending = store.list_pending()
+    assert [r.bet_id for r in pending] == ["1552069807104277"]
+    assert isinstance(store.load_frame()["bet_id"].iloc[0], str)
+    fetched = store.get("1552069807104277")
+    assert fetched is not None and fetched.game_id == "g1"

@@ -38,7 +38,7 @@ from src.quant.contracts import (
 from src.quant.odds_math import (
     american_to_implied_probability,
     american_to_profit_multiple,
-    expected_value_per_unit,
+    expected_value_two_way,
     multiplicative_devig,
 )
 
@@ -191,6 +191,21 @@ class EvEngine:
         )
 
         if model_prob_b is None:
+            # Whole-number lines can carry push mass. Folding that mass into
+            # under via 1-P(over) overstates under EV / mis-calibrates.
+            whole_line = False
+            if line is not None:
+                try:
+                    lf = float(line)
+                    whole_line = math.isfinite(lf) and lf == float(int(lf))
+                except (TypeError, ValueError):
+                    whole_line = False
+            if whole_line:
+                out.reason = (
+                    "model_prob_b required for whole-number lines (push mass); "
+                    "refusing silent 1-P(over) complement"
+                )
+                return out
             model_prob_b = 1.0 - float(model_prob_a)
 
         for name, value in (("model_prob_a", model_prob_a), ("model_prob_b", model_prob_b)):
@@ -199,7 +214,10 @@ class EvEngine:
                 return out
 
         try:
-            fair = multiplicative_devig(int(american_a), int(american_b))
+            aa, ab = int(american_a), int(american_b)
+            if aa == 0 or ab == 0:
+                raise ValueError("American odds of 0 are not a price")
+            fair = multiplicative_devig(aa, ab)
         except (TypeError, ValueError) as exc:
             out.reason = f"Cannot de-vig this market: {exc}"
             return out
@@ -212,18 +230,25 @@ class EvEngine:
                 game_id, total,
             )
 
+        # Each side is paired with the OTHER side's probability as its losing
+        # mass, rather than with its own complement. On a whole-number line
+        # the two differ by the push mass, and the complement form charges
+        # that mass a full stake although a push refunds it — understating
+        # both sides' EV by exactly P(push).
         pairs = (
-            (label_a, int(american_a), float(model_prob_a), fair.fair_prob_a, fair.implied_prob_a),
-            (label_b, int(american_b), float(model_prob_b), fair.fair_prob_b, fair.implied_prob_b),
+            (label_a, int(american_a), float(model_prob_a), float(model_prob_b),
+             fair.fair_prob_a, fair.implied_prob_a),
+            (label_b, int(american_b), float(model_prob_b), float(model_prob_a),
+             fair.fair_prob_b, fair.implied_prob_b),
         )
-        for side, american, model_p, fair_p, implied_p in pairs:
+        for side, american, model_p, lose_p, fair_p, implied_p in pairs:
             out.sides.append(EvSide(
                 side=side,
                 american=american,
                 model_prob=model_p,
                 fair_prob=fair_p,
                 implied_prob=implied_p,
-                ev=expected_value_per_unit(model_p, american),
+                ev=expected_value_two_way(model_p, lose_p, american),
                 # Edge against the DE-VIGGED price, not the posted one.
                 # Measuring against the posted price counts the book's hold
                 # as edge and makes every market look beatable.
@@ -251,6 +276,7 @@ class EvEngine:
         model_prob_over: float,
         *,
         market_type: MarketType = "player_prop",
+        model_prob_under: float | None = None,
     ) -> EvEvaluation:
         """
         Price a posted market, but only after the gate allows it.
@@ -259,6 +285,9 @@ class EvEngine:
         computed at all — pick'em boards, missing odds, absent lines. Going
         around it here would reintroduce exactly the silent-EV path it
         exists to prevent.
+
+        Pass ``model_prob_under`` for whole-number lines so push mass is
+        not silently assigned to under.
         """
         context = (
             market.to_market_context()
@@ -280,6 +309,7 @@ class EvEngine:
             american_a=int(context.over_odds_american),
             american_b=int(context.under_odds_american),
             model_prob_a=float(model_prob_over),
+            model_prob_b=model_prob_under,
             label_a="over", label_b="under",
             line=context.line,
             market_type=market_type,
