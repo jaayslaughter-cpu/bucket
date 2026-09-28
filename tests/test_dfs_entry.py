@@ -514,3 +514,56 @@ def test_the_entry_serialises_every_leg_and_its_reason():
     assert payload["LEGS"][1]["REASON"]
     assert payload["LEGS"][0]["PROBABILITY_SOURCE"] == "SHARP_BENCHMARK"
     assert "ENTRY" not in payload, "an abstaining entry must not carry pricing"
+
+
+# --- the de-vig method travels with the leg -----------------------------
+
+def test_a_leg_records_which_devig_produced_its_probability():
+    """
+    A probability whose method is not recorded cannot be compared with another's.
+    A model-sourced leg records None: no de-vig happened there, and naming a
+    method would suggest a market price was involved.
+    """
+    from src.quant.devig_methods import MULTIPLICATIVE
+
+    benchmarked = resolve_leg_probability(benchmark_leg("l1"))
+    assert benchmarked.devig_method == MULTIPLICATIVE
+    assert benchmarked.as_dict()["DEVIG_METHOD"] == MULTIPLICATIVE
+
+    modelled = resolve_leg_probability(
+        PickemLeg("l2", pickem_row(), model_probability=0.6)
+    )
+    assert modelled.devig_method is None
+
+
+def test_a_leg_can_ask_for_a_different_devig_and_gets_a_different_number():
+    """
+    The choice is worth one to two points on a heavy favourite, which is the
+    same order as the edge such a leg would be claimed on.
+    """
+    from src.quant.devig_methods import SHIN
+
+    default = resolve_leg_probability(benchmark_leg("l1", over=-450, under=340))
+    shin = resolve_leg_probability(
+        PickemLeg(
+            leg_id="l1", market=pickem_row(), side="over",
+            benchmark_over_american=-450, benchmark_under_american=340,
+            benchmark_line=25.5, devig_method=SHIN,
+        )
+    )
+    assert shin.status == LEG_READY
+    assert shin.devig_method == SHIN
+    assert shin.probability > default.probability
+    assert shin.probability - default.probability > 0.01
+
+
+def test_an_unusable_devig_method_abstains_the_leg_rather_than_falling_back():
+    leg = PickemLeg(
+        leg_id="l1", market=pickem_row(), side="over",
+        benchmark_over_american=-130, benchmark_under_american=110,
+        benchmark_line=25.5, devig_method="kelly",
+    )
+    out = resolve_leg_probability(leg)
+    assert out.status == LEG_ABSTAIN
+    assert "de-vigged" in out.reason
+    assert out.probability is None

@@ -443,14 +443,40 @@ def test_an_unknown_side_is_refused():
 
 
 def test_it_reuses_the_single_devig_rather_than_reimplementing_it():
+    """
+    Checked on the NUMBERS, not on a substring. An earlier version of this
+    asserted that "multiplicative_devig" appeared in the source, which a
+    docstring mentioning it would satisfy on its own.
+    """
     import inspect
 
     import src.quant.dfs_payouts as mod
+    from src.quant.odds_math import multiplicative_devig
 
     source = inspect.getsource(mod.benchmark_fair_probability)
-    assert "multiplicative_devig" in source, (
-        "a second de-vig implementation would drift from contracts.devig_two_way"
+    assert "devig_two_way" in source, (
+        "a second de-vig implementation would drift from the single one"
     )
+    for over, under in [(-110, -110), (-130, 110), (-450, 340)]:
+        assert benchmark_fair_probability(over, under) == pytest.approx(
+            multiplicative_devig(over, under).fair_prob_a, abs=1e-12
+        )
+
+
+def test_the_default_devig_method_is_unchanged_by_the_alternatives_existing():
+    """Nothing moves unless a caller asks for another method."""
+    from src.quant.devig_methods import SHIN
+
+    default = benchmark_fair_probability(-300, 240)
+    shin = benchmark_fair_probability(-300, 240, method=SHIN)
+    assert default == pytest.approx(0.7183, abs=5e-5)
+    assert shin > default, "shin should give the favourite more, not less"
+
+
+def test_an_unusable_devig_method_abstains_in_this_modules_own_error_type():
+    """A caller here catches DfsPayoutError; leaking another type would escape it."""
+    with pytest.raises(DfsPayoutError, match="could not be de-vigged"):
+        benchmark_fair_probability(-130, 110, method="kelly")
 
 
 # --- the entry evaluator (the routing the gate now points at) ----------

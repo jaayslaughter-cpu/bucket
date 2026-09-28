@@ -65,7 +65,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from src.quant.odds_math import multiplicative_devig, probability_to_american
+from src.quant.odds_math import probability_to_american
 
 logger = logging.getLogger(__name__)
 
@@ -461,7 +461,11 @@ def structure_from_mapping(payload: dict[str, Any]) -> DfsPayoutStructure:
 # ---------------------------------------------------------------------------
 
 def benchmark_fair_probability(
-    over_american: int, under_american: int, *, side: str = "over"
+    over_american: int,
+    under_american: int,
+    *,
+    side: str = "over",
+    method: str = "multiplicative",
 ) -> float:
     """
     De-vig a SHARP BENCHMARK's two-way prop into a fair probability for one side.
@@ -472,20 +476,33 @@ def benchmark_fair_probability(
     is right to refuse the latter and was wrong only in concluding that EV is
     therefore undefined.
 
-    Delegates to ``odds_math.multiplicative_devig`` so there stays exactly one
-    de-vig in this codebase, and inherits its documented caveat: multiplicative
+    Delegates to ``devig_methods.devig_two_way``, which for the default method
+    delegates in turn to ``odds_math.multiplicative_devig`` -- so there stays
+    exactly one implementation of the default de-vig in this codebase.
+
+    ``method`` defaults to multiplicative and nothing changes unless a caller
+    asks. Its documented caveat still applies at the default: multiplicative
     de-vigging spreads the vig proportionally and will not correct a
-    favourite-longshot skew.
+    favourite-longshot skew. ``devig_methods`` measures what that costs -- under
+    a third of a percentage point on the prices a prop board normally quotes,
+    but one to two points on a heavy favourite, which on such a leg is the same
+    order as the edge being claimed. Use ``devig_methods.method_spread`` to see
+    whether the choice matters on a given price before arguing about it.
 
     THE LINE MUST MATCH. A benchmark priced at 25.5 does not give the fair
     probability of a pick'em leg at 24.5, and substituting one for the other is
     the most likely way to produce a confidently wrong edge. Matching is the
     caller's responsibility; this function cannot see the lines.
     """
+    from src.quant.devig_methods import DevigMethodError, devig_two_way
+
     chosen = str(side).strip().lower()
     if chosen not in {"over", "under"}:
         raise DfsPayoutError(f"side must be 'over' or 'under', got {side!r}")
-    fair = multiplicative_devig(int(over_american), int(under_american))
+    try:
+        fair = devig_two_way(int(over_american), int(under_american), method=method)
+    except DevigMethodError as exc:
+        raise DfsPayoutError(f"benchmark could not be de-vigged: {exc}") from exc
     return float(fair.fair_prob_a if chosen == "over" else fair.fair_prob_b)
 
 

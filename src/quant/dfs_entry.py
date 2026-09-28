@@ -69,6 +69,7 @@ from src.quant.contracts import (
     PropMarketSnapshot,
     market_ev_gate,
 )
+from src.quant.devig_methods import MULTIPLICATIVE
 from src.quant.dfs_payouts import (
     PAYOUT_EV_ABSTAIN,
     DfsPayoutError,
@@ -115,6 +116,12 @@ class PickemLeg:
     benchmark_line: float | None = None
     benchmark_source: str | None = None
     model_probability: float | None = None
+    # Which de-vig to apply to the benchmark pair. The default is the only one
+    # this pipeline used before alternatives existed, so an unset leg behaves
+    # exactly as it did. See src.quant.devig_methods for what the choice is
+    # worth: under a third of a point on a normal prop price, one to two points
+    # on a heavy favourite.
+    devig_method: str = MULTIPLICATIVE
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,9 @@ class LegResolution:
     line: float | None = None
     reason: str | None = None
     benchmark_source: str | None = None
+    # None on a model-sourced leg: no de-vig happened, and recording a method
+    # there would suggest a market price was involved.
+    devig_method: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +151,7 @@ class LegResolution:
             ),
             "PROBABILITY_SOURCE": self.probability_source.value,
             "BENCHMARK_SOURCE": self.benchmark_source,
+            "DEVIG_METHOD": self.devig_method,
             "REASON": self.reason,
         }
 
@@ -259,7 +270,7 @@ def resolve_leg_probability(leg: PickemLeg) -> LegResolution:
             )
         try:
             probability = benchmark_fair_probability(
-                int(over), int(under), side=side
+                int(over), int(under), side=side, method=leg.devig_method,
             )
         except (DfsPayoutError, ValueError, TypeError) as exc:
             return _abstain_leg(leg, f"benchmark could not be de-vigged: {exc}", line)
@@ -271,6 +282,7 @@ def resolve_leg_probability(leg: PickemLeg) -> LegResolution:
             side=side,
             line=float(line),
             benchmark_source=leg.benchmark_source,
+            devig_method=leg.devig_method,
         )
 
     if over is not None or under is not None:
