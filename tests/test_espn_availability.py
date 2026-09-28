@@ -155,17 +155,22 @@ def test_out_and_doubtful_are_withheld_from_a_projection():
         _entry("Doubtful Guy", status="Doubtful", athlete_id="2"),
         _entry("Questionable Guy", status="Questionable", athlete_id="3"),
     ))
-    available, withheld = projected_available(roster, report)
-    assert sorted(p.player_name for p in withheld) == ["Doubtful Guy", "Out Guy"]
-    assert sorted(p.player_name for p in available) == ["Questionable Guy", "Unmentioned Guy"]
+    out = projected_available(roster, report)
+    assert out.status == "OK"
+    assert sorted(p.player_name for p in out.withheld) == ["Doubtful Guy", "Out Guy"]
+    assert sorted(p.player_name for p in out.available) == [
+        "Questionable Guy", "Unmentioned Guy"
+    ]
 
 
 def test_unmentioned_players_stay_in_the_projection():
     """Most of a roster is healthy and absent from an injury feed."""
     roster = [RosterPlayer("Nobody Mentioned", "9", "9", "PF", "Active")]
-    available, withheld = projected_available(roster, parse_injuries(_injuries()))
-    assert [p.player_name for p in available] == ["Nobody Mentioned"]
-    assert withheld == []
+    report = parse_injuries(_injuries(_entry("Someone Else", status="Out")))
+    out = projected_available(roster, report)
+    assert out.status == "OK"
+    assert [p.player_name for p in out.available] == ["Nobody Mentioned"]
+    assert out.withheld == [] and out.unknown == []
 
 
 def test_unavailable_set_is_explicit_and_excludes_questionable():
@@ -180,14 +185,95 @@ def test_unavailable_names_lists_only_the_withheld_statuses():
     assert report.unavailable_names == ["A"]
 
 
-def test_no_availability_multiplier_is_invented():
-    """Ingestion reports status; an effect size is a modelling choice."""
-    import inspect
+def test_no_availability_multiplier_reaches_a_caller():
+    """Ingestion reports status; an effect size is a modelling choice.
 
-    from src.ingestion import espn_availability
+    The earlier version grepped the module source for the literals "0.35",
+    "0.70" and "0.92". That asserted incidental text: any of those could
+    legitimately appear as a timeout, a threshold or a number in prose, and an
+    unrelated edit would red-CI it. This checks the surface a caller actually
+    sees instead.
+    """
+    report = parse_injuries(_injuries(
+        _entry("Q Guy", status="Questionable", athlete_id="1"),
+        _entry("Out Guy", status="Out", athlete_id="2"),
+    ))
 
-    source = inspect.getsource(espn_availability)
-    for forbidden in ("AVAILABILITY_MULT", "avail_mult", "0.35", "0.70", "0.92"):
-        assert forbidden not in source, (
-            f"{forbidden!r} would bury an effect size in an ingestion layer"
+    for row in report.injuries:
+        emitted = row.as_dict()
+        numeric = {
+            k: v for k, v in emitted.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+        assert not numeric, (
+            f"ingestion emitted a numeric field {numeric} — a dampener or "
+            "effect size belongs in the model layer, not here"
         )
+        assert not any(
+            "MULT" in k.upper() or "WEIGHT" in k.upper() or "FACTOR" in k.upper()
+            for k in emitted
+        ), f"an effect-size-shaped key reached a caller: {sorted(emitted)}"
+
+    # and the public surface offers no such helper to reach for
+    import src.ingestion.espn_availability as mod
+
+    exported = [n for n in dir(mod) if not n.startswith("_")]
+    assert not [
+        n for n in exported
+        if "mult" in n.lower() or "dampen" in n.lower()
+    ], f"module exports an availability multiplier: {exported}"
+
+
+def test_a_failed_report_abstains_instead_of_declaring_everyone_healthy():
+    """The inversion this guards: a fetch failure must not mean "all fit".
+
+    projected_available previously folded every uncertainty into `available`,
+    so an empty or failed report returned the whole roster as likely to play.
+    """
+    roster = [
+        RosterPlayer("A", "1", "1", "PG", "Active"),
+        RosterPlayer("B", "2", "2", "SG", "Active"),
+    ]
+    failed = parse_injuries({"injuries": []})
+    assert failed.status == "DATA_NOT_AVAILABLE"
+
+    out = projected_available(roster, failed)
+    assert out.status == "DATA_NOT_AVAILABLE"
+    assert out.available == [], "a failed report produced available players"
+    assert [p.player_name for p in out.unknown] == ["A", "B"]
+    assert any("unknown" in n for n in out.notes)
+
+
+def test_an_unbucketable_status_lands_in_unknown_not_available():
+    roster = [RosterPlayer("Novel", "1", "1", "PG", "Active")]
+    report = parse_injuries(_injuries(
+        _entry("Novel", status="Reconditioning", athlete_id="1"),
+    ))
+    out = projected_available(roster, report)
+    assert [p.player_name for p in out.unknown] == ["Novel"]
+    assert out.available == []
+
+
+def test_matching_prefers_the_athlete_id_over_the_name():
+    """Names collide and get reformatted; ids do not.
+
+    The roster player and the injury row share an id but spell the name
+    differently, so a name-only match would miss the OUT entirely.
+    """
+    roster = [RosterPlayer("C.J. McCollum", "3033", "3", "SG", "Active")]
+    report = parse_injuries(_injuries(
+        _entry("CJ McCollum", status="Out", athlete_id="3033"),
+    ))
+    out = projected_available(roster, report)
+    assert [p.player_name for p in out.withheld] == ["C.J. McCollum"]
+    assert out.available == []
+
+
+def test_a_name_match_is_recorded_when_no_id_is_available():
+    roster = [RosterPlayer("No Id Player", None, "9", "C", "Active")]
+    report = parse_injuries(_injuries(
+        {"athlete": {"displayName": "No Id Player"}, "status": "Out"},
+    ))
+    out = projected_available(roster, report)
+    assert [p.player_name for p in out.withheld] == ["No Id Player"]
+    assert any("matched by name" in n for n in out.notes)

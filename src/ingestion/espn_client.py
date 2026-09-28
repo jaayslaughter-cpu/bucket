@@ -32,7 +32,19 @@ SITE_API_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 CORE_API_BASE = "https://sports.core.api.espn.com"
 WEB_API_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
 
-ENV_SITE_BASE = "PROPIQ_ESPN_BASE_URL"
+# The SITE API ROOT, with no endpoint path. Every ESPN module appends its own
+# path to this (/scoreboard, /summary, /injuries, /teams/{id}/roster), so a
+# mirror or a test override is set once and works for all of them. An earlier
+# revision had espn_schedule read the same variable as a COMPLETE scoreboard
+# URL, so overriding it sent summary and injury requests to paths under that
+# scoreboard endpoint — silently wrong rather than failing.
+ENV_SITE_BASE = "PROPIQ_ESPN_SITE_BASE"
+
+
+def site_url(path: str, config: "EspnConfig | None" = None) -> str:
+    """Join an endpoint path onto the configured site root."""
+    base = (config or EspnConfig()).site_base.rstrip("/")
+    return f"{base}/{path.lstrip('/')}"
 
 
 TOO_MANY_REQUESTS = 429

@@ -37,11 +37,11 @@ from typing import Any
 import requests
 
 from src.ingestion.espn_client import (
-    SITE_API_BASE,
     EspnConfig,
     as_dict,
     as_list,
     get_json,
+    site_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,51 +178,93 @@ def _stats_from_block(names: list[Any], values: list[Any]) -> dict[str, float | 
     return out
 
 
+def _player_groups(payload: dict[str, Any]) -> list[tuple[Any, dict[str, Any]]]:
+    """
+    (fallback team id, player group) pairs, from EITHER documented shape.
+
+    The reference documents two layouts and this module cannot reach the live
+    endpoint to settle which the summary returns:
+
+      docs/response_schemas.md "Game Summary"  boxscore.teams[].players[]
+      docs/response_schemas.md "CDN Game Package"  boxscore: {teams, players}
+
+    Picking one and being wrong yields zero box-score rows on every response,
+    silently. Both are walked instead, and a group reached twice is harmless
+    because ``parse_box_score`` keys output on (athlete id, stat block).
+    """
+    box = as_dict(payload.get("boxscore"))
+    groups: list[tuple[Any, dict[str, Any]]] = []
+
+    # Shape A: players nested inside each team block.
+    for team_block in as_list(box.get("teams")):
+        team_block = as_dict(team_block)
+        team_id = as_dict(team_block.get("team")).get("id")
+        for group in as_list(team_block.get("players")):
+            groups.append((team_id, as_dict(group)))
+
+    # Shape B: players as a sibling of teams, each group carrying its own team.
+    for group in as_list(box.get("players")):
+        group = as_dict(group)
+        groups.append((as_dict(group.get("team")).get("id"), group))
+
+    return groups
+
+
 def parse_box_score(payload: dict[str, Any], event_id: str) -> tuple[list[BoxScoreRow], list[str]]:
-    """Per-player rows from ``boxscore.teams[].players[].statistics[]``."""
+    """Per-player rows from whichever box-score layout the payload uses."""
     rows: list[BoxScoreRow] = []
     notes: list[str] = []
     mismatched = 0
+    seen: set[str] = set()
 
-    for team_block in as_list(as_dict(payload.get("boxscore")).get("teams")):
-        team_block = as_dict(team_block)
-        team_id = as_dict(team_block.get("team")).get("id")
-        for player_block in as_list(team_block.get("players")):
-            player_block = as_dict(player_block)
-            block_team = as_dict(player_block.get("team")).get("id") or team_id
-            for stat_block in as_list(player_block.get("statistics")):
-                stat_block = as_dict(stat_block)
-                names = as_list(stat_block.get("names"))
-                for athlete_entry in as_list(stat_block.get("athletes")):
-                    athlete_entry = as_dict(athlete_entry)
-                    athlete = as_dict(athlete_entry.get("athlete"))
-                    values = as_list(athlete_entry.get("stats"))
-                    dnp = bool(athlete_entry.get("didNotPlay"))
+    for team_id, player_block in _player_groups(payload):
+        block_team = as_dict(player_block.get("team")).get("id") or team_id
+        for stat_block in as_list(player_block.get("statistics")):
+            stat_block = as_dict(stat_block)
+            names = as_list(stat_block.get("names"))
+            for athlete_entry in as_list(stat_block.get("athletes")):
+                athlete_entry = as_dict(athlete_entry)
+                athlete = as_dict(athlete_entry.get("athlete"))
+                values = as_list(athlete_entry.get("stats"))
+                dnp = bool(athlete_entry.get("didNotPlay"))
 
-                    stats: dict[str, float | None] = {}
-                    if values and len(values) != len(names):
-                        # Truncating to the shorter array would shift every
-                        # column after the first divergence.
-                        mismatched += 1
-                        logger.warning(
-                            "espn_game %s: %s has %d stat value(s) against %d "
-                            "header name(s); stats dropped rather than aligned "
-                            "by position.",
-                            event_id, athlete.get("displayName"),
-                            len(values), len(names),
-                        )
-                    elif values:
-                        stats = _stats_from_block(names, values)
+                athlete_id = str(athlete.get("id")) if athlete.get("id") else None
+                if athlete_id is not None:
+                    # Both layouts can reach the same group; an athlete with
+                    # no id cannot be deduped and is kept, since dropping a
+                    # row is worse than repeating one.
+                    if athlete_id in seen:
+                        continue
+                    seen.add(athlete_id)
 
-                    rows.append(BoxScoreRow(
-                        espn_event_id=event_id,
-                        espn_athlete_id=str(athlete.get("id")) if athlete.get("id") else None,
-                        player_name=athlete.get("displayName"),
-                        espn_team_id=str(block_team) if block_team else None,
-                        did_not_play=dnp,
-                        stats=stats,
-                        raw={str(n): str(v) for n, v in zip(names, values, strict=False)},
-                    ))
+                stats: dict[str, float | None] = {}
+                # An empty stats array is legitimate ONLY for a DNP. For a
+                # player who appeared it means the row carries no numbers
+                # while still being counted among those who played, which
+                # would quietly understate everything downstream.
+                if len(values) != len(names) and not (dnp and not values):
+                    # Truncating to the shorter array would shift every
+                    # column after the first divergence.
+                    mismatched += 1
+                    logger.warning(
+                        "espn_game %s: %s has %d stat value(s) against %d "
+                        "header name(s); stats dropped rather than aligned "
+                        "by position.",
+                        event_id, athlete.get("displayName"),
+                        len(values), len(names),
+                    )
+                elif values:
+                    stats = _stats_from_block(names, values)
+
+                rows.append(BoxScoreRow(
+                    espn_event_id=event_id,
+                    espn_athlete_id=athlete_id,
+                    player_name=athlete.get("displayName"),
+                    espn_team_id=str(block_team) if block_team else None,
+                    did_not_play=dnp,
+                    stats=stats,
+                    raw={str(n): str(v) for n, v in zip(names, values, strict=False)},
+                ))
 
     if mismatched:
         notes.append(
@@ -300,7 +342,7 @@ def fetch_summary(
     """
     cfg = config or EspnConfig()
     payload = get_json(
-        f"{cfg.site_base if cfg.site_base != SITE_API_BASE else SITE_API_BASE}{SUMMARY_PATH}",
+        site_url(SUMMARY_PATH, cfg),
         params={"event": str(espn_event_id)},
         config=cfg,
         session=session,

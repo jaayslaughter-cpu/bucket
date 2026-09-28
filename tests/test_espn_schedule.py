@@ -243,9 +243,38 @@ def test_a_retry_that_succeeds_returns_the_payload():
     assert out.status == "OK" and len(out.games) == 1
 
 
-def test_base_url_is_overridable_by_env_not_hardcoded(monkeypatch):
-    monkeypatch.setenv("PROPIQ_ESPN_BASE_URL", "https://mirror.invalid/scoreboard")
-    assert EspnScheduleConfig().base_url == "https://mirror.invalid/scoreboard"
+def test_one_env_var_redirects_every_espn_module_consistently(monkeypatch):
+    """PROPIQ_ESPN_SITE_BASE is a ROOT, and every module appends its own path.
+
+    It previously meant "the complete scoreboard URL" here and "the site root"
+    in espn_client, so overriding it pointed summary and injury requests at
+    paths underneath the scoreboard endpoint — wrong, and silently so.
+    """
+    from src.ingestion.espn_availability import INJURIES_PATH
+    from src.ingestion.espn_client import site_url
+    from src.ingestion.espn_game import SUMMARY_PATH
+
+    monkeypatch.setenv("PROPIQ_ESPN_SITE_BASE", "https://mirror.invalid/nba")
+    assert EspnScheduleConfig().base_url == "https://mirror.invalid/nba/scoreboard"
+    assert site_url(SUMMARY_PATH) == "https://mirror.invalid/nba/summary"
+    assert site_url(INJURIES_PATH) == "https://mirror.invalid/nba/injuries"
+
+
+def test_a_trailing_slash_on_the_root_does_not_double_up(monkeypatch):
+    from src.ingestion.espn_client import site_url
+
+    monkeypatch.setenv("PROPIQ_ESPN_SITE_BASE", "https://mirror.invalid/nba/")
+    assert site_url("/summary") == "https://mirror.invalid/nba/summary"
+
+
+def test_a_malformed_success_is_not_presented_as_an_empty_slate():
+    """A non-object 200 must reach parse_scoreboard's own reason."""
+    session = _Session(_Response(200, None))
+    session._responses = [_Response(200)]
+    session._responses[0]._body = ["not", "an", "object"]
+    out = load_slate(date(2025, 3, 14), session=session)
+    assert out.status == "DATA_NOT_AVAILABLE"
+    assert any("not an object" in n for n in out.notes), out.notes
 
 
 def test_no_api_key_is_read_or_required():

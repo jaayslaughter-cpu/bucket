@@ -34,7 +34,7 @@ from typing import Any, Literal
 
 import requests
 
-from src.ingestion.espn_client import EspnConfig, as_dict, as_list, get_json
+from src.ingestion.espn_client import EspnConfig, as_dict, as_list, get_json, site_url
 
 logger = logging.getLogger(__name__)
 
@@ -239,29 +239,89 @@ def parse_roster(payload: Any) -> list[RosterPlayer]:
     return players
 
 
+@dataclass
+class ProjectedAvailability:
+    """
+    Three buckets, never two. ``status`` says whether this is usable at all.
+
+    An earlier version returned (available, withheld) and folded every
+    uncertainty into ``available``: a report that failed outright, or a player
+    ESPN bucketed DATA_NOT_AVAILABLE, both came back as likely to play. That
+    turns a fetch failure into "the whole roster is healthy", which is the
+    exact inversion of the rule this module is built on.
+    """
+
+    status: str
+    available: list[RosterPlayer] = field(default_factory=list)
+    withheld: list[RosterPlayer] = field(default_factory=list)
+    unknown: list[RosterPlayer] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
 def projected_available(
     roster: list[RosterPlayer], report: AvailabilityReport
-) -> tuple[list[RosterPlayer], list[RosterPlayer]]:
+) -> ProjectedAvailability:
     """
-    (likely available, withheld) — an INFERENCE, not an ESPN lineup.
+    Split a roster into likely available / withheld / unknown. An INFERENCE.
 
-    A player is withheld when ESPN lists them OUT or DOUBTFUL. Everyone else is
-    returned as likely available, INCLUDING players ESPN does not mention,
-    because most of a roster is healthy and absent from an injury feed. That is
-    the opposite default from ``normalize_status``, and deliberately so: silence
-    means "no injury reported", which is not the same as "confirmed fit", so the
-    caller still sees DATA_NOT_AVAILABLE on the status itself.
+    ABSTAINS ENTIRELY when the report is not OK. Without a usable injury feed
+    there is no basis for calling anyone available, so every player lands in
+    ``unknown`` and ``status`` is DATA_NOT_AVAILABLE — a caller that ignores
+    status gets an empty projection rather than a falsely healthy one.
+
+    With a usable report:
+      withheld   ESPN says OUT or DOUBTFUL
+      unknown    ESPN has a row but could not bucket it (DATA_NOT_AVAILABLE)
+      available  everyone else, INCLUDING players ESPN never mentions, because
+                 most of a roster is healthy and absent from an injury feed
+
+    Matching prefers ``espn_athlete_id`` and falls back to a lowercased name.
+    Ids are stable; names collide ("Jaylen Brown"), get reformatted, and change.
     """
-    lookup = report.by_name()
+    if report.status != "OK":
+        return ProjectedAvailability(
+            status="DATA_NOT_AVAILABLE",
+            unknown=list(roster),
+            notes=[
+                f"injury report status is {report.status!r}, so no player can be "
+                "called available; every roster spot is unknown"
+            ],
+        )
+
+    by_id = {r.espn_athlete_id: r for r in report.injuries if r.espn_athlete_id}
+    by_name = report.by_name()
+
     available: list[RosterPlayer] = []
     withheld: list[RosterPlayer] = []
+    unknown: list[RosterPlayer] = []
+    matched_by_name = 0
+
     for player in roster:
-        hit = lookup.get(player.player_name.strip().lower())
-        if hit is not None and hit.status in UNAVAILABLE:
+        hit = by_id.get(player.espn_athlete_id) if player.espn_athlete_id else None
+        if hit is None:
+            hit = by_name.get(player.player_name.strip().lower())
+            if hit is not None:
+                matched_by_name += 1
+
+        if hit is None:
+            available.append(player)            # no injury row at all
+        elif hit.status in UNAVAILABLE:
             withheld.append(player)
+        elif hit.status == "DATA_NOT_AVAILABLE":
+            unknown.append(player)              # listed, but unbucketable
         else:
             available.append(player)
-    return available, withheld
+
+    notes: list[str] = []
+    if matched_by_name:
+        notes.append(
+            f"{matched_by_name} player(s) matched by name because no athlete id "
+            "was available on one side; ids are preferred"
+        )
+    return ProjectedAvailability(
+        status="OK", available=available, withheld=withheld,
+        unknown=unknown, notes=notes,
+    )
 
 
 def fetch_injuries(
@@ -270,7 +330,7 @@ def fetch_injuries(
     """League-wide injury report."""
     cfg = config or EspnConfig()
     payload = get_json(
-        f"{cfg.site_base}{INJURIES_PATH}", config=cfg, session=session
+        site_url(INJURIES_PATH, cfg), config=cfg, session=session
     )
     report = parse_injuries(payload)
     logger.info(
@@ -290,7 +350,7 @@ def fetch_roster(
     """One team's roster, by ESPN team id (not an NBA team id)."""
     cfg = config or EspnConfig()
     payload = get_json(
-        f"{cfg.site_base}{ROSTER_PATH.format(team_id=espn_team_id)}",
+        site_url(ROSTER_PATH.format(team_id=espn_team_id), cfg),
         config=cfg, session=session,
     )
     players = parse_roster(payload)

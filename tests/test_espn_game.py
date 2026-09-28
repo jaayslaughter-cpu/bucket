@@ -247,3 +247,78 @@ def test_transport_failure_raises_rather_than_returning_an_empty_summary():
     )
     with pytest.raises(EspnError, match="unreachable after 2 attempts"):
         fetch_summary("1", config=cfg, session=session)
+
+
+def _summary_players_at_top_level() -> dict:
+    """The CDN-gamepackage layout: players as a SIBLING of teams."""
+    return {
+        "boxscore": {
+            "teams": [{"team": {"id": "9"}, "statistics": []}],
+            "players": [{
+                "team": {"id": "9"},
+                "statistics": [{
+                    "names": NAMES,
+                    "athletes": [{
+                        "athlete": {"id": "3136776", "displayName": "Stephen Curry"},
+                        "didNotPlay": False,
+                        "stats": CURRY,
+                    }],
+                }],
+            }],
+        },
+        "plays": [],
+    }
+
+
+def test_both_documented_box_score_layouts_are_parsed():
+    """The reference documents two shapes and this cannot reach the endpoint.
+
+    docs/response_schemas.md shows boxscore.teams[].players[] under "Game
+    Summary" and boxscore: {teams, players} under "CDN Game Package". Picking
+    one and being wrong yields zero rows on every live response, silently.
+    """
+    nested, _ = parse_box_score(_summary(), "e1")
+    top_level, _ = parse_box_score(_summary_players_at_top_level(), "e1")
+
+    for rows in (nested, top_level):
+        assert len(rows) == 1
+        assert rows[0].player_name == "Stephen Curry"
+        assert rows[0].stats["PTS"] == 32.0
+        assert rows[0].espn_team_id == "9"
+
+
+def test_an_athlete_reached_by_both_layouts_is_not_duplicated():
+    payload = _summary()
+    payload["boxscore"]["players"] = payload["boxscore"]["teams"][0]["players"]
+    rows, _ = parse_box_score(payload, "e1")
+    assert len(rows) == 1, f"the same athlete was emitted {len(rows)} times"
+
+
+def test_empty_stats_on_a_player_who_appeared_is_flagged():
+    """A DNP legitimately has no stats. Someone who played does not."""
+    rows, notes = parse_box_score(
+        _summary(athletes=[{
+            "athlete": {"id": "1", "displayName": "Played But Blank"},
+            "didNotPlay": False,
+            "stats": [],
+        }]),
+        "e1",
+    )
+    assert any("mismatched" in n for n in notes), (
+        "a played row with no stats passed silently and would be counted "
+        "among those who appeared"
+    )
+    assert rows[0].stats == {}
+
+
+def test_a_dnp_with_no_stats_is_still_not_flagged():
+    rows, notes = parse_box_score(
+        _summary(athletes=[{
+            "athlete": {"id": "2", "displayName": "Scratched"},
+            "didNotPlay": True,
+            "stats": [],
+        }]),
+        "e1",
+    )
+    assert notes == [], f"an empty DNP row was wrongly flagged: {notes}"
+    assert rows[0].did_not_play is True

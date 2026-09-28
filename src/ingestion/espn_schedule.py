@@ -39,14 +39,13 @@ only. Treat the first live run as the real test.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
 import requests
 
-from src.ingestion.espn_client import EspnConfig, EspnError, get_json
+from src.ingestion.espn_client import EspnConfig, EspnError, get_json, site_url
 from src.utils.timezones import DISPLAY_TZ_NAME, pacific_calendar_date, to_pacific
 
 logger = logging.getLogger(__name__)
@@ -57,8 +56,6 @@ SCOREBOARD_URL = (
 INJURIES_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 )
-
-ENV_BASE_URL = "PROPIQ_ESPN_BASE_URL"
 
 # ESPN code -> NBA code, for the teams where they differ. Only codes that are
 # genuinely ambiguous are listed; an identity mapping is not an entry. Anything
@@ -101,10 +98,9 @@ class EspnScheduleConfig:
     retry_backoff: float = 2.0
     user_agent: str = "PropIQ-Analytics/research (public ESPN JSON)"
     # Overridable so a test or a mirror can point elsewhere without editing code.
-    base_url: str = field(
-        default_factory=lambda: os.environ.get(ENV_BASE_URL, "").strip()
-        or SCOREBOARD_URL
-    )
+    # Derived from the shared site root so PROPIQ_ESPN_SITE_BASE means the
+    # same thing here as in every other ESPN module.
+    base_url: str = field(default_factory=lambda: site_url("scoreboard"))
 
 
 @dataclass(frozen=True)
@@ -306,7 +302,7 @@ def fetch_scoreboard(
     *,
     config: EspnScheduleConfig | None = None,
     session: requests.Session | None = None,
-) -> dict[str, Any]:
+) -> Any:
     """
     Raw scoreboard payload for a Pacific calendar day. Raises on failure.
 
@@ -329,7 +325,10 @@ def fetch_scoreboard(
         payload = get_json(cfg.base_url, params=params, config=shared, session=session)
     except EspnError as exc:
         raise EspnScheduleError(str(exc)) from exc
-    return payload if isinstance(payload, dict) else {}
+    # Returned unchanged: coercing a non-object to {} would present a malformed
+    # 200 as an empty slate, and parse_scoreboard has a distinct
+    # DATA_NOT_AVAILABLE reason for exactly that case.
+    return payload
 
 
 def load_slate(
