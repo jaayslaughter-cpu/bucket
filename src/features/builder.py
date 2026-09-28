@@ -160,6 +160,12 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
         ("src.features.absences", "attach_absence_features_layer", "absences"),
         ("src.features.teammate_cascade", "attach_teammate_cascade_stub", "teammate_cascade"),
         ("src.features.scoring_efficiency", "attach_box_ts_features", "scoring_efficiency"),
+        # fatigue_load reads TRAVEL_MILES, which attach_team_schedule_features
+        # creates earlier in build_feature_matrix. Registered here rather than
+        # beside attach_fatigue_column deliberately: it emits a FEATURE, not a
+        # haircut, and must not be mistaken for part of the multiplier that
+        # already folds into {stat}_L2.
+        ("src.features.fatigue_load", "attach_fatigue_load_layer", "fatigue_load"),
     ):
         if _module_has(module_path, func_name):
             module = __import__(module_path, fromlist=[func_name])

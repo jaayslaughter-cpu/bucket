@@ -284,3 +284,16 @@ line_aware:
 blowout:
   enabled: false
   spread_threshold: 9.0
+
+# Exponential cumulative fatigue load (src/features/fatigue_load.py).
+# Emits FATIGUE_LOAD_L7 and FATIGUE_LOAD_MIN_L7 as model FEATURES; it does not
+# touch fatigue_multiplier or {stat}_L2. All three parameters are UNFITTED —
+# exactly like the B2B/3-in-4/4-in-5 constants in fatigue_logic.py that this is
+# meant to replace. Fit them with scripts/feature_ab.py before reading meaning
+# into any particular value, and do not quote a coefficient as measured until
+# then.
+fatigue_load:
+  decay_lambda: 0.20   # midpoint of the conventional 0.15-0.25 day-decay range
+  miles_theta: 0.05    # per 1000 flown miles
+  tz_phi: 0.05         # per hour of time-zone change
+  window_days: 7
