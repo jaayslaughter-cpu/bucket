@@ -22,6 +22,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+
 from src.models.oof import chronological_fold_indices
 
 logger = logging.getLogger(__name__)

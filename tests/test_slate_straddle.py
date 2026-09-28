@@ -201,3 +201,48 @@ def test_catboost_pipeline_hands_real_dates_to_the_dispersion_fit(monkeypatch):
     assert calls, "no chronological folds were built at all"
     offenders = [c for c in calls if c["dates_is_none"]]
     assert not offenders, f"dates=None reached the fold helper: {offenders}"
+
+
+def test_undated_rows_are_not_silently_dropped_from_every_fold():
+    """pd.factorize gives NaT the code -1, which matches no date block.
+
+    Rows with a missing or unparseable date therefore appeared in NO fold,
+    while the final fit used them — so cross-validation and the dispersion
+    fit silently trained on a different sample than the model that ships.
+    They now join every fold's TRAIN side and never its validation side: a
+    row with no timestamp cannot be asserted to fall before or after a
+    validation day, so it must not be scored, but there is no reason to
+    withhold it from training.
+    """
+    dated = pd.date_range("2025-01-01", periods=30, freq="D").repeat(10)
+    dates = pd.Series(list(dated) + [pd.NaT] * 25)
+    n = len(dates)
+
+    folds = chronological_fold_indices(n, splits=5, market="PTS", dates=dates)
+    assert folds
+
+    undated = set(np.flatnonzero(pd.isna(dates).to_numpy()))
+    assert len(undated) == 25
+
+    for train_idx, valid_idx in folds:
+        assert undated <= set(train_idx), "undated rows missing from a train fold"
+        assert not (undated & set(valid_idx)), "an undated row was scored"
+
+
+def test_every_row_lands_in_some_fold():
+    """The accounting claim, actually asserted.
+
+    Checking only that folds are non-empty and disjoint would pass for a
+    helper that quietly omits rows from all of them — which is exactly the
+    bug above.
+    """
+    panel = slate_panel()
+    folds = chronological_fold_indices(
+        len(panel), splits=5, market="PTS", dates=panel["GAME_DATE"]
+    )
+    seen: set[int] = set()
+    for train_idx, valid_idx in folds:
+        seen |= set(train_idx) | set(valid_idx)
+    assert seen == set(range(len(panel))), (
+        f"{len(set(range(len(panel))) - seen)} row(s) appear in no fold"
+    )

@@ -164,13 +164,33 @@ def chronological_fold_indices(
         )
         return list(TimeSeriesSplit(n_splits=splits).split(np.arange(n)))
 
+    # factorize gives an unparseable or missing date the code -1, which
+    # matches no date block, so those rows would appear in NO fold while the
+    # final fit used them -- cross-validation and the dispersion fit would
+    # then silently train on a different sample than the model that ships.
+    # They join every fold's TRAIN side and never its validation side: a row
+    # with no timestamp cannot be asserted to fall before or after a
+    # validation day, so it must not be scored, but there is no reason to
+    # withhold it from training. Its OOF prediction stays NaN, which the
+    # callers already treat as "no fold predicted this row".
     positions = np.arange(n)
+    undated = positions[codes < 0]
+    if len(undated):
+        logger.warning(
+            "oof %s: %d of %d row(s) have no parseable date; training on them "
+            "in every fold but never scoring them.",
+            market or "?", len(undated), n,
+        )
+
     folds: list[tuple[np.ndarray, np.ndarray]] = []
     for tr_d, va_d in TimeSeriesSplit(n_splits=splits).split(np.arange(n_dates)):
         tr = positions[np.isin(codes, tr_d)]
         va = positions[np.isin(codes, va_d)]
-        if len(tr) and len(va):
-            folds.append((tr, va))
+        if not len(tr) or not len(va):
+            continue
+        if len(undated):
+            tr = np.union1d(tr, undated)
+        folds.append((tr, va))
     return folds
 
 

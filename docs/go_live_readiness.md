@@ -3,8 +3,10 @@
 RESEARCH_ONLY. Nothing here places or sizes a wager.
 
 Audited against the shadow-live checklist by inspecting the tree, not by
-reading the packs' own status tables. Every FAIL below is backed by a
-command whose output is quoted in the finding.
+reading the packs' own status tables. Each finding cites the file and line
+that establishes it; the FAIL in 3.2 quotes the six `pg_insert` targets it
+rests on. Numbers attributed to a measurement name the panel they came
+from.
 
 ## Verdict
 
@@ -148,8 +150,8 @@ a whole-number line's push mass is unrecoverable after the fact and
    PT-anchored cron first, and Celery only if per-game staggering proves
    necessary in practice.
 
-3. **"Only flag high-probability plays."** `decision_board` already takes
-   `min_ev`, `require_valid_book`, `min_leg_prob` and `consider_only`, and
+3. **"Only flag high-probability plays."** `build_decision_board` already
+   takes `min_ev`, `min_lean`, `require_valid_book` and `consider_only`, and
    by the project's own rule nothing ranks by EV without VALID two-way
    odds and a no-vig fair probability. With boards EMPTY pre-season every
    row abstains, so the threshold currently gates nothing. That is the

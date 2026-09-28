@@ -23,13 +23,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.stats import nbinom, norm, poisson
 
 from src.models.oof import chronological_fold_indices
+
+if TYPE_CHECKING:  # annotation only — this module needs no pandas at runtime
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
