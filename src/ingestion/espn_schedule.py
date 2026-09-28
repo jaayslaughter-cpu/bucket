@@ -40,13 +40,13 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
 import requests
 
+from src.ingestion.espn_client import EspnConfig, EspnError, get_json
 from src.utils.timezones import DISPLAY_TZ_NAME, pacific_calendar_date, to_pacific
 
 logger = logging.getLogger(__name__)
@@ -304,47 +304,26 @@ def fetch_scoreboard(
     """
     Raw scoreboard payload for a Pacific calendar day. Raises on failure.
 
-    Never returns a stub or an empty dict in place of a failed request: a
-    caller must be able to tell "no games today" from "the fetch failed".
+    Transport (retry policy, 4xx handling, raise-rather-than-empty) lives in
+    ``espn_client.get_json`` so the schedule, game and availability modules
+    cannot drift apart on it.
     """
     cfg = config or EspnScheduleConfig()
     params: dict[str, str] = {}
     if slate is not None:
         params["dates"] = slate.strftime("%Y%m%d")
 
-    sess = session or requests.Session()
-    last: Exception | None = None
-    for attempt in range(1, cfg.retry_attempts + 1):
-        try:
-            response = sess.get(
-                cfg.base_url,
-                params=params or None,
-                timeout=cfg.timeout,
-                headers={"Accept": "application/json", "User-Agent": cfg.user_agent},
-            )
-            # A 4xx is not worth retrying — the request itself is wrong.
-            if 400 <= response.status_code < 500:
-                raise EspnScheduleError(
-                    f"ESPN scoreboard returned {response.status_code} for "
-                    f"{cfg.base_url} params={params}; retrying will not help."
-                )
-            response.raise_for_status()
-            return response.json()
-        except EspnScheduleError:
-            raise
-        except (requests.exceptions.RequestException, ValueError) as exc:
-            last = exc
-            if attempt < cfg.retry_attempts:
-                wait = cfg.retry_backoff ** attempt
-                logger.warning(
-                    "espn_schedule: attempt %d/%d failed (%s); retrying in %.1fs",
-                    attempt, cfg.retry_attempts, exc, wait,
-                )
-                time.sleep(wait)
-
-    raise EspnScheduleError(
-        f"ESPN scoreboard unreachable after {cfg.retry_attempts} attempts: {last}"
+    shared = EspnConfig(
+        timeout=cfg.timeout,
+        retry_attempts=cfg.retry_attempts,
+        retry_backoff=cfg.retry_backoff,
+        user_agent=cfg.user_agent,
     )
+    try:
+        payload = get_json(cfg.base_url, params=params, config=shared, session=session)
+    except EspnError as exc:
+        raise EspnScheduleError(str(exc)) from exc
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_slate(

@@ -1,0 +1,103 @@
+"""Shared HTTP for the ESPN public JSON endpoints (RESEARCH_ONLY, NBA only).
+
+One place for the retry policy so the schedule, game and injury modules cannot
+drift apart on it -- the same reason ``nba_playbyplay`` deliberately mirrors
+``boxscores``.
+
+NO CREDENTIALS. These endpoints are public and take none. If a future endpoint
+needs a key it belongs in an env var like ``PROPLINE_API_KEY``, never here.
+
+POLICY, and why each part is deliberate:
+  - a 4xx is NOT retried: the request itself is wrong, so a second identical
+    one wastes a call and hides the cause behind a timeout-shaped error.
+  - a failed fetch RAISES. It never returns an empty dict, because a caller
+    must be able to tell "no games tonight" from "the fetch failed".
+  - the base host is overridable by env var so a test or mirror needs no code
+    edit, and no URL is hardcoded at a call site.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+SITE_API_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+CORE_API_BASE = "https://sports.core.api.espn.com"
+WEB_API_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
+
+ENV_SITE_BASE = "PROPIQ_ESPN_BASE_URL"
+
+
+class EspnError(RuntimeError):
+    """An ESPN fetch failed. Never raised in place of legitimately empty data."""
+
+
+@dataclass(frozen=True)
+class EspnConfig:
+    timeout: int = 30
+    retry_attempts: int = 3
+    retry_backoff: float = 2.0
+    user_agent: str = "PropIQ-Analytics/research (public ESPN JSON)"
+    site_base: str = field(
+        default_factory=lambda: os.environ.get(ENV_SITE_BASE, "").strip() or SITE_API_BASE
+    )
+
+
+def get_json(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    config: EspnConfig | None = None,
+    session: requests.Session | None = None,
+) -> Any:
+    """GET and decode JSON, with retry on transport faults only."""
+    cfg = config or EspnConfig()
+    sess = session or requests.Session()
+    last: Exception | None = None
+
+    for attempt in range(1, cfg.retry_attempts + 1):
+        try:
+            response = sess.get(
+                url,
+                params=params or None,
+                timeout=cfg.timeout,
+                headers={"Accept": "application/json", "User-Agent": cfg.user_agent},
+            )
+            status = getattr(response, "status_code", 200)
+            if 400 <= status < 500:
+                raise EspnError(
+                    f"ESPN returned {status} for {url} params={params}; "
+                    "the request is wrong, so retrying will not help."
+                )
+            response.raise_for_status()
+            return response.json()
+        except EspnError:
+            raise
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            last = exc
+            if attempt < cfg.retry_attempts:
+                wait = cfg.retry_backoff ** attempt
+                logger.warning(
+                    "espn: attempt %d/%d for %s failed (%s); retrying in %.1fs",
+                    attempt, cfg.retry_attempts, url, exc, wait,
+                )
+                time.sleep(wait)
+
+    raise EspnError(f"ESPN unreachable after {cfg.retry_attempts} attempts: {url}: {last}")
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    """``value`` if it is a dict, else {} — for walking payloads defensively."""
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value: Any) -> list[Any]:
+    """``value`` if it is a list, else [] — for walking payloads defensively."""
+    return value if isinstance(value, list) else []
