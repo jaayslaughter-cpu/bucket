@@ -24,6 +24,10 @@ MarketStatus = Literal["VALID", "DATA_NOT_AVAILABLE"]
 GATE_READY = "READY_FOR_EVALUATION"
 GATE_ABSTAIN = "DATA_NOT_AVAILABLE"
 
+# Named route for a pick'em row, so a caller can branch on a constant rather
+# than on the wording of a reason string.
+PICKEM_ENTRY_ROUTE = "PICKEM_ENTRY_EV"
+
 
 @dataclass(frozen=True)
 class MarketContext:
@@ -163,6 +167,7 @@ def market_ev_gate(context: MarketContext) -> dict[str, Any]:
     """
     verdict: dict[str, Any] = {
         "status": GATE_ABSTAIN,
+        "route": None,
         "ev": None,
         "game_id": context.game_id,
         "market": context.market,
@@ -177,13 +182,32 @@ def market_ev_gate(context: MarketContext) -> dict[str, Any]:
         return verdict
 
     # Pick'em first, and unconditionally. Checking odds first would let a
-    # pick'em row that happens to carry two odds fields through the gate,
-    # and a payout multiplier is not a two-way price however it is labelled.
+    # pick'em row that happens to carry two odds fields through the gate, and a
+    # payout multiplier is not a two-way price however it is labelled.
+    #
+    # THIS IS A ROUTING DECISION, NOT A DEAD END, and the earlier wording of
+    # this reason ("EV is undefined here") was wrong. What is undefined is
+    # de-vigging the PICK'EM OPERATOR, which posts no opposing price. Pick'em EV
+    # itself is fully defined once the leg probabilities come from somewhere
+    # else: de-vig a two-way SHARP BENCHMARK for the same player, market and
+    # line, then evaluate the operator's payout matrix against those
+    # probabilities. src.quant.dfs_payouts does exactly that, and the mistake
+    # was concluding from "cannot de-vig this row" that no EV exists.
+    #
+    # The refusal stays because this gate answers one question -- may this ROW
+    # be priced as a two-way market -- and for a pick'em row the answer is still
+    # no. Letting it through would price a payout multiple as if it were a
+    # two-sided quote. The reason now names the path that does apply.
     if context.is_pickem or context.payout_multiplier is not None:
         verdict["reason"] = (
-            "Pick'em board: a payout multiplier is not a two-way price and "
-            "cannot be de-vigged, so EV is undefined here"
+            "Pick'em board: a payout multiplier is not a two-way price, so THIS "
+            "row cannot be de-vigged. Pick'em EV is not undefined -- route the "
+            "entry through src.quant.dfs_payouts.evaluate_pickem_entry with leg "
+            "probabilities de-vigged from a sharp two-way benchmark "
+            "(benchmark_fair_probability), and price the operator's payout "
+            "matrix against those."
         )
+        verdict["route"] = PICKEM_ENTRY_ROUTE
         return verdict
 
     over = _finite_american(context.over_odds_american)

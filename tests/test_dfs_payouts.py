@@ -16,7 +16,11 @@ from src.quant.dfs_payouts import (
     PAYOUT_EV_READY,
     DfsPayoutError,
     DfsPayoutStructure,
+    ProbabilitySource,
+    benchmark_fair_probability,
     evaluate_payout,
+    evaluate_pickem_entry,
+    independent_hit_count_distribution,
     structure_from_mapping,
 )
 from src.quant.parlay import ParlayLeg, hit_count_distribution
@@ -168,12 +172,32 @@ def test_a_negative_cell_abstains():
 
 # --- the honesty properties --------------------------------------------
 
-def test_every_evaluation_carries_the_calibration_caveat():
-    """A positive figure here is the model's claim, not evidence of profit."""
-    out = evaluate_payout(power(2, 3.0), [0.16, 0.48, 0.36])
-    assert "calibration" in out.disclaimer
-    assert "not evidence of profit" in out.disclaimer
-    assert out.as_dict()["DISCLAIMER"] == out.disclaimer
+def test_the_caveat_follows_the_probability_source_not_the_payout():
+    """The caveat is source-specific, which is the whole correction.
+
+    An earlier version asserted "calibration" on EVERY evaluation. That was the
+    overclaim: it is true of a model-sourced figure and false of one whose legs
+    were de-vigged from a sharp benchmark, where the market IS the evidence.
+    """
+    model = evaluate_pickem_entry(
+        power(2, 3.0), [0.6, 0.6], source=ProbabilitySource.MODEL
+    )
+    assert "calibration" in model.disclaimer
+    assert "not evidence of profit" in model.disclaimer
+
+    benchmark = evaluate_pickem_entry(
+        power(2, 3.0), [0.6, 0.6], source=ProbabilitySource.SHARP_BENCHMARK
+    )
+    assert "Market-grounded" in benchmark.disclaimer
+    assert "not evidence of profit" not in benchmark.disclaimer
+
+    mixed = evaluate_pickem_entry(
+        power(2, 3.0), [0.6, 0.6], source=ProbabilitySource.MIXED
+    )
+    assert "weakest leg" in mixed.disclaimer
+
+    assert model.as_dict()["DISCLAIMER"] == model.disclaimer
+    assert model.as_dict()["PROBABILITY_SOURCE"] == "MODEL"
 
 
 def test_the_status_cannot_be_confused_with_a_cleared_market_gate():
@@ -242,3 +266,200 @@ def test_a_non_integer_payout_key_is_an_error_not_a_skipped_tier():
         structure_from_mapping({
             "n_picks": 3, "payouts": {"three": 2.25}, "source": FIXTURE,
         })
+
+
+# --- the per-leg synthetic price (the documented worked example) ---------
+
+def test_per_leg_breakeven_is_the_nth_root_and_agrees_with_the_joint_one():
+    """A 3-leg power play at 6x: 6^(-1/3) = 55.03%, and 0.5503^3 = 1/6."""
+    s3 = power(3, 6.0)
+    per_leg = s3.per_leg_breakeven_probability()
+    assert per_leg == pytest.approx(6 ** (-1 / 3))
+    assert per_leg == pytest.approx(0.550321, abs=1e-6)
+    # consistent with the joint threshold, not an alternative to it
+    assert per_leg ** 3 == pytest.approx(s3.breakeven_joint_probability())
+    assert per_leg ** 3 == pytest.approx(1 / 6)
+
+
+def test_the_synthetic_american_price_matches_the_worked_example():
+    """55.03% -> -122 (unrounded -122.4)."""
+    assert power(3, 6.0).per_leg_synthetic_american() == -122
+
+
+def test_a_flex_has_no_per_leg_breakeven_either():
+    flex = DfsPayoutStructure(3, {3: 2.25, 2: 1.25}, source=FIXTURE)
+    assert flex.per_leg_breakeven_probability() is None
+    assert flex.per_leg_synthetic_american() is None
+
+
+# --- exact Poisson binomial --------------------------------------------
+
+def test_the_exact_distribution_matches_scipy_poisson_binom():
+    from scipy.stats import poisson_binom
+
+    probs = [0.58, 0.61, 0.545, 0.62]
+    mine = independent_hit_count_distribution(probs)
+    theirs = np.array([poisson_binom(probs).pmf(k) for k in range(len(probs) + 1)])
+    assert np.allclose(mine, theirs, atol=1e-12)
+    assert mine.sum() == pytest.approx(1.0)
+
+
+def test_the_exact_distribution_reduces_to_the_binomial_when_legs_are_equal():
+    from math import comb
+
+    p, n = 0.6, 3
+    mine = independent_hit_count_distribution([p] * n)
+    for k in range(n + 1):
+        assert mine[k] == pytest.approx(comb(n, k) * p**k * (1 - p) ** (n - k))
+
+
+def test_the_exact_distribution_agrees_with_the_copula_at_independence():
+    """Same question, two methods: exact has no Monte Carlo error."""
+    from src.quant.parlay import ParlayLeg, hit_count_distribution
+
+    probs = [0.58, 0.61, 0.545]
+    exact = independent_hit_count_distribution(probs)
+    legs = [ParlayLeg(f"l{i}", p, game_id=f"g{i}") for i, p in enumerate(probs)]
+    simulated, _ = hit_count_distribution(legs, n_sims=400_000, seed=7)
+    assert np.allclose(exact, simulated, atol=5e-3)
+
+
+@pytest.mark.parametrize("bad", [[1.5], [-0.1], [float("nan")]])
+def test_a_probability_outside_zero_one_is_refused(bad):
+    with pytest.raises(DfsPayoutError, match="not in"):
+        independent_hit_count_distribution(bad)
+
+
+# --- benchmark de-vig ---------------------------------------------------
+
+def test_the_devig_happens_on_the_benchmark_and_removes_the_hold():
+    """-110/-110 implies 52.38% each; fair is 50/50."""
+    assert benchmark_fair_probability(-110, -110) == pytest.approx(0.5, abs=1e-9)
+    assert benchmark_fair_probability(-110, -110, side="under") == pytest.approx(0.5)
+
+
+def test_an_asymmetric_benchmark_gives_asymmetric_fair_probabilities():
+    over = benchmark_fair_probability(-140, 120, side="over")
+    under = benchmark_fair_probability(-140, 120, side="under")
+    assert over > 0.5 > under
+    assert over + under == pytest.approx(1.0, abs=1e-9)
+
+
+def test_an_unknown_side_is_refused():
+    with pytest.raises(DfsPayoutError, match="over"):
+        benchmark_fair_probability(-110, -110, side="middle")
+
+
+def test_it_reuses_the_single_devig_rather_than_reimplementing_it():
+    import inspect
+
+    import src.quant.dfs_payouts as mod
+
+    source = inspect.getsource(mod.benchmark_fair_probability)
+    assert "multiplicative_devig" in source, (
+        "a second de-vig implementation would drift from contracts.devig_two_way"
+    )
+
+
+# --- the entry evaluator (the routing the gate now points at) ----------
+
+def test_a_benchmark_sourced_entry_is_market_grounded_and_says_so():
+    structure = power(3, 6.0)
+    probs = [
+        benchmark_fair_probability(-130, 110),
+        benchmark_fair_probability(-125, 105),
+        benchmark_fair_probability(-140, 120),
+    ]
+    out = evaluate_pickem_entry(
+        structure, probs, source=ProbabilitySource.SHARP_BENCHMARK
+    )
+    assert out.status == PAYOUT_EV_READY
+    assert out.expected_value == pytest.approx(np.prod(probs) * 6.0 - 1.0, abs=1e-9)
+    assert out.probability_source is ProbabilitySource.SHARP_BENCHMARK
+    assert "Market-grounded" in out.disclaimer
+    assert "calibration" not in out.disclaimer
+
+
+def test_a_model_sourced_entry_carries_the_calibration_caveat_instead():
+    out = evaluate_pickem_entry(
+        power(2, 3.0), [0.6, 0.6], source=ProbabilitySource.MODEL
+    )
+    assert "rests entirely on the model" in out.disclaimer
+    assert out.expected_value == pytest.approx(0.36 * 3.0 - 1.0)
+
+
+def test_an_unrecorded_source_is_flagged_rather_than_assumed():
+    out = evaluate_pickem_entry(power(2, 3.0), [0.6, 0.6])
+    assert out.probability_source is ProbabilitySource.UNSPECIFIED
+    assert "unrecorded" in out.disclaimer
+
+
+def test_the_entry_carries_the_synthetic_per_leg_price():
+    out = evaluate_pickem_entry(
+        power(3, 6.0), [0.6, 0.6, 0.6], source=ProbabilitySource.SHARP_BENCHMARK
+    )
+    assert out.per_leg_breakeven_probability == pytest.approx(0.550321, abs=1e-6)
+    assert out.per_leg_synthetic_american == -122
+
+
+def test_a_leg_count_mismatch_abstains_rather_than_mispricing():
+    out = evaluate_pickem_entry(power(3, 6.0), [0.6, 0.6])
+    assert out.status == PAYOUT_EV_ABSTAIN
+    assert "different products" in out.reason
+
+
+def test_correlation_lowers_ev_relative_to_assuming_independence():
+    """Treating correlated legs as independent overstates a perfect card.
+
+    Negative correlation is the case that matters for the warning in the
+    docstring: with positively correlated same-side legs P(all) RISES, so the
+    danger is the opposite direction — a parlay of legs that are negatively
+    related is overstated by the independence assumption.
+    """
+    structure = power(3, 6.0)
+    probs = [0.6, 0.6, 0.6]
+    independent = evaluate_pickem_entry(structure, probs)
+
+    rho = np.array([[1.0, -0.3, -0.3], [-0.3, 1.0, -0.3], [-0.3, -0.3, 1.0]])
+    correlated = evaluate_pickem_entry(structure, probs, correlation=rho)
+
+    assert correlated.status == PAYOUT_EV_READY
+    assert correlated.probability_all_hit < independent.probability_all_hit
+    assert correlated.expected_value < independent.expected_value
+
+
+def test_a_non_psd_correlation_abstains_with_a_reason():
+    bad = np.array([[1.0, 0.99, -0.99], [0.99, 1.0, 0.99], [-0.99, 0.99, 1.0]])
+    out = evaluate_pickem_entry(power(3, 6.0), [0.6, 0.6, 0.6], correlation=bad)
+    assert out.status == PAYOUT_EV_ABSTAIN
+    assert "refused" in out.reason
+
+
+# --- the gate now routes rather than dead-ending -----------------------
+
+def test_the_gate_names_the_pickem_route_instead_of_calling_ev_undefined():
+    from src.quant.contracts import PICKEM_ENTRY_ROUTE, MarketContext, market_ev_gate
+
+    verdict = market_ev_gate(MarketContext(
+        game_id="g1", status="VALID", is_pickem=True, payout_multiplier=3.0,
+    ))
+    # still refuses to price THIS ROW as a two-way market, which is correct
+    assert verdict["status"] == "DATA_NOT_AVAILABLE"
+    # but no longer claims EV does not exist. Checking for the substring
+    # "undefined" alone is not enough: the new reason contains the phrase
+    # "EV is not undefined", which an earlier version of this assertion
+    # matched and failed on.
+    assert "EV is undefined" not in verdict["reason"]
+    assert "is not undefined" in verdict["reason"]
+    assert "dfs_payouts" in verdict["reason"]
+    assert verdict["route"] == PICKEM_ENTRY_ROUTE
+
+
+def test_a_two_way_row_is_unaffected_and_carries_no_route():
+    from src.quant.contracts import MarketContext, market_ev_gate
+
+    verdict = market_ev_gate(MarketContext(
+        game_id="g1", status="VALID", over_odds_american=-110,
+        under_odds_american=-110, line=25.5,
+    ))
+    assert verdict["route"] is None
