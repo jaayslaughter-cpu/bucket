@@ -156,6 +156,127 @@ def test_an_unpriced_board_says_so_rather_than_looking_empty():
     assert all("No priced market" in f["value"] for f in embed["fields"])
 
 
+# --- DFS entries, and the publication gate in front of them --------------
+
+
+def _dfs_entry(source_label: str = "SHARP_BENCHMARK"):
+    """A priced 2-leg pick'em entry, built through the real routing path."""
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutStructure
+
+    structure = DfsPayoutStructure(
+        2, {2: 3.0}, source="TEST FIXTURE — invented multiple", label="testop:power:2",
+    )
+
+    def row(game_id: str, line: float) -> MarketContext:
+        return MarketContext(
+            game_id=game_id, status="VALID", market="PTS", line=line,
+            payout_multiplier=3.0, is_pickem=True,
+        )
+
+    if source_label == "SHARP_BENCHMARK":
+        legs = [
+            PickemLeg("a", row("g1", 25.5), benchmark_over_american=-130,
+                      benchmark_under_american=110, benchmark_line=25.5,
+                      benchmark_source="fixture book"),
+            PickemLeg("b", row("g2", 7.5), benchmark_over_american=-125,
+                      benchmark_under_american=105, benchmark_line=7.5,
+                      benchmark_source="fixture book"),
+        ]
+    else:
+        legs = [
+            PickemLeg("a", row("g1", 25.5), model_probability=0.62),
+            PickemLeg("b", row("g2", 7.5), model_probability=0.60),
+        ]
+    return route_pickem_entry(structure, legs)
+
+
+def test_a_dfs_entry_states_where_its_probabilities_came_from():
+    from src.notify.discord import build_dfs_entry_embed
+
+    embed = build_dfs_entry_embed(_dfs_entry(), slate_date="2026-09-28")
+    assert "SHARP_BENCHMARK" in embed["description"]
+    assert "Market-grounded" in embed["description"]
+    assert [f["name"].split()[0] for f in embed["fields"]] == ["a", "b"]
+    assert "RESEARCH_ONLY" in embed["footer"]["text"]
+
+
+def test_a_model_sourced_dfs_entry_carries_the_calibration_caveat():
+    from src.notify.discord import build_dfs_entry_embed
+
+    embed = build_dfs_entry_embed(_dfs_entry("MODEL"))
+    assert "MODEL" in embed["description"]
+    assert "calibration" in embed["description"]
+
+
+def test_a_withheld_entry_posts_the_gates_reason_instead_of_the_numbers():
+    """
+    The gate is the point: an ungated model EV reads, in a channel, exactly like
+    a verified one.
+    """
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.publication_gate import calibration_gate
+
+    evaluation = _dfs_entry("MODEL")
+    verdict = calibration_gate(None)          # no calibration evidence at all
+    assert not verdict.allowed
+
+    embed = build_dfs_entry_embed(evaluation, publication=verdict)
+    assert "withheld from publication" in embed["description"]
+    assert "absent evidence is not evidence" in embed["description"]
+    assert embed["fields"] == []
+    # the figures themselves must not survive the refusal
+    assert "EV " not in embed["description"]
+
+
+def test_a_benchmark_sourced_entry_is_published_without_a_model_backtest():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.publication_gate import calibration_gate
+
+    evaluation = _dfs_entry()
+    verdict = calibration_gate(None, probability_source=evaluation.probability_source)
+    assert verdict.allowed
+
+    embed = build_dfs_entry_embed(evaluation, publication=verdict)
+    assert "SHARP_BENCHMARK" in embed["description"]
+    assert embed["fields"], "a published entry must still show its legs"
+
+
+def test_an_abstaining_entry_posts_its_reason_rather_than_an_empty_card():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutStructure
+
+    structure = DfsPayoutStructure(2, {2: 3.0}, source="TEST FIXTURE")
+    legs = [
+        PickemLeg("a", MarketContext(
+            game_id="g1", status="VALID", line=25.5,
+            payout_multiplier=3.0, is_pickem=True,
+        )),
+        PickemLeg("b", MarketContext(
+            game_id="g2", status="VALID", line=7.5,
+            payout_multiplier=3.0, is_pickem=True,
+        )),
+    ]
+    embed = build_dfs_entry_embed(route_pickem_entry(structure, legs))
+    assert "Not priced" in embed["description"]
+    assert "no probability source" in embed["description"]
+
+
+def test_an_advisory_size_on_a_dfs_card_is_labelled_advisory():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.advisory_sizing import recommended_units_binary
+
+    embed = build_dfs_entry_embed(
+        _dfs_entry(), advisory_size=recommended_units_binary(0.40, 3.0),
+    )
+    field = next(f for f in embed["fields"] if f["name"] == "Advisory size")
+    assert "advisory only" in field["value"].lower()
+    assert "does not place or size" in field["value"]
+
+
 # --- sending -------------------------------------------------------------
 
 

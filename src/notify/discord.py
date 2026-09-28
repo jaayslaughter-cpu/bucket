@@ -384,6 +384,104 @@ def build_parlay_embed(ticket: Any, legs: Sequence[Any]) -> dict[str, Any]:
     return _fit_embed(embed)
 
 
+def build_dfs_entry_embed(
+    evaluation: Any,
+    *,
+    publication: Any = None,
+    slate_date: str | None = None,
+    advisory_size: Any = None,
+) -> dict[str, Any]:
+    """
+    One embed for a DFS pick'em entry priced by ``quant.dfs_entry``.
+
+    THE PUBLICATION GATE DECIDES WHAT THIS SHOWS, which is the point of taking
+    it as an argument rather than leaving it to the caller's discipline. When
+    ``publication`` is withheld, the numbers are replaced by the gate's reason:
+    a model-sourced EV whose model has not been shown calibrated is exactly the
+    figure that reads, in a channel, as though it had been. Pass the verdict
+    from ``quant.publication_gate.calibration_gate``; passing None publishes the
+    numbers unguarded and is only right where the caller has already gated.
+
+    Where a probability came from is stated on the face of the embed. A
+    market-grounded entry and a model-grounded one are different claims and look
+    identical once the column headers are gone.
+    """
+    entry = getattr(evaluation, "payout", None)
+    legs = list(getattr(evaluation, "legs", []) or [])
+    status = str(getattr(evaluation, "status", "") or "")
+    source = getattr(evaluation, "probability_source", None)
+    source_label = getattr(source, "value", None) or "UNSPECIFIED"
+    structure = getattr(evaluation, "structure_label", None) or "entry"
+    title = f"DFS entry — {structure}" + (f" · {slate_date}" if slate_date else "")
+
+    if entry is None or status != "PAYOUT_EV_READY":
+        return build_abstention_embed(
+            f"Not priced: {getattr(evaluation, 'reason', None) or 'no reason given'}",
+            title=title,
+        )
+
+    if publication is not None and not getattr(publication, "allowed", False):
+        return build_abstention_embed(
+            "Priced but withheld from publication: "
+            f"{getattr(publication, 'reason', None) or 'no reason given'}",
+            title=title,
+        )
+
+    ev = getattr(entry, "expected_value", None)
+    p_all = getattr(entry, "probability_all_hit", None)
+    breakeven = getattr(entry, "breakeven_joint_probability", None)
+
+    description = [
+        f"**{len(legs)} legs** · model {_prob(p_all)}"
+        + (f" · breakeven {_prob(breakeven)}" if breakeven is not None else "")
+        + f" · EV {_pct(ev)}",
+        f"Probabilities: **{source_label}**",
+    ]
+    disclaimer = getattr(entry, "disclaimer", None)
+    if disclaimer:
+        description.append(str(disclaimer))
+
+    fields: list[dict[str, Any]] = []
+    for leg in legs:
+        fields.append({
+            "name": _clip(
+                f"{getattr(leg, 'leg_id', '?')} "
+                f"{str(getattr(leg, 'side', '') or '').upper()} "
+                f"{getattr(leg, 'line', '—')}",
+                MAX_FIELD_NAME,
+            ),
+            "value": _clip(
+                f"model {_prob(getattr(leg, 'probability', None))} · "
+                f"{getattr(getattr(leg, 'probability_source', None), 'value', '?')}"
+                + (f" · {benchmark}" if (benchmark := getattr(
+                    leg, "benchmark_source", None)) else ""),
+                MAX_FIELD_VALUE,
+            ),
+            "inline": False,
+        })
+
+    if advisory_size is not None:
+        units = getattr(advisory_size, "recommended_units", None)
+        fields.append({
+            "name": "Advisory size",
+            "value": _clip(
+                f"{float(units):g}u (percent of bankroll) — advisory only. "
+                "PropIQ does not place or size wagers, and Kelly is optimal only "
+                "if the probabilities are right.",
+                MAX_FIELD_VALUE,
+            ) if units is not None else "—",
+            "inline": False,
+        })
+
+    return _fit_embed({
+        "title": _clip(title, MAX_TITLE),
+        "description": "\n".join(description),
+        "color": COLOR_CONSIDER,
+        "fields": fields,
+        "footer": {"text": RESEARCH_FOOTER[:MAX_FOOTER]},
+    })
+
+
 def build_abstention_embed(reason: str, *, title: str = "No ticket") -> dict[str, Any]:
     """
     Post the refusal too.

@@ -1060,6 +1060,255 @@ def game_clv_cmd(
     }, indent=2))
 
 
+@app.command("dfs-entry")
+def dfs_entry_cmd(
+    entry: Path = typer.Option(
+        ..., "--entry",
+        help="JSON file describing one pick'em slip (see the docstring).",
+    ),
+    catalog: Path = typer.Option(
+        Path("config/dfs_payouts.yaml"), "--catalog",
+        help="Payout catalogue. No table is hardcoded; this file is the source.",
+    ),
+    structure: Optional[str] = typer.Option(
+        None, "--structure",
+        help="Catalogue key, e.g. underdog:power:3. Overrides the file's own.",
+    ),
+    advisory_sizing: bool = typer.Option(
+        True, "--advisory-sizing/--no-advisory-sizing",
+        help="Include a READ-ONLY recommended_units figure (fractional Kelly).",
+    ),
+    kelly_fraction: float = typer.Option(
+        0.25, "--kelly-fraction", help="Fraction of full Kelly. 0.25 by default.",
+    ),
+    max_units: float = typer.Option(
+        3.0, "--max-units", help="Hard cap on advisory units (percent of bankroll).",
+    ),
+    calibration_report: Optional[Path] = typer.Option(
+        None, "--calibration-report",
+        help="JSON paper-calibration report; required before a MODEL-sourced "
+             "entry may be posted to Discord.",
+    ),
+    discord: bool = typer.Option(
+        False, "--discord", help="Build a Discord embed for this entry.",
+    ),
+    send: bool = typer.Option(
+        False, "--send",
+        help="With --discord, actually POST. Without it the payload is printed.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the evaluation JSON here as well as stdout.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Price ONE DFS pick'em slip against an operator's payout matrix.
+
+    RESEARCH_ONLY · MANUAL_ONLY. Places nothing, contacts no operator, and
+    sizes no stake: any units shown are advisory metadata for a person
+    deciding by hand.
+
+    This is the path src/quant/contracts.py routes a pick'em row to. The gate
+    refuses to price such a row as a two-way market — correctly, since a payout
+    multiplier is not a price — and returns route=PICKEM_ENTRY_EV instead.
+    src/quant/dfs_entry.py reads that route; this command is its entry point.
+
+    The entry file is YOUR record of an operator's board and a benchmark's
+    quotes. Nothing here invents a line, a payout or a price:
+
+      {
+        "structure": "underdog:power:3",
+        "legs": [
+          {"leg_id": "leg1", "game_id": "0022500123", "market": "PTS",
+           "line": 25.5, "side": "over",
+           "payout_multiplier": 6.0,
+           "benchmark_over_american": -130, "benchmark_under_american": 110,
+           "benchmark_line": 25.5, "benchmark_source": "book X close",
+           "model_probability": 0.58}
+        ],
+        "correlation": [[1.0, 0.3], [0.3, 1.0]]
+      }
+
+    A leg's probability comes from the de-vigged two-way BENCHMARK when one is
+    supplied, and only then is the resulting EV a claim about a market
+    disagreement. A benchmark on a different line abstains rather than falling
+    back to the model — half a point is a different contract. With no benchmark
+    at all the model probability is used and the output says so, and that figure
+    inherits the model's calibration error whole.
+
+    Omit "correlation" only for genuinely unrelated legs. Teammate and same-game
+    legs are correlated, and which way ignoring that biases the entry depends on
+    the sign of the correlation.
+
+    PUBLISHING IS GATED SEPARATELY FROM PRICING. The JSON printed here is a
+    diagnostic and always shows its numbers. --discord publishes, and a
+    MODEL-sourced entry is posted only when --calibration-report shows the model
+    recently calibrated on enough graded results; otherwise the embed carries the
+    gate's reason instead of the figure. A benchmark-sourced entry needs no such
+    report — those probabilities are the market's, not the model's.
+    """
+    _setup_logging(verbose)
+    from src.quant.advisory_sizing import recommended_units_for_entry
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutError, load_payout_catalog
+    from src.quant.publication_gate import calibration_gate
+
+    if not entry.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {entry} missing", err=True)
+        raise SystemExit(2)
+    try:
+        payload = json.loads(entry.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        typer.echo(f"ERROR: {entry} is not valid JSON: {exc}", err=True)
+        raise SystemExit(2) from exc
+    if not isinstance(payload, dict):
+        typer.echo(f"ERROR: {entry} must contain a JSON object", err=True)
+        raise SystemExit(2)
+
+    try:
+        structures = load_payout_catalog(catalog)
+    except DfsPayoutError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    key = structure or payload.get("structure")
+    if not key:
+        typer.echo(
+            "ERROR: no payout structure named. Pass --structure or set "
+            f"\"structure\" in {entry}. Known keys: {', '.join(sorted(structures))}",
+            err=True,
+        )
+        raise SystemExit(2)
+    if key not in structures:
+        typer.echo(
+            f"DATA_NOT_AVAILABLE: {key!r} is not in {catalog}. Known keys: "
+            f"{', '.join(sorted(structures))}",
+            err=True,
+        )
+        raise SystemExit(2)
+    payout_structure = structures[key]
+
+    raw_legs = payload.get("legs")
+    if not isinstance(raw_legs, list) or not raw_legs:
+        typer.echo(f"ERROR: {entry} declares no \"legs\"", err=True)
+        raise SystemExit(2)
+
+    legs = []
+    for index, row in enumerate(raw_legs):
+        if not isinstance(row, dict):
+            typer.echo(f"ERROR: leg {index} is not a JSON object", err=True)
+            raise SystemExit(2)
+        leg_id = str(row.get("leg_id") or f"leg{index + 1}")
+        legs.append(PickemLeg(
+            leg_id=leg_id,
+            market=MarketContext(
+                game_id=str(row.get("game_id") or leg_id),
+                # The operator's board is the caller's own record, so a row is
+                # taken as posted unless it says otherwise. The gate still has
+                # to agree it is a pick'em row with a finite line.
+                status=str(row.get("status") or "VALID"),
+                market=row.get("market"),
+                player_name=row.get("player_name"),
+                line=row.get("line"),
+                payout_multiplier=row.get("payout_multiplier"),
+                is_pickem=bool(row.get("is_pickem", True)),
+                source=row.get("source"),
+            ),
+            side=str(row.get("side") or "over"),
+            benchmark_over_american=row.get("benchmark_over_american"),
+            benchmark_under_american=row.get("benchmark_under_american"),
+            benchmark_line=row.get("benchmark_line"),
+            benchmark_source=row.get("benchmark_source"),
+            model_probability=row.get("model_probability"),
+        ))
+
+    correlation = payload.get("correlation")
+    if correlation is not None:
+        import numpy as np
+
+        correlation = np.asarray(correlation, dtype=float)
+
+    evaluation = route_pickem_entry(
+        payout_structure, legs, correlation=correlation
+    )
+    result = evaluation.as_dict()
+    result["RESEARCH_STATUS"] = "RESEARCH_ONLY"
+    result["STRUCTURE_SOURCE"] = payout_structure.source
+    result["CORRELATION_SUPPLIED"] = correlation is not None
+    if correlation is None:
+        result["CORRELATION_NOTE"] = (
+            "No correlation matrix supplied, so the legs were treated as "
+            "independent. For related legs that biases the entry, in whichever "
+            "direction the correlation runs."
+        )
+
+    size = None
+    if advisory_sizing and evaluation.payout is not None:
+        size = recommended_units_for_entry(
+            evaluation.payout,
+            payout_structure.payout_multiples(),
+            kelly_fraction=kelly_fraction,
+            max_cap_units=max_units,
+        )
+        result["ADVISORY_SIZE"] = size.as_dict()
+        result["ADVISORY_SIZE"]["NOTE"] = (
+            "Advisory only, in percent of bankroll. Nothing here places or "
+            "sizes a wager, and Kelly is optimal only if the probabilities are "
+            "right — on a MODEL-sourced entry it compounds calibration error."
+        )
+
+    calibration: dict | None = None
+    if calibration_report is not None:
+        if not calibration_report.exists():
+            typer.echo(
+                f"DATA_NOT_AVAILABLE: {calibration_report} missing", err=True
+            )
+            raise SystemExit(2)
+        try:
+            calibration = json.loads(calibration_report.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            typer.echo(
+                f"ERROR: {calibration_report} is not valid JSON: {exc}", err=True
+            )
+            raise SystemExit(2) from exc
+
+    publication = calibration_gate(
+        calibration, probability_source=evaluation.probability_source
+    )
+    result["PUBLICATION"] = publication.as_dict()
+
+    if discord:
+        from src.notify.discord import (
+            DiscordConfig,
+            DiscordDispatchError,
+            build_dfs_entry_embed,
+            preview_json,
+            send_embeds,
+        )
+
+        embed = build_dfs_entry_embed(
+            evaluation,
+            publication=publication,
+            advisory_size=size if publication.allowed else None,
+        )
+        try:
+            dispatch = send_embeds([embed], config=DiscordConfig(dry_run=not send))
+        except DiscordDispatchError as exc:
+            typer.echo(f"REFUSED: {exc}", err=True)
+            raise SystemExit(4) from exc
+        result["DISCORD"] = dispatch.as_dict() | {"payload_preview": "omitted"}
+        if dispatch.status == "DRY_RUN":
+            typer.echo(preview_json(dispatch))
+
+    rendered = json.dumps(result, indent=2, default=str)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
+    typer.echo(rendered)
+    if evaluation.status != "PAYOUT_EV_READY":
+        raise SystemExit(3)
+
+
 @app.command("notify-discord")
 def notify_discord_cmd(
     source: str = typer.Option(

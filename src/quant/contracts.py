@@ -6,8 +6,15 @@ compute one". Every refusal returns a named reason.
 
 EV for a two-way prop requires genuine two-way American odds. A pick'em
 board publishes a payout multiplier instead, which is not a price and
-cannot be de-vigged, so those rows abstain by design rather than by
+cannot be de-vigged, so those rows abstain HERE by design rather than by
 accident.
+
+Abstaining here is not the end of the road, and an earlier version of this
+docstring left it sounding like one. A pick'em row is ROUTED: the verdict
+carries ``route = PICKEM_ENTRY_ROUTE``, and ``src.quant.dfs_entry`` reads
+that field, de-vigs a sharp two-way benchmark for the same contract, and
+prices the operator's payout matrix against it. What is undefined is
+de-vigging the operator; pick'em EV itself is not.
 """
 
 from __future__ import annotations

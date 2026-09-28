@@ -51,6 +51,29 @@ def test_fewer_than_two_picks_is_not_a_parlay(n):
         DfsPayoutStructure(n, {2: 3.0}, source=FIXTURE)
 
 
+def test_the_payout_table_cannot_be_mutated_after_validation():
+    """
+    ``frozen=True`` freezes the attribute, not the dict behind it.
+
+    Without the defensive copy the caller keeps a live reference and can add a
+    tier the validation never saw — here a 5-hit tier on a 3-pick card, which
+    ``payout_for`` would then happily pay.
+    """
+    raw = {3: 2.25, 2: 1.25}
+    structure = DfsPayoutStructure(3, raw, source=FIXTURE)
+
+    raw[5] = 100.0
+    assert structure.payout_for(5) == 0.0, "the structure tracked the caller's dict"
+
+    with pytest.raises(TypeError):
+        structure.payouts[5] = 100.0  # type: ignore[index]
+
+
+def test_a_non_mapping_payout_table_is_refused():
+    with pytest.raises(DfsPayoutError, match="mapping"):
+        DfsPayoutStructure(2, [3.0, 1.0], source=FIXTURE)  # type: ignore[arg-type]
+
+
 def test_a_negative_payout_is_refused():
     with pytest.raises(DfsPayoutError, match="not a payout"):
         DfsPayoutStructure(2, {2: 3.0, 1: -1.0}, source=FIXTURE)
@@ -136,7 +159,7 @@ def test_a_missing_hit_tier_pays_nothing_rather_than_raising():
 
 
 def test_ev_is_exactly_zero_at_the_breakeven_probability():
-    probs = [0.0, 0.0, 1 / 3, 2 / 3]
+    # P(3 of 3) = 1/3 is the breakeven for a 3.0x power play.
     probs = [0.0, 0.0, 1 - 1 / 3, 1 / 3]
     out = evaluate_payout(power(3, 3.0), probs)
     assert out.expected_value == pytest.approx(0.0, abs=1e-12)
@@ -262,9 +285,51 @@ def test_string_keys_from_yaml_are_coerced():
 
 def test_a_non_integer_payout_key_is_an_error_not_a_skipped_tier():
     """Dropping a tier silently would misprice every ticket using it."""
-    with pytest.raises(DfsPayoutError, match="not a hit count"):
+    with pytest.raises(DfsPayoutError, match="not a whole number"):
         structure_from_mapping({
             "n_picks": 3, "payouts": {"three": 2.25}, "source": FIXTURE,
+        })
+
+
+def test_a_fractional_payout_key_is_refused_rather_than_truncated():
+    """
+    ``int(2.9)`` is 2, which is a REAL tier on a 3-pick card.
+
+    Truncation files the 2.9 multiple under 2 hits and leaves no trace, so every
+    ticket built on the structure is mispriced by whatever the two tiers differ
+    by.
+    """
+    with pytest.raises(DfsPayoutError, match="not a whole number"):
+        structure_from_mapping({
+            "n_picks": 3, "payouts": {3: 2.25, 2.9: 1.25}, "source": FIXTURE,
+        })
+
+
+def test_a_fractional_pick_count_is_refused_rather_than_truncated():
+    with pytest.raises(DfsPayoutError, match="not a whole number"):
+        structure_from_mapping({
+            "n_picks": 3.7, "payouts": {3: 2.25}, "source": FIXTURE,
+        })
+
+
+def test_a_null_source_in_config_is_not_the_string_None():
+    """``str(None)`` is 'None', which is non-empty and would pass the check."""
+    with pytest.raises(DfsPayoutError, match="source is missing"):
+        structure_from_mapping({
+            "n_picks": 2, "payouts": {2: 3.0}, "source": None,
+        })
+
+
+def test_a_missing_source_key_is_refused():
+    with pytest.raises(DfsPayoutError, match="source is missing"):
+        structure_from_mapping({"n_picks": 2, "payouts": {2: 3.0}})
+
+
+def test_a_repeated_hit_count_across_key_types_is_refused():
+    """{3: ..., "3": ...} would keep one multiple and discard the other."""
+    with pytest.raises(DfsPayoutError, match="repeats hit count"):
+        structure_from_mapping({
+            "n_picks": 3, "payouts": {3: 2.25, "3": 9.9}, "source": FIXTURE,
         })
 
 
@@ -294,14 +359,41 @@ def test_a_flex_has_no_per_leg_breakeven_either():
 
 # --- exact Poisson binomial --------------------------------------------
 
+def test_the_exact_distribution_matches_brute_force_enumeration():
+    """
+    The reference that always runs: sum the probability of every outcome.
+
+    2**4 = 16 subsets, so the whole distribution is enumerable exactly. This
+    replaces ``scipy.stats.poisson_binom`` as the primary check because that
+    function only landed in scipy 1.15 and this project supports 1.11+ — the
+    cross-check against it is kept below, skipped where it does not exist.
+    """
+    from itertools import product
+
+    probs = [0.58, 0.61, 0.545, 0.62]
+    expected = np.zeros(len(probs) + 1)
+    for outcome in product([0, 1], repeat=len(probs)):
+        mass = 1.0
+        for hit, prob in zip(outcome, probs):
+            mass *= prob if hit else 1.0 - prob
+        expected[sum(outcome)] += mass
+
+    mine = independent_hit_count_distribution(probs)
+    assert np.allclose(mine, expected, atol=1e-15)
+    assert mine.sum() == pytest.approx(1.0)
+
+
 def test_the_exact_distribution_matches_scipy_poisson_binom():
-    from scipy.stats import poisson_binom
+    """Optional cross-check: scipy.stats.poisson_binom needs scipy >= 1.15."""
+    scipy_stats = pytest.importorskip("scipy.stats")
+    poisson_binom = getattr(scipy_stats, "poisson_binom", None)
+    if poisson_binom is None:
+        pytest.skip("scipy.stats.poisson_binom requires scipy >= 1.15")
 
     probs = [0.58, 0.61, 0.545, 0.62]
     mine = independent_hit_count_distribution(probs)
     theirs = np.array([poisson_binom(probs).pmf(k) for k in range(len(probs) + 1)])
     assert np.allclose(mine, theirs, atol=1e-12)
-    assert mine.sum() == pytest.approx(1.0)
 
 
 def test_the_exact_distribution_reduces_to_the_binomial_when_legs_are_equal():
@@ -408,13 +500,13 @@ def test_a_leg_count_mismatch_abstains_rather_than_mispricing():
     assert "different products" in out.reason
 
 
-def test_correlation_lowers_ev_relative_to_assuming_independence():
-    """Treating correlated legs as independent overstates a perfect card.
+def test_negative_correlation_lowers_ev_relative_to_assuming_independence():
+    """The direction of the independence error follows the SIGN of the correlation.
 
-    Negative correlation is the case that matters for the warning in the
-    docstring: with positively correlated same-side legs P(all) RISES, so the
-    danger is the opposite direction — a parlay of legs that are negatively
-    related is overstated by the independence assumption.
+    With NEGATIVELY correlated legs P(all hit) falls below the product, so
+    assuming independence OVERSTATES the card — the case asserted here. With
+    positively correlated same-side legs it rises, and independence understates
+    it; that direction is asserted separately above.
     """
     structure = power(3, 6.0)
     probs = [0.6, 0.6, 0.6]
@@ -463,3 +555,71 @@ def test_a_two_way_row_is_unaffected_and_carries_no_route():
         under_odds_american=-110, line=25.5,
     ))
     assert verdict["route"] is None
+
+
+# --- the shipped catalogue ---------------------------------------------
+
+def test_the_shipped_catalogue_loads_and_carries_its_provenance():
+    """
+    config/dfs_payouts.yaml must parse into valid structures.
+
+    A malformed entry there is not cosmetic: it is the only payout source in
+    the repository, so every ticket priced against that key would be wrong.
+    """
+    from src.quant.dfs_payouts import load_payout_catalog
+
+    catalog = load_payout_catalog()
+    assert catalog, "the shipped catalogue defines no structures"
+    for key, structure in catalog.items():
+        assert structure.label == key
+        assert "as_of" in structure.source, (
+            f"{key} lost the catalogue's as_of date, so a number evaluated on "
+            "its own carries no provenance"
+        )
+        assert structure.n_picks == int(key.rsplit(":", 1)[1])
+        assert structure.payout_for(structure.n_picks) > 0.0
+
+
+def test_the_catalogue_distinguishes_power_from_flex():
+    from src.quant.dfs_payouts import load_payout_catalog
+
+    catalog = load_payout_catalog()
+    assert catalog["underdog:power:3"].is_all_or_nothing
+    assert not catalog["underdog:flex:3"].is_all_or_nothing
+
+
+def test_a_missing_catalogue_raises_rather_than_returning_a_default():
+    from src.quant.dfs_payouts import load_payout_catalog
+
+    with pytest.raises(DfsPayoutError, match="not found"):
+        load_payout_catalog("config/does_not_exist.yaml")
+
+
+def test_a_catalogue_without_top_level_provenance_is_refused(tmp_path):
+    from src.quant.dfs_payouts import load_payout_catalog
+
+    path = tmp_path / "no_source.yaml"
+    path.write_text(
+        "as_of: '2026-01-01'\nplatforms:\n  x:\n    power:\n      2: {2: 3.0}\n"
+    )
+    with pytest.raises(DfsPayoutError, match="no top-level"):
+        load_payout_catalog(path)
+
+
+def test_a_malformed_catalogue_entry_names_its_key_rather_than_being_skipped(tmp_path):
+    """A silently dropped key reads as 'that product does not exist'."""
+    from src.quant.dfs_payouts import load_payout_catalog
+
+    path = tmp_path / "bad_tier.yaml"
+    path.write_text(
+        "as_of: '2026-01-01'\n"
+        "source: 'test fixture'\n"
+        "platforms:\n  udx:\n    power:\n      3: {2: 3.0}\n"
+    )
+    with pytest.raises(DfsPayoutError, match="udx:power:3"):
+        load_payout_catalog(path)
+
+
+def test_payout_multiples_are_zero_filled_and_aligned_to_hit_counts():
+    flex = DfsPayoutStructure(3, {3: 2.25, 2: 1.25}, source=FIXTURE)
+    assert flex.payout_multiples() == [0.0, 0.0, 1.25, 2.25]

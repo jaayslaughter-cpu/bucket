@@ -3,16 +3,16 @@
 RESEARCH_ONLY. Nothing here places a wager or sizes a stake.
 
 WHY THIS IS A SEPARATE CONCEPT FROM ``ev_engine``, AND MUST STAY ONE.
-``contracts.market_ev_gate`` refuses a pick'em board unconditionally:
+``contracts.market_ev_gate`` refuses to price a pick'em board as a two-way
+market, and routes it here instead (``route = PICKEM_ENTRY_ROUTE``, read by
+``src.quant.dfs_entry``).
 
-    "Pick'em board: a payout multiplier is not a two-way price and cannot be
-     de-vigged, so EV is undefined here"
-
-That is correct and this module does NOT go around it. A sportsbook quotes two
-prices, the pair carries the hold, and de-vigging recovers a market consensus
-probability to measure a model against. A DFS pick'em quotes ONE fixed payout
-and no opposing price, so there is no consensus to recover and no vig to
-remove. ``market_ev_gate`` is right that two-way EV is undefined here.
+That refusal is correct and this module does NOT go around it. A sportsbook
+quotes two prices, the pair carries the hold, and de-vigging recovers a market
+consensus probability to measure a model against. A DFS pick'em quotes ONE fixed
+payout and no opposing price, so there is no consensus to recover and no vig to
+remove. TWO-WAY EV on that row is undefined; pick'em EV is not, and the gate's
+original wording conflated the two.
 
 What IS defined is different, and is what this module computes: a fixed payout
 implies an exact BREAKEVEN probability, and comparing a model's own probability
@@ -59,7 +59,9 @@ import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Sequence
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -122,27 +124,43 @@ class DfsPayoutStructure:
 
     ``source`` is required and free-text: where the numbers came from. A
     structure with no provenance is indistinguishable from an invented one.
+
+    ``frozen=True`` only stops the ATTRIBUTE being rebound; it does nothing to
+    the mapping behind it, so a validated structure whose caller still held the
+    original dict could be mutated into an unvalidated one after the fact. The
+    mapping is therefore copied and wrapped read-only in ``__post_init__``, and
+    validation runs on that copy.
     """
 
     n_picks: int
-    payouts: dict[int, float]
+    payouts: Mapping[int, float]
     source: str
     label: str = ""
 
     def __post_init__(self) -> None:
-        if not isinstance(self.n_picks, int) or self.n_picks < 2:
+        if isinstance(self.n_picks, bool) or not isinstance(self.n_picks, int) or self.n_picks < 2:
             raise DfsPayoutError(
                 f"n_picks must be an integer of at least 2, got {self.n_picks!r}"
             )
+        if not isinstance(self.payouts, Mapping):
+            raise DfsPayoutError(
+                f"payouts must be a mapping of hit count to multiple, got "
+                f"{type(self.payouts).__name__}"
+            )
+        # Copy first: validating the caller's dict and then keeping a reference
+        # to it would leave the checks below describing a mapping the caller can
+        # still change.
+        object.__setattr__(self, "payouts", MappingProxyType(dict(self.payouts)))
         if not self.payouts:
             raise DfsPayoutError("payouts is empty, so this structure pays nothing")
-        if not str(self.source).strip():
+        if not isinstance(self.source, str) or not self.source.strip():
             raise DfsPayoutError(
-                "source is required: a payout table with no provenance cannot be "
-                "distinguished from an invented one"
+                "source is required and must be a non-empty string: a payout "
+                "table with no provenance cannot be distinguished from an "
+                f"invented one (got {self.source!r})"
             )
         for hits, multiple in self.payouts.items():
-            if not isinstance(hits, int) or not 0 <= hits <= self.n_picks:
+            if isinstance(hits, bool) or not isinstance(hits, int) or not 0 <= hits <= self.n_picks:
                 raise DfsPayoutError(
                     f"payout key {hits!r} is not a hit count in 0..{self.n_picks}"
                 )
@@ -168,6 +186,17 @@ class DfsPayoutStructure:
     def payout_for(self, hits: int) -> float:
         """Gross return per 1 staked at this hit count. Absent means nothing back."""
         return float(self.payouts.get(int(hits), 0.0))
+
+    def payout_multiples(self) -> list[float]:
+        """
+        Gross returns indexed 0..n_picks, zero-filled where a tier does not pay.
+
+        The alignment ``evaluate_payout`` and ``advisory_sizing`` both expect.
+        Exposed as a method so those two cannot disagree about how an absent
+        tier is represented: a caller assembling the list by hand is one
+        off-by-one away from sizing a flex as a power play.
+        """
+        return [self.payout_for(k) for k in range(self.n_picks + 1)]
 
     def per_leg_breakeven_probability(self) -> float | None:
         """
@@ -353,29 +382,77 @@ def evaluate_payout(
     )
 
 
+def _exact_int(value: Any, what: str) -> int:
+    """
+    Coerce to int only when the value IS that integer.
+
+    ``int()`` alone truncates: a YAML key of ``2.9`` would silently become the
+    2-hit tier, and ``n_picks: 3.7`` a 3-pick structure. Truncation here
+    misprices every ticket built from the structure and leaves no trace, so a
+    non-integral value is refused instead.
+    """
+    if isinstance(value, bool):
+        raise DfsPayoutError(f"{what} is a boolean ({value!r}), not a number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise DfsPayoutError(
+                f"{what} is {value!r}, which is not a whole number; refusing to "
+                "truncate it"
+            )
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise DfsPayoutError(
+                f"{what} is {value!r}, which is not a whole number"
+            ) from exc
+    raise DfsPayoutError(f"{what} is {value!r}, which is not a whole number")
+
+
 def structure_from_mapping(payload: dict[str, Any]) -> DfsPayoutStructure:
     """
     Build a structure from config or a user-supplied CSV row.
 
     Hit-count keys arrive as strings from YAML and JSON, so they are coerced;
     a key that is not an integer is an error rather than a skipped row, because
-    silently dropping a payout tier would misprice every ticket using it.
+    silently dropping a payout tier would misprice every ticket using it. The
+    coercion is exact -- see ``_exact_int`` -- because a truncated key lands on
+    a real, wrong tier.
     """
     raw = payload.get("payouts")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, Mapping):
         raise DfsPayoutError("payouts must be a mapping of hit count to multiple")
     payouts: dict[int, float] = {}
     for key, value in raw.items():
+        hits = _exact_int(key, f"payout key {key!r}")
+        if hits in payouts:
+            raise DfsPayoutError(
+                f"payout key {key!r} repeats hit count {hits}; two multiples for "
+                "one tier means one of them is being discarded"
+            )
         try:
-            hits = int(key)
+            payouts[hits] = float(value)
         except (TypeError, ValueError) as exc:
-            raise DfsPayoutError(f"payout key {key!r} is not a hit count") from exc
-        payouts[hits] = float(value)
+            raise DfsPayoutError(
+                f"payout for {hits} hits is not a number: {value!r}"
+            ) from exc
+    source = payload.get("source")
+    if source is None:
+        raise DfsPayoutError(
+            "source is missing: a payout table with no provenance cannot be "
+            "distinguished from an invented one. (A null in config is not a "
+            "source -- str(None) would pass the check as the text 'None'.)"
+        )
+    label = payload.get("label")
     return DfsPayoutStructure(
-        n_picks=int(payload.get("n_picks", 0) or 0),
+        n_picks=_exact_int(payload.get("n_picks", 0), "n_picks"),
         payouts=payouts,
-        source=str(payload.get("source", "")),
-        label=str(payload.get("label", "")),
+        source=source if isinstance(source, str) else str(source),
+        label="" if label is None else str(label),
     )
 
 
@@ -424,16 +501,35 @@ def independent_hit_count_distribution(
 
     The Poisson-binomial distribution, computed by the standard exact recursion
     rather than by simulation: for independent legs there is no reason to accept
-    Monte Carlo error. Verified against ``scipy.stats.poisson_binom`` to 1e-12
-    and against ``parlay.hit_count_distribution`` to simulation noise.
+    Monte Carlo error. Verified against brute-force enumeration of all 2**n
+    outcomes to 1e-15, against ``parlay.hit_count_distribution`` to simulation
+    noise, and — where the installed scipy is new enough to have it (1.15+) —
+    against ``scipy.stats.poisson_binom`` to 1e-12.
 
     USE THE COPULA INSTEAD WHEN LEGS ARE CORRELATED.
     ``parlay.hit_count_distribution`` takes a correlation matrix; this does not,
     and cannot. Teammate legs and game-script stacks are exactly the correlated
-    case, and treating them as independent OVERSTATES the probability of a
-    perfect card, which overstates EV in the direction that loses money. This
-    function is for genuinely unrelated legs, or as an exact reference for the
-    simulation.
+    case.
+
+    WHICH WAY THE ERROR RUNS DEPENDS ON THE SIGN, and an earlier version of this
+    docstring asserted a single direction, which was wrong:
+
+      positive correlation  P(all hit) EXCEEDS the product of the legs, so
+                            assuming independence UNDERSTATES a perfect card
+                            (two overs on teammates in the same blowout land
+                            together more often than independence allows).
+      negative correlation  P(all hit) falls BELOW the product, so assuming
+                            independence OVERSTATES it (two players splitting
+                            one team's shot attempts).
+
+    For a power play that is the whole story, since only the top cell pays. For
+    a flex it is not even that simple: correlation moves probability mass out of
+    the middle counts toward both tails, so the sign of the EV error also
+    depends on the payout curve, and a flex can lose EV from positive
+    correlation while a power play gains. Either way the direction is not
+    knowable without the matrix, which is why the correlated path exists rather
+    than a correction factor. This function is for genuinely unrelated legs, or
+    as an exact reference for the simulation.
     """
     probabilities = [float(p) for p in leg_probabilities]
     if not probabilities:
@@ -512,3 +608,77 @@ def evaluate_pickem_entry(
     out.per_leg_breakeven_probability = structure.per_leg_breakeven_probability()
     out.per_leg_synthetic_american = structure.per_leg_synthetic_american()
     return out
+
+
+# ---------------------------------------------------------------------------
+# The shipped catalogue (config/dfs_payouts.yaml)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CATALOG_PATH = Path("config/dfs_payouts.yaml")
+
+
+def load_payout_catalog(
+    path: str | Path = DEFAULT_CATALOG_PATH,
+) -> dict[str, DfsPayoutStructure]:
+    """
+    Load ``config/dfs_payouts.yaml`` into ``{"platform:variant:n": structure}``.
+
+    Keys look like ``underdog:power:3``. The file's top-level ``source`` and
+    ``as_of`` are folded into every structure's ``source``, because provenance
+    that lives only in a comment at the top of a config file does not travel
+    with the number once one entry is evaluated on its own.
+
+    A malformed entry is refused with its key named rather than skipped: a
+    catalogue silently missing the tier a caller asked for reads as "that
+    product does not exist" instead of "that row is malformed".
+
+    Raises ``DfsPayoutError`` when the file is absent. There is deliberately no
+    fallback table — see the module docstring.
+    """
+    import yaml
+
+    resolved = Path(path)
+    if not resolved.exists():
+        raise DfsPayoutError(
+            f"payout catalogue {resolved} not found, and no table is hardcoded: "
+            "supply one whose numbers you can point at"
+        )
+    payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, Mapping):
+        raise DfsPayoutError(f"{resolved} does not contain a mapping")
+
+    as_of = str(payload.get("as_of") or "unknown date")
+    file_source = str(payload.get("source") or "").strip()
+    if not file_source:
+        raise DfsPayoutError(
+            f"{resolved} has no top-level `source`; a payout catalogue with no "
+            "provenance cannot be distinguished from an invented one"
+        )
+
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, Mapping) or not platforms:
+        raise DfsPayoutError(f"{resolved} declares no `platforms`")
+
+    catalog: dict[str, DfsPayoutStructure] = {}
+    for platform, variants in platforms.items():
+        if not isinstance(variants, Mapping):
+            raise DfsPayoutError(f"platform {platform!r} is not a mapping of variants")
+        for variant, by_count in variants.items():
+            if not isinstance(by_count, Mapping):
+                raise DfsPayoutError(
+                    f"{platform}:{variant} is not a mapping of pick count to payouts"
+                )
+            for count, payouts in by_count.items():
+                key = f"{platform}:{variant}:{count}"
+                try:
+                    catalog[key] = structure_from_mapping({
+                        "n_picks": count,
+                        "payouts": payouts,
+                        "label": key,
+                        "source": f"{file_source} (as_of {as_of})",
+                    })
+                except DfsPayoutError as exc:
+                    raise DfsPayoutError(f"{key}: {exc}") from exc
+    if not catalog:
+        raise DfsPayoutError(f"{resolved} defines no payout structures")
+    return catalog
