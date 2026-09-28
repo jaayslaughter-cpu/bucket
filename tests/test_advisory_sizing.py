@@ -198,26 +198,128 @@ def test_the_output_is_labelled_advisory_and_carries_no_currency():
     ], f"a currency field reached the caller: {sorted(out)}"
 
 
-def test_no_execution_or_dispatch_module_imports_this_one():
-    """The guardrail: advisory sizing must not reach an execution path."""
+def test_no_module_under_src_imports_this_one():
+    """
+    The guardrail: advisory sizing must not reach an execution or dispatch path.
+
+    Checked across ALL of src/ and on real IMPORTS, not on a substring in a
+    subset of directories. The earlier version collected every file mentioning
+    the module and then kept only those whose path contained "/notify/" or
+    "dispatch" — so a future src/execution/orders.py importing it would have
+    been collected and then filtered straight back out, which is the one case
+    the guardrail exists for. Matching the substring also counted a docstring
+    that merely names the module.
+
+    Nothing under src/ may import it at all. A size is held by a caller that
+    already computed it (the CLI), never fetched by a module that sends or
+    places anything.
+    """
+    import ast
     import pathlib
 
-    root = pathlib.Path("src")
     offenders = []
-    for path in root.rglob("*.py"):
+    for path in pathlib.Path("src").rglob("*.py"):
         if "advisory_sizing" in path.name:
             continue
-        text = path.read_text()
-        if "advisory_sizing" in text:
-            offenders.append(str(path))
-    # notify/ and any future dispatcher are the ones that must stay clean
-    dispatchers = [o for o in offenders if "/notify/" in o or "dispatch" in o]
-    assert not dispatchers, (
-        f"a dispatch path imports advisory sizing: {dispatchers}. A size may be "
-        "shown by a caller that already holds it, never fetched by the sender."
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""] + [a.name for a in node.names]
+            else:
+                continue
+            if any("advisory_sizing" in n for n in names):
+                offenders.append(str(path))
+                break
+
+    assert not offenders, (
+        f"a module under src/ imports advisory sizing: {offenders}. A size may "
+        "be shown by a caller that already holds it, never fetched by the "
+        "sender, an execution path, or anything that places an order."
     )
 
 
 def test_quarter_kelly_is_the_default_and_the_cap_is_three_units():
     assert DEFAULT_KELLY_FRACTION == 0.25
     assert DEFAULT_MAX_CAP_UNITS == 3.0
+
+
+# --- the sizing controls themselves -------------------------------------
+
+@pytest.mark.parametrize("fraction", [-0.25, float("nan"), float("inf")])
+def test_an_unusable_kelly_fraction_returns_no_size_rather_than_a_negative_one(
+    fraction
+):
+    """
+    f* is POSITIVE on a real edge, so f* * -0.25 * 100 is a negative number of
+    units and the `suggested > cap` test does not catch it. The module's stated
+    invariant — never a negative size — was written about f* and did not hold
+    for the multiplier applied to it.
+    """
+    out = recommended_units_binary(0.60, 2.0, kelly_fraction=fraction)
+    assert out.recommended_units == 0.0
+    assert "kelly_fraction" in out.reason
+
+
+@pytest.mark.parametrize("cap", [-1.0, float("nan")])
+def test_an_unusable_cap_returns_no_size(cap):
+    out = recommended_units_binary(0.60, 2.0, max_cap_units=cap)
+    assert out.recommended_units == 0.0
+    assert "max_cap_units" in out.reason
+
+
+def test_a_zero_kelly_fraction_is_allowed_and_sizes_nothing():
+    """Zero is a legitimate setting — "compute it but do not size" — not an error."""
+    out = recommended_units_binary(0.60, 2.0, kelly_fraction=0.0)
+    assert out.recommended_units == 0.0
+    assert out.full_kelly_fraction > 0.0, "the edge itself is still reported"
+
+
+def test_the_cap_is_hard_even_when_it_is_not_a_whole_number_of_cents():
+    """
+    Capping and then rounding lets the answer back over the limit: min(...) of a
+    2.555 cap is 2.555, which rounds to 2.56. The cap is applied last.
+    """
+    out = recommended_units_binary(0.95, 10.0, kelly_fraction=1.0, max_cap_units=2.555)
+    assert out.capped is True
+    assert out.recommended_units <= 2.555
+
+
+# --- misaligned payout vectors ------------------------------------------
+
+def test_a_truncated_payout_vector_abstains_instead_of_sizing_the_wrong_tier():
+    """
+    The binary fast path used to skip the length check the multi-outcome path
+    made: probabilities[-1] is P(all hit) while a truncated multiples[-1] is a
+    middle tier's return, so the entry would be sized against a payout it does
+    not have.
+    """
+    class Evaluation:
+        status = "PAYOUT_EV_READY"
+        count_probabilities = [0.05, 0.20, 0.35, 0.40]   # 3-pick card
+
+    out = recommended_units_for_entry(Evaluation(), [0.0, 0.0, 6.0])  # one short
+    assert out.recommended_units == 0.0
+    assert "aligned by hit count" in out.reason
+
+
+def test_an_entry_with_no_count_distribution_abstains_rather_than_raising():
+    class Evaluation:
+        status = "PAYOUT_EV_READY"
+        count_probabilities = []
+
+    out = recommended_units_for_entry(Evaluation(), [0.0, 0.0, 3.0])
+    assert out.recommended_units == 0.0
+    assert "aligned by hit count" in out.reason
+
+
+def test_an_aligned_all_or_nothing_entry_still_takes_the_binary_path():
+    """The check must not break the routing it guards."""
+    class Evaluation:
+        status = "PAYOUT_EV_READY"
+        count_probabilities = [0.05, 0.20, 0.35, 0.40]
+
+    out = recommended_units_for_entry(Evaluation(), [0.0, 0.0, 0.0, 6.0])
+    assert out.method == "binary"
+    assert out.recommended_units > 0.0
