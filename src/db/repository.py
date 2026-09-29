@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
@@ -505,3 +505,58 @@ def upsert_parlay_ledger(table: str, frame: pd.DataFrame) -> int:
         )
         session.execute(stmt)
     return len(rows)
+
+
+def load_graded_prop_results(
+    *,
+    lookback_days: int | None = 180,
+    market: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Graded prop predictions, as the rows ``settlement.calibration`` reads.
+
+    Only the four columns calibration needs, plus the identity ones for a log
+    line. Selecting the whole table would pull raw box-score JSONB for every
+    row to compute one number from four of its columns.
+
+    PENDING and VOID are filtered in SQL; PUSH is NOT, because the calibration
+    report counts pushes as excluded and a board full of whole lines should be
+    visible in that count rather than invisible in a WHERE clause.
+    """
+    conditions = [PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH"))]
+    if lookback_days is not None and int(lookback_days) > 0:
+        cutoff = datetime.now(timezone.utc).date() - timedelta(days=int(lookback_days))
+        conditions.append(PropResult.game_date >= cutoff)
+    if market:
+        conditions.append(PropResult.market == str(market).upper())
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                PropResult.outcome_status,
+                PropResult.prob_over,
+                PropResult.predicted_side,
+                PropResult.predicted_line,
+                PropResult.market,
+                PropResult.game_date,
+                PropResult.source,
+            ).where(and_(*conditions))
+        ).all()
+
+    # Decimal -> float here rather than in the calibration module, so the pure
+    # function never has to know the column types came from Numeric.
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "outcome_status": r.outcome_status,
+            "prob_over": float(r.prob_over) if r.prob_over is not None else None,
+            "predicted_side": r.predicted_side,
+            "predicted_line": (
+                float(r.predicted_line) if r.predicted_line is not None else None
+            ),
+            "market": r.market,
+            "game_date": r.game_date,
+            "source": r.source,
+        })
+    logger.info("Loaded %d graded prop result(s) for calibration", len(out))
+    return out

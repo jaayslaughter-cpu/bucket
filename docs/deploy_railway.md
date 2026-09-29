@@ -50,6 +50,11 @@ these are the ones the worker reads.
 | `PROPIQ_SLATE_HOUR_PT` / `_MINUTE_PT` | Defaults 09:00 PT, before any tip. |
 | `PROPIQ_SETTLE_HOUR_PT` / `_MINUTE_PT` | Defaults 03:30 PT, after any finish. |
 | `PROPIQ_RUN_ON_START` | Off by default. Set it for a single first run; leaving it on means a redeploy loop re-runs the slate each time. |
+| `PROPIQ_DISPATCH` | Defaults to on when `DISCORD_WEBHOOK_URL` is set. |
+| `PROPIQ_DISPATCH_ABSTENTIONS` | Default on — the house rule is that a refusal is posted too, since silence reads as "nothing good today". |
+| `PROPIQ_CALIBRATION_REPORT` | Where the settlement job writes the evidence and the slate job reads it. Default `outputs/calibration.json`. **On a container this must be on the persistent volume**, or the morning run will not see what last night graded. |
+| `PROPIQ_BOARD_CSV` | Default `outputs/decision_board.csv`. |
+| `PROPIQ_BOARD_TRAIN_END` / `_VALIDATION_END` / `PROPIQ_BOARD_MARKETS` / `PROPIQ_MIN_EV` | Board build parameters, matching the `decision-board` CLI defaults. |
 
 ## 4. Database
 
@@ -68,8 +73,12 @@ migrations carry the CHECK constraints and views that `create_all` does not.
 
 | Job | Time (PT) | What it does |
 |---|---|---|
-| `slate` | 09:00 | ingest → features → score → EV gate → persist projections → write PENDING `prop_results` |
-| `settlement` | 03:30 | grade every PENDING prop whose game has finished |
+| `slate` | 09:00 | ingest → features → score → EV gate → persist projections → write PENDING `prop_results` → build the board CSV → dispatch it to Discord, gated |
+| `settlement` | 03:30 | grade every PENDING prop whose game has finished → **rebuild the calibration report** |
+
+The order between them is the dependency: settlement grades last night's games
+and recomputes the calibration evidence, so the morning slate reads evidence
+that already includes those results rather than evidence a day stale.
 
 Both run with `max_instances=1`: an overrunning job is never joined by a second
 copy. A missed slate is **not** run late (one-hour grace) — running late would
@@ -87,11 +96,23 @@ adaptive while being untested.
   and a source, graded by the settlement job. **These are predictions, not
   wagers:** no stake is written and none can be. Strike rate and CLV come out
   of them; ROI does not, and will not until you record a stake yourself.
+- `outputs/calibration.json` — the calibration report built from those graded
+  rows by `prop-calibration` (and by the settlement job). This is the file the
+  publication gate reads, and until it says `status: OK` with enough scored rows
+  every dispatched card is withheld.
 - `parlay_tickets` / `parlay_legs` — only what you log by hand.
 
-Nothing is dispatched to Discord unless a command is run with `--discord`, and a
-model-sourced card is withheld there until `src/quant/publication_gate.py` has
-recent, dense, sufficiently large calibration evidence to pass.
+**Dispatch is automatic, and gated.** The slate job builds the board and sends
+it. Every board row rests on the model's own probability — a `book_ev` row
+*measures* that probability against the market price rather than using the
+market's — so the board is gated as MODEL-sourced by
+`src/quant/publication_gate.py`. With no calibration evidence the card carries
+the gate's reason instead of the rows, which is the correct output while nothing
+is settled, not a failure.
+
+Dispatch is on when `DISCORD_WEBHOOK_URL` is set. `PROPIQ_DISPATCH` forces it
+either way; `PROPIQ_DISPATCH_ABSTENTIONS=false` stays silent on a withheld or
+empty board instead of saying so.
 
 ---
 

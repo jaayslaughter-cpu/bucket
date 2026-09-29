@@ -263,6 +263,7 @@ def build_decision_board_embed(
     *,
     slate_date: str | None = None,
     max_rows: int = 10,
+    publication: Any = None,
 ) -> dict[str, Any]:
     """
     One embed for a board of recommendations.
@@ -270,7 +271,30 @@ def build_decision_board_embed(
     Shows the BASIS of every row, not just its number. In a channel the column
     headers are gone, and a recommendation resting on the model alone must not
     read like one resting on a de-vigged price.
+
+    THE PUBLICATION GATE APPLIES HERE TOO, and until this parameter existed it
+    did not. Three docstrings in this repository claimed the gate stopped an
+    uncalibrated board row from being dispatched; only the DFS path actually
+    called it, so the board's rows went out ungated. That is the same
+    "documented guard that is not wired" defect this codebase keeps producing.
+
+    EVERY BOARD ROW IS MODEL-SOURCED, including a ``book_ev`` one — and that is
+    the subtlety worth stating. A book_ev row's EV compares THE MODEL's
+    probability against a de-vigged market price: the price is the benchmark it
+    is measured against, not the probability being used. So there is no
+    equivalent here of ``dfs_entry``'s SHARP_BENCHMARK case, where the market's
+    own probability is the input. The whole board is gated as MODEL.
+
+    ``publication`` withheld -> the gate's reason replaces the rows. None ->
+    published unguarded, which is only right where the caller already gated.
     """
+    if publication is not None and not getattr(publication, "allowed", False):
+        return build_abstention_embed(
+            "Board withheld from publication: "
+            f"{getattr(publication, 'reason', None) or 'no reason given'}",
+            title=f"Recommendations — {slate_date or 'slate'}",
+        )
+
     considered = [
         c for c in candidates if getattr(c, "decision_status", "") == "RECOMMENDED"
     ]

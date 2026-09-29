@@ -7,11 +7,18 @@ is no order API in this project and none is planned, so the last step is always
 yours.
 
 WHAT "RECOMMENDED" IS WORTH IS THE WHOLE QUESTION, and the row says so rather
-than leaving it to be inferred. A recommendation on ``book_ev`` rests on a real
-two-way price and a de-vigged fair probability. One on ``model_lean`` rests on
-the model alone — and until that model has graded results behind it, that is an
-opinion with a confident label. ``quant.publication_gate`` is what stops such a
-row reaching a channel; it is not bypassed here.
+than leaving it to be inferred. A recommendation on ``book_ev`` has a real
+two-way price behind it, so its EV is measured against a de-vigged market
+consensus. One on ``model_lean`` has no price at all.
+
+BOTH STILL REST ON THE MODEL'S OWN PROBABILITY. A book_ev row compares THE
+MODEL's probability against the market's; the price is what it is measured
+AGAINST, not the number being used. So every row on this board is model-sourced,
+and until the model has graded results behind it every row is an opinion with a
+confident label. ``quant.publication_gate`` is what withholds them from a
+channel — applied by the caller at dispatch (``notify-discord``, and
+``build_decision_board_embed``'s ``publication`` argument), not inside this
+module, which only builds rows.
 
 A RECOMMENDATION IS STILL NOT A PROMISE. The vocabulary guard below stays: no
 "lock", no "guaranteed", no "best bet". Recommending a side and promising an

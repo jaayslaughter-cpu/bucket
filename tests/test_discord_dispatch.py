@@ -391,3 +391,146 @@ def test_discord_limits_are_enforced_before_sending():
     )
     assert len(crowded["fields"]) <= MAX_FIELDS_PER_EMBED
     assert crowded["fields"][-1]["name"] == "…"
+
+
+# --- the board is gated too, which it was not before ---------------------
+
+def _board_rows(n: int = 2):
+    return [
+        type("Row", (), {
+            "decision_status": "RECOMMENDED", "decision_basis": "book_ev",
+            "player_name": f"DEMO_{i}", "target_market": "PTS", "side": "over",
+            "line": 24.5, "model_prob": 0.61, "book_ev": 0.04,
+            "american_odds": -110, "book_source": "propline",
+        })() for i in range(n)
+    ]
+
+
+def test_a_board_is_withheld_when_the_calibration_gate_refuses():
+    """
+    Three docstrings claimed the gate stopped an uncalibrated board row from
+    being dispatched, and only the DFS path actually called it. This is that
+    claim made true.
+    """
+    from src.quant.publication_gate import calibration_gate
+
+    verdict = calibration_gate(None)          # no evidence at all
+    assert not verdict.allowed
+
+    embed = build_decision_board_embed(
+        _board_rows(), slate_date="2026-09-29", publication=verdict,
+    )
+    assert "withheld from publication" in embed["description"]
+    assert "absent evidence is not evidence" in embed["description"]
+    assert embed["fields"] == [], "the rows must not survive the refusal"
+    assert "DEMO_0" not in str(embed)
+
+
+def test_a_board_publishes_once_the_gate_allows_it():
+    from datetime import datetime, timedelta, timezone
+
+    from src.quant.publication_gate import calibration_gate
+
+    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    report = {
+        "status": "OK", "n_scored": 400, "ece": 0.02, "ece_gate_passed": True,
+        "bin_coverage": 0.9,
+        "evidence_as_of": (now - timedelta(days=2)).isoformat(),
+    }
+    verdict = calibration_gate(report, now=now)
+    assert verdict.allowed
+
+    embed = build_decision_board_embed(
+        _board_rows(), slate_date="2026-09-29", publication=verdict,
+    )
+    assert "DEMO_0" in str(embed)
+    assert len(embed["fields"]) == 2
+
+
+def test_passing_no_verdict_still_publishes_for_a_caller_that_already_gated():
+    embed = build_decision_board_embed(_board_rows(), slate_date="2026-09-29")
+    assert len(embed["fields"]) == 2
+
+
+# --- the CLI dispatch surface -------------------------------------------
+
+def _board_csv(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-09-29", "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(path, index=False)
+    return path
+
+
+def test_the_cli_withholds_a_board_with_no_calibration_report(tmp_path):
+    """The default state today: rows exist, evidence does not, nothing goes out."""
+    import json
+
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "withheld from publication" in result.output
+    assert "DEMO_A" not in result.output, "a withheld board must not leak its rows"
+    payload = json.loads(result.output[result.output.rindex('{\n  "status"'):])
+    assert payload["PUBLICATION"]["PUBLICATION_STATUS"] == "PUBLISH_WITHHELD"
+
+
+def test_the_cli_publishes_a_board_once_a_report_backs_it(tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    report = tmp_path / "calibration.json"
+    report.write_text(json.dumps({
+        "status": "OK", "n_scored": 400, "ece": 0.02, "ece_gate_passed": True,
+        "bin_coverage": 0.9,
+        "evidence_as_of": (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat(),
+    }))
+
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+        "--calibration-report", str(report),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "withheld" not in result.output
+    assert "DEMO_A" in result.output
+    payload = json.loads(result.output[result.output.rindex('{\n  "status"'):])
+    assert payload["PUBLICATION"]["PUBLICATION_STATUS"] == "PUBLISH_ALLOWED"
+
+
+def test_a_broken_calibration_file_is_an_error_not_a_silent_withhold(tmp_path):
+    """"You forgot the flag" and "the file is corrupt" must not look the same."""
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    bad = tmp_path / "calibration.json"
+    bad.write_text("{not json")
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+        "--calibration-report", str(bad),
+    ])
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.output

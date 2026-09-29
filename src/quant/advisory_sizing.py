@@ -52,9 +52,13 @@ probabilities are right, and it is MOST sensitive to error exactly where the
 edge looks largest. On a model-sourced entry these numbers inherit the model's
 calibration error; on a benchmark-sourced one they inherit the benchmark's
 sharpness and the line match. ``dfs_payouts.ProbabilitySource`` records which,
-``quant.publication_gate`` refuses to publish the model-sourced case until there
-is graded evidence behind it, and a caller must carry the source alongside any
-size it shows.
+and a caller must carry the source alongside any size it shows.
+
+``quant.publication_gate`` is what withholds a model-sourced figure until there
+is graded evidence behind it, but note WHERE that happens: at the dispatch
+surfaces (``notify-discord``, ``dfs-entry --discord``), not inside this module.
+Nothing stops a Python caller computing a size on an uncalibrated model — the
+gate governs publication, not arithmetic.
 """
 
 from __future__ import annotations

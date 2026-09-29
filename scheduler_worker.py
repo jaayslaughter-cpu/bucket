@@ -55,6 +55,17 @@ ENV_SETTLE_HOUR = "PROPIQ_SETTLE_HOUR_PT"
 ENV_SETTLE_MINUTE = "PROPIQ_SETTLE_MINUTE_PT"
 ENV_MAX_THREADS = "PROPIQ_MAX_THREADS"
 ENV_RUN_ON_START = "PROPIQ_RUN_ON_START"
+ENV_DISPATCH = "PROPIQ_DISPATCH"
+ENV_DISPATCH_ABSTENTIONS = "PROPIQ_DISPATCH_ABSTENTIONS"
+ENV_CALIBRATION_REPORT = "PROPIQ_CALIBRATION_REPORT"
+ENV_BOARD_CSV = "PROPIQ_BOARD_CSV"
+ENV_BOARD_MARKETS = "PROPIQ_BOARD_MARKETS"
+ENV_BOARD_TRAIN_END = "PROPIQ_BOARD_TRAIN_END"
+ENV_BOARD_VALIDATION_END = "PROPIQ_BOARD_VALIDATION_END"
+ENV_MIN_EV = "PROPIQ_MIN_EV"
+
+DEFAULT_CALIBRATION_REPORT = "outputs/calibration.json"
+DEFAULT_BOARD_CSV = "outputs/decision_board.csv"
 
 # 09:00 PT: before any NBA tip (the earliest are late morning PT) and after the
 # night's box scores have settled into the sources.
@@ -125,26 +136,237 @@ def run_slate(argv: list[str] | None = None) -> int:
         logger.exception("Slate run raised; the scheduler stays up.")
         return 1
     logger.info("Slate run finished with code %s", code)
+
+    # Dispatch is part of the slate job, not a separate one: a card is only
+    # worth sending for the slate that was just built, and a second job could
+    # fire after a failed build and post yesterday's board.
+    if code == 0:
+        run_board()
+        run_dispatch()
+    else:
+        logger.warning("Slate returned %s — no board, no card.", code)
     return int(code)
 
 
-def run_settlement() -> dict[str, Any]:
-    """Grade every PENDING prop whose game has finished.
-
-    The other half of the feedback loop: ``settlement.recorder`` writes the
-    predictions, this grades them. Without it the ledger fills with PENDING rows
-    and the calibration gate never has evidence to pass.
+def run_board() -> dict[str, Any]:
     """
+    Build the recommendation board CSV that dispatch reads.
+
+    WHY THE SLATE JOB DOES NOT ALREADY PRODUCE THIS. ``main.py`` writes
+    projections to Postgres; the BOARD is a separate artifact built by comparing
+    models over the panel, and it existed only as a hand-run CLI command. Without
+    this step the dispatcher could only ever report that the CSV was missing.
+
+    Shares ``pipeline.slate_board.build_slate_board`` with the CLI so the two
+    cannot drift.
+
+    A failure here is logged and returned, not raised: the slate's real output is
+    already in Postgres, and a missing board turns into an honest abstention in
+    dispatch rather than a dead worker.
+    """
+    board_csv = os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV
+    try:
+        from src.pipeline.slate_board import DEFAULT_MARKETS, build_slate_board
+
+        raw_markets = (os.environ.get(ENV_BOARD_MARKETS) or "").strip()
+        markets = (
+            [m.strip() for m in raw_markets.split(",") if m.strip()]
+            if raw_markets else list(DEFAULT_MARKETS)
+        )
+        train_end = os.environ.get(ENV_BOARD_TRAIN_END) or "2025-01-15"
+        validation_end = os.environ.get(ENV_BOARD_VALIDATION_END) or "2025-02-15"
+        try:
+            min_ev = float(os.environ.get(ENV_MIN_EV) or 0.0)
+        except ValueError:
+            min_ev = 0.0
+
+        from src.db.repository import load_player_panel
+
+        panel = load_player_panel()
+        if panel is None or panel.empty:
+            logger.warning("No player panel available — no board built.")
+            return {"status": "DATA_NOT_AVAILABLE", "reason": "empty player panel"}
+
+        result = build_slate_board(
+            panel,
+            out=board_csv,
+            markets=markets,
+            train_end=train_end,
+            validation_end=validation_end,
+            min_ev=min_ev,
+        )
+        logger.info("Board: %s", result.as_dict())
+        return {"status": "OK", **result.as_dict()}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Board build raised; the scheduler stays up.")
+        return {"status": "FAILED", "error": str(exc), "out": board_csv}
+
+
+def run_dispatch() -> dict[str, Any]:
+    """
+    Send the slate's board to Discord, gated on the calibration report.
+
+    WHY THIS EXISTS. Until it did, `main.py` and this worker contained no
+    reference to `src/notify` at all: the scheduled run wrote projections and
+    PENDING rows and told nobody, and a card only went out if a person ran a
+    command by hand. For a pipeline whose point is a daily automated card, that
+    was the hole.
+
+    THE GATE IS NOT OPTIONAL HERE. Every board row rests on the model's own
+    probability, so the board is gated as MODEL-sourced; with no usable
+    calibration report the embed carries the gate's reason instead of the rows.
+    While no graded evidence exists that is the only thing this will send, and
+    that is correct rather than broken.
+
+    Off unless a webhook is configured — a worker without DISCORD_WEBHOOK_URL
+    should not spend a slate trying to post. Set PROPIQ_DISPATCH explicitly to
+    override either way, and PROPIQ_DISPATCH_ABSTENTIONS=false to stay silent on
+    a withheld or empty board instead of saying so.
+    """
+    import json
+    from pathlib import Path
+
+    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
+    if not _flag(ENV_DISPATCH, webhook_configured):
+        logger.info(
+            "Dispatch off (%s unset and no DISCORD_WEBHOOK_URL). Nothing sent.",
+            ENV_DISPATCH,
+        )
+        return {"status": "SKIPPED", "reason": "dispatch disabled"}
+
+    board_csv = Path(os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV)
+    report_path = Path(
+        os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
+    )
+
+    # Imported BEFORE the try, because the except clause below names
+    # DiscordDispatchError: an ImportError inside the try would leave that name
+    # unbound and turn a missing dependency into a NameError while handling it.
+    from src.notify.discord import DiscordDispatchError
+
+    try:
+        import pandas as pd
+
+        from src.notify.discord import (
+            DiscordConfig,
+            build_abstention_embed,
+            build_decision_board_embed,
+            send_embeds,
+        )
+        from src.quant.dfs_payouts import ProbabilitySource
+        from src.quant.publication_gate import calibration_gate
+
+        report = None
+        if report_path.exists():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                # An unreadable report is not the same as no report, and the gate
+                # would treat None as "none supplied". Say which it was.
+                logger.warning("Calibration report %s is not JSON: %s", report_path, exc)
+        verdict = calibration_gate(report, probability_source=ProbabilitySource.MODEL)
+
+        if not board_csv.exists():
+            if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+                return {"status": "SKIPPED", "reason": f"{board_csv} missing"}
+            embeds = [build_abstention_embed(
+                f"No board was written for this slate ({board_csv} absent), so "
+                "there is nothing to recommend. This is the pipeline reporting "
+                "its own state, not a slate with no value in it.",
+                title="No recommendations",
+            )]
+        else:
+            frame = pd.read_csv(board_csv)
+            rows = [
+                type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
+                for r in frame.to_dict("records")
+            ]
+            slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
+            embeds = [build_decision_board_embed(
+                rows, slate_date=slate, publication=verdict,
+            )]
+            if not verdict.allowed and not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+                logger.info("Board withheld and abstentions muted — nothing sent.")
+                return {
+                    "status": "SKIPPED",
+                    "reason": "withheld, abstentions muted",
+                    "publication": verdict.as_dict(),
+                }
+
+        result = send_embeds(embeds, config=DiscordConfig(dry_run=False))
+        logger.info("Dispatch: %s", result.status)
+        return {"status": result.status, "publication": verdict.as_dict()}
+    except DiscordDispatchError as exc:
+        logger.error("Dispatch refused: %s", exc)
+        return {"status": "REFUSED", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Dispatch raised; the scheduler stays up.")
+        return {"status": "FAILED", "error": str(exc)}
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def run_settlement() -> dict[str, Any]:
+    """Grade every PENDING prop, then rebuild the calibration report.
+
+    THE ORDER IS THE DEPENDENCY. ``settlement.recorder`` writes the predictions,
+    this grades them, and the calibration report is computed from what grading
+    produced. Rebuilding it here rather than in the slate job means the morning
+    run reads evidence that already includes last night's results, instead of
+    evidence one day stale.
+
+    A failed report does not fail settlement: the grading is the durable part and
+    the report can be rebuilt from the rows at any time.
+    """
+    out: dict[str, Any] = {}
     try:
         from src.settlement.runner import settle_pending_props
 
         report = settle_pending_props()
-        summary = report.as_dict() if hasattr(report, "as_dict") else {"report": report}
-        logger.info("Settlement: %s", summary)
-        return summary
+        out = report.as_dict() if hasattr(report, "as_dict") else {"report": report}
+        logger.info("Settlement: %s", out)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Settlement raised; the scheduler stays up.")
-        return {"status": "FAILED", "error": str(exc)}
+        out = {"status": "FAILED", "error": str(exc)}
+
+    out["calibration"] = rebuild_calibration_report()
+    return out
+
+
+def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
+    """
+    Recompute the calibration evidence the publication gate reads.
+
+    Writes JSON to ``PROPIQ_CALIBRATION_REPORT`` (default outputs/calibration.json).
+    A DATA_NOT_AVAILABLE report is still written: the gate reads its ``status``
+    and refuses, which is the state that should hold until graded rows exist. Not
+    writing it at all would leave a stale PASSING report in place after the rows
+    behind it aged out.
+    """
+    import json
+    from pathlib import Path
+
+    target = Path(path or os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT)
+    try:
+        from src.settlement.calibration import (
+            prop_result_calibration_report,
+            summarise,
+        )
+
+        report = prop_result_calibration_report()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+        logger.info("Calibration report -> %s: %s", target, summarise(report))
+        return {"out": str(target), "status": report.get("status"),
+                "n_scored": report.get("n_scored"), "ece": report.get("ece")}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Calibration report failed; the scheduler stays up.")
+        return {"status": "FAILED", "error": str(exc), "out": str(target)}
 
 
 def build_scheduler(scheduler: Any | None = None) -> Any:

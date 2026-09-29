@@ -180,3 +180,172 @@ def test_the_slate_job_delegates_rather_than_reimplementing_the_pipeline():
 def test_the_worker_states_that_it_places_nothing():
     assert "RESEARCH_ONLY" in worker.__doc__
     assert "places no wager" in worker.__doc__
+
+
+# --- dispatch, which the worker did not do at all before -----------------
+
+def test_the_slate_job_now_builds_a_board_and_dispatches(monkeypatch):
+    """
+    Before this, main.py and this worker contained no reference to src/notify:
+    the scheduled run wrote projections and told nobody.
+    """
+    import main
+
+    calls = []
+    monkeypatch.setattr(main, "main", lambda argv=None: 0)
+    monkeypatch.setattr(worker, "run_board", lambda: calls.append("board") or {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: calls.append("dispatch") or {})
+
+    assert worker.run_slate([]) == 0
+    assert calls == ["board", "dispatch"], "board must be built before it is sent"
+
+
+def test_a_failed_slate_dispatches_nothing(monkeypatch):
+    """Otherwise a broken build posts yesterday's board as today's card."""
+    import main
+
+    calls = []
+    monkeypatch.setattr(main, "main", lambda argv=None: 1)
+    monkeypatch.setattr(worker, "run_board", lambda: calls.append("board") or {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: calls.append("dispatch") or {})
+
+    assert worker.run_slate([]) == 1
+    assert calls == []
+
+
+def test_dispatch_is_off_without_a_webhook(monkeypatch):
+    """A worker with no DISCORD_WEBHOOK_URL should not spend a slate trying."""
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv(worker.ENV_DISPATCH, raising=False)
+    out = worker.run_dispatch()
+    assert out["status"] == "SKIPPED"
+    assert "disabled" in out["reason"]
+
+
+def test_dispatch_can_be_forced_off_even_with_a_webhook(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "false")
+    assert worker.run_dispatch()["status"] == "SKIPPED"
+
+
+def test_a_missing_board_dispatches_an_honest_abstention(monkeypatch, tmp_path):
+    """
+    The state today: nothing recommended. That must read as the pipeline
+    reporting itself, not as a slate that was examined and found empty.
+    """
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "absent.csv"))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+    assert out["status"] == "OK"
+    body = sent["embeds"][0]["description"]
+    assert "No board was written" in body
+    assert "not a slate with no value" in body
+
+
+def test_abstentions_can_be_muted(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_DISPATCH_ABSTENTIONS, "false")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "absent.csv"))
+    out = worker.run_dispatch()
+    assert out["status"] == "SKIPPED"
+
+
+def test_a_board_with_no_calibration_report_is_dispatched_withheld(
+    monkeypatch, tmp_path
+):
+    """The gate is applied in the worker, not only in the CLI."""
+    import pandas as pd
+
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-09-29", "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+    assert out["status"] == "OK"
+    assert out["publication"]["PUBLICATION_STATUS"] == "PUBLISH_WITHHELD"
+    body = sent["embeds"][0]["description"]
+    assert "withheld from publication" in body
+    assert "DEMO_A" not in str(sent["embeds"][0])
+
+
+def test_settlement_rebuilds_the_calibration_report(monkeypatch, tmp_path):
+    """
+    The order is the dependency: grade, then recompute the evidence, so the
+    morning run reads evidence that includes last night's results.
+    """
+    import src.settlement.runner as runner
+
+    monkeypatch.setattr(
+        runner, "settle_pending_props",
+        lambda *a, **k: type("R", (), {"as_dict": lambda self: {"props_graded": 0}})(),
+    )
+    target = tmp_path / "calibration.json"
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(target))
+
+    import src.settlement.calibration as cal
+
+    monkeypatch.setattr(
+        cal, "prop_result_calibration_report",
+        lambda **kw: {"status": "DATA_NOT_AVAILABLE", "reason": "nothing settled",
+                      "n_scored": 0},
+    )
+
+    out = worker.run_settlement()
+    assert out["calibration"]["status"] == "DATA_NOT_AVAILABLE"
+    assert target.exists(), "an abstaining report must still be written"
+
+
+def test_an_abstaining_report_is_written_so_a_stale_pass_cannot_linger(
+    monkeypatch, tmp_path
+):
+    """
+    Not writing it would leave yesterday's PASSING report in place after the
+    rows behind it aged out of the window.
+    """
+    import json
+
+    import src.settlement.calibration as cal
+
+    target = tmp_path / "calibration.json"
+    target.write_text(json.dumps({"status": "OK", "ece": 0.01, "n_scored": 500}))
+    monkeypatch.setattr(
+        cal, "prop_result_calibration_report",
+        lambda **kw: {"status": "DATA_NOT_AVAILABLE", "reason": "aged out"},
+    )
+
+    worker.rebuild_calibration_report(str(target))
+    assert json.loads(target.read_text())["status"] == "DATA_NOT_AVAILABLE"

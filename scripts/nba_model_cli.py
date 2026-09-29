@@ -27,6 +27,46 @@ def _setup_logging(verbose: bool = False) -> None:
     )
 
 
+def _load_calibration_report(path: "Path | None") -> Optional[dict]:
+    """
+    Read a calibration report, or None when none was given.
+
+    One reader for every dispatch surface, so the board path and the DFS path
+    cannot come to disagree about what counts as evidence. A path that was given
+    and cannot be read is an error, not a silent None: "you forgot the flag" and
+    "the file is broken" must not produce the same withheld card.
+    """
+    if path is None:
+        return None
+    if not path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {path} missing", err=True)
+        raise SystemExit(2)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        typer.echo(f"ERROR: {path} is not valid JSON: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+
+def _board_publication_verdict(path: "Path | None"):
+    """
+    Whether a decision board may be published, gated as MODEL-sourced.
+
+    EVERY board row is model-sourced, book_ev included: such a row measures the
+    MODEL's probability against a de-vigged market price rather than using the
+    market's own, so there is no SHARP_BENCHMARK case here as there is for a DFS
+    leg. Gating the board as MODEL is therefore not conservatism, it is the
+    accurate source.
+    """
+    from src.quant.dfs_payouts import ProbabilitySource
+    from src.quant.publication_gate import calibration_gate
+
+    return calibration_gate(
+        _load_calibration_report(path),
+        probability_source=ProbabilitySource.MODEL,
+    )
+
+
 def _load_team_games():
     """Team results and market lines from the licensed workbook.
 
@@ -860,60 +900,40 @@ def decision_board_cmd(
     American odds (PropLine first, OddsPapi as the fallback); everything else
     abstains with a named reason.
 
-    READ THE BASIS COLUMN. A row recommended on `book_ev` rests on a de-vigged
-    market price. One recommended on `model_lean` rests on the model alone, and
-    until that model has graded results behind it that is an opinion with a
-    confident label — `quant.publication_gate` is what stops such a row being
-    dispatched.
+    READ THE BASIS COLUMN. A row recommended on `book_ev` has a de-vigged market
+    price behind it; one on `model_lean` has no price at all. Both still rest on
+    the MODEL's probability — a book_ev row measures that probability against the
+    market's, it does not use the market's — so until the model has graded results
+    behind it, every row here is an opinion with a confident label.
+
+    This command WRITES A CSV; it publishes nothing. The calibration gate is
+    applied when the board is dispatched (`notify-discord --source
+    decision-board --calibration-report ...`), which is where it can withhold.
     """
     _setup_logging(verbose)
-    from src.models.compare import compare_models_on_panel, load_comparison_config
-    from src.quant.decision_board import (
-        BOARD_DISCLAIMER,
-        build_decision_board,
-        decision_board_summary,
-        write_decision_board_csv,
-    )
-    from src.quant.paper_research import research_slate_from_predictions
-    from src.utils.timezones import pacific_calendar_date
+    from src.pipeline.slate_board import build_slate_board
+    from src.quant.decision_board import BOARD_DISCLAIMER
 
     panel, is_demo = _load_real_or_demo(demo)
-    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
-    result = compare_models_on_panel(
+    # One code path with the scheduled worker, which dispatches this same board.
+    # A second copy of the sequence would drift, and the drifting one would be
+    # the unattended one.
+    result = build_slate_board(
         panel,
-        markets=mkt,
+        out=out,
+        markets=[m.strip() for m in markets.split(",") if m.strip()],
         train_end=train_end,
         validation_end=validation_end,
-        cfg=load_comparison_config(),
-    )
-    slate = str(pacific_calendar_date())
-    slate_rows = research_slate_from_predictions(
-        result.get("predictions") or [],
-        slate_date=slate,
-        preferred_model=preferred_model or None,
-    )
-
-    # No archived PropLine pull exists in this repository yet, so no market
-    # candidates are attached and nothing is priced. Every row therefore
-    # lands on model_lean or unavailable — the truthful state, not a bug.
-    # Once a pull is archived, enrich each row with
-    # decision_board.enrich_row_with_resolved_market(row, candidates), which
-    # applies the PropLine-primary / OddsPapi-fallback precedence.
-    board = build_decision_board(
-        slate_rows,
+        preferred_model=preferred_model,
         min_ev=min_ev,
         min_lean=min_lean,
         require_valid_book=require_valid_book,
-        consider_only=consider_only,
+        recommended_only=consider_only,
         top_n=top_n,
     )
-    n = write_decision_board_csv(board, out)
 
-    summary = decision_board_summary(board)
+    summary = result.as_dict()
     summary.update({
-        "slate_date": slate,
-        "written_rows": n,
-        "out": str(out),
         "demo": demo or is_demo,
         "min_ev": min_ev,
         "require_valid_book": require_valid_book,
@@ -1268,20 +1288,7 @@ def dfs_entry_cmd(
             "until there is graded evidence behind it."
         )
 
-    calibration: dict | None = None
-    if calibration_report is not None:
-        if not calibration_report.exists():
-            typer.echo(
-                f"DATA_NOT_AVAILABLE: {calibration_report} missing", err=True
-            )
-            raise SystemExit(2)
-        try:
-            calibration = json.loads(calibration_report.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            typer.echo(
-                f"ERROR: {calibration_report} is not valid JSON: {exc}", err=True
-            )
-            raise SystemExit(2) from exc
+    calibration = _load_calibration_report(calibration_report)
 
     publication = calibration_gate(
         calibration, probability_source=evaluation.probability_source
@@ -1339,6 +1346,11 @@ def notify_discord_cmd(
     message: Optional[str] = typer.Option(
         None, "--message", help="Text for --source abstention"
     ),
+    calibration_report: Optional[Path] = typer.Option(
+        None, "--calibration-report",
+        help="JSON calibration report (see prop-calibration). Required before a "
+             "decision board may be posted; without it the board is withheld.",
+    ),
     max_rows: int = typer.Option(10, "--max-rows"),
     send: bool = typer.Option(
         False, "--send",
@@ -1346,11 +1358,21 @@ def notify_discord_cmd(
     ),
     verbose: bool = False,
 ) -> None:
-    """Post research output to Discord. Dry run unless --send is passed.
+    """Post a recommendation to Discord. Dry run unless --send is passed.
 
-    A notification, never a bet instruction: no stake is suggested, claim
-    words are refused, and the research disclaimer rides on every embed.
-    The webhook URL is read from DISCORD_WEBHOOK_URL and is never printed.
+    Claim words are refused and the qualifier rides on every embed. The webhook
+    URL is read from DISCORD_WEBHOOK_URL and is never printed.
+
+    THE CALIBRATION GATE IS APPLIED HERE for --source decision-board, which is
+    the publication surface. Every board row rests on the model's own
+    probability, including a book_ev row (it MEASURES that probability against
+    the market price rather than using the market's), so the board is gated as
+    MODEL-sourced. With no --calibration-report the gate withholds and the embed
+    carries its reason instead of the rows — which is the correct output while no
+    graded evidence exists, not a failure.
+
+    Build the report with `prop-calibration --out <path>` once settled rows
+    exist.
     """
     _setup_logging(verbose)
     import pandas as pd
@@ -1366,6 +1388,7 @@ def notify_discord_cmd(
     )
 
     config = DiscordConfig(dry_run=not send)
+    publication_note: dict | None = None
 
     try:
         if source == "decision-board":
@@ -1381,7 +1404,11 @@ def notify_discord_cmd(
                 for r in frame.to_dict("records")
             ]
             slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
-            embeds = [build_decision_board_embed(rows, slate_date=slate, max_rows=max_rows)]
+            verdict = _board_publication_verdict(calibration_report)
+            publication_note = verdict.as_dict()
+            embeds = [build_decision_board_embed(
+                rows, slate_date=slate, max_rows=max_rows, publication=verdict,
+            )]
 
         elif source == "parlay":
             from src.quant.parlay_log import (
@@ -1432,7 +1459,10 @@ def notify_discord_cmd(
 
     if result.status == "DRY_RUN":
         typer.echo(preview_json(result))
-    typer.echo(json.dumps(result.as_dict() | {"payload_preview": "omitted"}, indent=2))
+    payload = result.as_dict() | {"payload_preview": "omitted"}
+    if publication_note is not None:
+        payload["PUBLICATION"] = publication_note
+    typer.echo(json.dumps(payload, indent=2, default=str))
     if result.status in {"FAILED", "REFUSED"}:
         raise SystemExit(4)
 
@@ -1541,6 +1571,72 @@ def paper_calibration_cmd(
         if k not in {"reliability_table", "chart_points", "perfect_calibration_line"}
     }
     typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("prop-calibration")
+def prop_calibration_cmd(
+    out: Path = typer.Option(
+        Path("outputs/calibration.json"), "--out",
+        help="Where to write the report. This file is what the dispatch "
+             "commands read via --calibration-report.",
+    ),
+    lookback_days: int = typer.Option(
+        180, "--lookback-days",
+        help="Only graded games this recent. 0 for all of them.",
+    ),
+    market: Optional[str] = typer.Option(
+        None, "--market", help="Restrict to one market, e.g. PTS.",
+    ),
+    n_bins: int = typer.Option(10, "--n-bins"),
+    min_bin_coverage: float = typer.Option(
+        0.8, "--min-bin-coverage",
+        help="Fraction of bins that must be populated before an ECE is stood behind.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Build the calibration report from graded prop_results.
+
+    THE MISSING LINK IN THE FEEDBACK LOOP. The recorder writes PENDING
+    predictions, `settle` grades them, metrics aggregates W/L/PUSH — and until
+    this command nothing turned those graded rows into the calibration evidence
+    `quant.publication_gate` asks for, so the gate could only be fed by hand.
+
+    Writes JSON, because JSON is what the gate reads:
+
+        python -m scripts.nba_model_cli prop-calibration --out outputs/calibration.json
+        python -m scripts.nba_model_cli notify-discord --source decision-board \
+            --calibration-report outputs/calibration.json
+
+    ABSTAINS LOUDLY WHILE THERE IS NOTHING TO MEASURE. With no settled rows it
+    writes a DATA_NOT_AVAILABLE report naming why, and the gate then withholds —
+    which is the correct state, not a failure. Exit code 3 marks it so a shell
+    script can tell "no evidence yet" from "wrote a usable report".
+
+    UNDER ROWS ON A WHOLE LINE ARE EXCLUDED, not approximated: the stored column
+    is P(over), and 1 - P(over) absorbs the push mass on a line that can tie.
+    Every exclusion is counted by reason in the report.
+    """
+    _setup_logging(verbose)
+    from src.settlement.calibration import prop_result_calibration_report, summarise
+
+    try:
+        report = prop_result_calibration_report(
+            lookback_days=lookback_days or None,
+            market=market,
+            n_bins=n_bins,
+            min_bin_coverage=min_bin_coverage,
+        )
+    except Exception as exc:  # noqa: BLE001 — a DB failure must name itself
+        typer.echo(f"DATA_NOT_AVAILABLE: could not read prop_results: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+
+    summary = summarise(report) | {"out": str(out)}
+    typer.echo(json.dumps(summary, indent=2, default=str))
+    if report.get("status") != "OK":
+        raise SystemExit(3)
 
 
 @app.command("fetch-pbp")
