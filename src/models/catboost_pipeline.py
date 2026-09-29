@@ -499,8 +499,17 @@ class CatBoostPropPipeline:
         elif mean_path.exists():
             mean_path.unlink()
             logger.info("Removed stale mean-head artifact at %s", mean_path)
+        from src.models.feature_spec import META_KEY, FeatureSpec
+
+        spec = FeatureSpec(
+            name=f"prop_over_{str(self.target_market or 'unknown').lower()}",
+            market=str(self.target_market or "UNKNOWN"),
+            features=list(self.feature_cols),
+            categorical=list(self.categorical_features),
+        )
         meta = {
             "feature_cols": self.feature_cols,
+            META_KEY: spec.to_meta(),
             "categorical_features": self.categorical_features,
             "target_market": self.target_market,
             "model_version": self.model_version,

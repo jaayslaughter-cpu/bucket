@@ -98,7 +98,7 @@ Settlement runs separately via `python -m src.settlement.cli settle`.
 | `src/features/minutes_weighted.py` | 134 | No production import, **no test either**. Emits `{STAT}_MW_L5` columns nothing reads. |
 | `src/models/eligibility.py` | 129 | Tested, never called. Its config block is also unread — see below. |
 | `src/models/combo_variance.py` | 282 | Tested, never called. PRA is in `markets_post_launch`, so the combo variance it provides is unreachable. |
-| `src/models/feature_spec.py` | — | Tested, never called. The SHA fingerprint that would catch train/serve drift never runs. |
+| `src/models/feature_spec.py` | — | ~~Tested, never called.~~ **Wired** — `verify_feature_contract` runs in `score_prob_over`, and both model `save` paths write the fingerprint. |
 | `src/models/protocol.py` | 48 | A typing `Protocol` no adapter declares conformance to, so nothing enforces the model interface. |
 | `src/settlement/cli.py` | 134 | **Not an orphan** — a `python -m` entrypoint with `if __name__ == "__main__"`, invoked by command rather than imported. |
 
@@ -219,6 +219,28 @@ the reachable alternative.
 when columns are missing, which catches *absence*. Column order and dtype
 are unchecked because `feature_spec.py` is orphaned.
 
+> **Resolved, and the finding's wording was too broad.** Order and dtype were
+> in fact already enforced: `xgboost_pipeline._matrix` selects by `feature_cols`
+> in order and refuses a column whose values will not parse as numbers. What
+> nothing checked was whether the SIDECAR AND THE ARTIFACT AGREE — a
+> `.meta.json` from one fit beside a booster from another. Both `save` methods
+> already carry code to delete a stale *mean head* for exactly that reason; the
+> classifier had no equivalent guard.
+>
+> `models/feature_spec.py:verify_feature_contract` now runs in
+> `score_prob_over`, and both `save` paths write a fingerprinted `feature_spec`
+> block. Two checks: the sidecar against its own fingerprint (catches a
+> hand-edited or half-written file — no modelling library can see this), and the
+> sidecar against the artifact's own column names.
+>
+> **What check 2 adds, measured rather than assumed:** on xgboost 3.2.0 a
+> permuted or short column list already raises `feature_names mismatch`, so
+> `score_prob_over` would have abstained anyway through its broad `except`. What
+> changes is the reason an operator reads — xgboost's internal message does not
+> say two artifacts came from different fits. It also does not depend on the
+> library validating names, which matters if a positionally-indexed model family
+> is ever put on the serving path.
+
 **R6 — Rate limits and timeouts: already sound, no action.**
 `propline.py` does 4 attempts with exponential backoff, honours
 `Retry-After`, parses live quota from response headers, refuses to start
@@ -282,6 +304,7 @@ artifacts from object storage** — the one step left, and the only one that
 cannot be taken from inside this repository.
 
 Minimum to reach READY: the above, plus ~~a pre-tip scratch filter (R4)~~
-(done), the `FeatureSpec` fingerprint wired at train and serve (R5), and
-~~thread caps on concurrent fits (R8)~~ (done). **R5 is the one left**, and
-`models/feature_spec.py` is still orphaned.
+(done), ~~the `FeatureSpec` fingerprint wired at train and serve (R5)~~ (done),
+and ~~thread caps on concurrent fits (R8)~~ (done). **All of READY's own items
+are closed**; the WARNING blocker above (model artifacts on an ephemeral
+filesystem) is the only thing outstanding, and it is a platform step.

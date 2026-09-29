@@ -436,6 +436,33 @@ def score_prob_over(
         pipeline = XGBoostPropPipeline(feature_cols)  # required positional arg
         booster = xgb.XGBClassifier()
         booster.load_model(str(model_path))
+
+        # TRAIN/SERVE CONTRACT CHECK (audit finding R5). The booster carries the
+        # column names it was trained on; nothing compared them to the sidecar's
+        # feature_cols, so a .meta.json from one fit beside an artifact from
+        # another was never identified as such.
+        #
+        # WHAT THIS ADDS, precisely: xgboost itself raises feature_names mismatch
+        # on a permuted or short column list, so the broad except below already
+        # abstained. It abstained with xgboost's internal message, which does not
+        # say that two artifacts came from different fits. This names the
+        # mismatch, the market and the fingerprint instead. It also catches a
+        # sidecar that contradicts its own fingerprint, which no modelling
+        # library can see — that is a property of the file.
+        from src.models.feature_spec import verify_feature_contract
+
+        try:
+            booster_columns = booster.get_booster().feature_names
+        except Exception:  # noqa: BLE001 — an artifact that cannot say is not a mismatch
+            booster_columns = None
+        spec, problem = verify_feature_contract(meta, booster_columns)
+        if problem is not None:
+            logger.warning(
+                "P(Over) skipped: %s (market=%s fingerprint=%s)",
+                problem, spec.market, spec.fingerprint(),
+            )
+            return null
+
         pipeline.model = booster
 
         raw = pd.Series(pipeline.predict_proba_over(features), index=features.index)
