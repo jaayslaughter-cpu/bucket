@@ -269,19 +269,42 @@ def _keys_read_from(function_name: str, module_path: str, variable: str) -> set[
     raise AssertionError(f"{function_name} not found in {module_path}")
 
 
-def test_every_projection_key_the_recorder_reads_is_one_the_assembler_writes():
+def test_every_projection_key_the_recorder_reads_has_a_writer():
+    """
+    The frame the recorder reads has TWO writers now: assemble_projections
+    builds it, and pipeline.scratches adds the availability columns on the way
+    through. A key with neither writer is a silent null, which would skip every
+    row for a reason that is not the real one.
+
+    The scratch filter's column names come from its own constants rather than
+    being repeated here, so renaming one cannot quietly pass this test.
+    """
     from test_projection_roundtrip import _keys_written_by_assemble_projections
+
+    from src.pipeline.scratches import AVAILABILITY_COLUMN, DETAIL_COLUMN
 
     read = _keys_read_from(
         "pending_prop_result_rows", "src/settlement/recorder.py", "row",
     )
-    written = _keys_written_by_assemble_projections()
+    written = _keys_written_by_assemble_projections() | {
+        AVAILABILITY_COLUMN, DETAIL_COLUMN,
+    }
     missing = read - written
-    assert not missing, (
-        f"recorder reads {sorted(missing)}, which assemble_projections never "
-        "writes — those would be silent nulls, so every row would be skipped "
-        "for a reason that is not the real one"
+    assert not missing, f"recorder reads {sorted(missing)} with no writer"
+
+
+def test_the_recorder_reads_the_availability_column_the_filter_writes():
+    """
+    Pins the seam itself: the constant the filter sets must be the string the
+    recorder checks. These are in different modules and only a test connects
+    them.
+    """
+    from src.pipeline.scratches import AVAILABILITY_COLUMN
+
+    read = _keys_read_from(
+        "pending_prop_result_rows", "src/settlement/recorder.py", "row",
     )
+    assert AVAILABILITY_COLUMN in read
 
 
 def test_every_line_field_the_recorder_wants_is_one_the_ingester_writes():
@@ -307,3 +330,41 @@ def test_every_line_field_the_recorder_wants_is_one_the_ingester_writes():
     assert written, "ingest_prop_lines builds no dict literal any more"
     missing = (set(LINE_FIELDS) | set(LINE_JOIN_KEYS)) - written
     assert not missing, f"recorder wants {sorted(missing)} from the prop board"
+
+
+# --- the scratch filter's effect on what gets recorded -------------------
+
+def test_a_player_ruled_out_is_not_recorded_as_a_prediction():
+    """
+    Settlement would VOID it, and a VOID row is noise in the backlog rather than
+    evidence. The projection itself survives in the frame; only the ledger skips.
+    """
+    from src.pipeline.scratches import AVAILABILITY_COLUMN
+
+    frame = projections()
+    frame[AVAILABILITY_COLUMN] = "WITHHELD"
+    report = pending_prop_result_rows(frame, lines())
+    assert report.rows == []
+    assert any("OUT or DOUBTFUL" in r for r in report.skipped_by_reason)
+
+
+@pytest.mark.parametrize("label", ["UNVERIFIED", "UNKNOWN", "AVAILABLE", None, ""])
+def test_anything_other_than_withheld_is_still_recorded(label):
+    """
+    "The feed did not answer" is not "the player is out". Discarding on an
+    unanswered check would silently shrink the evidence base every time ESPN had
+    a bad afternoon — and the evidence base is the thing the publication gate
+    waits on.
+    """
+    from src.pipeline.scratches import AVAILABILITY_COLUMN
+
+    frame = projections()
+    frame[AVAILABILITY_COLUMN] = label
+    report = pending_prop_result_rows(frame, lines())
+    assert len(report.rows) == 1, report.skipped_by_reason
+
+
+def test_a_frame_with_no_availability_column_at_all_is_still_recorded():
+    """The filter is a step, not a precondition — an older frame must still work."""
+    report = pending_prop_result_rows(projections(), lines())
+    assert len(report.rows) == 1

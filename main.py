@@ -776,6 +776,24 @@ def main(argv: list[str] | None = None) -> int:
         projections = assemble_projections(features, prob_over, ev_verdict, prop_lines=prop_df)
         stage_summary["projections"] = {"rows": len(projections)}
 
+        # PRE-TIP SCRATCH FILTER (audit finding R4). The absence features are a
+        # training-panel signal; nothing withheld a projection when a player was
+        # ruled out AFTER it was written. ESPN's public injuries feed is the
+        # reachable source — stats.nba.com is denied through this proxy.
+        #
+        # A FAILED CHECK LABELS, IT DOES NOT CLEAR. Rows come back UNVERIFIED and
+        # are still persisted and still recorded; only OUT/DOUBTFUL is withheld.
+        from src.pipeline.scratches import apply_scratch_filter
+
+        scratches = apply_scratch_filter(projections)
+        projections = scratches.projections
+        stage_summary["scratch_filter"] = scratches.as_dict()
+        if not scratches.verified:
+            logger.warning(
+                "Availability unverified (%s). Projections are labelled "
+                "UNVERIFIED, not cleared.", scratches.reason,
+            )
+
         if persist and not projections.empty:
             from src.db.repository import (
                 persist_projections,

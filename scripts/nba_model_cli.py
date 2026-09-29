@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -1636,6 +1636,183 @@ def prop_calibration_cmd(
     summary = summarise(report) | {"out": str(out)}
     typer.echo(json.dumps(summary, indent=2, default=str))
     if report.get("status") != "OK":
+        raise SystemExit(3)
+
+
+@app.command("espn-slate")
+def espn_slate_cmd(
+    day: Optional[str] = typer.Option(
+        None, "--date", help="Pacific calendar date YYYY-MM-DD. Default: today PT.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the games as CSV here as well as summarising.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Today's NBA games from ESPN's public scoreboard.
+
+    WHY THIS SOURCE. The player game log holds COMPLETED games, so a future
+    slate is legitimately absent from the panel and needs a schedule feed.
+    ESPN's scoreboard is public and needs no credential; stats.nba.com is denied
+    through this environment's proxy.
+
+    The slate day is a PACIFIC calendar date derived from each tip-off, not the
+    UTC date — a 7pm PT game is already tomorrow in UTC, and bucketing by UTC
+    would move the late West Coast games onto the next slate for part of the
+    year and not the rest.
+
+    Team codes are translated to the abbreviations the rest of this pipeline
+    joins on (GS -> GSW, NO -> NOP, and so on); a code with no mapping is
+    reported rather than guessed.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_schedule import EspnScheduleError, load_slate
+    from src.utils.timezones import pacific_calendar_date, parse_slate_date
+
+    target = parse_slate_date(day) if day else pacific_calendar_date()
+    try:
+        result = load_slate(target)
+    except EspnScheduleError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if result.status != "OK":
+        typer.echo(json.dumps({
+            "status": result.status,
+            "slate_date": str(target),
+            "notes": result.notes,
+        }, indent=2, default=str))
+        raise SystemExit(3)
+
+    games = [g.as_dict() for g in result.games]
+    if out is not None and games:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(games).to_csv(out, index=False)
+
+    typer.echo(json.dumps({
+        "status": result.status,
+        "slate_date": str(result.slate_date_pt or target),
+        "games": len(games),
+        # The only ones a pre-tip run may use; a game already in progress or
+        # final is not a slate a projection can be written for.
+        "pregame": len(result.pregame_only),
+        # Surfaced rather than swallowed: a code with no mapping means a game
+        # that cannot be joined to the panel, not a game that does not exist.
+        "unmapped_teams": result.unmapped_teams,
+        "notes": result.notes,
+        "out": str(out) if out is not None else None,
+        "matchups": [
+            f"{g['AWAY_TEAM']} @ {g['HOME_TEAM']}" for g in games[:15]
+        ],
+    }, indent=2, default=str))
+
+
+@app.command("espn-injuries")
+def espn_injuries_cmd(
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the injury rows as CSV here.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """The league-wide ESPN injury report — the pre-tip scratch source.
+
+    This is what `pipeline.scratches` applies to a slate's projections, and it
+    is the reachable substitute for the official pregame inactive list
+    (stats.nba.com is denied here).
+
+    A FAILED REPORT IS NOT AN EMPTY ONE. When ESPN does not answer, this exits
+    non-zero and says so rather than printing zero injuries, because "nobody is
+    hurt" and "we could not ask" must not look the same to a shell script.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_availability import fetch_injuries
+
+    try:
+        report = fetch_injuries()
+    except Exception as exc:  # noqa: BLE001 — name the failure, do not print zero
+        typer.echo(f"DATA_NOT_AVAILABLE: injury report unreachable: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    rows = [r.as_dict() for r in report.injuries]
+    if out is not None and rows:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out, index=False)
+
+    typer.echo(json.dumps({
+        "status": report.status,
+        "rows": len(rows),
+        "out_or_doubtful": len(report.unavailable_names),
+        "names": sorted(report.unavailable_names)[:25],
+        "notes": report.notes,
+        "out": str(out) if out is not None else None,
+    }, indent=2, default=str))
+    if report.status != "OK":
+        raise SystemExit(3)
+
+
+@app.command("espn-boxscore")
+def espn_boxscore_cmd(
+    event_id: str = typer.Option(..., "--event-id", help="ESPN event id."),
+    show_plays: int = typer.Option(
+        0, "--show-plays",
+        help="Print this many parsed plays. The fetch always returns them.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the box-score rows as CSV here.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """One game's ESPN box score, and optionally its play-by-play.
+
+    A SECOND SOURCE, not the primary one. Settlement grades against
+    `cdn.nba.com` via `settlement/boxscore_fetcher.py`; this exists so a game
+    that source cannot produce can still be inspected by hand, and so the
+    parsing is exercised by something other than its own tests.
+
+    Player stats are zipped against ESPN's OWN column header rather than a
+    positional assumption, and a played row carrying no stats is flagged instead
+    of being read as a zero line.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_game import fetch_summary
+
+    try:
+        summary = fetch_summary(event_id)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    rows = [r.as_dict() for r in summary.box_score]
+    if out is not None and rows:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out, index=False)
+
+    payload: dict[str, Any] = {
+        "status": summary.status,
+        "event_id": event_id,
+        "box_score_rows": len(rows),
+        "played": len(summary.played),
+        # Who dressed and did not play — the post-game scratch signal, which is
+        # NOT the same as the pre-tip injury report the scratch filter uses.
+        "inactive": len(summary.inactive_names),
+        "inactive_names": sorted(summary.inactive_names)[:25],
+        "plays": len(summary.plays),
+        "notes": summary.notes,
+        "out": str(out) if out is not None else None,
+    }
+    if show_plays > 0:
+        payload["sample_plays"] = [
+            p.as_dict() if hasattr(p, "as_dict") else vars(p)
+            for p in summary.plays[: int(show_plays)]
+        ]
+    typer.echo(json.dumps(payload, indent=2, default=str))
+    if summary.status != "OK":
         raise SystemExit(3)
 
 

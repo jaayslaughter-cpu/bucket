@@ -196,6 +196,24 @@ when a player is ruled out after that projection was written. Also
 existing puller cannot be exercised here; ESPN's public injuries feed is
 the reachable alternative.
 
+> **Resolved.** `pipeline/scratches.py:apply_scratch_filter` labels every
+> projection from ESPN's league-wide injury report, and `main.py` applies it
+> right after `assemble_projections`. `settlement/recorder.py` skips a WITHHELD
+> row, so a prediction on a player who will not dress is never written as one —
+> settlement would VOID it, and a VOID row is backlog noise rather than evidence.
+>
+> **Four values, not two:** AVAILABLE / WITHHELD / UNKNOWN / **UNVERIFIED**. A
+> feed that fails marks every row UNVERIFIED and drops nothing, because "we
+> could not ask" is not "everyone is playing". Only WITHHELD is skipped
+> downstream, so a bad afternoon at ESPN does not silently shrink the evidence
+> base the publication gate is waiting on. Doubtful counts as unavailable.
+>
+> Matching is exact on a normalised name, never fuzzy: withholding the wrong
+> player is worse than withholding nobody.
+>
+> **Never exercised live** — every ESPN host is denied from this environment, so
+> this is fixture-tested only.
+
 **R5 — Train/serve drift is unguarded.** `score_prob_over` loads
 `feature_cols` from the model's `.meta.json` sidecar and refuses to score
 when columns are missing, which catches *absence*. Column order and dtype
@@ -263,6 +281,7 @@ declare a Railway volume for `data/external/model_runs/` or load model
 artifacts from object storage** — the one step left, and the only one that
 cannot be taken from inside this repository.
 
-Minimum to reach READY: the above, plus a pre-tip scratch filter (R4), the
-`FeatureSpec` fingerprint wired at train and serve (R5), and thread caps on
-concurrent fits (R8).
+Minimum to reach READY: the above, plus ~~a pre-tip scratch filter (R4)~~
+(done), the `FeatureSpec` fingerprint wired at train and serve (R5), and
+~~thread caps on concurrent fits (R8)~~ (done). **R5 is the one left**, and
+`models/feature_spec.py` is still orphaned.

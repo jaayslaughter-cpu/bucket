@@ -36,6 +36,15 @@ alternative is a confidently wrong ledger entry:
   no game id       the grader fetches box scores by game id. A row it cannot
                    join to a game stays PENDING for ever and pollutes the
                    backlog.
+  ruled out        ESPN lists the player OUT or DOUBTFUL (``AVAILABILITY`` is
+                   WITHHELD, from ``pipeline.scratches``). A prediction on a
+                   player who will not dress is not a prediction worth grading:
+                   settlement would VOID it, and a VOID row is noise in the
+                   backlog rather than evidence. NOTE that only WITHHELD is
+                   skipped — UNVERIFIED and UNKNOWN are recorded, because "the
+                   feed did not answer" is not "the player is out", and
+                   discarding on an unanswered check would silently shrink the
+                   evidence base every time ESPN had a bad afternoon.
 
 Every skip is counted and reported by reason. A recorder that silently wrote
 fewer rows than it was given would reproduce the defect it exists to fix.
@@ -215,6 +224,14 @@ def pending_prop_result_rows(
             continue
         if pd.isna(game_date):
             report.skipped.append({"row": label, "reason": "no game date"})
+            continue
+        # Only WITHHELD. See the module docstring on why an unverified check is
+        # not a scratch.
+        if str(row.get("AVAILABILITY") or "").strip().upper() == "WITHHELD":
+            report.skipped.append({
+                "row": label,
+                "reason": "player is listed OUT or DOUBTFUL (would settle VOID)",
+            })
             continue
 
         side = SIDE_OVER if prob_over > 0.5 else SIDE_UNDER
