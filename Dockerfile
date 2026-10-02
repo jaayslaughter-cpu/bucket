@@ -31,6 +31,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# SET EXPLICITLY so the container's default is a decision rather than the
+# host's. Every slate cutoff in this project is a Pacific CALENDAR DAY and the
+# scheduler passes America/Los_Angeles to APScheduler directly, so none of the
+# timing logic depends on this value — it governs the naive datetime.now()
+# calls elsewhere, which should be UTC and reproducible rather than inherited.
+ENV TZ=Etc/UTC
+
 # libgomp1 is OpenMP, which xgboost and catboost link against. Without it the
 # image builds and then fails at import, which is the same late failure the ML
 # extra is installed to avoid.
@@ -65,10 +72,29 @@ ENV PROPIQ_MAX_THREADS=2
 # EV with it. Postgres is the only durable option in the image.
 ENV PROPIQ_PARLAY_LEDGER=postgres
 
-# MODEL ARTIFACTS ARE NOT IN THIS IMAGE and are not written to a volume by
-# anything here. data/external/model_runs/ is where score_prob_over looks; on a
-# fresh container it is empty and every row abstains. Mount a Railway volume at
-# /app/data, or fetch the artifacts from object storage at boot, BEFORE relying
-# on a deployed slate run. This comment is the warning, not a fix.
+# STATE THAT MUST OUTLIVE A REDEPLOY LIVES UNDER /app/data, so mount the
+# Railway volume there. Two things depend on it:
+#
+#   data/external/model_runs/  the trained artifacts score_prob_over loads. On
+#                              a fresh container this is empty and EVERY ROW
+#                              ABSTAINS — the pipeline runs, writes nothing
+#                              useful, and does not look broken. Not shipped in
+#                              this image; train into the volume or fetch from
+#                              object storage at boot.
+#   calibration.json           the evidence the publication gate reads. The
+#                              settlement job writes it at 03:30 PT and the
+#                              slate job reads it at 09:00 PT; on the ephemeral
+#                              layer a redeploy between those two leaves the
+#                              gate with no evidence, so every card is withheld
+#                              for a reason that is not the real one.
+ENV PROPIQ_CALIBRATION_REPORT=/app/data/calibration.json
+
+# THE VOLUME MOUNT SHADOWS THE chown ABOVE. /app/data is created and chowned to
+# propiq at build time, but a volume mounted there at RUN time replaces it with
+# whatever the platform provisions — commonly root-owned. This container runs as
+# uid 10001, so the first write can fail with EACCES, and the worker's broad
+# except would report it as a failed calibration report rather than a
+# permissions problem. scheduler_worker.check_state_dir() probes it at boot and
+# names it; see docs/deploy_railway.md for the fix if it fires.
 
 CMD ["python", "scheduler_worker.py"]

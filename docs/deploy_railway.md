@@ -27,6 +27,11 @@ client but no daemon and a network policy that denies the package index, so
 deploy; treat the layer ordering and the apt package list as reasoned, not
 verified.
 
+**Point the service at the Dockerfile, not Nixpacks.** Nixpacks reads
+`requirements.txt` rather than `pyproject.toml`'s extras. `APScheduler` is now
+in both, so a Nixpacks build no longer produces a worker that exits on import —
+but there is one build path that is tested by inspection and it is this file.
+
 It installs the `ml`, `db` and `deploy` extras. The ML extras are optional in
 `pyproject.toml` so a local checkout stays light — a minimal image would start
 cleanly and then fail at the first inference, unattended, after the slate had
@@ -34,6 +39,31 @@ already been ingested. Failing at build time is the better trade.
 
 `.dockerignore` keeps `.env` and `data/` out of the build context. A credential
 in an image layer survives every later layer that deletes it.
+
+## 2b. The volume, and the one trap in it
+
+Mount a persistent volume at **`/app/data`**. Two things need it:
+
+| Path | Why |
+|---|---|
+| `data/external/model_runs/comparison/` | the trained artifacts `score_prob_over` loads. Empty on a fresh container → **every row abstains**, and the pipeline does not look broken |
+| `/app/data/calibration.json` | the evidence the publication gate reads. Settlement writes it 03:30 PT, the slate reads it 09:00 PT — on the ephemeral layer a redeploy between the two withholds every card for a reason that is not the real one |
+
+**THE TRAP: a mounted volume shadows the image's `chown`.** The Dockerfile
+creates `/app/data` and chowns it to `propiq` (uid 10001), but a volume mounted
+there at run time replaces that directory with whatever the platform
+provisions — commonly root-owned. The container runs as uid 10001, so the first
+write fails with `EACCES`, and because every writer catches broadly you would
+see *"calibration report failed"* nightly rather than a permissions problem.
+
+`scheduler_worker.check_state_dir()` probes it at boot and says so. If it fires,
+the first log line is an ERROR naming the path and the uid. Two fixes:
+
+1. `chown` the volume to uid 10001 (a one-off `railway run chown -R 10001:10001 /app/data`, or an init step).
+2. Run the service as root — drop the `USER propiq` line. Smaller blast radius is worth keeping, so prefer (1).
+
+Nothing is lost while it is unwritable: projections and `prop_results` still go
+to Postgres. What stops is the calibration evidence, so every card is withheld.
 
 ## 3. Environment
 
@@ -47,6 +77,7 @@ these are the ones the worker reads.
 | `PROPLINE_API_KEY` | The odds source. Without it no line is captured, so every row abstains for want of a market. |
 | `DISCORD_WEBHOOK_URL` | Only if you dispatch. Never logged or printed. |
 | `PROPIQ_MAX_THREADS` | Defaults to 2 in the image. Match your plan's CPU allocation — the numeric libraries otherwise see the host's core count, not the container's share. |
+| `TZ` | Set to `Etc/UTC` in the image so the container default is a decision rather than the host's. The slate schedule does **not** depend on it: the scheduler passes `America/Los_Angeles` to APScheduler directly. |
 | `PROPIQ_SLATE_HOUR_PT` / `_MINUTE_PT` | Defaults 09:00 PT, before any tip. |
 | `PROPIQ_SETTLE_HOUR_PT` / `_MINUTE_PT` | Defaults 03:30 PT, after any finish. |
 | `PROPIQ_RUN_ON_START` | Off by default. Set it for a single first run; leaving it on means a redeploy loop re-runs the slate each time. |

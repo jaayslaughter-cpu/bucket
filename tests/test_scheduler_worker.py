@@ -349,3 +349,137 @@ def test_an_abstaining_report_is_written_so_a_stale_pass_cannot_linger(
 
     worker.rebuild_calibration_report(str(target))
     assert json.loads(target.read_text())["status"] == "DATA_NOT_AVAILABLE"
+
+
+# --- the state directory probe ------------------------------------------
+
+def test_a_writable_state_dir_reports_writable(tmp_path, monkeypatch):
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "calibration.json"))
+    out = worker.check_state_dir()
+    assert out["writable"] is True
+    assert not list(tmp_path.glob(".propiq_write_probe")), "the probe file was left behind"
+
+
+@pytest.mark.skipif(
+    hasattr(__import__("os"), "getuid") and __import__("os").getuid() == 0,
+    reason=(
+        "root bypasses directory permission bits, so an unwritable directory "
+        "cannot be simulated. Worth noting as a deployment fact: running the "
+        "Railway service as root is one of the two fixes for a root-owned "
+        "volume, and it makes this failure mode impossible."
+    ),
+)
+def test_an_unwritable_state_dir_is_named_rather_than_surfacing_later(
+    tmp_path, monkeypatch, caplog
+):
+    """
+    A Railway volume mounted at /app/data REPLACES the directory the Dockerfile
+    chowned, commonly with a root-owned one, while this process runs as uid
+    10001. Every writer here catches broadly, so without this probe the failure
+    appears as "calibration report failed" every night — the symptom, not the
+    cause.
+    """
+    import logging
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # readable, not writable
+    try:
+        monkeypatch.setenv(
+            worker.ENV_CALIBRATION_REPORT, str(locked / "calibration.json")
+        )
+        with caplog.at_level(logging.ERROR):
+            out = worker.check_state_dir()
+        assert out["writable"] is False
+        assert "NOT WRITABLE" in caplog.text
+        assert "owned by root" in caplog.text
+        assert "still writes to Postgres" in caplog.text, (
+            "the operator should know what still works"
+        )
+    finally:
+        locked.chmod(0o700)
+
+
+def test_the_probe_never_raises_and_still_names_the_cause(monkeypatch, caplog):
+    """
+    A worker that will not start is worse than one that logs the problem.
+
+    This also carries the message assertions under root, where the
+    permission-bits test above is skipped: /proc is unwritable for everyone, so
+    the error branch and its wording are exercised either way.
+    """
+    import logging
+
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, "/proc/nonexistent/x.json")
+    with caplog.at_level(logging.ERROR):
+        out = worker.check_state_dir()
+    assert out["writable"] is False
+    assert out["error"]
+    assert "NOT WRITABLE" in caplog.text
+    assert "owned by root" in caplog.text
+    assert "still writes to Postgres" in caplog.text, (
+        "the operator should know what still works"
+    )
+
+
+def test_the_probe_runs_at_boot():
+    import inspect
+
+    assert "check_state_dir()" in inspect.getsource(worker.main)
+
+
+# --- deployment manifests ------------------------------------------------
+
+def test_every_env_var_the_code_reads_is_documented():
+    """
+    An undocumented variable is one nobody sets on purpose. 16 of 28 were
+    missing from .env.example when the Railway audit ran, including the two
+    that decide whether a deployed run keeps anything.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).parent.parent
+    sources = (
+        list((root / "src").rglob("*.py"))
+        + list((root / "scripts").glob("*.py"))
+        + [root / "main.py", root / "scheduler_worker.py"]
+    )
+    pattern = re.compile(
+        r'os\.environ(?:\.get)?\(\s*["\']([A-Z_][A-Z0-9_]*)["\']'
+        r'|os\.getenv\(\s*["\']([A-Z_][A-Z0-9_]*)["\']'
+        r'|ENV_[A-Z_]+\s*=\s*["\']([A-Z_][A-Z0-9_]*)["\']'
+    )
+    read: set[str] = set()
+    for path in sources:
+        for m in pattern.finditer(path.read_text()):
+            read.add(m.group(1) or m.group(2) or m.group(3))
+
+    documented = (root / ".env.example").read_text()
+    missing = sorted(n for n in read if n not in documented)
+    assert not missing, f"{len(missing)} env var(s) absent from .env.example: {missing}"
+
+
+def test_the_worker_scheduler_is_installable_from_requirements_txt():
+    """
+    Railway's Nixpacks builder reads requirements.txt, NOT pyproject's extras.
+    APScheduler was only in the extra, so a Nixpacks build produced a container
+    whose worker hit its import guard and exited in a restart loop.
+    """
+    import pathlib
+
+    req = (pathlib.Path(__file__).parent.parent / "requirements.txt").read_text()
+    assert "APScheduler" in req
+
+
+def test_the_image_pins_a_timezone_and_a_volume_backed_report_path():
+    """
+    TZ so the container's default is a decision rather than the host's, and the
+    calibration report on the mounted volume because the settlement job writes
+    it at 03:30 PT and the slate job reads it at 09:00 PT.
+    """
+    import pathlib
+
+    dockerfile = (pathlib.Path(__file__).parent.parent / "Dockerfile").read_text()
+    assert "ENV TZ=" in dockerfile
+    assert "PROPIQ_CALIBRATION_REPORT=/app/data/" in dockerfile

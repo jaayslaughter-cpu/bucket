@@ -87,3 +87,16 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Model artifacts and local databases, wherever they land. `data/` above covers
+# the ones written there (including bet_lifecycle.sqlite), but an artifact saved
+# anywhere else was committable — and a booster or a pickle in git history is
+# both large and permanent.
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+*.cbm
+*.sqlite
+*.sqlite3
+*.db

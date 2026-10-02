@@ -120,6 +120,50 @@ def cap_thread_counts() -> int | None:
     return cap
 
 
+def check_state_dir(path: str | None = None) -> dict[str, Any]:
+    """
+    Probe the directory the durable state is written to, at boot.
+
+    WHY THIS IS A SEPARATE CHECK. A Railway volume mounted at /app/data REPLACES
+    the directory the Dockerfile created and chowned, with whatever the platform
+    provisions — commonly root-owned. This container runs as uid 10001, so the
+    first write fails with EACCES, and every writer here catches broadly: the
+    failure would surface as "calibration report failed" every night, which
+    names the symptom and not the cause.
+
+    Probes by actually creating and deleting a file rather than reading the mode
+    bits, because the mode is not the whole answer — an ownership mismatch, a
+    read-only mount and a full disk all present differently and all matter.
+
+    Warns, never raises. A worker that will not start is worse than one whose
+    first log line says the volume is not writable: the slate still runs and
+    still writes to Postgres, which is where the projections go.
+    """
+    from pathlib import Path
+
+    target = Path(
+        path or os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
+    ).parent
+    probe = target / ".propiq_write_probe"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        logger.error(
+            "STATE DIRECTORY %s IS NOT WRITABLE (%s). The calibration report and "
+            "the model artifacts live here, so the publication gate will withhold "
+            "every card and score_prob_over will find no model. If this is a "
+            "mounted volume, it is most likely owned by root while this process "
+            "runs as uid %s — chown it to that uid, or run the service as root. "
+            "The slate still runs and still writes to Postgres.",
+            target, exc, os.getuid() if hasattr(os, "getuid") else "?",
+        )
+        return {"path": str(target), "writable": False, "error": str(exc)}
+    logger.info("State directory %s is writable.", target)
+    return {"path": str(target), "writable": True}
+
+
 def run_slate(argv: list[str] | None = None) -> int:
     """One slate run: ingest, build features, score, gate, persist, record.
 
@@ -443,6 +487,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
     )
     cap_thread_counts()
+    check_state_dir()
 
     scheduler = build_scheduler()
     for job in describe(scheduler):
