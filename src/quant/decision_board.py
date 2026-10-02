@@ -336,6 +336,10 @@ class BettingDecisionCandidate(BaseModel):
     pickem_line: float | None = None
     pickem_source: str | None = None
     pickem_line_diff: float | None = None
+    # How many prior games this player had before the row's date. Exported so a
+    # reader can see WHY a row abstained on cold start rather than taking the
+    # reason on faith.
+    prior_games: int | None = None
     decision_status: DecisionStatus = "ABSTAIN"
     decision_basis: DecisionBasis = "unavailable"
     rank_score: float | None = None
@@ -463,6 +467,33 @@ def expand_row_to_candidates(
         else:
             why = f"DATA_NOT_AVAILABLE: cannot resolve P({side})"
 
+        # COLD START OVERRIDES EVERYTHING ABOVE, and it is applied last on
+        # purpose. A thin-history row can clear min_ev on a real price and still
+        # be a probability the model had almost nothing to learn from, so this
+        # cannot sit inside the book_ev branch — it has to be able to take a
+        # RECOMMENDED row back.
+        #
+        # The abstention is specific to RECOMMENDING. The prediction is still
+        # recorded and still graded: a thin-history row is the evidence where
+        # the model is weakest, and dropping it from the ledger would bias the
+        # calibration toward the easy cases.
+        # Carried onto the candidate independently of how the row was built.
+        # research_slate_from_predictions also folds these into row.warnings,
+        # but a row constructed any other way would then lose them, and the
+        # reason a board row abstained should not depend on its provenance.
+        for warning in row.eligibility_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+
+        if row.eligibility_warnings and status == "RECOMMENDED":
+            status = "ABSTAIN"
+            why = (
+                "ABSTAIN on cold start: "
+                + "; ".join(row.eligibility_warnings)
+                + f". The model's basis for this row was {basis}, and that "
+                "number stands — what is withheld is the recommendation."
+            )
+
         out.append(
             BettingDecisionCandidate(
                 slate_date=row.slate_date,
@@ -490,6 +521,7 @@ def expand_row_to_candidates(
                 edge_letter_grade=_side_grade(row, side),
                 confidence_tier=row.confidence_tier,
                 over_under_meter=row.over_under_meter,
+                prior_games=row.prior_games,
                 preferred_side=row.preferred_side,
                 is_preferred_side=row.preferred_side == side,
                 pickem_line=row.pickem_line,

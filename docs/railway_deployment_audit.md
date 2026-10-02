@@ -96,7 +96,7 @@ Settlement runs separately via `python -m src.settlement.cli settle`.
 | Module | Lines | State |
 |---|---|---|
 | `src/features/minutes_weighted.py` | 134 | No production import, **no test either**. Emits `{STAT}_MW_L5` columns nothing reads. |
-| `src/models/eligibility.py` | 129 | Tested, never called. Its config block is also unread — see below. |
+| `src/models/eligibility.py` | 129 | ~~Tested, never called.~~ **Wired** — the cold-start gate withholds a board recommendation, and `ks_feature_drift` reports train/validation covariate drift per market. Both config blocks are now read. |
 | `src/models/combo_variance.py` | 282 | Tested, never called. PRA is in `markets_post_launch`, so the combo variance it provides is unreachable. |
 | `src/models/feature_spec.py` | — | ~~Tested, never called.~~ **Wired** — `verify_feature_contract` runs in `score_prob_over`, and both model `save` paths write the fingerprint. |
 | `src/models/protocol.py` | 48 | A typing `Protocol` no adapter declares conformance to, so nothing enforces the model interface. |
@@ -107,9 +107,16 @@ Settlement runs separately via `python -m src.settlement.cli settle`.
 Two tiers, and the difference matters:
 
 **Module orphaned AND config unread** — the behaviour does not happen:
-- `eligibility: min_prior_games: 10, min_minutes_l5: 12.0` — the
-  configured cold-start abstain warnings are never applied.
-- `drift: ks_p_threshold: 0.01` — KS covariate drift is never reported.
+- ~~`eligibility: min_prior_games: 10, min_minutes_l5: 12.0`~~ — **now
+  applied.** `compare_models_on_panel` attaches the warnings to each prediction
+  row and `decision_board` refuses to RECOMMEND a row carrying them. It still
+  RECORDS the prediction: a thin-history row is the evidence where the model is
+  weakest, and dropping it from the ledger would bias the calibration toward
+  the easy cases.
+- ~~`drift: ks_p_threshold: 0.01`~~ — **now reported**, per market and feature,
+  returned as `covariate_drift`. Report only: dropping a feature on a KS
+  p-value would let the validation window choose the feature set, which is the
+  shape of a leak.
 
 **Module wired but config unread** — it runs on hardcoded defaults, so
 editing the YAML silently does nothing:
