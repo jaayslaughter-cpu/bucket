@@ -206,6 +206,17 @@ LAYERS: dict[str, Layer] = {
             "NEEDS --wire-under-test."
         ),
     ),
+    "minutes_weighted": Layer(
+        tuple(
+            f"{stat}_MW_L5" for stat in ("PTS", "REB", "AST", "STL", "BLK", "FG3M")
+        ) + tuple(f"{combo}_MW_L5" for combo in ("PR", "PA", "RA", "PRA")),
+        note=(
+            "Minutes-weighted L5. Built by the builder but absent from "
+            "default_feature_cols on purpose: |r| 0.976-0.992 against {STAT}_L5 "
+            "on the 214,381-row panel, inside the band halflife was excluded "
+            "for. Run with --wire-under-test to measure before promoting."
+        ),
+    ),
     "fatigue_load": Layer(
         ("FATIGUE_LOAD_L7", "FATIGUE_LOAD_MIN_L7"),
         note=(

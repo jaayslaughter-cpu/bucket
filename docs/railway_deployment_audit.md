@@ -95,7 +95,7 @@ Settlement runs separately via `python -m src.settlement.cli settle`.
 
 | Module | Lines | State |
 |---|---|---|
-| `src/features/minutes_weighted.py` | 134 | No production import, **no test either**. Emits `{STAT}_MW_L5` columns nothing reads. |
+| `src/features/minutes_weighted.py` | 134 | ~~No production import, no test either.~~ **Registered in the builder and tested** (22 tests). Its columns are deliberately kept OUT of `default_feature_cols`: measured \|r\| 0.976–0.992 against `{STAT}_L5` on the 214,381-row panel puts them inside the band the halflife family was excluded for. Registered as a `feature_ab` layer so `--wire-under-test` can settle it. |
 | `src/models/eligibility.py` | 129 | ~~Tested, never called.~~ **Wired** — the cold-start gate withholds a board recommendation, and `ks_feature_drift` reports train/validation covariate drift per market. Both config blocks are now read. |
 | `src/models/combo_variance.py` | 282 | Tested, never called. PRA is in `markets_post_launch`, so the combo variance it provides is unreachable. |
 | `src/models/feature_spec.py` | — | ~~Tested, never called.~~ **Wired** — `verify_feature_contract` runs in `score_prob_over`, and both model `save` paths write the fingerprint. |

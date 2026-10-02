@@ -150,6 +150,15 @@ def default_feature_cols(market: str) -> list[str]:
 #   FGA_L5                 0.955  0.839  0.839  PTS_BASELINE / MIN_L5
 #   FGA_L10                0.956  0.846  0.846  PTS_L10 / MIN_L10
 #   OPP_{M}_ALLOWED_L10    0.836  0.892  0.942  DEF_* (per 100 poss)
+#   {M}_MW_L5              0.991  0.989  0.992  {M}_L5
+#
+# {M}_MW_L5 is the minutes-weighted L5 from features/minutes_weighted.py, which
+# the builder DOES produce and this list deliberately omits. Measured the same
+# way, 204,529 overlapping rows: 0.976-0.992 against {M}_L5 across PTS, REB,
+# AST, FG3M, STL and BLK. A 0.5/1.0/1.5 reweighting of the same five games sits
+# inside the halflife band above, so the prediction is the same one -- the model
+# receives one number twice. It is registered as a feature_ab layer rather than
+# shipped, so `--layer minutes_weighted --wire-under-test` can settle it.
 #
 # OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
 # POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which
