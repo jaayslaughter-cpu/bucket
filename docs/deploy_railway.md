@@ -136,6 +136,36 @@ The schedule is fixed, not tip-off-driven. Re-anchoring needs a schedule feed,
 and timing logic that has never been exercised against real data would look
 adaptive while being untested.
 
+## 5b. Does your own computer need to be on?
+
+**No, if you deploy.** That is what deploying is for. The worker runs in the
+platform's container, Postgres is hosted (the `.env.example` default is a
+Supabase pooler URL), and the Discord card is posted by the container. Your
+machine can be off, asleep, or on a plane at 09:00 PT and the slate still runs.
+
+Four things still need a machine, and none of them is continuous:
+
+| | When | Why |
+|---|---|---|
+| `python -m scripts.validate_docker` | once, before the first deploy | the build and the six in-image checks need a Docker daemon |
+| `migrations/*.sql` + `python main.py --init-db` | once, per database | applied against the target database by hand |
+| training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or upload the artifacts to object storage and fetch them at boot |
+| recording a stake | whenever you place a bet | PropIQ never places one and never writes a stake. ROI exists only if you log it |
+
+**Yes, if you do not deploy.** Running `python scheduler_worker.py` on your own
+machine means the machine must be awake and the process running at both cron
+times, 09:00 and 03:30 Pacific. A laptop asleep at 03:30 does not grade last
+night's props, which means the 09:00 slate reads day-old calibration evidence.
+And the grace periods are deliberately asymmetric:
+
+- **slate: one hour.** A missed slate is **not** run late, because projecting
+  games that have already tipped is worse than projecting none.
+- **settlement: six hours.** A finished game stays finished, so catching up is
+  harmless.
+
+So a local run that wakes at 11:00 silently skips that day's board. That is the
+correct behaviour and it is also the reason to deploy rather than self-host.
+
 ## 6. What a deployed run produces
 
 - `projections` — the pipeline's deliverable.
