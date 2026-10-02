@@ -172,3 +172,63 @@ anything in this repository.
 | `pytest tests/test_wave6_shadow_live.py …` | not present; imports absent modules |
 | `feature_ab --layer minutes_weighted --wire-under-test` | present and wired |
 | `nba_model_cli celery-health` / `schedule-slate --plan-only` | no such subcommands here |
+
+---
+
+## 6. Pack v2 (`fb10c2f1-`, uploaded 06:48)
+
+A second upload, same filename, 65,888 bytes against the first's 63,634. It is
+**v1 plus Docker validation tooling** and nothing else — every other file,
+including the two byte-identical to this repo's HEAD, is unchanged.
+
+| | |
+|---|---|
+| new | `.dockerignore`, `docs/docker_validate.md`, `scripts/validate_docker.ps1`, `scripts/docker_dispatch_smoke.py` |
+| changed | `Dockerfile` (now `pip install -e ".[ml,db,ops]"` instead of `requirements.txt` + a bare `celery[redis]`), `README_GOLIVE.md`, `scripts/pack_go_live_readiness.py` |
+
+**None of it is drop-in**, and for one reason: every step validates the
+Celery stack from §3, which is not here. `docker compose build celery-worker`
+needs a `docker-compose.yml` this repo does not have; `celery-health` and
+`schedule-slate --plan-only` are not subcommands of this `nba_model_cli`;
+`docker_dispatch_smoke.py` imports `src.ops.celery_tasks`; and
+`pip install -e ".[ml,db,ops]"` names an extra this `pyproject.toml` does not
+declare (`deploy` is the one that exists). The script is PowerShell, which
+also says something useful about where it is meant to run.
+
+### What transferred
+
+The *shape* — build, bring the service up, run a health command **inside the
+image**, tear down — is exactly Railway roadmap **step 2**, which has been
+open since the Dockerfile was written and which that file admits to in its own
+header comment. So `scripts/validate_docker.py` does that for this repo's
+image: no compose, no redis, no celery, and in Python rather than PowerShell so
+one file covers Windows and Linux.
+
+It also goes somewhere the pack's does not. Two of its six in-image checks
+mount a **mode-0555 directory at `/app/data`** and require
+`scheduler_worker.check_state_dir()` to report it unwritable, then mount a
+writable one and require no false alarm. That is the trap
+`docs/deploy_railway.md` §2b describes — a volume mount shadows the image's
+`chown`, the container runs as uid 10001, and because every writer catches
+broadly the real symptom is a nightly *"calibration report failed"*. The page
+has claimed since it was written that `check_state_dir()` catches this. Nothing
+had ever executed it.
+
+`tests/test_validate_docker.py` (33 tests) drives every preflight check to
+failure against a synthetic tree, because a check that cannot fail reports PASS
+either way. Writing them found a real hole: the credential scan missed
+`ENV DISCORD_WEBHOOK_URL=https://…` — `WEBHOOK` was required to sit immediately
+before the `=` — and missed a secret on an `ENV ... \` continuation line, which
+is the shape a leak would actually take in this repo's own Dockerfile.
+
+### What the pack's `.dockerignore` caught that ours missed
+
+Ours is otherwise stricter (it covers `.env.*`, `*.pem`, `*.key`, `secrets/`,
+which the pack's does not), but the pack excludes `catboost_info`, `*.zip` and
+`*.pdf` and ours did not. `catboost_info/` is a training log CatBoost drops in
+the working directory — 33 KB of it is in this checkout right now, gitignored,
+and it was going into an image layer. Added, with the matching entries in
+`validate_docker.MUST_BE_IGNORED` so the check covers them.
+
+Measured build context after the change: **7.78 MB**, largest entries `tests/`
+(4.27) and `src/` (2.65).

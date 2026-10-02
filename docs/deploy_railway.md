@@ -23,9 +23,25 @@ The repository root has a `Dockerfile`; point the service at it.
 
 **It has never been built.** The environment it was written in has a docker
 client but no daemon and a network policy that denies the package index, so
-`docker build` has not run against it once. Build it locally before the first
-deploy; treat the layer ordering and the apt package list as reasoned, not
-verified.
+`docker build` has not run against it once. Treat the layer ordering and the
+apt package list as reasoned, not verified.
+
+Build it where a daemon exists, with:
+
+```
+python -m scripts.validate_docker          # preflight, build, six smoke checks
+python -m scripts.validate_docker --preflight   # the daemon-free half
+```
+
+The preflight half runs anywhere and passes today (7 checks: the CMD target
+exists, no credential is defaulted in a layer, every installed extra is
+declared, the uid is the one this page tells you to chown to, and the ignore
+file is evaluated by matching rather than grepped). The build and the six
+in-image checks are what remain, and two of them exist to test **this page**:
+they mount a mode-0555 directory at `/app/data` and require
+`check_state_dir()` to report it unwritable, then mount a writable one and
+require it not to false-alarm. Until that runs, the trap below is documented
+and not demonstrated.
 
 **Point the service at the Dockerfile, not Nixpacks.** Nixpacks reads
 `requirements.txt` rather than `pyproject.toml`'s extras. `APScheduler` is now

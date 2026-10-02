@@ -19,7 +19,12 @@ outputs/
 *.xlsx
 *.sqlite
 
-# Build and tooling noise.
+# Build and tooling noise. catboost_info/ is a training log CatBoost drops in
+# the working directory, and *.zip catches a training pack or an export sitting
+# in the checkout; both are gitignored, and neither belongs in an image layer.
+catboost_info/
+*.zip
+*.pdf
 .git/
 .github/
 .venv/
