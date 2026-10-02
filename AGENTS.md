@@ -183,6 +183,20 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   a daemon.
 - **Model artifacts do not survive a redeploy.** They live under
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
-  container abstains on every row without looking broken. This is the one
-  remaining deploy blocker and it is a platform step, not a code change.
-  `docs/railway_deployment_audit.md` §4.
+  container abstains on every row without looking broken. That one is a
+  platform step, not a code change. `docs/railway_deployment_audit.md` §4.
+- **Nothing produces rows for a slate that has not been played.**
+  `load_player_panel` reads completed box scores and `_filter_to_slate` keeps
+  only the slate date, so a 09:00 PT run finds nothing and exits 0.
+  `espn_schedule.load_slate` and `espn_availability.fetch_roster` both exist,
+  are tested, and are imported by no production module.
+  `docs/integration_audit.md` §1.1.
+- **A scheduled run cannot find a model even when one is trained.**
+  `score_prob_over` defaults to `models/xgb_prop_over.json`; `train-stats`
+  writes to `data/external/model_runs/comparison/`; `run_slate` passes no
+  `--model` and no variable overrides it. `docs/integration_audit.md` §2.1.
+- **Every board row carries today's date whatever game it describes.**
+  `research_slate_from_predictions` drops the detail row's `game_date` and
+  stamps its `slate_date` parameter instead. `docs/integration_audit.md` §2.2.
+
+Run `python -m scripts.verify_wiring` for the current state of all of these.
