@@ -291,7 +291,13 @@ Three blockers, each independently sufficient:
 
 1. ~~**Nothing to deploy.**~~ **CLEARED.** `Dockerfile` (worker service, no
    port), `.dockerignore` (no `.env`, no `data/`), and `scheduler_worker.py`
-   as the start command.
+   as the start command. **Still never built**, which is a separate thing from
+   not existing: `scripts/validate_docker.py` now does the building and
+   smoking, its 7 daemon-free preflight checks pass here, and its 6 in-image
+   checks — including the two that execute the mounted-volume permission trap
+   from `docs/deploy_railway.md` — run wherever a daemon is available.
+   `tests/test_validate_docker.py` drives each preflight check to failure, so
+   a PASS there means the check can fail.
 2. ~~**Nothing would be recorded.**~~ **CLEARED.** `prop_results` now has a
    writer wired into `main.py`, so a shadow run produces gradeable picks and,
    once settled, a strike rate and CLV. P/L still requires a stake the user
