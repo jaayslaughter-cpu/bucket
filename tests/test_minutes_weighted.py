@@ -270,6 +270,42 @@ def test_feature_ab_can_measure_the_layer():
     assert "wire-under-test" in layer.note
 
 
+def test_the_builder_attaches_each_player_s_values_to_that_player_s_rows():
+    """
+    Registered is not the same as correct through the builder.
+
+    build_feature_matrix sorts the panel to (PLAYER_ID, GAME_DATE) and the
+    layer loop swallows ANY exception from a layer, so a layer can be
+    registered, run, and still hand back values attached to the wrong rows
+    with nothing failing.
+
+    Each player here scores a different constant, so every non-null value is
+    that player's own number whatever the window or the minutes baseline
+    contains. A misalignment across the builder's re-sort reads B's 50 on one
+    of A's rows. Comparing against the layer called on its own would not work:
+    the builder supplies MIN_SEASON and the bare layer has to build a minutes
+    baseline from scratch at min_periods=3, so the two paths legitimately
+    average different numbers of weighted games early in a season.
+    """
+    from src.features.builder import build_feature_matrix
+
+    a = panel(10, player="A")
+    a["PTS"] = 10.0
+    b = panel(10, player="B")
+    b["PTS"] = 50.0
+    frame = pd.concat([b, a], ignore_index=True)
+    frame["TEAM_ABBREVIATION"] = "LAL"
+    frame["OPPONENT_ABBREVIATION"] = "BOS"
+    frame["GAME_ID"] = [f"g{i:03d}" for i in range(len(frame))]
+    shuffled = frame.sample(frac=1.0, random_state=19).reset_index(drop=True)
+
+    built = build_feature_matrix(shuffled)
+    values = built[["PLAYER_ID", "PTS_MW_L5"]].dropna()
+    assert len(values) >= 8, "no values to check alignment on"
+    assert set(values.loc[values["PLAYER_ID"] == "A", "PTS_MW_L5"]) == {10.0}
+    assert set(values.loc[values["PLAYER_ID"] == "B", "PTS_MW_L5"]) == {50.0}
+
+
 def test_the_measured_correlation_is_recorded_where_the_others_are():
     """An undocumented exclusion reads as an oversight."""
     import pathlib

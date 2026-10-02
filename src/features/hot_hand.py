@@ -12,6 +12,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.features.season import drop_season_key, player_season_keys
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_Z_THRESHOLD = 1.0
@@ -58,9 +60,8 @@ def attach_hot_hand_features(
     out = df.copy()
     if "PLAYER_ID" not in out.columns or "GAME_DATE" not in out.columns:
         raise ValueError("DATA_NOT_AVAILABLE: PLAYER_ID and GAME_DATE required")
-    if "SEASON" not in out.columns:
-        out["SEASON"] = pd.to_datetime(out["GAME_DATE"], errors="coerce").dt.year
-    group_keys = ["PLAYER_ID", "SEASON"]
+    # Derived season key is private to this layer — see src/features/season.py.
+    out, group_keys = player_season_keys(out)
 
     # Minutes stability (shared across stats)
     if "MIN_L5" in out.columns and "MIN_SEASON" in out.columns:
@@ -110,7 +111,7 @@ def attach_hot_hand_features(
 
     out.attrs["hot_hand_z_threshold"] = float(z_threshold)
     out.attrs["hot_hand_minutes_stable_ratio"] = float(minutes_stable_ratio)
-    return out
+    return drop_season_key(out)
 
 
 def hot_hand_note_for_row(row: pd.Series, market: str) -> str | None:
