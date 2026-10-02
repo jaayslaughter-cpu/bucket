@@ -184,11 +184,14 @@ def test_pregame_only_filters_out_started_games():
 # --- fetch behaviour ----------------------------------------------------
 
 class _Response:
-    def __init__(self, status: int = 200, body: dict | None = None):
+    # `body` is deliberately not typed `dict`: one test hands it a list, to
+    # check that a 200 whose payload is not an object reaches the parser's own
+    # reason rather than being read as an empty slate.
+    def __init__(self, status: int = 200, body: object | None = None):
         self.status_code = status
         self._body = body if body is not None else {}
 
-    def json(self) -> dict:
+    def json(self) -> object:
         return self._body
 
     def raise_for_status(self) -> None:
@@ -269,9 +272,7 @@ def test_a_trailing_slash_on_the_root_does_not_double_up(monkeypatch):
 
 def test_a_malformed_success_is_not_presented_as_an_empty_slate():
     """A non-object 200 must reach parse_scoreboard's own reason."""
-    session = _Session(_Response(200, None))
-    session._responses = [_Response(200)]
-    session._responses[0]._body = ["not", "an", "object"]
+    session = _Session(_Response(200, ["not", "an", "object"]))
     out = load_slate(date(2025, 3, 14), session=session)
     assert out.status == "DATA_NOT_AVAILABLE"
     assert any("not an object" in n for n in out.notes), out.notes

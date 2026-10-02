@@ -12,19 +12,22 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
     GameMarketLine,
+    ParlayLegRow,
+    ParlayTicketRow,
     PipelineRun,
     PlayerGameLog,
     Projection,
     PropLineSnapshot,
+    PropResult,
     TeamGameStat,
 )
 from src.db.session import session_scope
@@ -370,3 +373,190 @@ def record_run(
             set_={"status": stmt.excluded.status, "finished_at_utc": stmt.excluded.finished_at_utc},
         )
         session.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# prop_results: the settlement ledger's writer
+# ---------------------------------------------------------------------------
+
+# Refreshed on a re-run of the same slate. Deliberately NOT here:
+#   outcome_status, actual_result, minutes_played, did_not_play, profit_units,
+#   stake_units, settled_at_utc, result_source, raw_boxscore_json,
+#   settlement_note, closing_*, clv_*
+# Every one of those is the GRADER's output. Overwriting them from a
+# projections frame would un-settle a graded prop and reset it to PENDING, and
+# the settlement runner would then grade it a second time.
+PROP_RESULT_REFRESHABLE = (
+    "run_id", "nba_player_id", "model_projection", "prob_over",
+    "odds", "payout_multiplier", "is_pickem",
+)
+
+
+def pending_prop_result_statement(rows: list[dict[str, Any]]):
+    """
+    The upsert for PENDING prop_results, built but not executed.
+
+    Separated from the execution so the conflict guard can be tested by
+    compiling the SQL, which needs no database.
+
+    ON CONFLICT DO UPDATE ... WHERE prop_results.outcome_status = 'PENDING'.
+    The WHERE is the load-bearing part: without it, re-running a slate after
+    settlement would overwrite a graded row's pre-settlement fields with the
+    model's newer numbers, silently rewriting history in the one table whose
+    job is to record what was predicted BEFORE the game.
+    """
+    stmt = pg_insert(PropResult).values(rows)
+    return stmt.on_conflict_do_update(
+        constraint="uq_prop_result",
+        set_={c: stmt.excluded[c] for c in PROP_RESULT_REFRESHABLE},
+        where=PropResult.outcome_status == "PENDING",
+    )
+
+
+def record_pending_prop_results(rows: list[dict[str, Any]]) -> int:
+    """
+    Write model predictions to prop_results as PENDING, for later grading.
+
+    PREDICTIONS, NOT WAGERS: ``stake_units`` is never set here, so ROI over
+    these rows stays undefined until a stake is recorded by hand. Strike rate
+    and CLV do not need one.
+
+    Returns the number of rows sent, which is not the number inserted — a row
+    whose prop is already settled is skipped by the conflict guard above.
+    """
+    if not rows:
+        return 0
+    with session_scope() as session:
+        session.execute(pending_prop_result_statement(rows))
+    logger.info("Recorded %d pending prop result(s) for grading", len(rows))
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# the parlay ledger, durable
+# ---------------------------------------------------------------------------
+
+_PARLAY_MODELS = {"tickets": ParlayTicketRow, "legs": ParlayLegRow}
+
+# Columns lifted out of the JSONB record so the ledger is queryable from SQL.
+# A key absent from a record simply leaves its column NULL; the record is the
+# truth and these are a read convenience.
+_PARLAY_PROMOTED = {
+    "tickets": (
+        "ticket_id", "slate_date", "created_at_utc", "ticket_result",
+        "n_legs", "schema_version",
+    ),
+    "legs": (
+        "ticket_id", "leg_id", "slate_date", "game_id", "player_name",
+        "market", "leg_result", "schema_version",
+    ),
+}
+_PARLAY_KEYS = {"tickets": ("ticket_id",), "legs": ("ticket_id", "leg_id")}
+
+
+def _parlay_payload(table: str, record: dict[str, Any]) -> dict[str, Any]:
+    clean = {k: (None if (isinstance(v, float) and pd.isna(v)) else v)
+             for k, v in record.items()}
+    row: dict[str, Any] = {
+        c: clean.get(c) for c in _PARLAY_PROMOTED[table]
+    }
+    # JSONB must hold JSON-representable values. `default=str` rather than
+    # dropping: a datetime that cannot serialise would otherwise take the whole
+    # ticket down at write time, after the model already committed to it.
+    row["record"] = json.loads(json.dumps(clean, default=str))
+    return row
+
+
+def load_parlay_ledger(table: str) -> pd.DataFrame:
+    """Every stored row of the parlay ledger, rebuilt from its JSONB records.
+
+    Reading back the record rather than the promoted columns is what makes the
+    round-trip exact: JSONB preserves types, so the float precision and
+    zero-padded ids that the CSV backend needs explicit reader settings for are
+    simply not at risk here.
+    """
+    model = _PARLAY_MODELS[table]
+    with session_scope() as session:
+        records = [row.record for row in session.execute(select(model)).scalars()]
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+def upsert_parlay_ledger(table: str, frame: pd.DataFrame) -> int:
+    """
+    Write ledger rows, updating any that are already stored.
+
+    Upsert rather than insert because a settlement legitimately rewrites a row
+    it already wrote. Nothing is ever deleted, so this expresses both the
+    CSV backend's append and its whole-frame replace.
+    """
+    if frame is None or frame.empty:
+        return 0
+    model = _PARLAY_MODELS[table]
+    rows = [_parlay_payload(table, r) for r in _records(frame)]
+    with session_scope() as session:
+        stmt = pg_insert(model).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=list(_PARLAY_KEYS[table]),
+            set_={
+                c: stmt.excluded[c]
+                for c in (*_PARLAY_PROMOTED[table], "record")
+                if c not in _PARLAY_KEYS[table]
+            },
+        )
+        session.execute(stmt)
+    return len(rows)
+
+
+def load_graded_prop_results(
+    *,
+    lookback_days: int | None = 180,
+    market: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Graded prop predictions, as the rows ``settlement.calibration`` reads.
+
+    Only the four columns calibration needs, plus the identity ones for a log
+    line. Selecting the whole table would pull raw box-score JSONB for every
+    row to compute one number from four of its columns.
+
+    PENDING and VOID are filtered in SQL; PUSH is NOT, because the calibration
+    report counts pushes as excluded and a board full of whole lines should be
+    visible in that count rather than invisible in a WHERE clause.
+    """
+    conditions = [PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH"))]
+    if lookback_days is not None and int(lookback_days) > 0:
+        cutoff = datetime.now(timezone.utc).date() - timedelta(days=int(lookback_days))
+        conditions.append(PropResult.game_date >= cutoff)
+    if market:
+        conditions.append(PropResult.market == str(market).upper())
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                PropResult.outcome_status,
+                PropResult.prob_over,
+                PropResult.predicted_side,
+                PropResult.predicted_line,
+                PropResult.market,
+                PropResult.game_date,
+                PropResult.source,
+            ).where(and_(*conditions))
+        ).all()
+
+    # Decimal -> float here rather than in the calibration module, so the pure
+    # function never has to know the column types came from Numeric.
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "outcome_status": r.outcome_status,
+            "prob_over": float(r.prob_over) if r.prob_over is not None else None,
+            "predicted_side": r.predicted_side,
+            "predicted_line": (
+                float(r.predicted_line) if r.predicted_line is not None else None
+            ),
+            "market": r.market,
+            "game_date": r.game_date,
+            "source": r.source,
+        })
+    logger.info("Loaded %d graded prop result(s) for calibration", len(out))
+    return out

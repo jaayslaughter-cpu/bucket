@@ -23,8 +23,10 @@ from src.utils.timezones import DISPLAY_TZ_NAME, format_pacific_iso, now_pacific
 
 PLACEMENT_MODE = "MANUAL_ONLY"
 WAVE3_DISCLAIMER = (
-    "MANUAL_ONLY paper research — PropIQ does not place bets or size bankroll. "
-    "You wager outside the system; this layer logs, grades, and audits."
+    "MANUAL_ONLY — PropIQ recommends; it does not place the wager. You bet "
+    "outside the system; this layer logs, grades, and audits what you took. "
+    "(A recommended SIZE now exists, in quant.advisory_sizing. What stays true "
+    "is that nothing here places or auto-executes anything.)"
 )
 
 BetSide = Literal["over", "under"]
@@ -171,6 +173,11 @@ class ResearchSlateRow(BaseModel):
     edge_letter_grade_under: str | None = None
     over_under_meter: float | None = None
     hot_hand_status: str | None = None
+    # COLD START, carried from compare_models_on_panel. `prior_games` is counted
+    # over the whole market frame, not the validation slice — see the note there
+    # on why a per-player cumcount over `val` alone abstains veterans.
+    prior_games: int | None = None
+    eligibility_warnings: list[str] = Field(default_factory=list)
     book_line: float | None = None
     book_over_american: int | None = None
     book_under_american: int | None = None
@@ -364,6 +371,14 @@ def research_slate_from_predictions(
         warnings: list[str] = []
         if resolve_warn:
             warnings.append(resolve_warn)
+        # Pipe-joined on the detail row because it travels through CSV; split
+        # back here so the board does not have to know the encoding.
+        raw_eligibility = chosen.get("eligibility_warnings")
+        eligibility = (
+            [w for w in str(raw_eligibility).split("|") if w]
+            if raw_eligibility else []
+        )
+        warnings.extend(eligibility)
         preferred = None
         if po is not None and pu is not None:
             preferred = "over" if po >= pu else "under"
@@ -388,6 +403,11 @@ def research_slate_from_predictions(
                 edge_letter_grade_under=grade_under.get("edge_letter_grade"),
                 over_under_meter=card.over_under_meter,
                 hot_hand_status=chosen.get("hot_hand_status"),
+                prior_games=(
+                    int(chosen["prior_games"])
+                    if chosen.get("prior_games") is not None else None
+                ),
+                eligibility_warnings=eligibility,
                 preferred_side=preferred,
                 warnings=warnings,
             )

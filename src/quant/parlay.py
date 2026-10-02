@@ -34,9 +34,19 @@ model is shown calibrated on leakage-safe forward data, a parlay is the
 worst available way to express an edge, not the best — it is where an
 uncalibrated model's error compounds fastest.
 
-NOTHING HERE INVENTS A PRICE. A leg with no American odds cannot be priced
-and the evaluation abstains with a named reason, exactly as the single-leg
-gate does. That extends to the TICKET price: for legs in different games the
+NOTHING HERE INVENTS A PRICE — but "no price" means no price ANYWHERE, not a
+missing field. A leg with no American odds abstains when the ticket's price
+would then have to be built from the legs, and does not when a combined ticket
+price was quoted: that quote is the payout claim, and the legs' own odds feed
+nothing but the product path. A DFS pick'em posts exactly one multiplier and no
+per-leg prices, and its multiplier is a ``ticket_decimal``.
+
+(Only for an ALL-OR-NOTHING ticket. A flex pays several hit counts and is not a
+win/lose bet, so it belongs in ``dfs_payouts.evaluate_payout``, which takes the
+whole count distribution. Passing a flex's top multiple here prices it as a
+power play and understates it.)
+
+That extends to the TICKET price: for legs in different games the
 book really does multiply the legs, but a SAME-GAME parlay is re-priced by
 the book with the same correlation this module models, and the product of the
 individual legs is not a number any book offers. Using it would overstate the
@@ -489,7 +499,11 @@ def evaluate_parlay(
 
     Refuses when:
 
-    - fewer than two legs, or any leg carries no American price
+    - fewer than two legs
+    - a leg carries no American price AND no combined ticket price was quoted,
+      so the ticket's price could only come from multiplying prices that do not
+      exist. With a quoted ticket price, unpriced legs are fine — that is how a
+      DFS pick'em slip is priced, its payout multiple being the ticket_decimal
     - any leg carries no ``game_id``, so whether it shares a game is unknown
     - two legs share a ``game_id`` and no correlation was supplied — the
       naive product is not a conservative simplification there, it is a
@@ -522,11 +536,26 @@ def evaluate_parlay(
     except ParlayError as exc:
         return _abstain(str(exc), legs)
 
+    # A leg with no American price is refused ONLY when the ticket's price would
+    # then have to be invented from the legs. With a combined price quoted for
+    # the whole ticket, the payout claim rests on that quote and the legs'
+    # individual prices are not an input to anything -- they are used solely by
+    # parlay_decimal_price, the product path.
+    #
+    # This is the DFS gate. A pick'em operator posts ONE payout multiplier and no
+    # per-leg prices at all, so requiring per-leg American odds refused every DFS
+    # ticket even when the operator's own multiplier was supplied as
+    # ticket_decimal. That refused a ticket whose price was the most certain
+    # thing about it.
+    quoted_ticket = ticket_american is not None or ticket_decimal is not None
     unpriced = [leg.leg_id for leg in legs if leg.american is None]
-    if unpriced:
+    if unpriced and not quoted_ticket:
         return _abstain(
-            f"No American odds for {unpriced}. EV is a claim about a price; "
-            "without one there is nothing to be right or wrong about.",
+            f"No American odds for {unpriced} and no combined ticket price. EV "
+            "is a claim about a price; with neither the legs' prices nor the "
+            "ticket's there is nothing to be right or wrong about. Supply "
+            "ticket_american/ticket_decimal (a DFS payout multiple is a "
+            "ticket_decimal) or the legs' odds.",
             legs,
         )
 
@@ -547,6 +576,16 @@ def evaluate_parlay(
         )
 
     warnings: list[str] = []
+    if unpriced:
+        warnings.append(
+            f"Legs {unpriced} carry no individual price, so the ticket was "
+            "priced entirely from the quoted combined price. Nothing here "
+            "cross-checks those legs' probabilities against a market — on a DFS "
+            "pick'em there is no per-leg market to check against, which is why "
+            "the leg probabilities should come from a sharp two-way benchmark "
+            "(see dfs_payouts.benchmark_fair_probability) rather than from the "
+            "model alone."
+        )
 
     # A leg whose game is unknown cannot be shown NOT to share one, and the
     # same-game refusal below is the module's central guard. Skipping such a

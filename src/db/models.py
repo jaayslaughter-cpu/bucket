@@ -396,3 +396,58 @@ class PropResult(Base):
     settlement_note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ParlayTicketRow(Base):
+    """
+    One logged parlay ticket, durable.
+
+    WHY THE RECORD IS JSONB RATHER THAN FORTY COLUMNS. ``ParlayTicketRecord``
+    in src/quant/parlay_log.py is the schema, and it changes: adding a field
+    there and forgetting it here would drop that field on every write, silently,
+    which is the exact failure mode ``test_projection_roundtrip`` exists for one
+    table along. Storing the record whole means a new field persists the day it
+    is added, and ``schema_version`` records which shape a row was written in.
+
+    The columns beside it are duplicated OUT of the record, not instead of it,
+    so the ledger can be queried and joined from SQL without JSON path
+    expressions. They are a read convenience; ``record`` is the truth.
+
+    Append-only in intent: settlement updates a row in place, nothing deletes
+    one. The at-bet-time freeze is enforced in ParlayLogStore, not here — a
+    constraint in the database could not tell a settlement write from a rewrite.
+    """
+
+    __tablename__ = "parlay_tickets"
+
+    ticket_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    slate_date: Mapped[str | None] = mapped_column(String(16), index=True)
+    created_at_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    ticket_result: Mapped[str | None] = mapped_column(String(16), index=True)
+    n_legs: Mapped[int | None] = mapped_column(Integer)
+    schema_version: Mapped[str | None] = mapped_column(String(16))
+    record: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ParlayLegRow(Base):
+    """One leg of a logged ticket. See ParlayTicketRow for why `record` is JSONB."""
+
+    __tablename__ = "parlay_legs"
+
+    ticket_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    leg_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    slate_date: Mapped[str | None] = mapped_column(String(16), index=True)
+    game_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    player_name: Mapped[str | None] = mapped_column(String(128), index=True)
+    market: Mapped[str | None] = mapped_column(String(32), index=True)
+    leg_result: Mapped[str | None] = mapped_column(String(16), index=True)
+    schema_version: Mapped[str | None] = mapped_column(String(16))
+    record: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

@@ -95,10 +95,56 @@ def test_same_game_legs_price_once_a_correlation_and_a_quote_are_supplied():
     )
 
 
-def test_an_unpriced_leg_abstains():
+def test_an_unpriced_leg_abstains_when_no_ticket_price_was_quoted_either():
     result = evaluate_parlay([ParlayLeg("a", 0.60, None, game_id="G1", line=24.5), B])
     assert result.status == "DATA_NOT_AVAILABLE"
     assert "No American odds" in result.reason
+
+
+def test_unpriced_legs_are_fine_once_the_whole_ticket_carries_a_price():
+    """
+    The DFS gate. A pick'em operator posts ONE payout multiplier and no per-leg
+    prices, so requiring per-leg odds refused every DFS ticket even when the
+    operator's own multiplier was supplied. The legs' individual prices feed
+    nothing but the product path, which a quoted ticket does not use.
+    """
+    legs = [
+        ParlayLeg("a", 0.60, None, game_id="G1", line=24.5),
+        ParlayLeg("b", 0.58, None, game_id="G2", line=7.5),
+    ]
+    result = evaluate_parlay(legs, ticket_decimal=3.0)
+
+    assert result.status == "OK", result.reason
+    assert result.price_source == "quoted_ticket"
+    assert result.decimal_price == pytest.approx(3.0)
+    assert result.expected_value_per_unit == pytest.approx(
+        result.joint_probability * 3.0 - 1.0
+    )
+    assert any("no individual price" in w for w in result.warnings), (
+        "priced the ticket off a quote with no per-leg market check and said "
+        "nothing about it"
+    )
+
+
+def test_an_unpriced_dfs_ticket_still_needs_a_correlation_for_same_game_legs():
+    """The DFS gate opens the price door, not the correlation one."""
+    legs = [
+        ParlayLeg("a", 0.60, None, game_id="G1", line=24.5),
+        ParlayLeg("b", 0.58, None, game_id="G1", line=7.5),
+    ]
+    result = evaluate_parlay(legs, ticket_decimal=3.0)
+    assert result.status == "DATA_NOT_AVAILABLE"
+    assert "share a game" in result.reason
+
+
+def test_an_unpriced_dfs_ticket_still_refuses_a_pushable_line():
+    legs = [
+        ParlayLeg("a", 0.60, None, game_id="G1", line=24.5),
+        ParlayLeg("b", 0.58, None, game_id="G2", line=8.0),
+    ]
+    result = evaluate_parlay(legs, ticket_decimal=3.0)
+    assert result.status == "DATA_NOT_AVAILABLE"
+    assert "push" in result.reason
 
 
 def test_a_line_that_can_push_is_refused():

@@ -354,8 +354,19 @@ class XGBoostAdapter:
             # A stale head from an earlier fit would be reloaded as current.
             mean_path.unlink()
 
+        # The feature contract, fingerprinted. Written so serving can check this
+        # sidecar against the booster it sits beside: the booster carries its own
+        # column names, and until this block existed nothing compared the two.
+        from src.models.feature_spec import META_KEY, FeatureSpec
+
+        spec = FeatureSpec(
+            name=f"prop_over_{str(self.target_market or 'unknown').lower()}",
+            market=str(self.target_market or "UNKNOWN"),
+            features=list(self.feature_cols),
+        )
         meta = {
             "feature_cols": self.feature_cols,
+            META_KEY: spec.to_meta(),
             "target_market": self.target_market,
             "model_version": self.model_version,
             "feature_schema_version": self.feature_schema_version,

@@ -1,11 +1,28 @@
 """
-src/quant/decision_board.py — MANUAL_ONLY betting decision layer.
+src/quant/decision_board.py — the recommendation layer.
 
-Status: RESEARCH_ONLY · MANUAL_ONLY.
+Expands each market into Over and Under candidates and RECOMMENDS the side the
+evidence supports, where there is evidence. It does not place the wager: there
+is no order API in this project and none is planned, so the last step is always
+yours.
 
-Expands each research market into Over and Under candidates so you can choose
-what to take when you bet outside PropIQ. Never places wagers, never sizes
-stakes, never computes Kelly.
+WHAT "RECOMMENDED" IS WORTH IS THE WHOLE QUESTION, and the row says so rather
+than leaving it to be inferred. A recommendation on ``book_ev`` has a real
+two-way price behind it, so its EV is measured against a de-vigged market
+consensus. One on ``model_lean`` has no price at all.
+
+BOTH STILL REST ON THE MODEL'S OWN PROBABILITY. A book_ev row compares THE
+MODEL's probability against the market's; the price is what it is measured
+AGAINST, not the number being used. So every row on this board is model-sourced,
+and until the model has graded results behind it every row is an opinion with a
+confident label. ``quant.publication_gate`` is what withholds them from a
+channel — applied by the caller at dispatch (``notify-discord``, and
+``build_decision_board_embed``'s ``publication`` argument), not inside this
+module, which only builds rows.
+
+A RECOMMENDATION IS STILL NOT A PROMISE. The vocabulary guard below stays: no
+"lock", no "guaranteed", no "best bet". Recommending a side and promising an
+outcome are different acts, and only the first one is supportable.
 
 SOURCE PRECEDENCE: PROPLINE IS PRIMARY, ODDSPAPI IS THE FALLBACK.
 
@@ -63,12 +80,13 @@ logger = logging.getLogger(__name__)
 
 RESEARCH_STATUS = "RESEARCH_ONLY"
 
-DecisionStatus = Literal["CONSIDER", "ABSTAIN"]
+DecisionStatus = Literal["RECOMMENDED", "ABSTAIN"]
 DecisionBasis = Literal["book_ev", "model_lean", "pickem_line_only", "unavailable"]
 
 BOARD_DISCLAIMER = (
-    "MANUAL_ONLY decision board — ranks Over/Under for your choice. "
-    "PropIQ never places bets or sizes bankroll. "
+    "Recommendations, not a promise of an outcome. Each row names the basis it "
+    "rests on: book_ev is a de-vigged two-way price, model_lean is the model's "
+    "opinion with no price behind it. PropIQ does not place the wager. "
     + WAVE3_DISCLAIMER
 )
 
@@ -318,6 +336,10 @@ class BettingDecisionCandidate(BaseModel):
     pickem_line: float | None = None
     pickem_source: str | None = None
     pickem_line_diff: float | None = None
+    # How many prior games this player had before the row's date. Exported so a
+    # reader can see WHY a row abstained on cold start rather than taking the
+    # reason on faith.
+    prior_games: int | None = None
     decision_status: DecisionStatus = "ABSTAIN"
     decision_basis: DecisionBasis = "unavailable"
     rank_score: float | None = None
@@ -389,7 +411,7 @@ def expand_row_to_candidates(
             score = float(ev)
             source = row.book_source or "book"
             if float(ev) > float(min_ev):
-                status = "CONSIDER"
+                status = "RECOMMENDED"
                 why = (
                     f"{side.upper()} EV={float(ev):+.4f} vs line {line} @ {odds} "
                     f"(model P={p_side:.3f}, {source} two-way de-vigged)"
@@ -412,10 +434,11 @@ def expand_row_to_candidates(
             lean = float(p_side) - 0.5
             score = lean
             if lean > float(min_lean):
-                status = "CONSIDER"
+                status = "RECOMMENDED"
                 why = (
-                    f"{side.upper()} model lean P={p_side:.3f} — a lean, not an "
-                    "edge, because no VALID two-way price says what it costs"
+                    f"{side.upper()} on the model alone, P={p_side:.3f} — no VALID "
+                    "two-way price, so nothing says what this costs and the "
+                    "recommendation rests entirely on the model's calibration"
                 )
             else:
                 why = (
@@ -434,7 +457,7 @@ def expand_row_to_candidates(
                 )
         elif row.pickem_line is not None:
             # A pick'em line is all we have. It is a number, not a price, so
-            # it can never justify CONSIDER.
+            # it can never justify a recommendation on its own.
             basis = "pickem_line_only"
             why = (
                 f"Pick'em {row.pickem_source or 'source'} line {row.pickem_line}: "
@@ -443,6 +466,33 @@ def expand_row_to_candidates(
             )
         else:
             why = f"DATA_NOT_AVAILABLE: cannot resolve P({side})"
+
+        # COLD START OVERRIDES EVERYTHING ABOVE, and it is applied last on
+        # purpose. A thin-history row can clear min_ev on a real price and still
+        # be a probability the model had almost nothing to learn from, so this
+        # cannot sit inside the book_ev branch — it has to be able to take a
+        # RECOMMENDED row back.
+        #
+        # The abstention is specific to RECOMMENDING. The prediction is still
+        # recorded and still graded: a thin-history row is the evidence where
+        # the model is weakest, and dropping it from the ledger would bias the
+        # calibration toward the easy cases.
+        # Carried onto the candidate independently of how the row was built.
+        # research_slate_from_predictions also folds these into row.warnings,
+        # but a row constructed any other way would then lose them, and the
+        # reason a board row abstained should not depend on its provenance.
+        for warning in row.eligibility_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+
+        if row.eligibility_warnings and status == "RECOMMENDED":
+            status = "ABSTAIN"
+            why = (
+                "ABSTAIN on cold start: "
+                + "; ".join(row.eligibility_warnings)
+                + f". The model's basis for this row was {basis}, and that "
+                "number stands — what is withheld is the recommendation."
+            )
 
         out.append(
             BettingDecisionCandidate(
@@ -471,6 +521,7 @@ def expand_row_to_candidates(
                 edge_letter_grade=_side_grade(row, side),
                 confidence_tier=row.confidence_tier,
                 over_under_meter=row.over_under_meter,
+                prior_games=row.prior_games,
                 preferred_side=row.preferred_side,
                 is_preferred_side=row.preferred_side == side,
                 pickem_line=row.pickem_line,
@@ -496,9 +547,9 @@ def build_decision_board(
     top_n: int | None = None,
 ) -> list[BettingDecisionCandidate]:
     """
-    Rank Over/Under candidates for human selection at bet time.
+    Rank Over/Under candidates, recommended ones first.
 
-    Sort: CONSIDER first, then BASIS BAND, then score, then the book's
+    Sort: RECOMMENDED first, then BASIS BAND, then score, then the book's
     preferred side as a tie-break.
 
     The band sits between status and score deliberately. Sorting a model
@@ -513,11 +564,11 @@ def build_decision_board(
             require_valid_book=require_valid_book,
         ))
     if consider_only:
-        cands = [c for c in cands if c.decision_status == "CONSIDER"]
+        cands = [c for c in cands if c.decision_status == "RECOMMENDED"]
 
     def _sort_key(c: BettingDecisionCandidate):
         return (
-            0 if c.decision_status == "CONSIDER" else 1,
+            0 if c.decision_status == "RECOMMENDED" else 1,
             BASIS_ORDER.get(c.decision_basis, len(BASIS_ORDER)),
             -(float(c.rank_score) if c.rank_score is not None else float("-inf")),
             0 if c.is_preferred_side else 1,
@@ -535,7 +586,7 @@ def build_decision_board(
 
 
 def decision_board_summary(cands: Sequence[BettingDecisionCandidate]) -> dict[str, Any]:
-    consider = [c for c in cands if c.decision_status == "CONSIDER"]
+    consider = [c for c in cands if c.decision_status == "RECOMMENDED"]
     with_ev = [c for c in consider if c.decision_basis == "book_ev"]
     lean_only = [c for c in consider if c.decision_basis == "model_lean"]
     priced = [c for c in cands if c.decision_basis == "book_ev"]
@@ -592,16 +643,19 @@ def write_decision_board_csv(cands: Sequence[BettingDecisionCandidate], path: An
 
 def candidate_to_manual_bet_fields(c: BettingDecisionCandidate) -> dict[str, Any]:
     """
-    Map a CONSIDER candidate into fields for ``log-manual-bet``.
+    Map a RECOMMENDED candidate into fields for ``log-manual-bet``.
 
     ``model_prob`` is P(THE SIDE YOU TOOK) — the same quantity the store
     records and the calibration reads, so nothing downstream has to
     reconstruct it with a complement that is wrong on a whole line.
 
-    No stake is returned. Sizing is yours; the model has no opinion it has
-    earned the right to express.
+    NO STAKE IS RETURNED HERE, and that is not the old "we do not size"
+    restriction — ``quant.advisory_sizing`` will recommend a size. It is that
+    this function feeds the LEDGER, which must record what you actually staked.
+    Writing a recommended size into it would grade the recommendation against a
+    bet that was never placed at that size.
     """
-    if c.decision_status != "CONSIDER":
+    if c.decision_status != "RECOMMENDED":
         return {
             "status": "ABSTAIN",
             "reason": c.why,
@@ -628,6 +682,10 @@ def candidate_to_manual_bet_fields(c: BettingDecisionCandidate) -> dict[str, Any
         "book_source": c.book_source,
         "edge_letter_grade": c.edge_letter_grade,
         "confidence_tier": c.confidence_tier,
-        "note": "unit_stake is YOUR choice — never auto-Kelly from PropIQ",
+        "note": (
+            "unit_stake is what YOU actually staked. For a recommended size see "
+            "quant.advisory_sizing; this field is the ledger's record, not the "
+            "recommendation."
+        ),
         "disclaimer": BOARD_DISCLAIMER,
     }

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -24,6 +24,46 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+    )
+
+
+def _load_calibration_report(path: "Path | None") -> Optional[dict]:
+    """
+    Read a calibration report, or None when none was given.
+
+    One reader for every dispatch surface, so the board path and the DFS path
+    cannot come to disagree about what counts as evidence. A path that was given
+    and cannot be read is an error, not a silent None: "you forgot the flag" and
+    "the file is broken" must not produce the same withheld card.
+    """
+    if path is None:
+        return None
+    if not path.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {path} missing", err=True)
+        raise SystemExit(2)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        typer.echo(f"ERROR: {path} is not valid JSON: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+
+def _board_publication_verdict(path: "Path | None"):
+    """
+    Whether a decision board may be published, gated as MODEL-sourced.
+
+    EVERY board row is model-sourced, book_ev included: such a row measures the
+    MODEL's probability against a de-vigged market price rather than using the
+    market's own, so there is no SHARP_BENCHMARK case here as there is for a DFS
+    leg. Gating the board as MODEL is therefore not conservatism, it is the
+    accurate source.
+    """
+    from src.quant.dfs_payouts import ProbabilitySource
+    from src.quant.publication_gate import calibration_gate
+
+    return calibration_gate(
+        _load_calibration_report(path),
+        probability_source=ProbabilitySource.MODEL,
     )
 
 
@@ -832,7 +872,7 @@ def decision_board_cmd(
     preferred_model: str = typer.Option("distribution", "--preferred-model"),
     min_ev: float = typer.Option(
         0.0, "--min-ev",
-        help="CONSIDER only when VALID two-way book EV clears this (e.g. 0.02)",
+        help="Recommend only when VALID two-way book EV clears this (e.g. 0.02)",
     ),
     min_lean: float = typer.Option(
         0.0, "--min-lean",
@@ -843,7 +883,8 @@ def decision_board_cmd(
         help="Hide model-lean-only rows (no EV without a two-way price)",
     ),
     consider_only: bool = typer.Option(
-        False, "--consider-only", help="Drop ABSTAIN rows from the output"
+        False, "--recommended-only/--all-rows", "--consider-only/--no-consider-only",
+        help="Drop ABSTAIN rows from the output",
     ),
     top_n: Optional[int] = typer.Option(
         None, "--top-n", help="Keep only the top ranked candidates"
@@ -852,67 +893,55 @@ def decision_board_cmd(
     demo: bool = typer.Option(True, help="DEMO panel for wiring"),
     verbose: bool = False,
 ) -> None:
-    """Rank Over and Under so YOU can choose. RESEARCH_ONLY · MANUAL_ONLY.
+    """Recommend Over/Under sides for the slate.
 
-    Never places a wager, never contacts a book or DFS order API, and never
-    sizes a stake. EV appears only where a source posted genuine two-way
-    American odds — PropLine first, OddsPapi as the fallback. Everything
-    else abstains with a named reason.
+    Does not place a wager and contacts no book or DFS order API — the last
+    step is yours. EV appears only where a source posted genuine two-way
+    American odds (PropLine first, OddsPapi as the fallback); everything else
+    abstains with a named reason.
+
+    READ THE BASIS COLUMN. A row recommended on `book_ev` has a de-vigged market
+    price behind it; one on `model_lean` has no price at all. Both still rest on
+    the MODEL's probability — a book_ev row measures that probability against the
+    market's, it does not use the market's — so until the model has graded results
+    behind it, every row here is an opinion with a confident label.
+
+    This command WRITES A CSV; it publishes nothing. The calibration gate is
+    applied when the board is dispatched (`notify-discord --source
+    decision-board --calibration-report ...`), which is where it can withhold.
     """
     _setup_logging(verbose)
-    from src.models.compare import compare_models_on_panel, load_comparison_config
-    from src.quant.decision_board import (
-        BOARD_DISCLAIMER,
-        build_decision_board,
-        decision_board_summary,
-        write_decision_board_csv,
-    )
-    from src.quant.paper_research import research_slate_from_predictions
-    from src.utils.timezones import pacific_calendar_date
+    from src.pipeline.slate_board import build_slate_board
+    from src.quant.decision_board import BOARD_DISCLAIMER
 
     panel, is_demo = _load_real_or_demo(demo)
-    mkt = [m.strip().upper() for m in markets.split(",") if m.strip()]
-    result = compare_models_on_panel(
+    # One code path with the scheduled worker, which dispatches this same board.
+    # A second copy of the sequence would drift, and the drifting one would be
+    # the unattended one.
+    result = build_slate_board(
         panel,
-        markets=mkt,
+        out=out,
+        markets=[m.strip() for m in markets.split(",") if m.strip()],
         train_end=train_end,
         validation_end=validation_end,
-        cfg=load_comparison_config(),
-    )
-    slate = str(pacific_calendar_date())
-    slate_rows = research_slate_from_predictions(
-        result.get("predictions") or [],
-        slate_date=slate,
-        preferred_model=preferred_model or None,
-    )
-
-    # No archived PropLine pull exists in this repository yet, so no market
-    # candidates are attached and nothing is priced. Every row therefore
-    # lands on model_lean or unavailable — the truthful state, not a bug.
-    # Once a pull is archived, enrich each row with
-    # decision_board.enrich_row_with_resolved_market(row, candidates), which
-    # applies the PropLine-primary / OddsPapi-fallback precedence.
-    board = build_decision_board(
-        slate_rows,
+        preferred_model=preferred_model,
         min_ev=min_ev,
         min_lean=min_lean,
         require_valid_book=require_valid_book,
-        consider_only=consider_only,
+        recommended_only=consider_only,
         top_n=top_n,
     )
-    n = write_decision_board_csv(board, out)
 
-    summary = decision_board_summary(board)
+    summary = result.as_dict()
     summary.update({
-        "slate_date": slate,
-        "written_rows": n,
-        "out": str(out),
         "demo": demo or is_demo,
         "min_ev": min_ev,
         "require_valid_book": require_valid_book,
         "next_step": (
-            "Scan CONSIDER rows, place the wager YOURSELF outside PropIQ, then "
-            "log-manual-bet --side <side> --model-prob <P(side you took)>"
+            "Read the RECOMMENDED rows and their basis column, place what you "
+            "take yourself (PropIQ has no order API), then log it back with "
+            "log-manual-bet --side <side> --model-prob <P(side you took)> so it "
+            "grades and feeds the calibration evidence."
         ),
         "disclaimer": BOARD_DISCLAIMER,
     })
@@ -1060,6 +1089,244 @@ def game_clv_cmd(
     }, indent=2))
 
 
+@app.command("dfs-entry")
+def dfs_entry_cmd(
+    entry: Path = typer.Option(
+        ..., "--entry",
+        help="JSON file describing one pick'em slip (see the docstring).",
+    ),
+    catalog: Path = typer.Option(
+        Path("config/dfs_payouts.yaml"), "--catalog",
+        help="Payout catalogue. No table is hardcoded; this file is the source.",
+    ),
+    structure: Optional[str] = typer.Option(
+        None, "--structure",
+        help="Catalogue key, e.g. underdog:power:3. Overrides the file's own.",
+    ),
+    advisory_sizing: bool = typer.Option(
+        True, "--advisory-sizing/--no-advisory-sizing",
+        help="Include a READ-ONLY recommended_units figure (fractional Kelly).",
+    ),
+    kelly_fraction: float = typer.Option(
+        0.25, "--kelly-fraction", help="Fraction of full Kelly. 0.25 by default.",
+    ),
+    max_units: float = typer.Option(
+        3.0, "--max-units", help="Hard cap on advisory units (percent of bankroll).",
+    ),
+    calibration_report: Optional[Path] = typer.Option(
+        None, "--calibration-report",
+        help="JSON paper-calibration report; required before a MODEL-sourced "
+             "entry may be posted to Discord.",
+    ),
+    discord: bool = typer.Option(
+        False, "--discord", help="Build a Discord embed for this entry.",
+    ),
+    send: bool = typer.Option(
+        False, "--send",
+        help="With --discord, actually POST. Without it the payload is printed.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the evaluation JSON here as well as stdout.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Price ONE DFS pick'em slip against an operator's payout matrix.
+
+    RESEARCH_ONLY · MANUAL_ONLY. Places nothing, contacts no operator, and
+    sizes no stake: any units shown are advisory metadata for a person
+    deciding by hand.
+
+    This is the path src/quant/contracts.py routes a pick'em row to. The gate
+    refuses to price such a row as a two-way market — correctly, since a payout
+    multiplier is not a price — and returns route=PICKEM_ENTRY_EV instead.
+    src/quant/dfs_entry.py reads that route; this command is its entry point.
+
+    The entry file is YOUR record of an operator's board and a benchmark's
+    quotes. Nothing here invents a line, a payout or a price:
+
+      {
+        "structure": "underdog:power:3",
+        "legs": [
+          {"leg_id": "leg1", "game_id": "0022500123", "market": "PTS",
+           "line": 25.5, "side": "over",
+           "payout_multiplier": 6.0,
+           "benchmark_over_american": -130, "benchmark_under_american": 110,
+           "benchmark_line": 25.5, "benchmark_source": "book X close",
+           "model_probability": 0.58}
+        ],
+        "correlation": [[1.0, 0.3], [0.3, 1.0]]
+      }
+
+    A leg's probability comes from the de-vigged two-way BENCHMARK when one is
+    supplied, and only then is the resulting EV a claim about a market
+    disagreement. A benchmark on a different line abstains rather than falling
+    back to the model — half a point is a different contract. With no benchmark
+    at all the model probability is used and the output says so, and that figure
+    inherits the model's calibration error whole.
+
+    Omit "correlation" only for genuinely unrelated legs. Teammate and same-game
+    legs are correlated, and which way ignoring that biases the entry depends on
+    the sign of the correlation.
+
+    PUBLISHING IS GATED SEPARATELY FROM PRICING. The JSON printed here is a
+    diagnostic and always shows its numbers. --discord publishes, and a
+    MODEL-sourced entry is posted only when --calibration-report shows the model
+    recently calibrated on enough graded results; otherwise the embed carries the
+    gate's reason instead of the figure. A benchmark-sourced entry needs no such
+    report — those probabilities are the market's, not the model's.
+    """
+    _setup_logging(verbose)
+    from src.quant.advisory_sizing import recommended_units_for_entry
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutError, load_payout_catalog
+    from src.quant.publication_gate import calibration_gate
+
+    if not entry.exists():
+        typer.echo(f"DATA_NOT_AVAILABLE: {entry} missing", err=True)
+        raise SystemExit(2)
+    try:
+        payload = json.loads(entry.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        typer.echo(f"ERROR: {entry} is not valid JSON: {exc}", err=True)
+        raise SystemExit(2) from exc
+    if not isinstance(payload, dict):
+        typer.echo(f"ERROR: {entry} must contain a JSON object", err=True)
+        raise SystemExit(2)
+
+    try:
+        structures = load_payout_catalog(catalog)
+    except DfsPayoutError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    key = structure or payload.get("structure")
+    if not key:
+        typer.echo(
+            "ERROR: no payout structure named. Pass --structure or set "
+            f"\"structure\" in {entry}. Known keys: {', '.join(sorted(structures))}",
+            err=True,
+        )
+        raise SystemExit(2)
+    if key not in structures:
+        typer.echo(
+            f"DATA_NOT_AVAILABLE: {key!r} is not in {catalog}. Known keys: "
+            f"{', '.join(sorted(structures))}",
+            err=True,
+        )
+        raise SystemExit(2)
+    payout_structure = structures[key]
+
+    raw_legs = payload.get("legs")
+    if not isinstance(raw_legs, list) or not raw_legs:
+        typer.echo(f"ERROR: {entry} declares no \"legs\"", err=True)
+        raise SystemExit(2)
+
+    legs = []
+    for index, row in enumerate(raw_legs):
+        if not isinstance(row, dict):
+            typer.echo(f"ERROR: leg {index} is not a JSON object", err=True)
+            raise SystemExit(2)
+        leg_id = str(row.get("leg_id") or f"leg{index + 1}")
+        legs.append(PickemLeg(
+            leg_id=leg_id,
+            market=MarketContext(
+                game_id=str(row.get("game_id") or leg_id),
+                # The operator's board is the caller's own record, so a row is
+                # taken as posted unless it says otherwise. The gate still has
+                # to agree it is a pick'em row with a finite line.
+                status=str(row.get("status") or "VALID"),
+                market=row.get("market"),
+                player_name=row.get("player_name"),
+                line=row.get("line"),
+                payout_multiplier=row.get("payout_multiplier"),
+                is_pickem=bool(row.get("is_pickem", True)),
+                source=row.get("source"),
+            ),
+            side=str(row.get("side") or "over"),
+            benchmark_over_american=row.get("benchmark_over_american"),
+            benchmark_under_american=row.get("benchmark_under_american"),
+            benchmark_line=row.get("benchmark_line"),
+            benchmark_source=row.get("benchmark_source"),
+            model_probability=row.get("model_probability"),
+        ))
+
+    correlation = payload.get("correlation")
+    if correlation is not None:
+        import numpy as np
+
+        correlation = np.asarray(correlation, dtype=float)
+
+    evaluation = route_pickem_entry(
+        payout_structure, legs, correlation=correlation
+    )
+    result = evaluation.as_dict()
+    result["RESEARCH_STATUS"] = "RESEARCH_ONLY"
+    result["STRUCTURE_SOURCE"] = payout_structure.source
+    result["CORRELATION_SUPPLIED"] = correlation is not None
+    if correlation is None:
+        result["CORRELATION_NOTE"] = (
+            "No correlation matrix supplied, so the legs were treated as "
+            "independent. For related legs that biases the entry, in whichever "
+            "direction the correlation runs."
+        )
+
+    size = None
+    if advisory_sizing and evaluation.payout is not None:
+        size = recommended_units_for_entry(
+            evaluation.payout,
+            payout_structure.payout_multiples(),
+            kelly_fraction=kelly_fraction,
+            max_cap_units=max_units,
+        )
+        result["ADVISORY_SIZE"] = size.as_dict()
+        result["ADVISORY_SIZE"]["NOTE"] = (
+            "Recommended stake, in percent of bankroll. Nothing here PLACES it. "
+            "Kelly is optimal only if the probabilities are right, so on a "
+            "MODEL-sourced entry this size compounds the model's calibration "
+            "error — which is why the publication gate withholds such an entry "
+            "until there is graded evidence behind it."
+        )
+
+    calibration = _load_calibration_report(calibration_report)
+
+    publication = calibration_gate(
+        calibration, probability_source=evaluation.probability_source
+    )
+    result["PUBLICATION"] = publication.as_dict()
+
+    if discord:
+        from src.notify.discord import (
+            DiscordConfig,
+            DiscordDispatchError,
+            build_dfs_entry_embed,
+            preview_json,
+            send_embeds,
+        )
+
+        embed = build_dfs_entry_embed(
+            evaluation,
+            publication=publication,
+            advisory_size=size if publication.allowed else None,
+        )
+        try:
+            dispatch = send_embeds([embed], config=DiscordConfig(dry_run=not send))
+        except DiscordDispatchError as exc:
+            typer.echo(f"REFUSED: {exc}", err=True)
+            raise SystemExit(4) from exc
+        result["DISCORD"] = dispatch.as_dict() | {"payload_preview": "omitted"}
+        if dispatch.status == "DRY_RUN":
+            typer.echo(preview_json(dispatch))
+
+    rendered = json.dumps(result, indent=2, default=str)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
+    typer.echo(rendered)
+    if evaluation.status != "PAYOUT_EV_READY":
+        raise SystemExit(3)
+
+
 @app.command("notify-discord")
 def notify_discord_cmd(
     source: str = typer.Option(
@@ -1079,6 +1346,11 @@ def notify_discord_cmd(
     message: Optional[str] = typer.Option(
         None, "--message", help="Text for --source abstention"
     ),
+    calibration_report: Optional[Path] = typer.Option(
+        None, "--calibration-report",
+        help="JSON calibration report (see prop-calibration). Required before a "
+             "decision board may be posted; without it the board is withheld.",
+    ),
     max_rows: int = typer.Option(10, "--max-rows"),
     send: bool = typer.Option(
         False, "--send",
@@ -1086,11 +1358,21 @@ def notify_discord_cmd(
     ),
     verbose: bool = False,
 ) -> None:
-    """Post research output to Discord. Dry run unless --send is passed.
+    """Post a recommendation to Discord. Dry run unless --send is passed.
 
-    A notification, never a bet instruction: no stake is suggested, claim
-    words are refused, and the research disclaimer rides on every embed.
-    The webhook URL is read from DISCORD_WEBHOOK_URL and is never printed.
+    Claim words are refused and the qualifier rides on every embed. The webhook
+    URL is read from DISCORD_WEBHOOK_URL and is never printed.
+
+    THE CALIBRATION GATE IS APPLIED HERE for --source decision-board, which is
+    the publication surface. Every board row rests on the model's own
+    probability, including a book_ev row (it MEASURES that probability against
+    the market price rather than using the market's), so the board is gated as
+    MODEL-sourced. With no --calibration-report the gate withholds and the embed
+    carries its reason instead of the rows — which is the correct output while no
+    graded evidence exists, not a failure.
+
+    Build the report with `prop-calibration --out <path>` once settled rows
+    exist.
     """
     _setup_logging(verbose)
     import pandas as pd
@@ -1106,6 +1388,7 @@ def notify_discord_cmd(
     )
 
     config = DiscordConfig(dry_run=not send)
+    publication_note: dict | None = None
 
     try:
         if source == "decision-board":
@@ -1121,12 +1404,23 @@ def notify_discord_cmd(
                 for r in frame.to_dict("records")
             ]
             slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
-            embeds = [build_decision_board_embed(rows, slate_date=slate, max_rows=max_rows)]
+            verdict = _board_publication_verdict(calibration_report)
+            publication_note = verdict.as_dict()
+            embeds = [build_decision_board_embed(
+                rows, slate_date=slate, max_rows=max_rows, publication=verdict,
+            )]
 
         elif source == "parlay":
-            from src.quant.parlay_log import ParlayLegRecord, ParlayLogStore, ParlayTicketRecord
+            from src.quant.parlay_log import (
+                ParlayLegRecord,
+                ParlayTicketRecord,
+                open_parlay_log,
+            )
 
-            store = ParlayLogStore(store_dir)
+            # Honours PROPIQ_PARLAY_LEDGER: 'csv' (the default, files under
+            # --store-dir) or 'postgres', which is what a container needs since
+            # its filesystem does not survive a redeploy.
+            store = open_parlay_log(store_dir)
             tickets = store.load_tickets()
             if tickets.empty:
                 typer.echo("DATA_NOT_AVAILABLE: no tickets logged yet", err=True)
@@ -1165,7 +1459,10 @@ def notify_discord_cmd(
 
     if result.status == "DRY_RUN":
         typer.echo(preview_json(result))
-    typer.echo(json.dumps(result.as_dict() | {"payload_preview": "omitted"}, indent=2))
+    payload = result.as_dict() | {"payload_preview": "omitted"}
+    if publication_note is not None:
+        payload["PUBLICATION"] = publication_note
+    typer.echo(json.dumps(payload, indent=2, default=str))
     if result.status in {"FAILED", "REFUSED"}:
         raise SystemExit(4)
 
@@ -1274,6 +1571,249 @@ def paper_calibration_cmd(
         if k not in {"reliability_table", "chart_points", "perfect_calibration_line"}
     }
     typer.echo(json.dumps(summary, indent=2, default=str))
+
+
+@app.command("prop-calibration")
+def prop_calibration_cmd(
+    out: Path = typer.Option(
+        Path("outputs/calibration.json"), "--out",
+        help="Where to write the report. This file is what the dispatch "
+             "commands read via --calibration-report.",
+    ),
+    lookback_days: int = typer.Option(
+        180, "--lookback-days",
+        help="Only graded games this recent. 0 for all of them.",
+    ),
+    market: Optional[str] = typer.Option(
+        None, "--market", help="Restrict to one market, e.g. PTS.",
+    ),
+    n_bins: int = typer.Option(10, "--n-bins"),
+    min_bin_coverage: float = typer.Option(
+        0.8, "--min-bin-coverage",
+        help="Fraction of bins that must be populated before an ECE is stood behind.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Build the calibration report from graded prop_results.
+
+    THE MISSING LINK IN THE FEEDBACK LOOP. The recorder writes PENDING
+    predictions, `settle` grades them, metrics aggregates W/L/PUSH — and until
+    this command nothing turned those graded rows into the calibration evidence
+    `quant.publication_gate` asks for, so the gate could only be fed by hand.
+
+    Writes JSON, because JSON is what the gate reads:
+
+        python -m scripts.nba_model_cli prop-calibration --out outputs/calibration.json
+        python -m scripts.nba_model_cli notify-discord --source decision-board \
+            --calibration-report outputs/calibration.json
+
+    ABSTAINS LOUDLY WHILE THERE IS NOTHING TO MEASURE. With no settled rows it
+    writes a DATA_NOT_AVAILABLE report naming why, and the gate then withholds —
+    which is the correct state, not a failure. Exit code 3 marks it so a shell
+    script can tell "no evidence yet" from "wrote a usable report".
+
+    UNDER ROWS ON A WHOLE LINE ARE EXCLUDED, not approximated: the stored column
+    is P(over), and 1 - P(over) absorbs the push mass on a line that can tie.
+    Every exclusion is counted by reason in the report.
+    """
+    _setup_logging(verbose)
+    from src.settlement.calibration import prop_result_calibration_report, summarise
+
+    try:
+        report = prop_result_calibration_report(
+            lookback_days=lookback_days or None,
+            market=market,
+            n_bins=n_bins,
+            min_bin_coverage=min_bin_coverage,
+        )
+    except Exception as exc:  # noqa: BLE001 — a DB failure must name itself
+        typer.echo(f"DATA_NOT_AVAILABLE: could not read prop_results: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+
+    summary = summarise(report) | {"out": str(out)}
+    typer.echo(json.dumps(summary, indent=2, default=str))
+    if report.get("status") != "OK":
+        raise SystemExit(3)
+
+
+@app.command("espn-slate")
+def espn_slate_cmd(
+    day: Optional[str] = typer.Option(
+        None, "--date", help="Pacific calendar date YYYY-MM-DD. Default: today PT.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the games as CSV here as well as summarising.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """Today's NBA games from ESPN's public scoreboard.
+
+    WHY THIS SOURCE. The player game log holds COMPLETED games, so a future
+    slate is legitimately absent from the panel and needs a schedule feed.
+    ESPN's scoreboard is public and needs no credential; stats.nba.com is denied
+    through this environment's proxy.
+
+    The slate day is a PACIFIC calendar date derived from each tip-off, not the
+    UTC date — a 7pm PT game is already tomorrow in UTC, and bucketing by UTC
+    would move the late West Coast games onto the next slate for part of the
+    year and not the rest.
+
+    Team codes are translated to the abbreviations the rest of this pipeline
+    joins on (GS -> GSW, NO -> NOP, and so on); a code with no mapping is
+    reported rather than guessed.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_schedule import EspnScheduleError, load_slate
+    from src.utils.timezones import pacific_calendar_date, parse_slate_date
+
+    target = parse_slate_date(day) if day else pacific_calendar_date()
+    try:
+        result = load_slate(target)
+    except EspnScheduleError as exc:
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    if result.status != "OK":
+        typer.echo(json.dumps({
+            "status": result.status,
+            "slate_date": str(target),
+            "notes": result.notes,
+        }, indent=2, default=str))
+        raise SystemExit(3)
+
+    games = [g.as_dict() for g in result.games]
+    if out is not None and games:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(games).to_csv(out, index=False)
+
+    typer.echo(json.dumps({
+        "status": result.status,
+        "slate_date": str(result.slate_date_pt or target),
+        "games": len(games),
+        # The only ones a pre-tip run may use; a game already in progress or
+        # final is not a slate a projection can be written for.
+        "pregame": len(result.pregame_only),
+        # Surfaced rather than swallowed: a code with no mapping means a game
+        # that cannot be joined to the panel, not a game that does not exist.
+        "unmapped_teams": result.unmapped_teams,
+        "notes": result.notes,
+        "out": str(out) if out is not None else None,
+        "matchups": [
+            f"{g['AWAY_TEAM']} @ {g['HOME_TEAM']}" for g in games[:15]
+        ],
+    }, indent=2, default=str))
+
+
+@app.command("espn-injuries")
+def espn_injuries_cmd(
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the injury rows as CSV here.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """The league-wide ESPN injury report — the pre-tip scratch source.
+
+    This is what `pipeline.scratches` applies to a slate's projections, and it
+    is the reachable substitute for the official pregame inactive list
+    (stats.nba.com is denied here).
+
+    A FAILED REPORT IS NOT AN EMPTY ONE. When ESPN does not answer, this exits
+    non-zero and says so rather than printing zero injuries, because "nobody is
+    hurt" and "we could not ask" must not look the same to a shell script.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_availability import fetch_injuries
+
+    try:
+        report = fetch_injuries()
+    except Exception as exc:  # noqa: BLE001 — name the failure, do not print zero
+        typer.echo(f"DATA_NOT_AVAILABLE: injury report unreachable: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    rows = [r.as_dict() for r in report.injuries]
+    if out is not None and rows:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out, index=False)
+
+    typer.echo(json.dumps({
+        "status": report.status,
+        "rows": len(rows),
+        "out_or_doubtful": len(report.unavailable_names),
+        "names": sorted(report.unavailable_names)[:25],
+        "notes": report.notes,
+        "out": str(out) if out is not None else None,
+    }, indent=2, default=str))
+    if report.status != "OK":
+        raise SystemExit(3)
+
+
+@app.command("espn-boxscore")
+def espn_boxscore_cmd(
+    event_id: str = typer.Option(..., "--event-id", help="ESPN event id."),
+    show_plays: int = typer.Option(
+        0, "--show-plays",
+        help="Print this many parsed plays. The fetch always returns them.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write the box-score rows as CSV here.",
+    ),
+    verbose: bool = False,
+) -> None:
+    """One game's ESPN box score, and optionally its play-by-play.
+
+    A SECOND SOURCE, not the primary one. Settlement grades against
+    `cdn.nba.com` via `settlement/boxscore_fetcher.py`; this exists so a game
+    that source cannot produce can still be inspected by hand, and so the
+    parsing is exercised by something other than its own tests.
+
+    Player stats are zipped against ESPN's OWN column header rather than a
+    positional assumption, and a played row carrying no stats is flagged instead
+    of being read as a zero line.
+    """
+    _setup_logging(verbose)
+    from src.ingestion.espn_game import fetch_summary
+
+    try:
+        summary = fetch_summary(event_id)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"DATA_NOT_AVAILABLE: {exc}", err=True)
+        raise SystemExit(2) from exc
+
+    rows = [r.as_dict() for r in summary.box_score]
+    if out is not None and rows:
+        import pandas as pd
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out, index=False)
+
+    payload: dict[str, Any] = {
+        "status": summary.status,
+        "event_id": event_id,
+        "box_score_rows": len(rows),
+        "played": len(summary.played),
+        # Who dressed and did not play — the post-game scratch signal, which is
+        # NOT the same as the pre-tip injury report the scratch filter uses.
+        "inactive": len(summary.inactive_names),
+        "inactive_names": sorted(summary.inactive_names)[:25],
+        "plays": len(summary.plays),
+        "notes": summary.notes,
+        "out": str(out) if out is not None else None,
+    }
+    if show_plays > 0:
+        payload["sample_plays"] = [
+            p.as_dict() if hasattr(p, "as_dict") else vars(p)
+            for p in summary.plays[: int(show_plays)]
+        ]
+    typer.echo(json.dumps(payload, indent=2, default=str))
+    if summary.status != "OK":
+        raise SystemExit(3)
 
 
 @app.command("fetch-pbp")

@@ -39,3 +39,15 @@ rapidfuzz>=3.6.0
 pytest>=8.0.0
 pytest-socket>=0.7.0     # CI runs with --disable-socket; see .github/workflows/tests.yml
 ruff>=0.5.0
+
+# ---------------------------------------------------------------------------
+# DEPLOYED WORKER
+# ---------------------------------------------------------------------------
+# APScheduler is in pyproject's `deploy` extra, and WAS NOT HERE. That mattered:
+# Railway's Nixpacks builder reads THIS file, not pyproject's extras, so a
+# Nixpacks build produced an image whose scheduler_worker.py hit its import
+# guard and exited — a container that boots, dies and restarts in a loop.
+#
+# Build from the Dockerfile so there is one build path. This line is the
+# belt-and-braces for the day someone points Railway at Nixpacks anyway.
+APScheduler>=3.10

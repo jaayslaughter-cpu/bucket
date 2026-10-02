@@ -1,0 +1,35 @@
+# Keep secrets and bulk data out of the image.
+#
+# THE FIRST BLOCK IS THE IMPORTANT ONE. `COPY . .` copies whatever is in the
+# build context, including an untracked .env sitting next to the Dockerfile. A
+# credential in an image layer survives every later layer that deletes it, and
+# the image is pushed to a registry.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Bulk data. data/** is gitignored anyway, but a local checkout has gigabytes of
+# panels and box scores in it and every byte would be sent to the builder.
+data/
+outputs/
+*.parquet
+*.xlsx
+*.sqlite
+
+# Build and tooling noise.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+htmlcov/
+.coverage
+node_modules/

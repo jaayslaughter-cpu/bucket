@@ -13,6 +13,11 @@ import yaml
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
 
 from src.models.distribution_adapter import DistributionPropModel
+from src.models.eligibility import (
+    eligibility_warnings_for_row,
+    ks_feature_drift,
+    prior_game_counts,
+)
 from src.models.ensemble import EnsemblePropModel
 from src.models.labels import attach_research_over_labels, default_feature_cols
 from src.models.prob_calibration import expected_calibration_error
@@ -532,6 +537,10 @@ def compare_models_on_panel(
     ensemble_composition: list[dict[str, Any]] = []
     detail_rows: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
+    # Covariate drift per market/feature. Returned, not only logged: a model
+    # trained on one distribution and scored on another is not comparable to
+    # one that was not, and its metrics alone do not say which it was.
+    drift_rows: list[dict[str, Any]] = []
     calib_rows: list[dict[str, Any]] = []
     calibration_meta: dict[tuple[str, str], dict[str, Any]] = {}
     winners: dict[str, dict[str, Any]] = {}
@@ -588,6 +597,36 @@ def compare_models_on_panel(
                 )
                 continue
 
+        # KS COVARIATE DRIFT, train vs validation (config block `drift`, which
+        # had no reader). REPORT ONLY: a drifted feature is named, never dropped.
+        # Dropping on a KS p-value would let the validation window decide the
+        # feature set, which is the shape of a leak.
+        drift_threshold = float((cfg.get("drift") or {}).get("ks_p_threshold", 0.01))
+        market_drift = ks_feature_drift(
+            train, val, list(feature_cols), p_threshold=drift_threshold,
+        )
+        drifted = [d["feature_name"] for d in market_drift if d["status"] == "DRIFT"]
+        if drifted:
+            logger.warning(
+                "Market %s: %d of %d feature(s) differ between the training and "
+                "validation windows at p<%.3g: %s. Reported, not dropped — the "
+                "scores for this market describe a model trained on one "
+                "distribution and scored on another.",
+                market, len(drifted), len(market_drift), drift_threshold, drifted[:10],
+            )
+        for d in market_drift:
+            drift_rows.append({"target_market": market, **d})
+
+        # ELIGIBILITY / COLD START (config block `eligibility`, also unread).
+        #
+        # PRIOR GAMES ARE COUNTED OVER THE WHOLE MARKET FRAME, not over `val`.
+        # prior_game_counts is a per-player cumcount, so handing it the
+        # validation slice alone would restart every player at zero and abstain
+        # a 60-game veteran as a cold start.
+        eligibility_cfg = cfg.get("eligibility") or {}
+        min_prior_games = int(eligibility_cfg.get("min_prior_games", 10))
+        min_minutes_l5 = float(eligibility_cfg.get("min_minutes_l5", 12.0))
+        prior_games = prior_game_counts(work)
         components = build_components(market, feature_cols, cfg, xgb_feature_cols=xgb_cols)
         weights_series, recency_report = recency_sample_weights(train, cfg, market)
         if recency_report is not None:
@@ -787,6 +826,13 @@ def compare_models_on_panel(
                 if pd.notna(gdate):
                     # Date-only rows: treat as Pacific calendar date (no feed TZ shown).
                     game_date_pt = str(gdate.date())
+                row_prior_games = int(prior_games.get(r.name, 0))
+                row_eligibility = eligibility_warnings_for_row(
+                    r,
+                    prior_games=row_prior_games,
+                    min_prior_games=min_prior_games,
+                    min_minutes_l5=min_minutes_l5,
+                )
                 detail_rows.append(
                     {
                         "event_id": pred.event_id,
@@ -821,6 +867,15 @@ def compare_models_on_panel(
                         "actual_stat_value": float(actual[i]) if np.isfinite(actual[i]) else None,
                         "settlement": None,
                         "warnings": "|".join(pred.warnings) if pred.warnings else None,
+                        # Cold-start state, carried so the BOARD can refuse to
+                        # recommend a row the model has too little history for.
+                        # Deliberately not a reason to stop RECORDING the
+                        # prediction: a thin-history row is still gradeable, and
+                        # it is the evidence where the model is weakest.
+                        "prior_games": int(row_prior_games),
+                        "eligibility_warnings": (
+                            "|".join(row_eligibility) if row_eligibility else None
+                        ),
                     }
                 )
 
@@ -871,6 +926,7 @@ def compare_models_on_panel(
         "summary": summary_rows,
         "predictions": detail_rows,
         "feature_importance": importance_rows,
+        "covariate_drift": drift_rows,
         "calibration": calib_rows,
         "calibration_meta": {f"{m}|{n}": v for (m, n), v in calibration_meta.items()},
         "model_vs_line": market_rows,

@@ -118,28 +118,43 @@ def test_claim_words_are_refused_in_any_embed():
             build_abstention_embed(phrase)
 
 
-def test_the_research_footer_travels_with_every_embed():
+def test_the_footer_travels_with_every_embed():
+    """
+    A notification is the most screenshottable thing this system produces, so
+    every embed carries the qualifier. The wording changed when recommendations
+    were permitted; what must not change is that something qualifying rides
+    along and that it still says PropIQ does not place the bet.
+    """
     ticket, legs = _ticket()
     for embed in (
         build_parlay_embed(ticket, legs),
         build_decision_board_embed([], slate_date="2026-09-21"),
         build_abstention_embed("No two-way price reached the gate"),
     ):
-        assert "RESEARCH_ONLY" in embed["footer"]["text"]
-        assert "never places or sizes" in embed["footer"]["text"]
+        text = embed["footer"]["text"]
+        assert "not a promise of an outcome" in text.lower()
+        assert "does not place" in text.lower()
 
 
-def test_a_stake_is_labelled_as_the_users_own():
+def test_a_logged_stake_is_kept_distinct_from_a_recommended_one():
+    """
+    Two different numbers with the same unit. Collapsing them would make a
+    recommendation look like a record of a bet that happened.
+    """
     ticket, legs = _ticket()
     embed = build_parlay_embed(ticket, legs)
-    stake = next(f for f in embed["fields"] if f["name"] == "Stake")
+    stake = next(f for f in embed["fields"] if f["name"] == "Stake logged")
     assert "**your** figure" in stake["value"]
-    assert "does not size bets" in stake["value"]
+    assert "not a recommended size" in stake["value"]
 
 
 def test_an_unpriced_board_says_so_rather_than_looking_empty():
+    """
+    A recommendation with no market price behind it must not read like one that
+    has a de-vigged price behind it — in a channel the basis column is gone.
+    """
     class Row:
-        decision_status = "CONSIDER"
+        decision_status = "RECOMMENDED"
         decision_basis = "model_lean"
         player_name = "DEMO_A"
         target_market = "PTS"
@@ -152,8 +167,135 @@ def test_an_unpriced_board_says_so_rather_than_looking_empty():
 
     embed = build_decision_board_embed([Row(), Row()], slate_date="2026-09-21")
     assert "none priced" in embed["description"]
+    assert "model alone" in embed["description"]
     assert all("model_lean" in f["value"] for f in embed["fields"])
     assert all("No priced market" in f["value"] for f in embed["fields"])
+
+
+# --- DFS entries, and the publication gate in front of them --------------
+
+
+def _dfs_entry(source_label: str = "SHARP_BENCHMARK"):
+    """A priced 2-leg pick'em entry, built through the real routing path."""
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutStructure
+
+    structure = DfsPayoutStructure(
+        2, {2: 3.0}, source="TEST FIXTURE — invented multiple", label="testop:power:2",
+    )
+
+    def row(game_id: str, line: float) -> MarketContext:
+        return MarketContext(
+            game_id=game_id, status="VALID", market="PTS", line=line,
+            payout_multiplier=3.0, is_pickem=True,
+        )
+
+    if source_label == "SHARP_BENCHMARK":
+        legs = [
+            PickemLeg("a", row("g1", 25.5), benchmark_over_american=-130,
+                      benchmark_under_american=110, benchmark_line=25.5,
+                      benchmark_source="fixture book"),
+            PickemLeg("b", row("g2", 7.5), benchmark_over_american=-125,
+                      benchmark_under_american=105, benchmark_line=7.5,
+                      benchmark_source="fixture book"),
+        ]
+    else:
+        legs = [
+            PickemLeg("a", row("g1", 25.5), model_probability=0.62),
+            PickemLeg("b", row("g2", 7.5), model_probability=0.60),
+        ]
+    return route_pickem_entry(structure, legs)
+
+
+def test_a_dfs_entry_states_where_its_probabilities_came_from():
+    from src.notify.discord import build_dfs_entry_embed
+
+    embed = build_dfs_entry_embed(_dfs_entry(), slate_date="2026-09-28")
+    assert "SHARP_BENCHMARK" in embed["description"]
+    assert "Market-grounded" in embed["description"]
+    assert [f["name"].split()[0] for f in embed["fields"]] == ["a", "b"]
+    assert "not a promise of an outcome" in embed["footer"]["text"].lower()
+
+
+def test_a_model_sourced_dfs_entry_carries_the_calibration_caveat():
+    from src.notify.discord import build_dfs_entry_embed
+
+    embed = build_dfs_entry_embed(_dfs_entry("MODEL"))
+    assert "MODEL" in embed["description"]
+    assert "calibration" in embed["description"]
+
+
+def test_a_withheld_entry_posts_the_gates_reason_instead_of_the_numbers():
+    """
+    The gate is the point: an ungated model EV reads, in a channel, exactly like
+    a verified one.
+    """
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.publication_gate import calibration_gate
+
+    evaluation = _dfs_entry("MODEL")
+    verdict = calibration_gate(None)          # no calibration evidence at all
+    assert not verdict.allowed
+
+    embed = build_dfs_entry_embed(evaluation, publication=verdict)
+    assert "withheld from publication" in embed["description"]
+    assert "absent evidence is not evidence" in embed["description"]
+    assert embed["fields"] == []
+    # the figures themselves must not survive the refusal
+    assert "EV " not in embed["description"]
+
+
+def test_a_benchmark_sourced_entry_is_published_without_a_model_backtest():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.publication_gate import calibration_gate
+
+    evaluation = _dfs_entry()
+    verdict = calibration_gate(None, probability_source=evaluation.probability_source)
+    assert verdict.allowed
+
+    embed = build_dfs_entry_embed(evaluation, publication=verdict)
+    assert "SHARP_BENCHMARK" in embed["description"]
+    assert embed["fields"], "a published entry must still show its legs"
+
+
+def test_an_abstaining_entry_posts_its_reason_rather_than_an_empty_card():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+    from src.quant.dfs_payouts import DfsPayoutStructure
+
+    structure = DfsPayoutStructure(2, {2: 3.0}, source="TEST FIXTURE")
+    legs = [
+        PickemLeg("a", MarketContext(
+            game_id="g1", status="VALID", line=25.5,
+            payout_multiplier=3.0, is_pickem=True,
+        )),
+        PickemLeg("b", MarketContext(
+            game_id="g2", status="VALID", line=7.5,
+            payout_multiplier=3.0, is_pickem=True,
+        )),
+    ]
+    embed = build_dfs_entry_embed(route_pickem_entry(structure, legs))
+    assert "Not priced" in embed["description"]
+    assert "no probability source" in embed["description"]
+
+
+def test_an_advisory_size_on_a_dfs_card_is_labelled_advisory():
+    from src.notify.discord import build_dfs_entry_embed
+    from src.quant.advisory_sizing import recommended_units_binary
+
+    embed = build_dfs_entry_embed(
+        _dfs_entry(), advisory_size=recommended_units_binary(0.40, 3.0),
+    )
+    field = next(f for f in embed["fields"] if f["name"] == "Recommended stake")
+    assert "fractional Kelly" in field["value"]
+    assert "does not place it" in field["value"], (
+        "the card may recommend a size; it must still say nothing places it"
+    )
+    assert "calibration" in field["value"], (
+        "a recommended size inherits the model's calibration error and must say so"
+    )
 
 
 # --- sending -------------------------------------------------------------
@@ -240,7 +382,7 @@ def test_discord_limits_are_enforced_before_sending():
 
     crowded = build_decision_board_embed(
         [type("R", (), {
-            "decision_status": "CONSIDER", "decision_basis": "book_ev",
+            "decision_status": "RECOMMENDED", "decision_basis": "book_ev",
             "player_name": f"P{i}", "target_market": "PTS", "side": "over",
             "line": 24.5, "model_prob": 0.6, "book_ev": 0.03,
             "american_odds": -110, "book_source": "propline",
@@ -249,3 +391,146 @@ def test_discord_limits_are_enforced_before_sending():
     )
     assert len(crowded["fields"]) <= MAX_FIELDS_PER_EMBED
     assert crowded["fields"][-1]["name"] == "…"
+
+
+# --- the board is gated too, which it was not before ---------------------
+
+def _board_rows(n: int = 2):
+    return [
+        type("Row", (), {
+            "decision_status": "RECOMMENDED", "decision_basis": "book_ev",
+            "player_name": f"DEMO_{i}", "target_market": "PTS", "side": "over",
+            "line": 24.5, "model_prob": 0.61, "book_ev": 0.04,
+            "american_odds": -110, "book_source": "propline",
+        })() for i in range(n)
+    ]
+
+
+def test_a_board_is_withheld_when_the_calibration_gate_refuses():
+    """
+    Three docstrings claimed the gate stopped an uncalibrated board row from
+    being dispatched, and only the DFS path actually called it. This is that
+    claim made true.
+    """
+    from src.quant.publication_gate import calibration_gate
+
+    verdict = calibration_gate(None)          # no evidence at all
+    assert not verdict.allowed
+
+    embed = build_decision_board_embed(
+        _board_rows(), slate_date="2026-09-29", publication=verdict,
+    )
+    assert "withheld from publication" in embed["description"]
+    assert "absent evidence is not evidence" in embed["description"]
+    assert embed["fields"] == [], "the rows must not survive the refusal"
+    assert "DEMO_0" not in str(embed)
+
+
+def test_a_board_publishes_once_the_gate_allows_it():
+    from datetime import datetime, timedelta, timezone
+
+    from src.quant.publication_gate import calibration_gate
+
+    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    report = {
+        "status": "OK", "n_scored": 400, "ece": 0.02, "ece_gate_passed": True,
+        "bin_coverage": 0.9,
+        "evidence_as_of": (now - timedelta(days=2)).isoformat(),
+    }
+    verdict = calibration_gate(report, now=now)
+    assert verdict.allowed
+
+    embed = build_decision_board_embed(
+        _board_rows(), slate_date="2026-09-29", publication=verdict,
+    )
+    assert "DEMO_0" in str(embed)
+    assert len(embed["fields"]) == 2
+
+
+def test_passing_no_verdict_still_publishes_for_a_caller_that_already_gated():
+    embed = build_decision_board_embed(_board_rows(), slate_date="2026-09-29")
+    assert len(embed["fields"]) == 2
+
+
+# --- the CLI dispatch surface -------------------------------------------
+
+def _board_csv(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-09-29", "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(path, index=False)
+    return path
+
+
+def test_the_cli_withholds_a_board_with_no_calibration_report(tmp_path):
+    """The default state today: rows exist, evidence does not, nothing goes out."""
+    import json
+
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "withheld from publication" in result.output
+    assert "DEMO_A" not in result.output, "a withheld board must not leak its rows"
+    payload = json.loads(result.output[result.output.rindex('{\n  "status"'):])
+    assert payload["PUBLICATION"]["PUBLICATION_STATUS"] == "PUBLISH_WITHHELD"
+
+
+def test_the_cli_publishes_a_board_once_a_report_backs_it(tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    report = tmp_path / "calibration.json"
+    report.write_text(json.dumps({
+        "status": "OK", "n_scored": 400, "ece": 0.02, "ece_gate_passed": True,
+        "bin_coverage": 0.9,
+        "evidence_as_of": (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat(),
+    }))
+
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+        "--calibration-report", str(report),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "withheld" not in result.output
+    assert "DEMO_A" in result.output
+    payload = json.loads(result.output[result.output.rindex('{\n  "status"'):])
+    assert payload["PUBLICATION"]["PUBLICATION_STATUS"] == "PUBLISH_ALLOWED"
+
+
+def test_a_broken_calibration_file_is_an_error_not_a_silent_withhold(tmp_path):
+    """"You forgot the flag" and "the file is corrupt" must not look the same."""
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from scripts.nba_model_cli import app
+
+    bad = tmp_path / "calibration.json"
+    bad.write_text("{not json")
+    result = CliRunner().invoke(app, [
+        "notify-discord", "--source", "decision-board",
+        "--board-csv", str(_board_csv(tmp_path)),
+        "--calibration-report", str(bad),
+    ])
+    assert result.exit_code == 2
+    assert "not valid JSON" in result.output

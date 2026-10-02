@@ -1,10 +1,10 @@
-"""Advisory unit sizing from fractional Kelly. READ-ONLY, NEVER EXECUTION.
+"""Recommended stake from fractional Kelly. NEVER EXECUTION.
 
-WHAT THIS IS AND IS NOT. ``recommended_units`` is an INFORMATIONAL METADATA
-FIELD. Nothing here places a wager, reads a bankroll, returns a currency amount,
-or is imported by any execution or dispatch path. The number is a reference for a
-person deciding by hand, and the standing rule it respects is that PropIQ never
-auto-sizes a stake.
+WHAT THIS IS AND IS NOT. ``recommended_units`` is a RECOMMENDED SIZE — this
+module is allowed to say how much, and it does. What it is not is an executed
+order: nothing here places a wager, reads a bankroll, returns a currency amount,
+or is imported by any execution or dispatch path. Recommending a size and placing
+a bet are different acts, and this project does only the first.
 
 Three properties keep that true, and each is enforced by a test:
 
@@ -46,11 +46,19 @@ optimiser's floor, not a tolerance chosen for comfort: measured at xatol 1e-10,
 and then degrades on floating point. An earlier version of this docstring
 claimed 1e-9, which is wrong by a factor of about 1.3.
 
-NOT A PREDICTION OF PROFIT. Kelly is optimal only if the probabilities are
-right. On a model-sourced entry these numbers inherit the model's calibration
-error; on a benchmark-sourced one they inherit the benchmark's sharpness and the
-line match. ``dfs_payouts.ProbabilitySource`` records which, and a caller should
-carry it alongside any size it shows.
+A RECOMMENDED SIZE IS STILL NOT A PREDICTION OF PROFIT, and this is the caveat
+that survives the permission to recommend. Kelly is optimal only if the
+probabilities are right, and it is MOST sensitive to error exactly where the
+edge looks largest. On a model-sourced entry these numbers inherit the model's
+calibration error; on a benchmark-sourced one they inherit the benchmark's
+sharpness and the line match. ``dfs_payouts.ProbabilitySource`` records which,
+and a caller must carry the source alongside any size it shows.
+
+``quant.publication_gate`` is what withholds a model-sourced figure until there
+is graded evidence behind it, but note WHERE that happens: at the dispatch
+surfaces (``notify-discord``, ``dfs-entry --discord``), not inside this module.
+Nothing stops a Python caller computing a size on an uncalibrated model — the
+gate governs publication, not arithmetic.
 """
 
 from __future__ import annotations
@@ -99,8 +107,40 @@ class AdvisorySize:
             "CAPPED": self.capped,
             "SIZING_METHOD": self.method,
             "SIZING_NOTE": self.reason,
-            "ADVISORY_ONLY": True,
+            # A recommended size, not an order. "ADVISORY_ONLY" said the same
+            # thing but now reads as "do not take this seriously", which is the
+            # wrong hedge: the number IS the recommendation. What stays true is
+            # that nothing in this project places it.
+            "AUTO_PLACED": False,
         }
+
+
+def _unusable_controls(kelly_fraction: float, max_cap_units: float) -> str | None:
+    """
+    Why these sizing controls cannot produce a size, or None if they can.
+
+    A NEGATIVE kelly_fraction or cap used to flow straight through: f* is
+    positive on a real edge, so `f* * -0.25 * 100` is a NEGATIVE
+    recommended_units, and the `suggested > cap` test does not catch it. That
+    contradicts this module's own stated invariant -- "a non-positive Kelly
+    fraction returns 0.0 rather than a negative number" -- which was written
+    about f* and quietly did not hold for the multiplier applied to it.
+
+    Refused by returning an abstaining AdvisorySize rather than raising,
+    because every other bad input in this module returns one, and a caller that
+    handles "no size, here is why" for a miscalibrated probability should not
+    have to handle an exception for a mistyped argument.
+    """
+    if not math.isfinite(kelly_fraction) or kelly_fraction < 0.0:
+        return (
+            f"kelly_fraction {kelly_fraction!r} is not a finite non-negative "
+            "fraction; a negative one would return a negative size on a real edge"
+        )
+    if not math.isfinite(max_cap_units) or max_cap_units < 0.0:
+        return (
+            f"max_cap_units {max_cap_units!r} is not a finite non-negative cap"
+        )
+    return None
 
 
 def _finalise(
@@ -110,6 +150,17 @@ def _finalise(
     method: str,
     reason: str | None = None,
 ) -> AdvisorySize:
+    unusable = _unusable_controls(kelly_fraction, max_cap_units)
+    if unusable is not None:
+        return AdvisorySize(
+            recommended_units=0.0,
+            full_kelly_fraction=float(f_star) if math.isfinite(f_star) else 0.0,
+            kelly_fraction_applied=float(kelly_fraction)
+            if math.isfinite(kelly_fraction) else 0.0,
+            capped=False,
+            method=method,
+            reason=unusable,
+        )
     if not math.isfinite(f_star) or f_star <= 0.0:
         return AdvisorySize(
             recommended_units=0.0,
@@ -121,8 +172,13 @@ def _finalise(
         )
     suggested = f_star * float(kelly_fraction) * 100.0
     capped = suggested > float(max_cap_units)
+    # ROUND FIRST, THEN CAP. The other order lets rounding push the answer back
+    # over a cap that is not a whole number of cents: a cap of 2.555 with a
+    # larger suggestion gives min(...) = 2.555, which rounds to 2.56 -- above
+    # the hard limit. The cap is the last thing applied, by definition of being
+    # hard.
     return AdvisorySize(
-        recommended_units=round(min(suggested, float(max_cap_units)), 2),
+        recommended_units=min(round(suggested, 2), float(max_cap_units)),
         full_kelly_fraction=float(f_star),
         kelly_fraction_applied=float(kelly_fraction),
         capped=capped,
@@ -264,6 +320,21 @@ def recommended_units_for_entry(
 
     probabilities = list(getattr(evaluation, "count_probabilities", []) or [])
     multiples = list(payout_multiples)
+
+    # CHECKED BEFORE ROUTING, not inside one branch. The multi-outcome path
+    # validated this and the binary one did not, so a TRUNCATED payout vector
+    # looked like a top-tier-only table: probabilities[-1] is P(all hit) while
+    # multiples[-1] is then some middle tier's return, and the entry is sized
+    # against a payout it does not have. An empty probabilities list also made
+    # probabilities[-1] an IndexError rather than an abstention.
+    if not probabilities or len(probabilities) != len(multiples):
+        return AdvisorySize(
+            0.0, 0.0, float(kelly_fraction), False, "none",
+            f"{len(probabilities)} probability(ies) against {len(multiples)} "
+            "payout(s); they must be aligned by hit count, so this entry cannot "
+            "be sized without guessing which tier each return belongs to",
+        )
+
     paying = [i for i, m in enumerate(multiples) if m > 0.0]
 
     if len(paying) == 1 and paying[0] == len(multiples) - 1:

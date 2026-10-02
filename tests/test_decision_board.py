@@ -220,7 +220,7 @@ def test_decision_board_expands_both_sides_and_ranks_plus_ev():
     assert PLACEMENT_MODE == "MANUAL_ONLY"
     assert "MANUAL_ONLY" in BOARD_DISCLAIMER
 
-    consider = [c for c in board if c.decision_status == "CONSIDER"]
+    consider = [c for c in board if c.decision_status == "RECOMMENDED"]
     assert consider and consider[0].decision_basis == "book_ev"
     assert board[0].rank == 1
 
@@ -260,9 +260,9 @@ def test_a_pickem_line_alone_can_never_be_considered():
 
 def test_min_ev_and_top_n_and_consider_only():
     enriched = enrich_row_with_book(_row(), PROPLINE)
-    assert any(c.decision_status == "CONSIDER"
+    assert any(c.decision_status == "RECOMMENDED"
                for c in build_decision_board([enriched], min_ev=0.0))
-    assert not any(c.decision_status == "CONSIDER"
+    assert not any(c.decision_status == "RECOMMENDED"
                    for c in build_decision_board([enriched], min_ev=0.50))
     assert len(build_decision_board([enriched], top_n=1)) == 1
     assert len(build_decision_board([enriched], consider_only=True)) == 1
@@ -337,7 +337,13 @@ def test_candidate_maps_to_manual_log_fields():
     assert fields["side"] == "under"
     # model_prob is P(THE SIDE TAKEN) — 0.60, not P(over).
     assert fields["model_prob"] == pytest.approx(0.60)
-    assert "kelly" in fields["note"].lower()
+    # The note used to say "never auto-Kelly". A recommended size now exists, so
+    # what the note must still do is keep the LEDGER's record distinct from that
+    # recommendation: writing a suggested size in here would grade the
+    # recommendation against a bet nobody placed at that size.
+    note = fields["note"].lower()
+    assert "actually staked" in note
+    assert "not the recommendation" in note
     assert not [k for k in fields if "stake" in k]
 
 
@@ -365,3 +371,51 @@ def test_board_summary_and_csv(tmp_path):
     for column in ("side", "decision_status", "decision_basis", "book_ev",
                    "preferred_side", "why", "rank", "book_source"):
         assert column in frame.columns
+
+
+# --- recommendations, and what still qualifies them ----------------------
+
+def test_a_priced_row_is_recommended_and_names_its_price():
+    enriched = enrich_row_with_book(_row(), PROPLINE)
+    board = build_decision_board([enriched], min_ev=0.0, consider_only=True)
+    top = board[0]
+    assert top.decision_status == "RECOMMENDED"
+    assert top.decision_basis == "book_ev"
+    assert "EV=" in top.why and "de-vigged" in top.why
+
+
+def test_a_model_only_recommendation_says_nothing_prices_it():
+    """
+    The distinction the basis column exists for. A row recommended on the model
+    alone must say so in its own reason, because in a channel or a CSV opened
+    without headers the basis is the only thing separating it from a priced edge.
+    """
+    lean = _row(model_p_over=0.72, model_p_under=0.28)
+    board = build_decision_board([lean], min_lean=0.03, consider_only=True)
+    over = next(c for c in board if c.side == "over")
+    assert over.decision_status == "RECOMMENDED"
+    assert over.decision_basis == "model_lean"
+    assert "no VALID" in over.why
+    assert "calibration" in over.why
+    assert over.book_ev is None, "a model-only row must carry no EV"
+
+
+def test_recommending_is_still_not_promising():
+    """
+    The permission to recommend did not extend to promising an outcome. The
+    vocabulary guard is unchanged, and it is the one thing here that raises.
+    """
+    from src.quant.decision_board import _assert_no_claims
+
+    for phrase in ("this is a lock", "guaranteed winner", "best bet tonight"):
+        with pytest.raises(DecisionBoardError):
+            _assert_no_claims(phrase)
+
+    # and the ordinary recommendation vocabulary passes
+    for phrase in ("RECOMMENDED over 25.5", "take the under", "recommended stake 1.4u"):
+        assert _assert_no_claims(phrase) == phrase
+
+
+def test_the_disclaimer_says_it_recommends_but_does_not_place():
+    assert "recommend" in BOARD_DISCLAIMER.lower()
+    assert "does not place" in BOARD_DISCLAIMER.lower()
