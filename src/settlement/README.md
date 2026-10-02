@@ -56,8 +56,10 @@ Missing stat components raise rather than defaulting to 0 — a missing
 rebound count is not zero rebounds, and treating it as such would
 mis-grade every Over as a LOSS.
 
-## NCAA
+## Other leagues
 
-Not implemented. Would need a different provider, id scheme, and name
-crosswalk. Add `ncaa_boxscore_fetcher.py` implementing the same
-`extract_player_stats()` contract rather than widening the NBA module.
+Out of scope. This project is NBA only — `main.py` says so on line 4 and
+`src/ingestion/propline.py` refuses every other league the provider offers.
+An earlier version of this section described how to add an NCAA fetcher; that
+was a roadmap for something the project does not do, so it is gone rather than
+left to read as a plan.
