@@ -43,6 +43,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.features.season import season_start_year
+
 logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "defense"
@@ -98,9 +100,12 @@ def _season_key(dates: pd.Series) -> pd.Series:
 
     Rolling within a season rather than across one keeps last June's defence
     out of this October's average, where the roster is a different roster.
+
+    This module had the correct form first; it now lives in
+    ``src/features/season.py`` so the layers that used a plain ``dt.year``
+    share it rather than disagreeing with it.
     """
-    d = pd.to_datetime(dates)
-    return (d.dt.year - (d.dt.month < 8).astype(int)).astype("Int64")
+    return season_start_year(dates)
 
 
 def build_team_defense(team_games: pd.DataFrame) -> pd.DataFrame:

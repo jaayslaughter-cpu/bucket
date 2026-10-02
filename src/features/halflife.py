@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.features.season import drop_season_key, player_season_keys
+
 # Half-life in games for exponential recency weighting (pandas ewm halflife).
 DEFAULT_HALFLIFE_GAMES = 10.0
 # Prior strength for shrink toward season EWM (higher → more shrinkage).
@@ -56,9 +58,11 @@ def attach_halflife_shrink_features(
     out = df.copy()
     if "PLAYER_ID" not in out.columns or "GAME_DATE" not in out.columns:
         raise ValueError("DATA_NOT_AVAILABLE: PLAYER_ID and GAME_DATE required for halflife")
-    if "SEASON" not in out.columns:
-        out["SEASON"] = pd.to_datetime(out["GAME_DATE"], errors="coerce").dt.year
-    group_keys = ["PLAYER_ID", "SEASON"]
+    # A derived season stays PRIVATE to this layer. Writing it into the frame
+    # under the public name made this layer's guess every later layer's fact —
+    # halflife runs first — and defeated minutes_weighted's abstention. See
+    # src/features/season.py.
+    out, group_keys = player_season_keys(out)
     n_prior = _prior_game_counts(out, group_keys).astype(float)
     w = n_prior / (n_prior + float(shrink_k))
 
@@ -102,7 +106,7 @@ def attach_halflife_shrink_features(
 
     out.attrs["halflife_games"] = float(halflife_games)
     out.attrs["halflife_shrink_k"] = float(shrink_k)
-    return out
+    return drop_season_key(out)
 
 
 def attach_pra_component_rollups(df: pd.DataFrame) -> pd.DataFrame:
