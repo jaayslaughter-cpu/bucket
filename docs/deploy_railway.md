@@ -91,6 +91,8 @@ these are the ones the worker reads.
 | `DATABASE_URL` | Required. Use the **pooler** URL (port 6543 on Supabase) — these are short-lived jobs and the direct port exhausts connections. |
 | `PROPIQ_PARLAY_LEDGER=postgres` | Already set in the image. Without it the ledger writes CSVs to an ephemeral disk and a redeploy destroys every ticket's at-bet-time probability and EV. |
 | `PROPLINE_API_KEY` | The odds source. Without it no line is captured, so every row abstains for want of a market. |
+| `PROPIQ_MODEL` | Which fitted artifact to score with. Unset, `main.resolve_model_artifact` tries the comparison `artifacts_dir` for the newest `xgboost_*.json` that has its `.meta.json` sidecar. Set it when the artifact is on the mounted volume. |
+| `PROPIQ_FORWARD_SLATE` | Default **on**. Adds rows for games that have not been played, from the ESPN schedule plus each team's recent appearances in the panel. Without it a 09:00 PT run has no rows for tonight — the panel is completed box scores only. |
 | `DISCORD_WEBHOOK_URL` | Only if you dispatch. Never logged or printed. |
 | `PROPIQ_MAX_THREADS` | Defaults to 2 in the image. Match your plan's CPU allocation — the numeric libraries otherwise see the host's core count, not the container's share. |
 | `TZ` | Set to `Etc/UTC` in the image so the container default is a decision rather than the host's. The slate schedule does **not** depend on it: the scheduler passes `America/Los_Angeles` to APScheduler directly. |

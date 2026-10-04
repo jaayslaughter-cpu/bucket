@@ -28,7 +28,7 @@ so they cannot drift back.
 
 ## 1. Broken connections & disconnected modules
 
-### 1.1 BLOCKER — nothing produces rows for a slate that has not been played
+### 1.1 CLOSED (2026-10-04) — nothing produced rows for a slate that had not been played
 
 `load_player_panel` selects `PlayerGameLog`, which is **completed box scores**.
 `main._filter_to_slate` then keeps only rows whose `GAME_DATE` equals the slate
@@ -50,10 +50,24 @@ in the production path:
 | `src/ingestion/espn_schedule.py` `load_slate()` | games, tip-offs, `pregame_only` | `scripts/nba_model_cli.py` only |
 | `src/ingestion/espn_availability.py` `fetch_roster()` | players per ESPN team id | **nothing** |
 
-`docs/go_live_readiness.md` recorded this as "schedule source is still open"
-without its consequence. Reconciled 2026-10-04: it is O9 there, and the
-consequence is stated — a deployed worker is not degraded, it is inert. A
-forward slate needs both halves, the schedule *and* a roster.
+**Fixed.** `src/pipeline/forward_slate.py` adds one row per (player, scheduled
+game) from the schedule's **pre-tip** games plus each team's recent appearances
+in the panel, with **every box-score column NaN** so the rolling features read
+each player's own prior real games and the forward row has nothing of its own
+to leak — measured by value in `tests/test_forward_slate.py`, which also runs
+`assert_no_lookahead` over the result.
+
+The lineup comes from the panel rather than `fetch_roster`, on purpose: a
+roster fetch is keyed by ESPN athlete name and would need the crosswalk in §1.2
+that still does not exist, so a name mismatch would silently drop a player.
+"Who appeared for this team in its last few games" is a narrower claim than a
+roster — it misses a player returning from a long absence, which is stated in
+the module rather than hidden — but it is a true one, and the ESPN injury feed
+already removes the ruled-out through `src/pipeline/scratches.py`.
+
+Wired into `main.py` behind `PROPIQ_FORWARD_SLATE` (default on). A denied or
+unreachable schedule leaves the panel untouched with a named reason, so the run
+degrades to exactly what it did before rather than failing.
 
 ### 1.2a CLOSED (2026-10-04) — OddsPapi was in the source precedence with no client
 
@@ -109,19 +123,29 @@ Dead public functions: **16 of 321**. Most are harmless second doors
 
 ## 2. Schema & interface mismatches
 
-### 2.1 BLOCKER — scoring reads one path, training writes another, and the worker passes neither
+### 2.1 CLOSED (2026-10-04) — scoring read one path, training wrote another, and the worker passed neither
 
 | | path |
 |---|---|
 | `main.MODEL_ARTIFACT_DEFAULT` (what `score_prob_over` loads) | `models/xgb_prop_over.json` — **the `models/` directory does not exist** |
 | `config/model_comparison.yaml:artifacts_dir` (where `train-stats` writes) | `data/external/model_runs/comparison/xgboost_{MARKET}.json` |
 
-`main.py` bridges them only via `--model`, and
-`scheduler_worker.run_slate` calls `main.main(argv or [])` — **no arguments**.
-No environment variable overrides the model path either. So a scheduled run
-scores nothing *even after a model is trained into the right place*. Train
-`--model` into the worker, add a `PROPIQ_MODEL` variable, or have
-`score_prob_over` consult `artifact_registry` (1.3).
+`main.py` bridged them only via `--model`, and `scheduler_worker.run_slate`
+calls `main.main(argv or [])` — **no arguments** — so a scheduled run scored
+nothing *even after a model was trained into the right place*.
+
+**Fixed.** `main.resolve_model_artifact` tries `--model`, then `PROPIQ_MODEL`,
+then the newest `xgboost_*.json` in `artifacts_dir` **that has its
+`.meta.json` sidecar** (one without it cannot be scored with anyway), then the
+legacy path — and returns a reason naming every path it tried rather than a
+missing-file message for a path nobody chose. `score_prob_over` no longer
+defaults to a path nothing writes.
+
+The worker needed **no argv plumbing**: it calls `main.main([])` in-process, so
+`PROPIQ_MODEL` set on the service reaches the resolver through the shared
+environment. `artifact_registry` (1.3) is deliberately **not** read — nothing
+writes to it, and resolving through a dead module is how `oddspapi` survived in
+the source precedence for months.
 
 ### 2.2 `research_slate_from_predictions` drops the game date and stamps today's
 

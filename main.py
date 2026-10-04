@@ -87,7 +87,105 @@ FATIGUE_FLAG_COLS = ("is_back_to_back", "is_3_in_4", "is_4_in_5")
 DEFAULT_STATS = ("PTS", "REB", "AST", "FG3M")
 
 MASTER_GUIDELINE_DEFAULT_PATH = Path("config/master_guideline_props.yaml")
+#: The path this pipeline read before `resolve_model_artifact` existed. Kept as
+#: the LAST resort rather than the default: nothing writes here. `train-stats`
+#: writes to config/model_comparison.yaml's `artifacts_dir`, and the two paths
+#: never coincided (readiness item O2).
 MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
+
+ENV_MODEL = "PROPIQ_MODEL"
+ENV_FORWARD_SLATE = "PROPIQ_FORWARD_SLATE"
+
+
+def _flag_env(name: str, default: bool) -> bool:
+    """An env flag, defaulting rather than raising on an unusable value."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def resolve_model_artifact(
+    explicit: Path | str | None = None,
+    *,
+    market: str | None = None,
+) -> tuple[Path | None, str]:
+    """
+    Find the fitted artifact to score with. Returns ``(path, how)``.
+
+    WHY THIS EXISTS (readiness item O2). ``score_prob_over`` defaulted to
+    ``models/xgb_prop_over.json``; ``train-stats`` writes
+    ``xgboost_{MARKET}.json`` under ``config/model_comparison.yaml``'s
+    ``artifacts_dir``. The two never coincided, the ``models/`` directory does
+    not exist, and ``scheduler_worker.run_slate`` calls ``main.main([])`` with
+    no ``--model`` — so a scheduled run scored nothing EVEN AFTER a model was
+    trained into the right place, and said only "no fitted model at ...".
+
+    Resolution order, most explicit first:
+
+      1. ``--model``, which still wins over everything;
+      2. ``PROPIQ_MODEL``, so a deployed worker can be pointed at an artifact
+         without a code change or a command-line argument;
+      3. the newest ``xgboost_*.json`` in ``artifacts_dir`` that HAS its
+         ``.meta.json`` sidecar — scoring without the sidecar's feature_cols is
+         refused anyway, so an artifact without one is not a candidate;
+      4. ``MODEL_ARTIFACT_DEFAULT``, the legacy path, last.
+
+    Deliberately NOT read: ``src/models/artifact_registry.py``. It would be the
+    right index for this, and nothing writes to it — resolving through a dead
+    module is how ``oddspapi`` stayed in the source precedence for months. The
+    filesystem is where training actually puts files, so that is what is read.
+
+    ``(None, reason)`` when nothing is found, so the caller logs one reason
+    rather than a missing-file message for a path nobody chose.
+    """
+    if explicit:
+        return Path(explicit), "--model"
+
+    from_env = (os.environ.get(ENV_MODEL) or "").strip()
+    if from_env:
+        return Path(from_env), ENV_MODEL
+
+    try:
+        from src.models.compare import load_comparison_config
+
+        artifacts_dir = Path(
+            str((load_comparison_config() or {}).get(
+                "artifacts_dir", "data/external/model_runs/comparison"
+            ))
+        )
+    except Exception as exc:  # noqa: BLE001 — a missing config is not fatal here
+        logger.debug("Could not read artifacts_dir from the comparison config: %s", exc)
+        artifacts_dir = Path("data/external/model_runs/comparison")
+
+    pattern = f"xgboost_{market.upper()}.json" if market else "xgboost_*.json"
+    if artifacts_dir.is_dir():
+        candidates = [
+            p for p in sorted(artifacts_dir.glob(pattern))
+            if p.with_suffix(".meta.json").exists()
+        ]
+        if candidates:
+            newest = max(candidates, key=lambda p: p.stat().st_mtime)
+            return newest, f"{artifacts_dir}/{pattern}"
+        unpaired = sorted(artifacts_dir.glob(pattern))
+        if unpaired:
+            logger.warning(
+                "%d artifact(s) in %s have no .meta.json sidecar, so none can be "
+                "scored with: %s. The feature_cols used at training time must be "
+                "persisted beside the model.",
+                len(unpaired), artifacts_dir, [p.name for p in unpaired][:4],
+            )
+
+    if MODEL_ARTIFACT_DEFAULT.exists():
+        return MODEL_ARTIFACT_DEFAULT, "legacy default"
+    return None, (
+        f"no artifact found: {ENV_MODEL} unset, no xgboost_*.json with a sidecar "
+        f"in {artifacts_dir}, and {MODEL_ARTIFACT_DEFAULT} does not exist. Train "
+        f"one with `scripts/nba_model_cli.py train-stats --market PTS "
+        f"--start-date ... --end-date ...` and it will be found there."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +457,7 @@ def build_features_and_verify_fatigue(
 def score_prob_over(
     features: pd.DataFrame,
     prop_lines: pd.DataFrame,
-    model_path: Path = MODEL_ARTIFACT_DEFAULT,
+    model_path: Path | None = None,
 ) -> pd.Series:
     """
     Score P(Over) with a PREVIOUSLY FITTED model.
@@ -369,27 +467,43 @@ def score_prob_over(
     stage only scores, returning an all-null Series with a named reason when it
     cannot.
 
-    THE TWO DO NOT SHARE A DEFAULT PATH. train-stats needs three flags and
-    writes elsewhere::
+    ``model_path`` is resolved by ``resolve_model_artifact``, not defaulted
+    here. The two paths USED TO NOT COINCIDE: train-stats writes
+    ``xgboost_{MARKET}.json`` plus its ``.meta.json`` under ``artifacts_dir``
+    from config/model_comparison.yaml, while this stage read
+    ``models/xgb_prop_over.json`` — a directory that does not exist — so
+    training a model and then running the pipeline still scored nothing, and
+    the scheduled worker passes no ``--model`` at all. The resolver now finds
+    the trained artifact; see its docstring for the order it tries.
+
+    ``None`` means nothing was resolved, and the resolver has already said
+    which paths it looked in.
+
+    TRAINING IS A SEPARATE OFFLINE JOB, and its command needs all three of
+    these options — a pointer naming only ``--market`` fails when followed::
 
         python scripts/nba_model_cli.py train-stats --market PTS \
             --start-date 2024-11-01 --end-date 2025-03-01
 
-    writes ``xgboost_PTS.json`` (plus its ``.meta.json``) under
-    ``data/external/model_runs/comparison/``, set by ``artifacts_dir`` in
-    config/model_comparison.yaml. This stage reads ``models/xgb_prop_over.json``
-    by default, so a freshly trained model has to be named explicitly::
+    That writes ``xgboost_PTS.json`` plus its ``.meta.json`` under
+    ``data/external/model_runs/comparison/`` (``artifacts_dir`` in
+    config/model_comparison.yaml). ``resolve_model_artifact`` looks there, so
+    the artifact no longer has to be named by hand — but ``--model`` still wins
+    when you want a specific one::
 
         python main.py --model data/external/model_runs/comparison/xgboost_PTS.json
-
-    Following the command without those flags fails, and following it without
-    ``--model`` trains successfully and still skips scoring.
     """
     null = pd.Series([None] * len(features), index=features.index, dtype="object")
 
     if prop_lines.empty:
         logger.info("P(Over) skipped: no prop lines (expected off-season).")
         return null
+    if model_path is None:
+        # The resolver already logged WHICH paths it tried; repeating its
+        # reason here would be the second half of one message.
+        logger.info("P(Over) skipped: no model artifact was resolved.")
+        return null
+    model_path = Path(model_path)
     if not model_path.exists():
         logger.warning(
             "P(Over) skipped: no fitted model at %s. This stage does not fit "
@@ -782,7 +896,12 @@ def main(argv: list[str] | None = None) -> int:
                         default=os.environ.get(
                             "BIGDATABALL_XLSX",
                             "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats__1_.xlsx"))
-    parser.add_argument("--model", type=str, default=str(MODEL_ARTIFACT_DEFAULT))
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Fitted artifact to score with. Omitted: resolve_model_artifact "
+             f"tries ${ENV_MODEL}, then the comparison artifacts_dir, then "
+             f"{MODEL_ARTIFACT_DEFAULT}.",
+    )
     parser.add_argument("--no-db", action="store_true", help="Dry run, no persistence")
     args = parser.parse_args(argv)
 
@@ -822,12 +941,40 @@ def main(argv: list[str] | None = None) -> int:
 
         from src.db.repository import load_player_panel
 
-        panel = load_player_panel(slate_date=args.date or str(pacific_calendar_date()))
+        slate_pt = args.date or str(pacific_calendar_date())
+        panel = load_player_panel(slate_date=slate_pt)
+
+        # ROWS FOR GAMES THAT HAVE NOT BEEN PLAYED (readiness item O1).
+        #
+        # The panel above is COMPLETED box scores, and the slate filter further
+        # down keeps only rows dated on the slate. For a future slate that
+        # intersection is empty, so every scheduled run exited 0 with
+        # success_no_data and nothing looked wrong. The forward rows carry the
+        # identity the feature builder needs and NO box-score stat, so the
+        # rolling features read each player's own prior real games and the
+        # forward row has nothing of its own to leak.
+        #
+        # Best-effort: a denied or unreachable schedule leaves the panel
+        # untouched and names the reason, so the run degrades to exactly what it
+        # did before rather than failing.
+        if _flag_env(ENV_FORWARD_SLATE, True):
+            from src.pipeline.forward_slate import attach_forward_slate
+
+            forward = attach_forward_slate(panel, slate_date=slate_pt)
+            panel = forward.panel
+            stage_summary["forward_slate"] = forward.as_dict()
+        else:
+            logger.info(
+                "%s is off — projecting only games already in the panel, which "
+                "for a future slate is none.", ENV_FORWARD_SLATE,
+            )
+            stage_summary["forward_slate"] = {"status": "SKIPPED"}
+
         if panel.empty:
             logger.warning(
                 "Player panel EMPTY for %s (%s) — nothing to project. Expected off-season "
                 "or before box scores are ingested.",
-                args.date or str(pacific_calendar_date()),
+                slate_pt,
                 DISPLAY_TZ_NAME,
             )
             stage_summary["projections"] = {"rows": 0, "reason": "empty player panel"}
@@ -846,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
         # not output: projecting and persisting them turns a request for one
         # slate into a retrospective projection of the whole lookback. Filter
         # after feature-building so the history is used but not scored.
-        slate = args.date or str(pacific_calendar_date())
+        slate = slate_pt
         features, slate_rows = _filter_to_slate(features, slate)
         stage_summary["slate_filter"] = {
             "slate_pt": slate,
@@ -871,7 +1018,16 @@ def main(argv: list[str] | None = None) -> int:
                 record_run(run_id, status="success_no_data", stage_summary=stage_summary)
             return 0
 
-        prob_over = score_prob_over(features, prop_df, Path(args.model))
+        model_path, resolved_by = resolve_model_artifact(args.model)
+        if model_path is None:
+            logger.warning("P(Over) will be skipped: %s", resolved_by)
+        else:
+            logger.info("Scoring model: %s (resolved by %s)", model_path, resolved_by)
+        stage_summary["model"] = {
+            "path": str(model_path) if model_path else None,
+            "resolved_by": resolved_by,
+        }
+        prob_over = score_prob_over(features, prop_df, model_path)
         ev_verdict = evaluate_ev_gate(prop_df, market_df)
         stage_summary["ev_gate"] = ev_verdict
 

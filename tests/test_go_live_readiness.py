@@ -209,34 +209,69 @@ def test_o8_nothing_populates_the_tipoff_column():
     )
 
 
-def test_o9_the_schedule_and_roster_sources_are_still_unwired():
-    assert (ROOT / "src" / "ingestion" / "espn_schedule.py").is_file()
-    assert "def fetch_roster" in (
-        ROOT / "src" / "ingestion" / "espn_availability.py"
-    ).read_text(encoding="utf-8")
-    for entry in ("main.py", "scheduler_worker.py"):
-        body = (ROOT / entry).read_text(encoding="utf-8")
-        assert "espn_schedule" not in body, (
-            f"O9 is fixed — {entry} imports espn_schedule. Update "
-            "docs/go_live_readiness.md and docs/integration_audit.md."
-        )
-
-
-def test_o2_the_model_path_mismatch_is_still_there():
+def test_the_forward_slate_is_wired_into_the_run():
     """
-    The worker passes no --model and nothing overrides the path, so a scheduled
-    run reads main.MODEL_ARTIFACT_DEFAULT whatever was trained.
+    Was the first open item on this page. The panel is completed box scores, so
+    without this a 09:00 PT run has no rows for tonight.
     """
-    worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
-    assert "--model" not in worker, (
-        "O2 is fixed — the worker now passes --model. Update the page."
+    assert (ROOT / "src" / "pipeline" / "forward_slate.py").is_file()
+    body = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "attach_forward_slate" in body, (
+        "the page says the forward slate is wired, and main.py does not use it"
     )
-    assert "PROPIQ_MODEL" not in worker, (
-        "O2 is fixed — an env override exists now. Update the page."
+    assert "PROPIQ_FORWARD_SLATE" in body
+
+
+def test_fetch_roster_is_still_uncalled_and_the_page_says_why():
+    """
+    The page claims this is now DELIBERATE: a roster fetch needs the ESPN-name
+    crosswalk that does not exist. If something starts calling it, the page's
+    reasoning needs revisiting rather than silently going stale.
+    """
+    # A CALL or an IMPORT, not the word: forward_slate.py names it in prose to
+    # explain why it does NOT use it, and an earlier version of this check
+    # counted that explanation as a caller.
+    callers = []
+    for path in list((ROOT / "src").rglob("*.py")) + [ROOT / "main.py"]:
+        if "__pycache__" in str(path) or path.name == "espn_availability.py":
+            continue
+        body = path.read_text(encoding="utf-8")
+        if re.search(r"fetch_roster\s*\(|import[^\n]*\bfetch_roster\b", body):
+            callers.append(path.relative_to(ROOT).as_posix())
+    assert not callers, (
+        f"{callers} now calls fetch_roster — update the crosswalk reasoning in "
+        "docs/go_live_readiness.md"
+    )
+    assert "fetch_roster" in TEXT
+
+
+def test_the_model_resolver_reaches_the_scheduled_worker():
+    """
+    Was the second open item. The worker calls main.main([]) with no arguments,
+    so the environment is the only channel — which is why the fix is a resolver
+    reading PROPIQ_MODEL rather than argv plumbing.
+    """
+    import main
+
+    assert hasattr(main, "resolve_model_artifact")
+    assert main.ENV_MODEL == "PROPIQ_MODEL"
+    assert "PROPIQ_MODEL" in TEXT
+    path, reason = main.resolve_model_artifact()
+    assert path is not None or "PROPIQ_MODEL" in reason, (
+        "with nothing resolvable, the reason must name the paths it tried"
     )
 
 
 def test_the_open_list_is_numbered_without_gaps():
+    """
+    Renumbering on a closure is easy to get wrong, and a gap or a duplicate
+    makes every cross-reference to an O-number ambiguous.
+    """
     found = sorted(int(n) for n in set(re.findall(r"\*\*O(\d+)\*\*", TEXT)))
     assert found == list(range(1, len(found) + 1)), f"O-numbers have gaps: {found}"
-    assert len(found) >= 10
+    rows = len(re.findall(r"^\| \*\*O\d+\*\* \|", TEXT, re.M))
+    assert rows == len(found), (
+        f"{rows} table row(s) but {len(found)} distinct O-number(s) — a "
+        "reference in the prose points at an item that is not in the table"
+    )
+    assert found, "the open list is empty; if that is true, say so in prose"

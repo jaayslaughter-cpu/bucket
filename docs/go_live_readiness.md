@@ -17,7 +17,7 @@ dropped.
 **For the current state, run the checker rather than trusting this page:**
 
 ```bash
-python -m scripts.verify_wiring     # 21 PASS · 5 FAIL · 5 WARN · 2 SKIP
+python -m scripts.verify_wiring     # counts move as items close; run it
 ```
 
 `tests/test_go_live_readiness.py` pins this page in both directions: what it
@@ -40,27 +40,29 @@ asserted.
 
 | # | Open item | Where it is established |
 |---|---|---|
-| **O1** | **No rows exist for a slate that has not been played.** `load_player_panel` reads completed box scores; `_filter_to_slate` keeps only the slate date. A 09:00 PT run finds nothing and exits 0. | `docs/integration_audit.md` §1.1 |
-| **O2** | **A scheduled run cannot find a model.** Scoring defaults to `models/xgb_prop_over.json`; training writes `data/external/model_runs/comparison/`; `run_slate` passes no `--model` and no variable overrides it. | §2.1 |
-| **O3** | **Every board row carries today's date whatever game it describes.** `research_slate_from_predictions` drops the detail row's `game_date` and stamps its `slate_date` parameter. | §2.2 |
-| **O4** | **The board's train/validation window is pinned to two 2025 dates** that never advance, and `run_board` re-fits every model on every slate job. | §2.3 |
-| **O5** | **`src/ingestion/id_crosswalk.py` does not exist** and three modules name it as the fix for name-format mismatch; the exact-name join silently records zero gradeable rows when formats differ. | §1.2, §3 |
-| **O6** | **Model artifacts do not survive a redeploy** — ephemeral filesystem, no volume declared. A platform step, not a code change. | `docs/railway_deployment_audit.md` §4 |
-| **O7** | **A slate-level EV verdict is persisted as a per-row claim** (`market_status`). | §2.4 |
-| **O8** | **`Game.tipoff_utc` has no writer.** The column exists and nothing populates it, so any tip-anchored scheduling has no times to anchor to. | `grep tipoff_utc src/` |
-| **O9** | **Schedule source: still open in the sense that matters.** `src/ingestion/espn_schedule.py` now exists and is tested — so "neither is wired" is no longer true of ESPN — but nothing in `main.py` or `scheduler_worker.py` imports it, and a forward slate also needs a roster, which `espn_availability.fetch_roster` provides and nothing calls. | §1.1 |
-| **O10** | **Eight config blocks are declared and never read**, so editing the YAML changes nothing. | `docs/railway_deployment_audit.md` §2 |
-| **O11** | **Self-referential evaluation.** `RESEARCH_LINE` is `{stat}_L10` and `over_hit` is measured against that same rolling history, so Brier and log-loss measure form against form until a posted-line archive drives line-aware training. | `src/models/labels.py`, `docs/DATA_GAPS.md` |
-| **O12** | **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp two-way NBA player-prop benchmark feed in reach, so nothing cross-checks the model's own number and the publication gate treats every board as model-sourced. Blocked externally, not by this repository. | `src/quant/dfs_entry.py`, `src/quant/publication_gate.py` |
+| **O1** | **Every board row carries today's date whatever game it describes.** `research_slate_from_predictions` drops the detail row's `game_date` and stamps its `slate_date` parameter. | §2.2 |
+| **O2** | **The board's train/validation window is pinned to two 2025 dates** that never advance, and `run_board` re-fits every model on every slate job. | §2.3 |
+| **O3** | **`src/ingestion/id_crosswalk.py` does not exist** and three modules name it as the fix for name-format mismatch; the exact-name join silently records zero gradeable rows when formats differ. | §1.2, §3 |
+| **O4** | **Model artifacts do not survive a redeploy** — ephemeral filesystem, no volume declared. A platform step, not a code change. | `docs/railway_deployment_audit.md` §4 |
+| **O5** | **A slate-level EV verdict is persisted as a per-row claim** (`market_status`). | §2.4 |
+| **O6** | **`Game.tipoff_utc` has no writer.** The column exists and nothing populates it, so any tip-anchored scheduling has no times to anchor to. | `grep tipoff_utc src/` |
+| **O7** | **Eight config blocks are declared and never read**, so editing the YAML changes nothing. | `docs/railway_deployment_audit.md` §2 |
+| **O8** | **Self-referential evaluation.** `RESEARCH_LINE` is `{stat}_L10` and `over_hit` is measured against that same rolling history, so Brier and log-loss measure form against form until a posted-line archive drives line-aware training. | `src/models/labels.py`, `docs/DATA_GAPS.md` |
+| **O9** | **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp two-way NBA player-prop benchmark feed in reach, so nothing cross-checks the model's own number and the publication gate treats every board as model-sourced. Blocked externally, not by this repository. | `src/quant/dfs_entry.py`, `src/quant/publication_gate.py` |
 
-O1 and O2 gate the rest: until they are done, a deployed worker runs on
-schedule, logs cleanly and produces nothing. O3 is the one that could mislead
-a reader rather than merely disappoint one.
+**The two that gated everything else are closed** (see below), so a deployed
+worker can now reach rows and a model. **O1 is what remains of the misleading
+class**: a board row carrying today's date whatever game it describes could
+mislead a reader rather than merely disappoint one, and it is the next thing to
+fix.
 
 ### Closed since this page was reconciled
 
 | Was | Closed |
 |---|---|
+| **No rows existed for a slate that had not been played.** `load_player_panel` reads completed box scores and `_filter_to_slate` keeps only the slate date, so a 09:00 PT run found an empty intersection and exited 0 with `success_no_data` — every day, without looking broken | 2026-10-04. `src/pipeline/forward_slate.py` adds one row per (player, scheduled game) from the ESPN schedule's **pre-tip** games plus each team's recent appearances in the panel, carrying **no box-score stat** so the rolling features read each player's own prior real games and the forward row has nothing of its own to leak. The lineup comes from the panel rather than `fetch_roster` on purpose: a roster fetch would need the ESPN-name → NBA-name crosswalk that still does not exist (O3). A denied schedule leaves the panel untouched and says so. `PROPIQ_FORWARD_SLATE` turns it off. |
+| **A scheduled run could not find a model even when one was trained.** Scoring defaulted to `models/xgb_prop_over.json`, a directory that does not exist; `train-stats` writes to the comparison `artifacts_dir`; `run_slate` passes no `--model` | 2026-10-04. `main.resolve_model_artifact` tries `--model`, then `PROPIQ_MODEL`, then the newest `xgboost_*.json` in `artifacts_dir` **that has its `.meta.json` sidecar**, then the legacy path — and returns a reason naming every path it tried. The worker needs no argv plumbing: it calls `main.main([])` in-process, so the env var reaches the resolver directly. `artifact_registry` is deliberately **not** read; nothing writes to it, and resolving through a dead module is how `oddspapi` survived in the source precedence for months. |
+| **The schedule and roster sources were unwired.** `espn_schedule.load_slate` was imported only by the CLI and `fetch_roster` by nothing | 2026-10-04 for the schedule, via the forward slate above. `fetch_roster` is **still uncalled**, and now deliberately: see the crosswalk note. |
 | **`Projection` stored only `prob_over`**, so a whole line's push mass was unrecoverable and `1 - prob_over` was the wrong under | 2026-10-04. `prob_under` and `prob_push` columns, `migrations/005_projection_under_push.sql`, populated through `paper_research.resolve_two_way_model_probs`: a half line gets an exact under and a zero push; a **whole or unknown** line gets NULL for both plus the refusal reason in `notes`. A binary classifier has no push mass to split out, and that is recorded rather than guessed. |
 | **No daily W/L reconciliation embed** — four builders, none reporting a settled day | 2026-10-04. `build_win_loss_embed` is the fifth, sent from the settlement job by `scheduler_worker.run_results_card`. It withholds a strike rate under 30 decided props with the reason, reports ROI only when a stake was actually recorded, and carries the metrics layer's CLV caveat with the CLV figure. Not behind the calibration gate, deliberately: that gate stops an uncalibrated model *probability* reaching a person, and this card carries none. |
 

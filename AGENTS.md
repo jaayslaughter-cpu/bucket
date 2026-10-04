@@ -124,7 +124,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:97`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:195`
 `load_master_guideline()` returns `None` and the caller logs it. The
 `.example` beside it is a placeholder shape, not the real file.
 
@@ -185,16 +185,16 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
   container abstains on every row without looking broken. That one is a
   platform step, not a code change. `docs/railway_deployment_audit.md` §4.
-- **Nothing produces rows for a slate that has not been played.**
-  `load_player_panel` reads completed box scores and `_filter_to_slate` keeps
-  only the slate date, so a 09:00 PT run finds nothing and exits 0.
-  `espn_schedule.load_slate` and `espn_availability.fetch_roster` both exist,
-  are tested, and are imported by no production module.
-  `docs/integration_audit.md` §1.1.
-- **A scheduled run cannot find a model even when one is trained.**
-  `score_prob_over` defaults to `models/xgb_prop_over.json`; `train-stats`
-  writes to `data/external/model_runs/comparison/`; `run_slate` passes no
-  `--model` and no variable overrides it. `docs/integration_audit.md` §2.1.
+- **No model has been trained in this checkout.** The resolution is wired —
+  `main.resolve_model_artifact` finds the newest trained artifact — but there
+  is nothing yet to resolve, so every row abstains for want of a model rather
+  than for want of wiring. `docs/integration_audit.md` §2.1.
+- **A forward slate rests on who played recently, not on a roster.**
+  `src/pipeline/forward_slate.py` builds tonight's rows from each team's recent
+  appearances in the panel, which misses a player returning from a long
+  absence. `espn_availability.fetch_roster` would cover that and needs the
+  name crosswalk this repository does not have. `docs/integration_audit.md`
+  §1.1.
 - **Every board row carries today's date whatever game it describes.**
   `research_slate_from_predictions` drops the detail row's `game_date` and
   stamps its `slate_date` parameter instead. `docs/integration_audit.md` §2.2.

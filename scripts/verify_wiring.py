@@ -313,22 +313,26 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
     g = guard(report, "the path scoring reads and the path training writes agree")
 
     def _paths() -> None:
-        from main import MODEL_ARTIFACT_DEFAULT
-        scoring = ROOT / MODEL_ARTIFACT_DEFAULT
-        trained = sorted(art_dir.glob("xgboost_*.json")) if art_dir.exists() else []
-        if scoring.exists():
+        from main import ENV_MODEL, resolve_model_artifact
+        path, how = resolve_model_artifact()
+        if path is not None:
             report.ok("the path scoring reads and the path training writes agree",
-                      f"{MODEL_ARTIFACT_DEFAULT} exists")
+                      f"resolved {path} by {how}")
             return
-        report.bad(
-            "the path scoring reads and the path training writes agree",
-            f"score_prob_over defaults to {MODEL_ARTIFACT_DEFAULT} (absent); "
-            f"train-stats writes to {art_dir.relative_to(ROOT) if art_dir.exists() else art_dir}"
-            f" ({len(trained)} xgboost_*.json there). main.py needs --model to "
-            "bridge them, and scheduler_worker.run_slate calls main.main([]) with "
-            "no arguments — so a scheduled run scores nothing even when a model "
-            "has been trained.",
-        )
+        trained = sorted(art_dir.glob("xgboost_*.json")) if art_dir.exists() else []
+        if trained:
+            report.bad(
+                "the path scoring reads and the path training writes agree",
+                f"{len(trained)} xgboost_*.json in {art_dir} and the resolver "
+                f"found none of them: {how}",
+            )
+        else:
+            report.skip(
+                "the path scoring reads and the path training writes agree",
+                f"no artifact has been trained yet. The RESOLUTION is wired "
+                f"(--model, then ${ENV_MODEL}, then {art_dir}); there is simply "
+                "nothing to resolve in this checkout.",
+            )
     g(_paths)
 
     # the train/serve contract check, exercised against a real sidecar if present
@@ -852,15 +856,17 @@ def section_5(report: Report) -> None:
 
     def _argv() -> None:
         src = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
-        if "main.main(argv or [])" in src and "--model" not in src:
-            report.warn(
-                "the scheduled slate passes the arguments it needs",
-                "run_slate calls main.main(argv or []) with no --model, and no "
-                "environment variable overrides the model path, so a scheduled "
-                "run always reads main.MODEL_ARTIFACT_DEFAULT. See section 2.",
-            )
+        from main import ENV_MODEL
+
+        if "main.main(argv or [])" not in src:
+            report.warn("the scheduled slate passes the arguments it needs",
+                        "run_slate no longer delegates to main.main — check by hand")
         else:
-            report.ok("the scheduled slate passes the arguments it needs")
+            report.ok(
+                "the scheduled slate passes the arguments it needs",
+                f"it calls main.main([]) in-process, so ${ENV_MODEL} reaches "
+                "resolve_model_artifact with no argv plumbing",
+            )
     g(_argv)
 
     g = guard(report, "a withheld board sends the gate's reason, not the rows")
@@ -1021,23 +1027,26 @@ def section_6(report: Report) -> None:
         has_roster = "def fetch_roster" in (
             ROOT / "src/ingestion/espn_availability.py"
         ).read_text(encoding="utf-8")
-        wired = "espn_schedule" in main_src or "espn_schedule" in worker_src
-        if has_schedule and has_roster and not wired:
+        wired = "attach_forward_slate" in main_src or "attach_forward_slate" in worker_src
+        if not (ROOT / "src/pipeline/forward_slate.py").exists():
             report.bad(
-                "a schedule and a roster source exist for a forward slate",
-                "load_player_panel reads PlayerGameLog — COMPLETED games only — and "
-                "_filter_to_slate keeps rows whose GAME_DATE equals the slate, so a "
-                "09:00 PT run finds zero rows for games that have not been played "
-                "and returns success_no_data. espn_schedule.load_slate (games + "
-                "tipoffs) and espn_availability.fetch_roster (players per team) both "
-                "exist and are tested; neither is imported by main.py or "
-                "scheduler_worker.py.",
+                "a slate that has not been played can produce rows",
+                "src/pipeline/forward_slate.py is gone; load_player_panel reads "
+                "COMPLETED box scores only, so a 09:00 PT run has no rows",
             )
-        elif wired:
-            report.ok("a schedule and a roster source exist for a forward slate")
+        elif not wired:
+            report.bad(
+                "a slate that has not been played can produce rows",
+                "forward_slate.py exists and nothing calls it — the same shape "
+                "the gap was in when espn_schedule was CLI-only",
+            )
         else:
-            report.skip("a schedule and a roster source exist for a forward slate",
-                        f"schedule={has_schedule} roster={has_roster}")
+            report.ok(
+                "a slate that has not been played can produce rows",
+                f"forward_slate wired into main.py; schedule={has_schedule}, "
+                f"roster helper present={has_roster} (unused on purpose — it "
+                "would need the name crosswalk that does not exist)",
+            )
     g(_forward)
 
 
