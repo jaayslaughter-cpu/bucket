@@ -59,9 +59,11 @@ paths in `src/`, `scripts/` or `main.py`. The only `localhost` occurrence is
 `db/session.py:68`, a membership test deciding whether to append
 `sslmode=require` — correct behaviour, not a hardcoded host.
 
-**Odds source: PropLine (decided).** PropLine is primary;
-`decision_board.py:76` sets `SOURCE_PRECEDENCE = ("propline", "oddspapi")`
-with OddsPapi as fallback. The Odds API is not used and must not be added.
+**Odds source: PropLine (decided).** `decision_board.py` sets
+`SOURCE_PRECEDENCE = ("propline",)` — one entry. It listed OddsPapi as a
+fallback until 2026-10-04, which had no client in this repository at all;
+deleted, see `docs/decision_board.md`. The Odds API is not used and must not
+be added.
 
 ---
 

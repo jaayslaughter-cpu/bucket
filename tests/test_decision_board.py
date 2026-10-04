@@ -3,8 +3,11 @@ Tests for src/quant/decision_board.py — the MANUAL_ONLY decision layer.
 
 Three things are load-bearing and each has a test that fails without it:
 
-1. PropLine is PRIMARY and OddsPapi the FALLBACK, by precedence rather than
-   by arrival order, with every skip explained.
+1. The source precedence is walked by PRECEDENCE, not by arrival order, with
+   every skip explained. PropLine is the only source this repository has, so
+   the fallback MECHANISM is exercised against a second source the test
+   invents — deliberately, because the repository listing a feed it cannot
+   fetch is the bug that removed OddsPapi from SOURCE_PRECEDENCE.
 2. P(under) is never the complement of P(over) when a push is possible.
 3. A model lean never outranks a priced edge, and nothing in this layer can
    place, price or size a wager.
@@ -54,7 +57,12 @@ def _snap(source: str, **kw) -> PropMarketSnapshot:
 
 
 PROPLINE = _snap("propline", over_odds_american=-115, under_odds_american=-105)
-ODDSPAPI = _snap("oddspapi")
+# A SECOND SOURCE THAT EXISTS ONLY HERE. It is not a vendor this repository
+# claims to have a client for; it is a probe for the walker. Naming a real
+# product here is what let "oddspapi" live in SOURCE_PRECEDENCE for months
+# with no client module, no key reader and no ingestion path.
+SECOND = _snap("secondbook")
+TWO_SOURCE = ("propline", "secondbook")
 PROPLINE_PICKEM = _snap(
     "propline", over_odds_american=None, under_odds_american=None,
     payout_multiplier=3.0, is_pickem=True, bookmaker="prizepicks",
@@ -129,35 +137,97 @@ def test_enrich_row_with_book_refuses_the_complement_on_a_whole_line():
     assert priced.book_ev_under is not None
 
 
-# --- source precedence: PropLine primary, OddsPapi fallback --------------
+# --- source precedence ---------------------------------------------------
 
 
-def test_propline_is_preferred_over_oddspapi():
-    assert SOURCE_PRECEDENCE == ("propline", "oddspapi")
-    assert resolve_market([ODDSPAPI, PROPLINE]).source == "propline"
-    assert resolve_market([ODDSPAPI, PROPLINE]).fallback_used is False
+def test_the_repository_lists_exactly_the_sources_it_can_fetch():
+    """
+    The tuple is the claim. It read ("propline", "oddspapi") until 2026-10-04,
+    and OddsPapi had no client module, no key reader and no ingestion path —
+    so a precedence that promised a fallback had none.
+    """
+    import pathlib
+
+    assert SOURCE_PRECEDENCE == ("propline",)
+    ingestion = pathlib.Path(__file__).parent.parent / "src" / "ingestion"
+    present = {p.stem.replace("_", "") for p in ingestion.glob("*.py")}
+    for name in SOURCE_PRECEDENCE:
+        assert name in present, (
+            f"SOURCE_PRECEDENCE names {name!r}, and src/ingestion has no client "
+            f"for it. A precedence entry without a fetcher is a promise, not a "
+            f"fallback."
+        )
+
+
+def test_the_listed_source_wins_over_an_unlisted_one():
+    """An unlisted source sorts last, so PropLine prices the row."""
+    assert resolve_market([SECOND, PROPLINE]).source == "propline"
+    assert resolve_market([SECOND, PROPLINE]).fallback_used is False
 
 
 def test_precedence_not_arrival_order():
-    assert resolve_market([ODDSPAPI, PROPLINE]).source == "propline"
-    assert resolve_market([PROPLINE, ODDSPAPI]).source == "propline"
+    assert resolve_market([SECOND, PROPLINE]).source == "propline"
+    assert resolve_market([PROPLINE, SECOND]).source == "propline"
 
 
-def test_oddspapi_is_used_when_propline_cannot_be_priced():
+def test_the_fallback_mechanism_works_when_a_second_source_is_supplied():
     """
-    A PropLine pick'em row posts a payout multiplier, not a price. The
-    fallback fires, is flagged, and the reason names the pick'em board.
+    THE WALKER, not a vendor. A PropLine pick'em row posts a payout multiplier
+    rather than a price, so under a two-source precedence the second one fires,
+    is flagged, and the reason names what was passed over.
+
+    This is what keeps ``resolve_market`` honest as a generic walker while
+    SOURCE_PRECEDENCE holds one name: add a real second feed and this is the
+    behaviour it gets, already tested.
     """
-    resolution = resolve_market([PROPLINE_PICKEM, ODDSPAPI])
-    assert resolution.source == "oddspapi"
+    resolution = resolve_market([PROPLINE_PICKEM, SECOND], precedence=TWO_SOURCE)
+    assert resolution.source == "secondbook"
     assert resolution.fallback_used is True
     assert "propline" in resolution.skipped_summary
     assert "multiplier" in resolution.skipped_summary
     assert resolution.pickem_snapshot is PROPLINE_PICKEM
 
 
-def test_a_lone_fallback_source_is_not_reported_as_a_fallback():
-    assert resolve_market([ODDSPAPI]).fallback_used is False
+def test_the_precedence_ranks_candidates_and_does_not_allow_list_them():
+    """
+    MEASURED, because it is easy to assume otherwise and it matters for what
+    deleting OddsPapi did and did not do.
+
+    `_source_rank` sorts an unlisted source LAST; it does not exclude it. So a
+    snapshot from a source missing from SOURCE_PRECEDENCE is still priced, just
+    after every listed one. Removing "oddspapi" from the tuple therefore
+    removed a false promise of a fallback — it did not add a filter, and no
+    filter is needed while nothing can fetch that source in the first place.
+
+    If this ever should become an allow-list, this is the test to change, and
+    the change is a behaviour change rather than a tidy-up.
+    """
+    resolution = resolve_market([PROPLINE_PICKEM, SECOND])
+    assert resolution.source == "secondbook", (
+        "an unlisted source is ranked last, not excluded"
+    )
+    assert resolution.fallback_used is True
+    assert "multiplier" in (resolution.skipped_summary or "")
+
+
+def test_with_only_propline_supplied_an_unpriceable_row_abstains():
+    """
+    The production path. PropLine posts a payout multiplier rather than a
+    price, there is nothing else to try, and the row abstains saying why —
+    instead of appearing to have been checked against a feed that cannot be
+    fetched.
+    """
+    resolution = resolve_market([PROPLINE_PICKEM])
+    assert resolution.snapshot is None
+    assert resolution.source is None
+    assert resolution.fallback_used is False
+    assert "multiplier" in (resolution.reason or "")
+    assert resolution.pickem_snapshot is PROPLINE_PICKEM
+
+
+def test_a_lone_source_is_not_reported_as_a_fallback():
+    assert resolve_market([SECOND], precedence=TWO_SOURCE).fallback_used is False
+    assert resolve_market([PROPLINE]).fallback_used is False
 
 
 def test_no_usable_source_abstains_with_a_reason():
@@ -167,18 +237,41 @@ def test_no_usable_source_abstains_with_a_reason():
 
 
 def test_resolved_market_stamps_the_source_on_the_row():
-    row, resolution = enrich_row_with_resolved_market(_row(), [PROPLINE_PICKEM, ODDSPAPI])
+    row, resolution = enrich_row_with_resolved_market(
+        _row(), [PROPLINE_PICKEM, SECOND], precedence=TWO_SOURCE
+    )
     assert row.book_status == "VALID"
-    assert row.book_source == "oddspapi"
+    assert row.book_source == "secondbook"
     assert row.book_fallback_used is True
     assert "propline" in row.book_sources_skipped
     # The pick'em line survives for line research even though it cannot price.
     assert row.pickem_line == pytest.approx(24.5)
-    assert resolution.source == "oddspapi"
+    assert resolution.source == "secondbook"
 
     board = build_decision_board([row])
-    assert {c.book_source for c in board} == {"oddspapi"}
+    assert {c.book_source for c in board} == {"secondbook"}
     assert all(c.book_fallback_used for c in board)
+
+
+def test_the_entry_point_passes_the_precedence_through():
+    """
+    ``resolve_market`` always took a precedence and its only caller did not, so
+    the fallback path could not be exercised end to end.
+
+    MEASURED BY REVERSING THE ORDER, not by reading the signature. Both
+    snapshots here clear the EV gate, so which one prices the row depends
+    ONLY on the precedence — the one thing being passed through. An earlier
+    version of this test asserted the parameter existed and passed with the
+    passthrough reverted, because an unlisted source is ranked last and still
+    priced (see the ranking test above): it measured nothing.
+    """
+    assert enrich_row_with_resolved_market(
+        _row(), [SECOND, PROPLINE],
+    )[1].source == "propline"
+
+    assert enrich_row_with_resolved_market(
+        _row(), [SECOND, PROPLINE], precedence=("secondbook", "propline"),
+    )[1].source == "secondbook", "the precedence argument is being ignored"
 
 
 def test_propline_rows_bridge_into_snapshots():
@@ -357,7 +450,7 @@ def test_abstained_candidates_do_not_hand_over_log_fields():
 
 
 def test_board_summary_and_csv(tmp_path):
-    row, _ = enrich_row_with_resolved_market(_row(), [ODDSPAPI, PROPLINE])
+    row, _ = enrich_row_with_resolved_market(_row(), [SECOND, PROPLINE])
     board = build_decision_board([row])
 
     summary = decision_board_summary(board)

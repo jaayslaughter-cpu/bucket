@@ -502,6 +502,26 @@ def section_3(report: Report) -> None:
             report.ok("MARKET_STATUS is a per-row claim, not a slate aggregate")
     g(_granularity)
 
+    g = guard(report, "every source in the precedence has a client to fetch it")
+
+    def _precedence() -> None:
+        from src.quant.decision_board import SOURCE_PRECEDENCE
+        ingestion = ROOT / "src" / "ingestion"
+        present = {p.stem.replace("_", "") for p in ingestion.glob("*.py")}
+        phantom = [n for n in SOURCE_PRECEDENCE if n not in present]
+        if phantom:
+            report.bad(
+                "every source in the precedence has a client to fetch it",
+                f"SOURCE_PRECEDENCE names {phantom} and src/ingestion has no "
+                "client for them. A precedence entry without a fetcher promises "
+                "a fallback that cannot fire, so an unpriced row looks like a "
+                "feed problem rather than the only outcome available.",
+            )
+        else:
+            report.ok("every source in the precedence has a client to fetch it",
+                      f"{list(SOURCE_PRECEDENCE)}")
+    g(_precedence)
+
     g = guard(report, "pick'em entry EV evaluates without a hard block")
 
     def _pickem() -> None:

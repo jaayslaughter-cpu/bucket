@@ -1,9 +1,14 @@
 """Ingestion layer.
 
-Only modules that exist in this repository are exported. The wider PropIQ
-tree carries additional loaders (box scores, play-by-play, pick'em boards,
-OddsPapi, the player id crosswalk); re-export them here as they land, so a
-missing module can never be mistaken for a silently empty data source.
+Only modules that exist in this repository are exported, so a missing module
+can never be mistaken for a silently empty data source. Re-export a loader
+here as it lands.
+
+Deliberately not listed as "coming": a loader named in a docstring and absent
+from the tree reads as a plan, and this project has been bitten twice by that
+— OddsPapi sat in the decision board's source precedence with no client at
+all, and `id_crosswalk.py` is still named as the fix for name-format mismatch
+by three modules while not existing.
 """
 
 from src.ingestion.basketball_reference import (

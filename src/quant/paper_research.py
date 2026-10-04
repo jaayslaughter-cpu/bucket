@@ -183,8 +183,9 @@ class ResearchSlateRow(BaseModel):
     book_under_american: int | None = None
     book_status: str = "DATA_NOT_AVAILABLE"
     # Which FEED priced this row, and what was passed over to get there.
-    # PropLine is primary and OddsPapi the fallback; a fallback nobody can
-    # explain is indistinguishable from a bug.
+    # PropLine is the only listed source, so `book_fallback_used` can only be
+    # False today; the field stays because a fallback nobody can explain is
+    # indistinguishable from a bug, and this is where it would be explained.
     book_source: str | None = None
     book_fallback_used: bool = False
     book_sources_skipped: str = ""
@@ -209,14 +210,14 @@ def enrich_row_with_book(
     """
     Attach VALID two-way EV when a source provides it; else DATA_NOT_AVAILABLE.
 
-    Source-neutral by design: PropLine is the primary feed and OddsPapi the
-    fallback (see ``decision_board.resolve_market``), so this takes whichever
-    snapshot was resolved rather than naming a vendor.
+    Source-neutral by design: this takes whichever snapshot
+    ``decision_board.resolve_market`` resolved rather than naming a vendor,
+    which is what lets a second feed be added without touching this function.
     """
     out = row.model_copy(deep=True)
     if market is None:
         out.book_status = "DATA_NOT_AVAILABLE"
-        out.warnings.append("No priced market attached (PropLine or OddsPapi)")
+        out.warnings.append("No priced market attached")
         return out
 
     ctx = market.to_market_context() if isinstance(market, PropMarketSnapshot) else market

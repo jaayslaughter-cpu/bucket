@@ -54,6 +54,27 @@ in the production path:
 which is now partly stale — ESPN *is* a schedule source here. What that note
 does not say is the consequence: a deployed worker is not degraded, it is inert.
 
+### 1.2a CLOSED (2026-10-04) — OddsPapi was in the source precedence with no client
+
+`decision_board.SOURCE_PRECEDENCE` read `("propline", "oddspapi")`. OddsPapi
+had **no client module, no key reader, no ingestion path**: a string in a tuple
+and prose in a dozen docstrings. `BetLifecycleRecord.source` also *defaulted*
+to `"oddspapi"` and no caller anywhere set it, so every paper ticket in the
+ledger carried the provenance of a feed that does not exist.
+
+Deleted. The precedence is `("propline",)`, the ledger's default source is
+`None` (unknown, not a vendor name), and the walker is unchanged and still
+generic — `resolve_market` and now `enrich_row_with_resolved_market` both take
+a `precedence`, and the fallback path is tested against a second source the
+test invents. `verify_wiring` section 3 gained a check that **every name in the
+precedence has an ingestion client**, which is the generalised form of this
+defect and of 1.2 below.
+
+Measured while deleting it: the precedence **ranks, it does not allow-list** —
+an unlisted source sorts last and is still priced. Removing the name removed a
+false promise of a fallback; it did not add a filter, and none is needed while
+nothing can fetch that source.
+
 ### 1.2 `src/ingestion/id_crosswalk.py` does not exist, and three modules name it as the fix
 
 Every exact-name join in the project defers to a module that was never written:

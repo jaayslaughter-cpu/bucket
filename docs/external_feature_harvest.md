@@ -138,7 +138,7 @@ dependency. Where an idea already exists in PropIQ, the module is named.
 | Injury vacuum by position | **absent** — no injury source ingested |
 | Consistency CV | **absent** |
 | Normal CDF P(over) with fitted σ | **done** — `src/models/residuals.py` fits the family by held-out log-likelihood |
-| Book priority / fallback | **done** — PropLine primary, oddspapi fallback |
+| Book priority / fallback | **partly** — the precedence walker is done and tested; PropLine is the only source in it, so no fallback fires (2026-10-04) |
 | Pick → grade → ledger | **done** — `src/quant/historical_store.py`, MANUAL_ONLY |
 
 The "skip" list is already honoured: no Odds API, no synthetic odds, no Kelly

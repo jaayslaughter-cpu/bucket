@@ -128,14 +128,19 @@ a whole-number line's push mass is unrecoverable after the fact and
 
 ## Three conflicts to settle before building
 
-1. **Odds source: SETTLED — PropLine.** The proposed 06:00 PT slate
-   initializer named The Odds API; that is not used and must not be added.
-   PropLine is the odds source, as `decision_board.py:76` already encodes
-   (`SOURCE_PRECEDENCE = ("propline", "oddspapi")`, PropLine primary and
-   OddsPapi — a different product from The Odds API — as fallback). The
-   OddsPapi fallback is left in place because it is existing tested
-   architecture (`tests/test_decision_board.py` asserts the precedence);
-   say so if you want it removed outright.
+1. **Odds source: SETTLED — PropLine, and it is now the only one.** The
+   proposed 06:00 PT slate initializer named The Odds API; that is not used and
+   must not be added. PropLine is the odds source, as `decision_board.py`
+   encodes in `SOURCE_PRECEDENCE`.
+
+   This section used to read `("propline", "oddspapi")` and argued the OddsPapi
+   fallback was "existing tested architecture" worth keeping, ending *"say so
+   if you want it removed outright."* **Removed, 2026-10-04, on request.** The
+   argument was wrong on its own terms: what was tested was the precedence
+   *walker*, and OddsPapi had no client module, no key reader and no ingestion
+   path in this repository — so the tuple promised a fallback that could never
+   fire. The walker is still generic and still tested, now against a second
+   source the test invents. See `docs/decision_board.md`.
 
    Schedule source is still open: the sketch named BallDontLie or
    SportsData.io, and neither is wired. PropLine supplies odds, not the
