@@ -159,6 +159,7 @@ def default_feature_cols(market: str) -> list[str]:
 # inside the halflife band above, so the prediction is the same one -- the model
 # receives one number twice. It is registered as a feature_ab layer rather than
 # shipped, so `--layer minutes_weighted --wire-under-test` can settle it.
+# Full write-up with the per-column table: docs/minutes_weighted.md.
 #
 # OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
 # POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which

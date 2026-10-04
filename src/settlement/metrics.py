@@ -65,9 +65,15 @@ class ClvBlock:
     avg_clv_line_points: float | None = None
     avg_clv_prob_points: float | None = None
     pct_positive_line_clv: float | None = None
+    # WORDED TO SURVIVE THE DISPATCHER'S OWN GUARD. This read "...does not
+    # guarantee future profitability", and notify/discord.py bans "guarantee"
+    # by substring -- deliberately bluntly, so it fires on a NEGATED claim too.
+    # The guard is right to be blunt; the fix is for the sentence not to need
+    # the word. Found when build_win_loss_embed first tried to pass this note
+    # through and was refused.
     note: str = (
         "CLV is a market-quality signal, not profit, and is never included "
-        "in ROI. Positive CLV does not guarantee future profitability."
+        "in ROI. Positive CLV is not evidence of future returns."
     )
 
 

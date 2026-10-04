@@ -59,9 +59,11 @@ paths in `src/`, `scripts/` or `main.py`. The only `localhost` occurrence is
 `db/session.py:68`, a membership test deciding whether to append
 `sslmode=require` — correct behaviour, not a hardcoded host.
 
-**Odds source: PropLine (decided).** PropLine is primary;
-`decision_board.py:76` sets `SOURCE_PRECEDENCE = ("propline", "oddspapi")`
-with OddsPapi as fallback. The Odds API is not used and must not be added.
+**Odds source: PropLine (decided).** `decision_board.py` sets
+`SOURCE_PRECEDENCE = ("propline",)` — one entry. It listed OddsPapi as a
+fallback until 2026-10-04, which had no client in this repository at all;
+deleted, see `docs/decision_board.md`. The Odds API is not used and must not
+be added.
 
 ---
 
@@ -291,7 +293,13 @@ Three blockers, each independently sufficient:
 
 1. ~~**Nothing to deploy.**~~ **CLEARED.** `Dockerfile` (worker service, no
    port), `.dockerignore` (no `.env`, no `data/`), and `scheduler_worker.py`
-   as the start command.
+   as the start command. **Still never built**, which is a separate thing from
+   not existing: `scripts/validate_docker.py` now does the building and
+   smoking, its 7 daemon-free preflight checks pass here, and its 6 in-image
+   checks — including the two that execute the mounted-volume permission trap
+   from `docs/deploy_railway.md` — run wherever a daemon is available.
+   `tests/test_validate_docker.py` drives each preflight check to failure, so
+   a PASS there means the check can fail.
 2. ~~**Nothing would be recorded.**~~ **CLEARED.** `prop_results` now has a
    writer wired into `main.py`, so a shadow run produces gradeable picks and,
    once settled, a strike rate and CLV. P/L still requires a stake the user

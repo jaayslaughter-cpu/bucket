@@ -52,7 +52,12 @@ class BetLifecycleRecord(BaseModel):
     unit_stake: float = 1.0
     notes: str = "RESEARCH_ONLY"
     season: str | None = None
-    source: str = "oddspapi"
+    # UNKNOWN, not a vendor name. This defaulted to "oddspapi" and no caller
+    # anywhere ever set it, so every paper ticket in the ledger carried the
+    # provenance of a feed with no client. An unset source is unknown; writing
+    # a specific feed's name into it is the kind of invented detail this
+    # project refuses everywhere else.
+    source: str | None = None
     # Wave 5a research tags for pocket ROI (optional; never used for Kelly)
     confidence_tier: str | None = None
     edge_letter_grade: str | None = None

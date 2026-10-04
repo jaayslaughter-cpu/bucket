@@ -23,9 +23,25 @@ The repository root has a `Dockerfile`; point the service at it.
 
 **It has never been built.** The environment it was written in has a docker
 client but no daemon and a network policy that denies the package index, so
-`docker build` has not run against it once. Build it locally before the first
-deploy; treat the layer ordering and the apt package list as reasoned, not
-verified.
+`docker build` has not run against it once. Treat the layer ordering and the
+apt package list as reasoned, not verified.
+
+Build it where a daemon exists, with:
+
+```
+python -m scripts.validate_docker          # preflight, build, six smoke checks
+python -m scripts.validate_docker --preflight   # the daemon-free half
+```
+
+The preflight half runs anywhere and passes today (7 checks: the CMD target
+exists, no credential is defaulted in a layer, every installed extra is
+declared, the uid is the one this page tells you to chown to, and the ignore
+file is evaluated by matching rather than grepped). The build and the six
+in-image checks are what remain, and two of them exist to test **this page**:
+they mount a mode-0555 directory at `/app/data` and require
+`check_state_dir()` to report it unwritable, then mount a writable one and
+require it not to false-alarm. Until that runs, the trap below is documented
+and not demonstrated.
 
 **Point the service at the Dockerfile, not Nixpacks.** Nixpacks reads
 `requirements.txt` rather than `pyproject.toml`'s extras. `APScheduler` is now
@@ -95,6 +111,7 @@ Apply the migrations against the target database before the first run:
 migrations/002_prop_results.sql      # settlement ledger + views
 migrations/003_capture_vs_ingest_time.sql
 migrations/004_parlay_ledger.sql     # parlay_tickets, parlay_legs
+migrations/005_projection_under_push.sql  # projections.prob_under, prob_push
 ```
 
 `python main.py --init-db` creates the ORM-defined tables and exits. The SQL
@@ -105,7 +122,7 @@ migrations carry the CHECK constraints and views that `create_all` does not.
 | Job | Time (PT) | What it does |
 |---|---|---|
 | `slate` | 09:00 | ingest → features → score → EV gate → persist projections → write PENDING `prop_results` → build the board CSV → dispatch it to Discord, gated |
-| `settlement` | 03:30 | grade every PENDING prop whose game has finished → **rebuild the calibration report** |
+| `settlement` | 03:30 | grade every PENDING prop whose game has finished → **rebuild the calibration report** → post the previous Pacific day's results card |
 
 The order between them is the dependency: settlement grades last night's games
 and recomputes the calibration evidence, so the morning slate reads evidence
@@ -119,6 +136,36 @@ hours; a finished game stays finished.
 The schedule is fixed, not tip-off-driven. Re-anchoring needs a schedule feed,
 and timing logic that has never been exercised against real data would look
 adaptive while being untested.
+
+## 5b. Does your own computer need to be on?
+
+**No, if you deploy.** That is what deploying is for. The worker runs in the
+platform's container, Postgres is hosted (the `.env.example` default is a
+Supabase pooler URL), and the Discord card is posted by the container. Your
+machine can be off, asleep, or on a plane at 09:00 PT and the slate still runs.
+
+Four things still need a machine, and none of them is continuous:
+
+| | When | Why |
+|---|---|---|
+| `python -m scripts.validate_docker` | once, before the first deploy | the build and the six in-image checks need a Docker daemon |
+| `migrations/*.sql` + `python main.py --init-db` | once, per database | applied against the target database by hand |
+| training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or upload the artifacts to object storage and fetch them at boot |
+| recording a stake | whenever you place a bet | PropIQ never places one and never writes a stake. ROI exists only if you log it |
+
+**Yes, if you do not deploy.** Running `python scheduler_worker.py` on your own
+machine means the machine must be awake and the process running at both cron
+times, 09:00 and 03:30 Pacific. A laptop asleep at 03:30 does not grade last
+night's props, which means the 09:00 slate reads day-old calibration evidence.
+And the grace periods are deliberately asymmetric:
+
+- **slate: one hour.** A missed slate is **not** run late, because projecting
+  games that have already tipped is worse than projecting none.
+- **settlement: six hours.** A finished game stays finished, so catching up is
+  harmless.
+
+So a local run that wakes at 11:00 silently skips that day's board. That is the
+correct behaviour and it is also the reason to deploy rather than self-host.
 
 ## 6. What a deployed run produces
 

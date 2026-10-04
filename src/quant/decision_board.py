@@ -24,15 +24,19 @@ A RECOMMENDATION IS STILL NOT A PROMISE. The vocabulary guard below stays: no
 "lock", no "guaranteed", no "best bet". Recommending a side and promising an
 outcome are different acts, and only the first one is supportable.
 
-SOURCE PRECEDENCE: PROPLINE IS PRIMARY, ODDSPAPI IS THE FALLBACK.
+SOURCE PRECEDENCE: PROPLINE IS THE ONLY SOURCE.
 
-``resolve_market`` walks ``SOURCE_PRECEDENCE`` and takes the first source
-whose market clears the EV gate — by precedence, not by arrival order. When
-PropLine is present but unusable (most often a PrizePicks/Underdog pick'em
-row, which posts a payout multiplier rather than a two-way price) the
-resolution falls through to OddsPapi and records ``fallback_used`` with the
-gate's own reason. Which source priced a row changes what its EV means, so
-the source travels with the row.
+``resolve_market`` walks ``SOURCE_PRECEDENCE`` and takes the first source whose
+market clears the EV gate — by precedence, not by arrival order — recording
+every source it passed over with the gate's own reason. Which source priced a
+row changes what its EV means, so the source travels with the row.
+
+``SOURCE_PRECEDENCE`` holds ONE name. It listed a second, OddsPapi, which had
+no client in this repository at all; see the note on the tuple. With one entry
+``fallback_used`` can only ever be False in production, and that is the honest
+answer: when PropLine posts a payout multiplier rather than a two-way price —
+most often a PrizePicks or Underdog pick'em row — there is nothing to fall
+through to, so the row abstains and says why.
 
 FOUR DECISION BASES, and only one of them is a price:
 
@@ -90,8 +94,22 @@ BOARD_DISCLAIMER = (
     + WAVE3_DISCLAIMER
 )
 
-# PropLine first, OddsPapi second. The order is the whole point of this tuple.
-SOURCE_PRECEDENCE: tuple[str, ...] = ("propline", "oddspapi")
+# ONE SOURCE, AND IT IS STILL A TUPLE ON PURPOSE.
+#
+# This read ("propline", "oddspapi") until 2026-10-04. OddsPapi had no client
+# module, no key reader and no ingestion path anywhere in this repository: it
+# was a string in this tuple and prose in a dozen docstrings. A precedence
+# naming a feed that cannot be fetched is not a safety net, it is a claim that
+# a fallback exists — so the next person debugging an unpriced row looks for a
+# fallback that was never there.
+#
+# The WALKER stays generic. `resolve_market` takes any `precedence` sequence,
+# ranks unlisted sources last, and records every source it passed over with the
+# gate's own reason. Adding a second feed is appending its name here once its
+# client exists — and `tests/test_decision_board.py` holds that mechanism open
+# by walking a two-source precedence built in the test, rather than by this
+# repository pretending to have two.
+SOURCE_PRECEDENCE: tuple[str, ...] = ("propline",)
 
 # Ranking bands. A priced edge always sorts above an unpriced lean.
 BASIS_ORDER: dict[str, int] = {
@@ -134,12 +152,12 @@ def _assert_no_claims(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# source resolution: PropLine primary, OddsPapi fallback
+# source resolution by precedence — PropLine is the only listed source
 # ---------------------------------------------------------------------------
 
 
 def normalise_source(name: Any) -> str:
-    """'OddsPapi ' -> 'oddspapi'. Unknown names pass through, lowercased."""
+    """'Prop Line ' -> 'propline'. Unknown names pass through, lowercased."""
     return (
         str(name or "").strip().lower()
         .replace("-", "").replace("_", "").replace(" ", "")
@@ -218,12 +236,19 @@ def resolve_market(
     precedence: Sequence[str] = SOURCE_PRECEDENCE,
 ) -> MarketResolution:
     """
-    Pick the market to price from, PropLine first and OddsPapi as fallback.
+    Pick the market to price from, by precedence rather than arrival order.
 
     A source is usable only when ``market_ev_gate`` returns
     READY_FOR_EVALUATION for it. Everything skipped on the way down is
     recorded with the gate's own reason, so a fallback is always explainable
     and a pick'em row is never mistaken for a missing one.
+
+    THIS RANKS, IT DOES NOT ALLOW-LIST. ``_source_rank`` sorts a source that is
+    absent from ``precedence`` LAST; it does not exclude it. A snapshot from an
+    unlisted source is still priced, after every listed one. Worth stating
+    because removing OddsPapi from the tuple removed a promise of a fallback
+    and did not add a filter — none is needed while nothing can fetch it.
+    ``tests/test_decision_board.py`` pins this either way.
     """
     if candidates is None:
         return MarketResolution(reason="No market candidates supplied")
@@ -275,15 +300,21 @@ def enrich_row_with_resolved_market(
     candidates: Iterable[PropMarketSnapshot] | None,
     *,
     ev_threshold: float = 0.0,
+    precedence: Sequence[str] = SOURCE_PRECEDENCE,
 ) -> tuple[ResearchSlateRow, MarketResolution]:
     """
     Resolve the source by precedence, then price the row from it.
 
-    This is the entry point that makes "PropLine primary" real rather than a
+    This is the entry point that makes the precedence real rather than a
     docstring: ``enrich_row_with_book`` prices whatever snapshot it is given,
     and this decides which snapshot that is.
+
+    ``precedence`` is passed through rather than fixed, because ``resolve_market``
+    has always accepted it and this caller did not — so the fallback path could
+    not be exercised end to end at all. Adding a second feed is a one-line
+    change here, once its client exists.
     """
-    resolution = resolve_market(candidates)
+    resolution = resolve_market(candidates, precedence=precedence)
     out = enrich_row_with_book(row, resolution.snapshot, ev_threshold=ev_threshold)
     out.book_source = resolution.source
     out.book_fallback_used = resolution.fallback_used
@@ -424,7 +455,7 @@ def expand_row_to_candidates(
         elif require_valid_book:
             why = (
                 "ABSTAIN: --require-valid-book and no VALID two-way price "
-                "(PropLine primary, OddsPapi fallback)"
+                "(PropLine is the only source)"
             )
             if p_side is None:
                 warnings.append(f"P({side}) unavailable")

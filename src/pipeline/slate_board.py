@@ -77,7 +77,7 @@ def build_slate_board(
     of unpriced model leans is exactly what must not go out looking priced. Once
     a pull is archived, enrich each row through
     ``decision_board.enrich_row_with_resolved_market``, which applies the
-    PropLine-primary / OddsPapi-fallback precedence.
+    source precedence (PropLine is the only listed source).
     """
     from src.models.compare import compare_models_on_panel, load_comparison_config
     from src.quant.decision_board import (

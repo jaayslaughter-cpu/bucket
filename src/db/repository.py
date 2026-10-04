@@ -328,7 +328,12 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
             "final_projection": r.get("FINAL_PROJECTION"),
             "line": r.get("LINE"),
             "prob_over": r.get("PROB_OVER"),
+            # NULL when the line is whole and no push mass was supplied, never
+            # 1 - P(over). See the note on Projection.prob_under.
+            "prob_under": r.get("PROB_UNDER"),
+            "prob_push": r.get("PROB_PUSH"),
             "market_status": r.get("MARKET_STATUS", "DATA_NOT_AVAILABLE"),
+            "notes": r.get("NOTES"),
         })
 
     with session_scope() as session:
@@ -344,6 +349,7 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
                 for c in (
                     "run_id", "baseline_projection", "fatigue_multiplier",
                     "fatigue_notes", "final_projection", "line", "prob_over",
+                    "prob_under", "prob_push",
                     "model_version", "market_status", "ev_per_dollar", "notes",
                 )
             },

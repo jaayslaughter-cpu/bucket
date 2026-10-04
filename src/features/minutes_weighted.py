@@ -40,7 +40,12 @@ So the columns are built and are registered as a ``scripts/feature_ab.py``
 layer, and they are deliberately ABSENT from ``labels.default_feature_cols``.
 Measure with ``feature_ab --layer minutes_weighted --wire-under-test`` before
 promoting them; the correlation above is a prediction, and this project's
-standard is to test it rather than argue from it.
+standard is to test it rather than argue from it. See docs/minutes_weighted.md.
+
+The SEASON abstention below was unreachable through the builder until
+src/features/season.py landed: halflife ran first and fabricated a SEASON
+column from GAME_DATE.dt.year, so by the time this layer looked, SEASON was
+never missing. See docs/season_key.md.
 
 RESEARCH_ONLY — never invents lines.
 """

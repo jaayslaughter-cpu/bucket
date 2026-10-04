@@ -524,6 +524,152 @@ def build_dfs_entry_embed(
     })
 
 
+def build_win_loss_embed(
+    summary: Any,
+    *,
+    slate_date: str | None = None,
+    min_sample_for_rate: int = 30,
+) -> dict[str, Any]:
+    """
+    The day's settled record. History, not a forecast.
+
+    This is the one card in this module that reports what ALREADY HAPPENED, and
+    that is exactly why it needs more care than the others rather than less. A
+    results card is the easiest place in a research system to start implying a
+    profit claim, so three things are refused here on purpose:
+
+    1. **A strike rate below ``min_sample_for_rate`` is not shown as a rate.**
+       ``settlement/metrics.MIN_SAMPLE_FOR_RATE`` is 30 and exists because a
+       rate over a handful of props is noise. The count is still reported; the
+       percentage is withheld with the reason.
+    2. **ROI is reported only when a stake was recorded.** Nothing in this
+       pipeline writes a stake — ``settlement/recorder.py`` deliberately never
+       writes ``stake_units`` — so ROI is normally undefined, and the metrics
+       layer's own note says which case applies. Printing "ROI 0.00%" over zero
+       staked units would read as a flat month rather than as no data.
+    3. **CLV is never presented as profit.** The metrics layer ships that
+       sentence itself and it is passed through rather than paraphrased.
+
+    ``summary`` is a ``settlement.metrics.PerformanceSummary`` — read by
+    attribute so this module does not import the settlement layer, matching how
+    the board embed reads its rows.
+    """
+    record = getattr(summary, "record", None)
+    roi = getattr(summary, "roi", None)
+    clv = getattr(summary, "clv", None)
+    warnings = list(getattr(summary, "warnings", None) or [])
+
+    graded = int(getattr(record, "graded_n", 0) or 0)
+    decided = int(getattr(record, "decided_n", 0) or 0)
+    pending = int(getattr(record, "pending", 0) or 0)
+
+    fields: list[dict[str, Any]] = []
+
+    if record is not None:
+        wins = int(getattr(record, "wins", 0) or 0)
+        losses = int(getattr(record, "losses", 0) or 0)
+        pushes = int(getattr(record, "pushes", 0) or 0)
+        voids = int(getattr(record, "voids", 0) or 0)
+        line = f"**{wins}-{losses}-{pushes}**"
+        if voids:
+            line += f"  ({voids} void)"
+        fields.append({
+            "name": "Record",
+            "value": _clip(f"{line}\n{graded} graded, {pending} still pending",
+                           MAX_FIELD_VALUE),
+            "inline": True,
+        })
+
+        rate = getattr(record, "strike_rate_pct", None)
+        if rate is None:
+            rate_text = "—"
+        elif decided < int(min_sample_for_rate):
+            rate_text = (
+                f"withheld\n{decided} decided prop(s) is under the "
+                f"{int(min_sample_for_rate)} this project treats as the "
+                "minimum for a rate rather than noise"
+            )
+        else:
+            rate_text = f"**{float(rate):.1f}%** over {decided} decided"
+        fields.append({
+            "name": "Strike rate",
+            "value": _clip(rate_text, MAX_FIELD_VALUE),
+            "inline": True,
+        })
+
+    if roi is not None:
+        staked = getattr(roi, "staked_units", None)
+        roi_pct = getattr(roi, "roi_pct", None)
+        note = str(getattr(roi, "note", "") or "")
+        if staked and roi_pct is not None:
+            roi_text = (
+                f"{float(roi_pct):+.2f}% on {float(staked):.2f} unit(s) staked"
+            )
+        else:
+            roi_text = (
+                "not computable — no stake is recorded by this pipeline, and "
+                "none can be"
+            )
+        if note:
+            roi_text += f"\n{note}"
+        fields.append({
+            "name": "ROI",
+            "value": _clip(roi_text, MAX_FIELD_VALUE),
+            "inline": False,
+        })
+
+    if clv is not None:
+        n_line = int(getattr(clv, "n_with_line_clv", 0) or 0)
+        avg_line = getattr(clv, "avg_clv_line_points", None)
+        avg_prob = getattr(clv, "avg_clv_prob_points", None)
+        if n_line:
+            clv_text = (
+                f"line {avg_line:+.3f} pts, probability {_pct(avg_prob)} "
+                f"over {n_line} prop(s)"
+                if avg_line is not None
+                else f"{n_line} prop(s) with a closing line"
+            )
+        else:
+            clv_text = "no closing lines captured, so no CLV"
+        clv_note = str(getattr(clv, "note", "") or "")
+        if clv_note:
+            clv_text += f"\n{clv_note}"
+        fields.append({
+            "name": "CLV",
+            "value": _clip(clv_text, MAX_FIELD_VALUE),
+            "inline": False,
+        })
+
+    for warning in warnings[:3]:
+        fields.append({
+            "name": "Note",
+            "value": _clip(warning, MAX_FIELD_VALUE),
+            "inline": False,
+        })
+
+    if graded == 0:
+        description = (
+            "Nothing was graded for this period. That is the pipeline reporting "
+            "its own state — no prop reached a final box score — and not a day "
+            "with no value in it."
+        )
+    else:
+        description = (
+            "Settled results for props this pipeline recorded as predictions. "
+            "These are graded predictions, not wagers: no stake was placed by "
+            "this system and none is recorded."
+        )
+
+    title = "Results" if slate_date is None else f"Results — {slate_date}"
+    return _fit_embed({
+        "title": _clip(title, MAX_TITLE),
+        "description": _clip(description, MAX_DESCRIPTION),
+        "color": COLOR_ABSTAIN if graded == 0 else COLOR_CONSIDER,
+        "fields": fields,
+        "footer": {"text": RESEARCH_FOOTER[:MAX_FOOTER]},
+    })
+
+
 def build_abstention_embed(reason: str, *, title: str = "No ticket") -> dict[str, Any]:
     """
     Post the refusal too.

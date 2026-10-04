@@ -1,8 +1,13 @@
-"""Pick'em vs OddsPapi line-diff helper (Wave 4).
+"""Pick'em vs sportsbook line-diff helper (Wave 4).
 
 RESEARCH_ONLY. Line-diff math runs only when the sportsbook side is a
 ``MarketContext`` / ``PropMarketSnapshot`` with ``status=VALID`` and verified
-two-way American odds (OddsPapi path). Pick'em multipliers never unlock EV.
+two-way American odds. Pick'em multipliers never unlock EV.
+
+Source-neutral: it takes whatever snapshot it is handed and asks the EV gate.
+The docstrings here named OddsPapi until 2026-10-04, which was misleading twice
+over — the helper never cared which feed it was, and OddsPapi had no client in
+this repository.
 """
 
 from __future__ import annotations
@@ -69,7 +74,7 @@ def pickem_vs_book_line_diff(
     pts_per_prob: float = 0.03,
 ) -> LineDiffResult:
     """
-    Compare an approved pick'em line to a VALID OddsPapi two-way book line.
+    Compare an approved pick'em line to a VALID two-way sportsbook line.
 
     Returns DATA_NOT_AVAILABLE when the book side is not VALID or lines missing.
     Does not invent odds or mark pick'em as VALID for stake math.
@@ -80,7 +85,7 @@ def pickem_vs_book_line_diff(
         return LineDiffResult(
             status="DATA_NOT_AVAILABLE",
             pickem_line=float(pickem_line) if pickem_line is not None else None,
-            reason=gate.get("reason") or "Book market not VALID two-way OddsPapi",
+            reason=gate.get("reason") or "Book market is not a VALID two-way price",
         )
 
     book_line, over_a, under_a = _book_line_and_odds(market)

@@ -897,7 +897,7 @@ def decision_board_cmd(
 
     Does not place a wager and contacts no book or DFS order API — the last
     step is yours. EV appears only where a source posted genuine two-way
-    American odds (PropLine first, OddsPapi as the fallback); everything else
+    American odds (PropLine is the only source); everything else
     abstains with a named reason.
 
     READ THE BASIS COLUMN. A row recommended on `book_ev` has a de-vigged market

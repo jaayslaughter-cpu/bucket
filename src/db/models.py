@@ -287,6 +287,21 @@ class Projection(Base):
 
     line: Mapped[float | None] = mapped_column(Float)
     prob_over: Mapped[float | None] = mapped_column(Float)
+    # ALL THREE LEGS, because two of them cannot be derived from the first.
+    #
+    # Only prob_over was stored. On a HALF line that is lossless: push is
+    # impossible, so the under is exactly 1 - P(over). On a WHOLE line it is
+    # not: push has real mass, 1 - P(over) is the probability of "under OR
+    # push" rather than of under, and once the row is written the push mass is
+    # unrecoverable. A reader with only prob_over cannot tell which case a row
+    # is, so every whole-line under read 1 - P(over) and was wrong.
+    #
+    # Both are NULL rather than guessed when the line is whole and the model
+    # supplied no push mass -- main.assemble_projections routes through
+    # paper_research.resolve_two_way_model_probs, which refuses the complement
+    # in exactly that case and returns the reason.
+    prob_under: Mapped[float | None] = mapped_column(Float)
+    prob_push: Mapped[float | None] = mapped_column(Float)
     model_version: Mapped[str | None] = mapped_column(String(64))
 
     market_status: Mapped[str] = mapped_column(String(32), default="DATA_NOT_AVAILABLE")

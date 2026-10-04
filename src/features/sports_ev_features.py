@@ -13,6 +13,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.features.season import drop_season_key, player_season_keys
+
 _STREAK_STATS = ("PTS", "REB", "AST", "FG3M")
 _OPP_ALLOWED_STATS = ("PTS", "REB", "AST", "FG3M", "STL", "BLK")
 
@@ -93,10 +95,8 @@ def attach_form_streaks(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "PLAYER_ID" not in out.columns or "GAME_DATE" not in out.columns:
         return out
-    if "SEASON" not in out.columns:
-        out["SEASON"] = pd.to_datetime(out["GAME_DATE"], errors="coerce").dt.year
-
-    group_keys = ["PLAYER_ID", "SEASON"]
+    # Derived season key is private to this layer — see src/features/season.py.
+    out, group_keys = player_season_keys(out)
     out = out.sort_values([c for c in (*group_keys, "GAME_DATE", "GAME_ID") if c in out.columns]).reset_index(
         drop=True
     )
@@ -132,7 +132,7 @@ def attach_form_streaks(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{stat}_STREAK_ABOVE"] = _run_length_within_groups(out, above, group_keys)
         out[f"{stat}_STREAK_BELOW"] = _run_length_within_groups(out, below, group_keys)
 
-    return out
+    return drop_season_key(out)
 
 
 def _run_length_within_groups(

@@ -19,7 +19,7 @@ behind it, that is an opinion with a confident label.
 | Placement | **Never** calls a book / DFS order API — the last step is yours |
 | Sizing | This layer suggests no stake. A recommended size lives in `quant.advisory_sizing` (fractional Kelly, capped), and nothing auto-executes it |
 | EV | Only from `MarketContext.status=VALID` two-way American odds |
-| Source | **PropLine primary, OddsPapi fallback** — and the source is on every row |
+| Source | **PropLine, the only source** — and the source is on every row |
 | Pick'em | No two-way EV; routed to `quant.dfs_entry` for payout-matrix EV instead |
 | Whole lines | Refuses silent `1 − P(over)` for the under when a push is possible |
 | Language | Refuses to emit "lock", "best bet", "guaranteed" and the like — recommending a side and promising an outcome are different acts |
@@ -40,7 +40,7 @@ vocabulary before a row can be written.
 | `preferred_side` | Higher-EV side, **only when both sides are priced** |
 | `why` | Short human-readable reason, including every refusal |
 | `rank` | RECOMMENDED first, then band, then score |
-| `book_source` | `propline` or `oddspapi` — which feed priced this row |
+| `book_source` | which feed priced this row (`propline` today) |
 | `book_fallback_used` | True when PropLine was present but unusable |
 | `book_sources_skipped` | What was passed over, and the gate's reason for each |
 | `line_can_push` | True on a whole line (and on an unknown one) |
@@ -49,15 +49,34 @@ vocabulary before a row can be written.
 
 ## Source precedence
 
-`resolve_market` walks `SOURCE_PRECEDENCE = ("propline", "oddspapi")` and
-takes the first source whose market clears the EV gate — **by precedence,
-not by arrival order**. `enrich_row_with_resolved_market(row, candidates)`
-is the entry point that applies it and stamps the source onto the row;
-`enrich_row_with_book` prices whatever snapshot it is handed. The common fallback is a PrizePicks or Underdog
-row: a pick'em board publishes a payout multiplier rather than a two-way
-price, so it cannot be de-vigged, PropLine is skipped for pricing, and
-OddsPapi prices the row instead. That is recorded, never silent:
-`fallback_used=True` and `sources_skipped` carries the gate's own reason.
+`resolve_market` walks `SOURCE_PRECEDENCE = ("propline",)` and takes the first
+source whose market clears the EV gate — **by precedence, not by arrival
+order**. `enrich_row_with_resolved_market(row, candidates)` is the entry point
+that applies it and stamps the source onto the row; `enrich_row_with_book`
+prices whatever snapshot it is handed. Both take a `precedence` argument.
+
+**One name in that tuple, deliberately.** It read `("propline", "oddspapi")`
+until 2026-10-04. OddsPapi had **no client module, no key reader and no
+ingestion path** anywhere in this repository — it was a string here and prose
+in a dozen docstrings. A precedence that names a feed nobody can fetch is not
+a safety net; it is a claim that a fallback exists, so the next person
+debugging an unpriced row goes looking for one.
+
+So when PropLine publishes a payout multiplier rather than a two-way price —
+the common case, a PrizePicks or Underdog pick'em row, which cannot be
+de-vigged — **there is nothing to fall through to**. The row abstains and says
+why. `fallback_used` can only be `False` in production, and that is the honest
+answer rather than a bug.
+
+**The walker is still generic**, and `resolve_market` still records every
+source it passed over with the gate's own reason. Adding a real second feed is
+appending its name to the tuple once its client exists; the fallback behaviour
+is already tested, against a second source the test invents rather than one the
+repository pretends to have.
+
+**It ranks, it does not allow-list.** `_source_rank` sorts an unlisted source
+*last*; it does not exclude it. Removing OddsPapi removed a false promise, not
+added a filter — and none is needed while nothing can fetch that source.
 
 The pick'em line itself survives on the row for line-diff research even
 when it cannot price anything.

@@ -39,17 +39,18 @@ Web notes (logged-in check 2026-09-15):
   - Flat index: `lines_index.csv` (append-only when lines exist)
 - CLI: `python scripts/pull_pickem_props.py`
 
-## Important: not OddsPapi EV
+## Important: a pick'em multiplier is not EV
 
-Pick'em rows carry **lines + optional multipliers**, not verified two-way American
-odds. Keep using OddsPapi for `MarketContext` EV/CLV. Do not mark pick'em rows
-as `MarketContext.status=VALID` for stake math.
+Pick'em rows carry **lines + optional multipliers**, not verified two-way
+American odds. EV and CLV need a two-way price, which only a sportsbook feed
+posts — PropLine here. Do not mark pick'em rows as
+`MarketContext.status=VALID` for stake math.
 
 ### Wave 4: pick'em vs book line-diff
 
 Helper: `src/quant/line_diff.py` → `pickem_vs_book_line_diff(...)`.
 
-- Runs **only** when the book side is OddsPapi `status=VALID` with two-way American odds.
+- Runs **only** when the book side is `status=VALID` with two-way American odds. Source-neutral: it asks the EV gate, not the vendor's name.
 - Returns pick'em−book line delta + a soft fair-prob adjustment for research display.
 - Never treats pick'em multipliers as VALID odds; never sizes stake from this helper.
 
