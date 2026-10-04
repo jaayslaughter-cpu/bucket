@@ -63,6 +63,7 @@ ENV_BOARD_MARKETS = "PROPIQ_BOARD_MARKETS"
 ENV_BOARD_TRAIN_END = "PROPIQ_BOARD_TRAIN_END"
 ENV_BOARD_VALIDATION_END = "PROPIQ_BOARD_VALIDATION_END"
 ENV_MIN_EV = "PROPIQ_MIN_EV"
+ENV_RESULTS_CARD = "PROPIQ_RESULTS_CARD"
 
 DEFAULT_CALIBRATION_REPORT = "outputs/calibration.json"
 DEFAULT_BOARD_CSV = "outputs/decision_board.csv"
@@ -379,7 +380,71 @@ def run_settlement() -> dict[str, Any]:
         out = {"status": "FAILED", "error": str(exc)}
 
     out["calibration"] = rebuild_calibration_report()
+    out["results_card"] = run_results_card()
     return out
+
+
+def run_results_card(slate_date: str | None = None) -> dict[str, Any]:
+    """
+    Post the day's settled record to Discord.
+
+    WHY THIS IS NOT BEHIND THE CALIBRATION GATE, which every other dispatch
+    surface in this project is. That gate exists to stop an UNCALIBRATED
+    MODEL PROBABILITY reaching a person. This card carries no probability and
+    makes no forecast: it reports props that already reached a final box score
+    and how they graded. Withholding settled history for want of calibration
+    evidence would withhold the very thing the evidence is built from.
+
+    What the card refuses instead is in ``build_win_loss_embed``: a strike rate
+    under the 30-prop minimum is withheld with its reason rather than printed,
+    ROI is reported only when a stake was actually recorded, and the CLV note
+    travels with the CLV figure.
+
+    Off unless a webhook is configured, like dispatch. A failure is logged and
+    returned: the grading is the durable part and a missing card costs nothing.
+    """
+    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
+    if not _flag(ENV_RESULTS_CARD, _flag(ENV_DISPATCH, webhook_configured)):
+        logger.info("Results card off. Nothing sent.")
+        return {"status": "SKIPPED", "reason": "results card disabled"}
+
+    from src.notify.discord import DiscordDispatchError
+
+    try:
+        from datetime import date as _date
+        from datetime import timedelta
+
+        from src.notify.discord import (
+            DiscordConfig,
+            build_win_loss_embed,
+            send_embeds,
+        )
+        from src.settlement.metrics import MIN_SAMPLE_FOR_RATE, get_performance_summary
+        from src.utils.timezones import pacific_calendar_date
+
+        # The settlement job runs at 03:30 PT and grades games that finished
+        # the previous Pacific calendar day, so that is the day to report. A
+        # card dated today would be empty every morning by construction.
+        day = slate_date or str(pacific_calendar_date() - timedelta(days=1))
+        target = _date.fromisoformat(day)
+        summary = get_performance_summary(start_date=target, end_date=target)
+        graded = int(getattr(summary.record, "graded_n", 0) or 0)
+        if graded == 0 and not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+            logger.info("Nothing graded for %s and abstentions muted — nothing sent.", day)
+            return {"status": "SKIPPED", "reason": "nothing graded", "slate_date": day}
+
+        embed = build_win_loss_embed(
+            summary, slate_date=day, min_sample_for_rate=MIN_SAMPLE_FOR_RATE
+        )
+        result = send_embeds([embed], config=DiscordConfig(dry_run=False))
+        logger.info("Results card for %s: %s (%d graded)", day, result.status, graded)
+        return {"status": result.status, "slate_date": day, "graded": graded}
+    except DiscordDispatchError as exc:
+        logger.error("Results card refused: %s", exc)
+        return {"status": "REFUSED", "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Results card raised; the scheduler stays up.")
+        return {"status": "FAILED", "error": str(exc)}
 
 
 def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:

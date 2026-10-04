@@ -111,6 +111,7 @@ Apply the migrations against the target database before the first run:
 migrations/002_prop_results.sql      # settlement ledger + views
 migrations/003_capture_vs_ingest_time.sql
 migrations/004_parlay_ledger.sql     # parlay_tickets, parlay_legs
+migrations/005_projection_under_push.sql  # projections.prob_under, prob_push
 ```
 
 `python main.py --init-db` creates the ORM-defined tables and exits. The SQL
@@ -121,7 +122,7 @@ migrations carry the CHECK constraints and views that `create_all` does not.
 | Job | Time (PT) | What it does |
 |---|---|---|
 | `slate` | 09:00 | ingest → features → score → EV gate → persist projections → write PENDING `prop_results` → build the board CSV → dispatch it to Discord, gated |
-| `settlement` | 03:30 | grade every PENDING prop whose game has finished → **rebuild the calibration report** |
+| `settlement` | 03:30 | grade every PENDING prop whose game has finished → **rebuild the calibration report** → post the previous Pacific day's results card |
 
 The order between them is the dependency: settlement grades last night's games
 and recomputes the calibration evidence, so the morning slate reads evidence

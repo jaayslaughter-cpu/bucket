@@ -152,34 +152,50 @@ def test_the_two_corrections_are_kept_rather_than_quietly_dropped():
 
 # --- what it lists as open. FAILING HERE MEANS UPDATE THE PAGE. ------------
 
-def test_o8_projection_still_stores_only_prob_over():
+# These two were open items on this page until 2026-10-04. The guard above
+# fired when they were fixed, which is what it is for; they are now pinned the
+# other way round, as closures the page claims and the tree must keep.
+
+
+def test_the_projection_table_carries_all_three_legs():
+    """
+    Was O8. The page's "Closed since this page was reconciled" table claims
+    these columns exist and that the writer fills them.
+    """
     models = (ROOT / "src" / "db" / "models.py").read_text(encoding="utf-8")
     block = models[models.index("class Projection"):]
     block = block[: block.index("\nclass ")]
-    assert "prob_over" in block
-    for closed in ("prob_under", "prob_push"):
-        assert closed not in block, (
-            f"O8 is fixed — Projection now stores {closed}. Update "
-            "docs/go_live_readiness.md: move O8 out of the open list and into "
-            "the verdict table."
-        )
+    for column in ("prob_over", "prob_under", "prob_push"):
+        assert column in block, f"the page says {column} exists on Projection"
+    assert "migrations/005_projection_under_push.sql" in TEXT
+    assert (ROOT / "migrations" / "005_projection_under_push.sql").is_file()
 
 
-def test_o9_there_is_still_no_daily_win_loss_embed():
+def test_the_results_card_exists_and_the_page_says_how_it_is_sent():
+    """
+    Was O9. Both halves matter: a builder nothing calls on a schedule is the
+    shape the gap was in to begin with.
+    """
     body = (ROOT / "src" / "notify" / "discord.py").read_text(encoding="utf-8")
     builders = re.findall(r"^def (build_\w+_embed)", body, re.M)
-    assert builders, "no embed builders found at all"
-    wl = [b for b in builders if any(k in b for k in ("win_loss", "wl_", "record"))]
-    assert not wl, (
-        f"O9 is fixed — {wl} exists. Update docs/go_live_readiness.md."
+    assert "build_win_loss_embed" in builders, "the page claims a fifth builder"
+    assert len(builders) == 5, (
+        f"the page says five builders; there are {len(builders)}: {builders}"
     )
-    assert len(builders) == 4, (
-        f"the page says four builders; there are now {len(builders)}: {builders}. "
-        "Update the 4.2 row."
+    worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
+    settle = worker[worker.index("def run_settlement"):]
+    settle = settle[: settle.index("\ndef ")]
+    assert "run_results_card()" in settle, (
+        "the page says the settlement job sends it, and nothing calls it"
     )
 
 
-def test_o10_nothing_populates_the_tipoff_column():
+def test_the_page_records_both_closures_rather_than_deleting_the_items():
+    assert "Closed since this page was reconciled" in TEXT
+    assert "prob_under" in TEXT and "build_win_loss_embed" in TEXT
+
+
+def test_o8_nothing_populates_the_tipoff_column():
     assert "tipoff_utc" in (ROOT / "src" / "db" / "models.py").read_text(encoding="utf-8")
     writers = []
     for path in list((ROOT / "src").rglob("*.py")) + [ROOT / "main.py"]:
@@ -188,12 +204,12 @@ def test_o10_nothing_populates_the_tipoff_column():
         if re.search(r"tipoff_utc\s*=|\[.tipoff_utc.\]\s*=", path.read_text(encoding="utf-8")):
             writers.append(path.relative_to(ROOT).as_posix())
     assert not writers, (
-        f"O10 is fixed — {writers} writes tipoff_utc. Update "
+        f"O8 is fixed — {writers} writes tipoff_utc. Update "
         "docs/go_live_readiness.md."
     )
 
 
-def test_o11_the_schedule_and_roster_sources_are_still_unwired():
+def test_o9_the_schedule_and_roster_sources_are_still_unwired():
     assert (ROOT / "src" / "ingestion" / "espn_schedule.py").is_file()
     assert "def fetch_roster" in (
         ROOT / "src" / "ingestion" / "espn_availability.py"
@@ -201,7 +217,7 @@ def test_o11_the_schedule_and_roster_sources_are_still_unwired():
     for entry in ("main.py", "scheduler_worker.py"):
         body = (ROOT / entry).read_text(encoding="utf-8")
         assert "espn_schedule" not in body, (
-            f"O11 is fixed — {entry} imports espn_schedule. Update "
+            f"O9 is fixed — {entry} imports espn_schedule. Update "
             "docs/go_live_readiness.md and docs/integration_audit.md."
         )
 

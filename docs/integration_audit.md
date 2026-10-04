@@ -51,7 +51,7 @@ in the production path:
 | `src/ingestion/espn_availability.py` `fetch_roster()` | players per ESPN team id | **nothing** |
 
 `docs/go_live_readiness.md` recorded this as "schedule source is still open"
-without its consequence. Reconciled 2026-10-04: it is O11 there, and the
+without its consequence. Reconciled 2026-10-04: it is O9 there, and the
 consequence is stated — a deployed worker is not degraded, it is inert. A
 forward slate needs both halves, the schedule *and* a roster.
 

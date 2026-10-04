@@ -47,17 +47,22 @@ asserted.
 | **O5** | **`src/ingestion/id_crosswalk.py` does not exist** and three modules name it as the fix for name-format mismatch; the exact-name join silently records zero gradeable rows when formats differ. | §1.2, §3 |
 | **O6** | **Model artifacts do not survive a redeploy** — ephemeral filesystem, no volume declared. A platform step, not a code change. | `docs/railway_deployment_audit.md` §4 |
 | **O7** | **A slate-level EV verdict is persisted as a per-row claim** (`market_status`). | §2.4 |
-| **O8** | **`Projection` stores only `prob_over`.** `residuals.over_under_push_from_dispersion` computes over/under/push and is called from five sites in four modules (`catboost_pipeline`, `distribution_adapter`, `combo_variance`, `xgb_adapter`), so a whole-number line's push mass is unrecoverable after the fact and `1 - prob_over` is the wrong under. The original audit said "six production callers"; counted again, it is five call sites. **Open since the original audit.** | `src/db/models.py` `Projection` |
-| **O9** | **No daily W/L reconciliation embed.** `src/notify/discord.py` has four builders — decision board, parlay, DFS entry, abstention — and none summarises a day's results. **Open since the original audit.** | `src/notify/discord.py` |
-| **O10** | **`Game.tipoff_utc` has no writer.** The column exists and nothing populates it, so any tip-anchored scheduling has no times to anchor to. | `grep tipoff_utc src/` |
-| **O11** | **Schedule source: still open in the sense that matters.** `src/ingestion/espn_schedule.py` now exists and is tested — so "neither is wired" is no longer true of ESPN — but nothing in `main.py` or `scheduler_worker.py` imports it, and a forward slate also needs a roster, which `espn_availability.fetch_roster` provides and nothing calls. | §1.1 |
-| **O12** | **Eight config blocks are declared and never read**, so editing the YAML changes nothing. | `docs/railway_deployment_audit.md` §2 |
-| **O13** | **Self-referential evaluation.** `RESEARCH_LINE` is `{stat}_L10` and `over_hit` is measured against that same rolling history, so Brier and log-loss measure form against form until a posted-line archive drives line-aware training. | `src/models/labels.py`, `docs/DATA_GAPS.md` |
-| **O14** | **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp two-way NBA player-prop benchmark feed in reach, so nothing cross-checks the model's own number and the publication gate treats every board as model-sourced. Blocked externally, not by this repository. | `src/quant/dfs_entry.py`, `src/quant/publication_gate.py` |
+| **O8** | **`Game.tipoff_utc` has no writer.** The column exists and nothing populates it, so any tip-anchored scheduling has no times to anchor to. | `grep tipoff_utc src/` |
+| **O9** | **Schedule source: still open in the sense that matters.** `src/ingestion/espn_schedule.py` now exists and is tested — so "neither is wired" is no longer true of ESPN — but nothing in `main.py` or `scheduler_worker.py` imports it, and a forward slate also needs a roster, which `espn_availability.fetch_roster` provides and nothing calls. | §1.1 |
+| **O10** | **Eight config blocks are declared and never read**, so editing the YAML changes nothing. | `docs/railway_deployment_audit.md` §2 |
+| **O11** | **Self-referential evaluation.** `RESEARCH_LINE` is `{stat}_L10` and `over_hit` is measured against that same rolling history, so Brier and log-loss measure form against form until a posted-line archive drives line-aware training. | `src/models/labels.py`, `docs/DATA_GAPS.md` |
+| **O12** | **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp two-way NBA player-prop benchmark feed in reach, so nothing cross-checks the model's own number and the publication gate treats every board as model-sourced. Blocked externally, not by this repository. | `src/quant/dfs_entry.py`, `src/quant/publication_gate.py` |
 
 O1 and O2 gate the rest: until they are done, a deployed worker runs on
 schedule, logs cleanly and produces nothing. O3 is the one that could mislead
 a reader rather than merely disappoint one.
+
+### Closed since this page was reconciled
+
+| Was | Closed |
+|---|---|
+| **`Projection` stored only `prob_over`**, so a whole line's push mass was unrecoverable and `1 - prob_over` was the wrong under | 2026-10-04. `prob_under` and `prob_push` columns, `migrations/005_projection_under_push.sql`, populated through `paper_research.resolve_two_way_model_probs`: a half line gets an exact under and a zero push; a **whole or unknown** line gets NULL for both plus the refusal reason in `notes`. A binary classifier has no push mass to split out, and that is recorded rather than guessed. |
+| **No daily W/L reconciliation embed** — four builders, none reporting a settled day | 2026-10-04. `build_win_loss_embed` is the fifth, sent from the settlement job by `scheduler_worker.run_results_card`. It withholds a strike rate under 30 decided props with the reason, reports ROI only when a stake was actually recorded, and carries the metrics layer's CLV caveat with the CLV figure. Not behind the calibration gate, deliberately: that gate stops an uncalibrated model *probability* reaching a person, and this card carries none. |
 
 ---
 
@@ -77,7 +82,7 @@ tree does, re-checked item by item.
 | 3.2 | Parlay & prop tracking in the DB | **FAIL — top blocker** | **PASS** | `pg_insert(PropResult)` exists in `repository.py`, `settlement/recorder.py` is its writer, and `main.py` calls it. `ParlayTicketRow` / `ParlayLegRow` + `migrations/004_parlay_ledger.sql` put parlays in Postgres with `PROPIQ_PARLAY_LEDGER=postgres`. |
 | 3.3 | Daily result reconciliation | PARTIAL (blocked by 3.2) | **PARTIAL** | Unblocked: `settle_pending_props` grades, `metrics.get_performance_summary` aggregates, and the settlement job rebuilds the calibration report. Still no W/L embed (O9), and ROI needs a stake only a person records. |
 | 4.1 | Automated scheduling | **ABSENT** | **PASS** | `Dockerfile`, `.dockerignore`, `scheduler_worker.py` (APScheduler, two PT-anchored cron jobs, `max_instances=1`), `APScheduler>=3.10` in both `requirements.txt` and `pyproject.toml`. Never built in CI — `scripts/validate_docker.py` is the build-and-smoke path. |
-| 4.2 | Discord dispatcher formatting | PASS, one gap | **PASS, same gap** | The gap is O9. Four builders now, not three. |
+| 4.2 | Discord dispatcher formatting | PASS, one gap | **PASS** | The gap — no daily W/L summary — is closed. `build_win_loss_embed` is the fifth builder and `scheduler_worker.run_results_card` sends it from the settlement job. |
 | 4.3 | Connection pooling | PASS | **PASS** | Unchanged: `pool_pre_ping=True`, `pool_size=5`, `max_overflow=5`, commit / rollback / `finally: close()`, `sslmode=require` for remote hosts, and `expire_on_commit=False` so ORM rows survive the session. |
 
 ---
@@ -117,8 +122,8 @@ checks each attribution against git.
 | P1 pre-tip scratch filter | `e3ad94d` added `src/pipeline/scratches.py`, wired in `main.py` |
 | P1 wire `FeatureSpec` | `a27ff25` |
 | P2 scheduling | `8ed808c` added `scheduler_worker.py` and `Dockerfile`; `3c77aee` added the board build and gated dispatch; `d9147da` hardened the image (non-root uid, `APScheduler` into `requirements.txt`, the full `.env.example`); `ed43c26` added `scripts/validate_docker.py` |
-| P1 daily W/L embed | **not closed** — O9 |
-| P2 `prob_under` / `prob_push` on `Projection` | **not closed** — O8 |
+| P1 daily W/L embed | **closed 2026-10-04** — `build_win_loss_embed`, sent by `scheduler_worker.run_results_card` |
+| P2 `prob_under` / `prob_push` on `Projection` | **closed 2026-10-04** — both columns, `migrations/005_projection_under_push.sql`, resolved through `paper_research.resolve_two_way_model_probs` |
 
 `8ed808c` is dated **2026-09-28 — the same day as this audit.** The two "top
 blocker" P0s were closed hours after being written up, which is why a page
@@ -139,7 +144,7 @@ immediately and never revisited.
    who adds Celery later — Redis's 1-hour default redelivers a long-ETA task —
    and `docs/go_live_pack_review.md` §3 reviews the uploaded Celery
    implementation and says what the cheaper path would be. Per-game staggering
-   is still not built, and O10 is why: nothing populates a tip-off time.
+   is still not built, and O8 is why: nothing populates a tip-off time.
 
 3. **"Only flag high-probability plays": unchanged and still correct.**
    `build_decision_board` takes `min_ev`, `min_lean`, `require_valid_book` and

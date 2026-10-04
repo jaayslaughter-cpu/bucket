@@ -635,6 +635,16 @@ def assemble_projections(
 
     out = pd.concat(frames, ignore_index=True)
     out["LINE"] = _attach_prop_lines(out, prop_lines)
+    # Assigned HERE rather than inside the helper so the keys are visible at
+    # the assembly site: tests/test_projection_roundtrip.py reads this function
+    # to check that every key persist_projections reads is actually produced,
+    # and a key written inside a helper is a key that test cannot see. That is
+    # the same guard that caught BASELINE_PROJECTION and FATIGUE_NOTES
+    # persisting as silent NULLs, so it is worth keeping legible.
+    under, push, reason = _under_push_and_reason(out)
+    out["PROB_UNDER"] = under
+    out["PROB_PUSH"] = push
+    out["NOTES"] = reason
 
     matched = int(out["LINE"].notna().sum())
     logger.info(
@@ -642,6 +652,71 @@ def assemble_projections(
         len(out), len(frames), matched,
     )
     return out
+
+
+def _under_push_and_reason(
+    projections: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Return (P(under), P(push), reason) for each row. The nulls are the point.
+
+    The classifier behind PROB_OVER is binary and does not model a push, so:
+
+      * a HALF line cannot push -> PROB_PUSH is 0.0 and PROB_UNDER is exactly
+        1 - PROB_OVER, which is lossless;
+      * a WHOLE line can -> 1 - PROB_OVER is P(under OR push), not P(under),
+        so both are left NULL and the refusal is returned as the reason;
+      * an UNKNOWN line takes the whole-line branch, because a line nobody can
+        see cannot be shown to be a half-line.
+
+    Routed through ``paper_research.resolve_two_way_model_probs`` rather than
+    reimplemented: that function already encodes this rule, is tested, and is
+    what the decision board uses. A second copy here would be the one that
+    drifts.
+    """
+    from src.quant.paper_research import resolve_two_way_model_probs
+
+    index = projections.index
+    if projections.empty:
+        empty = pd.Series([], index=index, dtype="object")
+        return empty.copy(), empty.copy(), empty.copy()
+
+    unders: list[float | None] = []
+    pushes: list[float | None] = []
+    reasons: list[str | None] = []
+    refused = 0
+
+    for over, line in zip(projections["PROB_OVER"], projections["LINE"], strict=True):
+        p_over = None if over is None or pd.isna(over) else float(over)
+        p_line = None if line is None or pd.isna(line) else float(line)
+        _po, p_under, p_push, warning = resolve_two_way_model_probs(
+            p_over=p_over, line=p_line
+        )
+        unders.append(p_under)
+        pushes.append(p_push)
+        reasons.append(warning)
+        # A row with no probability at all is not a refusal, it is an absence.
+        if warning is not None and p_over is not None:
+            refused += 1
+
+    under_series = pd.Series(unders, index=index, dtype="object")
+    if refused:
+        logger.info(
+            "P(under)/P(push): resolved on %d row(s); %d scored row(s) left null "
+            "because the line is whole or unknown and a binary classifier has no "
+            "push mass to split out. 1 - P(over) is not the under there.",
+            int(under_series.notna().sum()), refused,
+        )
+    else:
+        logger.info(
+            "P(under)/P(push): resolved on %d row(s).",
+            int(under_series.notna().sum()),
+        )
+    return (
+        under_series,
+        pd.Series(pushes, index=index, dtype="object"),
+        pd.Series(reasons, index=index, dtype="object"),
+    )
 
 
 def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | None) -> pd.Series:

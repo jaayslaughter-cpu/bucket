@@ -61,9 +61,13 @@ def resolve_two_way_model_probs(
     """
     Resolve P(over) / P(under) / P(push) for dual-side research.
 
-    - Half-point (or unknown) lines: push = 0; missing under = 1 − over.
-    - Whole-number lines: need an explicit under and/or push — never dump
-      push mass into under via a silent complement.
+    - Half-point lines: push = 0; missing under = 1 − over.
+    - Whole-number lines, AND unknown ones: need an explicit under and/or
+      push — never dump push mass into under via a silent complement. An
+      unknown line cannot be shown to be a half-line, so it takes the branch
+      that refuses rather than the one that assumes (see
+      ``is_whole_number_line``). This docstring said "half-point (or unknown)"
+      until 2026-10-04, which contradicted both the helper and the code.
     Returns (p_over, p_under, p_push, warning_or_None).
     """
     if p_over is None or not np.isfinite(float(p_over)):

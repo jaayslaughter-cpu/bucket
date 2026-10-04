@@ -71,9 +71,18 @@ def _keys_written_by_assemble_projections() -> set[str]:
                     for k in sub.keys:
                         if isinstance(k, ast.Constant) and isinstance(k.value, str):
                             keys.add(k.value)
-                # form 2: out["KEY"] = value
+                # form 2: out["KEY"] = value, including
+                #   out["A"], out["B"] = ...
+                # which this missed until 2026-10-04 — a tuple target made the
+                # keys invisible and the test reported a false missing key.
                 if isinstance(sub, ast.Assign):
+                    flat = []
                     for target in sub.targets:
+                        if isinstance(target, (ast.Tuple, ast.List)):
+                            flat.extend(target.elts)
+                        else:
+                            flat.append(target)
+                    for target in flat:
                         if (
                             isinstance(target, ast.Subscript)
                             and isinstance(target.slice, ast.Constant)
