@@ -50,9 +50,10 @@ in the production path:
 | `src/ingestion/espn_schedule.py` `load_slate()` | games, tip-offs, `pregame_only` | `scripts/nba_model_cli.py` only |
 | `src/ingestion/espn_availability.py` `fetch_roster()` | players per ESPN team id | **nothing** |
 
-`docs/go_live_readiness.md` records the gap as "schedule source is still open",
-which is now partly stale — ESPN *is* a schedule source here. What that note
-does not say is the consequence: a deployed worker is not degraded, it is inert.
+`docs/go_live_readiness.md` recorded this as "schedule source is still open"
+without its consequence. Reconciled 2026-10-04: it is O11 there, and the
+consequence is stated — a deployed worker is not degraded, it is inert. A
+forward slate needs both halves, the schedule *and* a roster.
 
 ### 1.2a CLOSED (2026-10-04) — OddsPapi was in the source precedence with no client
 
