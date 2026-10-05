@@ -219,3 +219,73 @@ def test_verify_wiring_would_fail_if_the_field_were_dropped_again():
         if getattr(row, f, None)
     }
     assert carried, "verify_wiring's board-date guard would report a FAIL"
+
+
+# --- the live chain: CSV round-trip into the embed ----------------------
+
+def test_the_date_survives_the_csv_round_trip_dispatch_actually_does(tmp_path):
+    """
+    THE LINK THE OTHER TESTS SKIP. They go row -> candidate -> embed in
+    memory. The deployed worker does not: run_board writes a CSV, run_dispatch
+    reads it back with pd.read_csv and rebuilds duck-typed row objects from
+    `frame.to_dict("records")`, and only then builds the embed. A column that
+    is dropped, renamed or NaN-ed by that round trip would leave every
+    in-memory test green and the live card still misleading.
+
+    This reproduces that exact reconstruction.
+    """
+    import pandas as pd
+
+    from src.notify.discord import build_decision_board_embed
+    from src.quant.decision_board import write_decision_board_csv
+
+    row = board_row(game_date="2025-02-10")
+    board = build_decision_board([row], min_ev=-1.0, require_valid_book=False)
+
+    # THROUGH A REAL FILE, because that is where dtype coercion happens.
+    target = tmp_path / "decision_board.csv"
+    write_decision_board_csv(board, target)
+    frame = pd.read_csv(target)
+    assert "game_date" in frame.columns
+
+    # run_dispatch's own reconstruction, verbatim in shape.
+    rows = [
+        type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
+        for r in frame.to_dict("records")
+    ]
+    # One candidate per SIDE, so a single research row yields over and under.
+    assert {getattr(r, "game_date", None) for r in rows} == {"2025-02-10"}
+
+    slate = str(frame["slate_date"].iloc[0])
+    blob = repr(build_decision_board_embed(rows, slate_date=slate))
+    assert "NOT TONIGHT'S SLATE" in blob
+    assert "2025-02-10" in blob
+
+
+def test_a_csv_with_an_empty_game_date_cell_reads_as_unknown_not_as_today(tmp_path):
+    """
+    A null round-trips through CSV as an empty cell and comes back as NaN,
+    which run_dispatch maps to None. It must not become the string "nan" --
+    that would print as a date and read as a real one.
+    """
+    import pandas as pd
+
+    from src.notify.discord import build_decision_board_embed
+    from src.quant.decision_board import write_decision_board_csv
+
+    row = board_row(game_date=None)
+    board = build_decision_board([row], min_ev=-1.0, require_valid_book=False)
+    target = tmp_path / "decision_board.csv"
+    write_decision_board_csv(board, target)
+    frame = pd.read_csv(target)
+    assert frame["game_date"].isna().all()
+
+    rows = [
+        type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
+        for r in frame.to_dict("records")
+    ]
+    assert all(getattr(r, "game_date", "sentinel") is None for r in rows)
+
+    blob = repr(build_decision_board_embed(rows, slate_date=SLATE))
+    assert "no game date" in blob.lower()
+    assert "nan" not in blob.lower().replace("financ", "")
