@@ -837,6 +837,15 @@ def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | Non
     """
     Exact-match join of captured prop lines onto projections.
 
+    THE JOIN IS STILL EXACT. What changed is that the board's names are first
+    rewritten to the panel's canonical form by
+    ``ingestion.id_crosswalk.resolve_board_names``, which is deterministic:
+    diacritics, dots, apostrophes and hyphens are normalised away so
+    ``Nikola Jokic`` resolves to ``Nikola Jokić``, while ``Jalen Williams`` and
+    ``Jaylen Williams`` stay two different people. A name that resolves to two
+    players is refused rather than guessed. See that module for why a fuzzy
+    score cutoff cannot do this job.
+
     Returns an all-None Series when no prop lines exist (correct
     off-season) rather than raising — but logs the unmatched count so a
     systematic name-format mismatch is visible rather than silent.
@@ -852,8 +861,13 @@ def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | Non
         )
         return null
 
+    from src.ingestion.id_crosswalk import apply_name_map, resolve_board_names
+
+    name_map, _report = resolve_board_names(prop_lines, projections)
+    resolved = apply_name_map(prop_lines, name_map)
+
     lookup = (
-        prop_lines.dropna(subset=["player_name", "market"])
+        resolved.dropna(subset=["player_name", "market"])
         .drop_duplicates(subset=["player_name", "market"], keep="last")
         .set_index(["player_name", "market"])["line"]
     )
@@ -865,9 +879,9 @@ def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | Non
     unmatched = int(result.isna().sum())
     if unmatched and unmatched == len(result):
         logger.warning(
-            "NO prop lines matched any projection (%d rows). Likely a player-name "
-            "format mismatch between the pick'em board and the player panel — "
-            "consider routing through ingestion/id_crosswalk.py.",
+            "NO prop lines matched any projection (%d rows), even after the name "
+            "crosswalk. The board and the panel are describing different players "
+            "or a different slate — not a name-format problem.",
             unmatched,
         )
     return result

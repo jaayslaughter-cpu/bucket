@@ -330,6 +330,24 @@ zero files.** No code at all.
 
 ## 8. Integration recommendation — extract vs ignore
 
+**PORTED 2026-10-05 — items 1 to 3 below are done.** `src/ingestion/id_crosswalk.py`,
+`src/quant/psd_repair.py` and `src/features/fatigue_fit.py`, with
+`tests/test_name_crosswalk.py` (34), `tests/test_psd_repair.py` (17) and
+`tests/test_fatigue_fit.py` (15). Two things changed on contact with the data
+and are written up where they belong:
+
+- The crosswalk is **not** a fuzzy matcher. Measured on real NBA names, no
+  score cutoff separates `Jokic`/`Jokić` (81.8) from `Jalen`/`Jaylen` Williams
+  (96.6), so the reference's `score_cutoff=85` would drop Dončić and accept the
+  wrong Williams. It is deterministic normalisation instead, and ambiguity
+  abstains. The port also found a **safety bug**: `scratches._normalise` was
+  lowercase-only, so a player ESPN reported OUT as `Nikola Jokić` was labelled
+  AVAILABLE against a panel spelling `Nikola Jokic`.
+- The fatigue fit came out **above 1.0 on every flag and every stat**, against
+  constants of 0.94–0.97. That is survivorship, not evidence, so the constants
+  were left alone — `docs/fatigue_fit.md` has the numbers and the design that
+  would actually answer it.
+
 **Extract, in this order:**
 
 1. **`id_crosswalk.py`** from the pack → `src/ingestion/id_crosswalk.py`.

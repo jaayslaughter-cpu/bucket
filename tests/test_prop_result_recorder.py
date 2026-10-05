@@ -149,9 +149,29 @@ def test_the_join_is_exact_and_never_fuzzy():
     """
     A near-miss name must not attach another player's price. In a settlement
     ledger that is not a near miss, it is a wrong record.
+
+    THE EXAMPLE CHANGED on 2026-10-05, the intent did not. It used to be
+    ``demo_a`` against ``DEMO_A`` — which is the SAME NAME in a different case,
+    not a near miss — and it passed only because the join was case-sensitive.
+    ``ingestion.id_crosswalk`` now case-folds, which is deterministic
+    normalisation rather than fuzzy matching, so the example is now two real
+    players whose names genuinely differ by a letter.
+    """
+    report = pending_prop_result_rows(
+        projections(PLAYER_NAME="Jalen Williams"),
+        lines(player_name="Jaylen Williams"),
+    )
+    assert report.rows == []
+    assert report.skipped and "source" in report.skipped[0]["reason"]
+
+
+def test_a_case_difference_is_the_same_name_and_does_join():
+    """
+    The other half of the change above. Case is not identity, and a board that
+    upper-cases its names should not cost a row.
     """
     report = pending_prop_result_rows(projections(), lines(player_name="demo_a"))
-    assert report.rows == []
+    assert len(report.rows) == 1
 
 
 @pytest.mark.parametrize("bad", [1.4, -0.2])
