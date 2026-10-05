@@ -194,8 +194,10 @@ LAYERS: dict[str, Layer] = {
         (
             "DVP_PTS_ALLOWED_L10", "DVP_REB_ALLOWED_L10", "DVP_AST_ALLOWED_L10",
             "DVP_FG3M_ALLOWED_L10", "DVP_STL_ALLOWED_L10", "DVP_BLK_ALLOWED_L10",
+            "DVP_PRA_ALLOWED_L10",
             "DVP_PTS_INDEX_L10", "DVP_REB_INDEX_L10", "DVP_AST_INDEX_L10",
             "DVP_FG3M_INDEX_L10", "DVP_STL_INDEX_L10", "DVP_BLK_INDEX_L10",
+            "DVP_PRA_INDEX_L10",
         ),
         note=(
             "Opponent defence split by the position it is defending -- the "
@@ -204,7 +206,9 @@ LAYERS: dict[str, Layer] = {
             "adds anything to DEF_RATING_L10, which hands every player in a "
             "game the same number. Covers the 87.2% of rows with an as-of "
             "position bucket; no market reads these columns, so run it with "
-            "--wire-under-test."
+            "--wire-under-test. REB was measured and improved Brier on 4 of 4 "
+            "folds (docs/fouls_and_dvp.md section 3a); PRA, whose DVP_PRA_* "
+            "pair is new, has not been run."
         ),
     ),
     # The four layers that ran on every build while no market read a column
@@ -322,8 +326,9 @@ _STAT_PREFIXES = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA")
 # labels._DEFENSE_BY_MARKET and must not be handed to a market it is not for.
 _UNIVERSAL_DEFENSE_COLS = frozenset({"DEF_RATING_L10", "DEF_PACE_L10"})
 
-# The three stats PRA is the sum of, so a PRA arm sees all three matchups.
-# Mirrors labels._DEFENSE_BY_MARKET["PRA"].
+# The three stats PRA is the sum of. Still used for the DEF_* family, which
+# has no combined column, so a PRA arm sees the rebound and assist defence
+# rates. Mirrors labels._DEFENSE_BY_MARKET["PRA"].
 _PRA_COMPONENTS = frozenset({"PTS", "REB", "AST"})
 
 
@@ -384,12 +389,26 @@ def _dvp_for_market(column: str, market: str) -> bool:
     encodes is not obvious from the column names: DVP_* carries its stat in
     the MIDDLE, so DVP_REB_ALLOWED_L10 starts with neither "REB_" nor
     "OPP_REB_" and the stat-prefix filter in _run does not see it at all.
+
+    PRA USED TO BE A SPECIAL CASE HERE and is not any more. It returned the
+    three COMPONENT matchups (PTS, REB, AST) because the layer had no combined
+    column; dvp.DVP_COMBOS now emits DVP_PRA_*, so PRA routes by the same
+    equality as every other market. Offering both would hand the model one
+    number twice on the ALLOWED side, where DVP_PRA_ALLOWED_L10 is the sum of
+    the three component columns by construction — a perfect dependency, well
+    past the ~0.97 at which labels._EXCLUDED_AS_REDUNDANT excludes a whole
+    feature family.
+
+    This CHANGES what `--layer dvp --markets PRA` measures, and invalidates
+    nothing: only the REB arm has ever been run (docs/fouls_and_dvp.md section
+    3a), and it reads DVP_REB_* either way. Whether the three component INDEX
+    columns carry something DVP_PRA_INDEX_L10 does not — they are ratios and
+    do not add, so the combo cannot reconstruct which stat a defence concedes
+    — is a separate arm nobody has run.
     """
     if not column.startswith("DVP_"):
         return True
     stat = column[len("DVP_"):].split("_", 1)[0]
-    if market.upper() == "PRA":
-        return stat in _PRA_COMPONENTS
     return stat == market.upper()
 
 

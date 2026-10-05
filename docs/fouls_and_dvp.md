@@ -221,6 +221,109 @@ points separate least across buckets, rebounds most.
 Most of what the position split carries is **not** in the team-level defence
 columns. Compare `DEF_RATING_INDEX_L10`'s 0.999 against `DEF_RATING_L10`.
 
+### Combination markets: `PRA`, and only `PRA`
+
+`PRA` is a market here (`labels.POST_LAUNCH_MARKETS`) and now gets
+`DVP_PRA_ALLOWED_L10` and `DVP_PRA_INDEX_L10`.
+
+**`PR`, `PA` and `RA` were asked for and are deliberately absent.** They are
+not markets in this project — `LAUNCH_MARKETS` is `(PTS, REB, AST)` and
+`POST_LAUNCH_MARKETS` is `(FG3M, STL, BLK, PRA)` — so nothing could read them
+and `feature_ab._dvp_for_market` has no market to route them to. Six columns
+computed on every build for nobody is the exact state AGENTS.md records four
+feature layers sitting in, with 71 numeric columns no market read. `DVP_COMBOS`
+is the one place to turn one on, and
+`test_every_combo_is_a_market_this_project_models` fails both ways: adding a
+combo without the market, and removing the market while the combo stays.
+
+#### The sum happens per player-game, not over the finished columns
+
+"Allowed means add" is true only while the means share a denominator, and this
+layer has two places they can stop doing so. Both aggregations skip nulls **per
+column**: the per-game bucket mean is a `groupby(...).mean()`, and the window is
+a `.rolling(min_periods=5).mean()`. So a player-game with points but no assists
+sits in one mean's denominator and not the other's, and a bucket with eight
+games of points and ten of rebounds averages two different sets of games.
+
+Summing inside the player-game — masked to rows where every part is known —
+makes one column that then travels the identical path a base stat travels.
+
+**Measured, and on today's panel it changes nothing.** PTS, REB and AST are
+null on **0** of the archive panel's 214,381 rows, so the two constructions
+agree to 7.1e-15 on all 56,729 rows where both are known. That is floating
+point, not disagreement. It is a **guard**, and what it guards against is
+reachable: the live panel comes from `player_game_logs`, where `pts`, `reb` and
+`ast` are each independently nullable.
+
+It also takes two conditions, which is worth recording because the first
+version of the test had only one. Nulling a component is not enough — the
+fixture gave every player in a bucket the same line, so dropping one from the
+AST denominator left the mean at 4 and the two constructions still agreed
+exactly. The divergence needs the bucket to be **heterogeneous** as well. Both
+directions are now asserted.
+
+#### The index is re-derived and never summed
+
+`_INDEX` columns are **ratios**. Adding three of them, each divided by a
+different league baseline, gives a quantity centred on 3 with no
+interpretation. Measured on the real panel:
+
+| | mean | correlation with the correct column |
+|---|---|---|
+| `DVP_PTS_INDEX + DVP_REB_INDEX + DVP_AST_INDEX` | 3.009 | 0.917 |
+| `DVP_PRA_INDEX_L10` (re-derived) | 1.001 | — |
+
+At `r` = 0.917 the summed version is not even a monotone restatement of the
+right number. `DVP_PRA_INDEX_L10` is `DVP_PRA_ALLOWED_L10` divided by what the
+league allowed **that bucket** in PRA, through the same
+`_bucket_relative_index` as every other index column, and it centres on 1.00 in
+all three buckets (C 1.006 / F 0.997 / G 1.001).
+
+#### The prior for the combo is weaker than for any of its parts
+
+Stated here so the column is not read as more promising than it is. Combining
+averages the position split away, because the component splits point in
+opposite directions:
+
+| allowed, per player-game | C | F | G | max/min |
+|---|---|---|---|---|
+| `REB` | 7.31 | 4.63 | 3.36 | **2.17** |
+| `AST` | 1.87 | 2.10 | 3.65 | 1.96 |
+| `PTS` | 10.92 | 11.44 | 12.89 | 1.18 |
+| `PRA` | 20.09 | 18.16 | 19.91 | **1.11** |
+
+Centres concede rebounds, guards concede assists, and the sum cancels most of
+both — `PRA` is the flattest of the four across buckets. The index follows: its
+within-bucket dispersion is the smallest of the set (sd 0.115 against REB's
+0.133 and AST's 0.198), so there is less matchup left to find.
+
+Coverage is the same 81.7% / 81.4% as the rest of the layer. Neither new column
+is in the 0.83–0.99 redundancy band against anything `PRA` already reads — the
+top correlate is `MKT_IMPLIED_TEAM_TOTAL` at 0.29, and `DEF_RATING_L10` is
+0.20–0.25. The deletion test (check 2 of `scripts/audit_leakage.py`, the one
+that catches an as-of mean quietly computed season-wide) moved **0 of 37,361**
+surviving rows for both new columns.
+
+Cheap, correct, leakage-clean, and with a smaller expected effect than the REB
+arm found. `--layer dvp --wire-under-test --markets PRA` is the arm that would
+settle it; it has not been run.
+
+#### What this changed about the PRA arm
+
+`feature_ab._dvp_for_market` used to give `PRA` the three **component**
+matchups, because the layer had no combined column. It now routes by the same
+equality as every other market, so `PRA` gets `DVP_PRA_*` and not the parts.
+Offering both would hand the model one number twice on the `ALLOWED` side,
+where `DVP_PRA_ALLOWED_L10` *is* the sum of the three components by
+construction — well past the ~0.97 at which `labels._EXCLUDED_AS_REDUNDANT`
+excludes whole feature families.
+
+This invalidates nothing: only the REB arm has ever been run, and it reads
+`DVP_REB_*` either way. Whether the three component `_INDEX` columns carry
+something `DVP_PRA_INDEX_L10` cannot — they are ratios and do not add, so the
+combo cannot reconstruct *which* stat a defence concedes — is a separate arm
+nobody has run.
+
 ## 2b. The repository's own leakage auditor was run
 
 `scripts/audit_leakage.py`'s deletion test rebuilds the feature matrix with

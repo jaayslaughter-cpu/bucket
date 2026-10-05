@@ -288,12 +288,35 @@ covers 18 seasons.
 - Measure with `scripts/feature_ab.py --layer <new> --wire-under-test` against
   `--layer dvp`, which is the comparison that decides which survives.
 
-**3. Combo-market DvP (LOW cost, small win).** Add `DVP_PRA_*`, `DVP_PR_*`,
-`DVP_PA_*`, `DVP_RA_*` to `src/features/dvp.py` as linear combinations of the
-existing per-stat columns. Valid because allowed means add. One caveat to
-state in the code: the `_INDEX` columns are **ratios** and do not add, so the
-combination must be done on `_ALLOWED` and re-indexed, not summed from
-`_INDEX`.
+**3. Combo-market DvP (LOW cost, small win). DONE, with two deviations.**
+`src/features/dvp.py` now emits `DVP_PRA_ALLOWED_L10` and
+`DVP_PRA_INDEX_L10`. Write-up: `docs/fouls_and_dvp.md` section 2's
+"Combination markets".
+
+- **`DVP_PR_*`, `DVP_PA_*` and `DVP_RA_*` were NOT added.** PR, PA and RA are
+  not markets in this project (`labels.LAUNCH_MARKETS` is PTS/REB/AST,
+  `POST_LAUNCH_MARKETS` is FG3M/STL/BLK/PRA), so nothing could read them and
+  `feature_ab._dvp_for_market` has no market to route them to. This item asked
+  for six columns computed on every build for nobody — the state AGENTS.md
+  records four feature layers sitting in. `dvp.DVP_COMBOS` is the one place to
+  turn one on, guarded by a test that every combo is a market.
+- **"Linear combinations of the existing per-stat columns" is not what was
+  built**, and the item's own premise is why. "Allowed means add" holds only
+  while the means share a denominator, and both of this layer's aggregations
+  skip nulls per column. The sum therefore happens PER PLAYER-GAME, masked to
+  rows where every part is known, and the one column then travels the same
+  path a base stat travels. On today's panel the two agree to 7.1e-15 (no
+  component is ever null in the archive), so it is a guard rather than a fix —
+  but `player_game_logs` has pts, reb and ast independently nullable, so the
+  live panel can produce exactly the partial row that breaks it.
+
+The `_INDEX` caveat this item named was right and it matters more than it
+looks: the summed trio has mean 3.009 against the re-derived column's 1.001
+and correlates with it at only 0.917, so it is not even a monotone restatement.
+Also measured, and worth stating against this item's "small win": combining
+averages the position split away. `PRA`'s between-bucket ratio is 1.11, the
+flattest of the four, because rebounds (C-heavy, 2.17x) and assists (G-heavy,
+1.96x) cancel. The arm has not been run.
 
 **4. Fix our own line-diff with dispersion, not their factors (MEDIUM).**
 Replace `_line_adjust_fair_prob`'s flat `0.03` with a CDF evaluation from

@@ -726,8 +726,12 @@ def test_each_market_is_offered_only_its_own_matchup_columns():
     written to fix, and it was reproduced in a launched run before being
     caught.
 
-    PRA takes the three it is the sum of, which is how
-    labels._DEFENSE_BY_MARKET already treats it.
+    PRA USED TO TAKE THE THREE IT IS THE SUM OF, because the layer had no
+    combined column. It has one now (``dvp.DVP_COMBOS``), so PRA routes by the
+    same equality as every other market. Offering both would hand the model one
+    number twice on the ALLOWED side — ``DVP_PRA_ALLOWED_L10`` IS the sum of
+    the three component columns by construction, which is past the ~0.97 at
+    which ``labels._EXCLUDED_AS_REDUNDANT`` excludes whole feature families.
     """
     import importlib.util
 
@@ -751,11 +755,14 @@ def test_each_market_is_offered_only_its_own_matchup_columns():
         assert got == expected, (market, sorted(got))
 
     pra = {c for c in under_test if module.column_for_market(c, "PRA")}
-    assert pra == {
-        "DVP_PTS_ALLOWED_L10", "DVP_PTS_INDEX_L10",
-        "DVP_REB_ALLOWED_L10", "DVP_REB_INDEX_L10",
-        "DVP_AST_ALLOWED_L10", "DVP_AST_INDEX_L10",
-    }, sorted(pra)
+    assert pra == {"DVP_PRA_ALLOWED_L10", "DVP_PRA_INDEX_L10"}, sorted(pra)
+    # And the components are NOT also offered, which is the half that would
+    # rot quietly: both sets parse, both look plausible, and only one of them
+    # avoids giving the model DVP_PRA_ALLOWED_L10 and its three addends.
+    for component in ("PTS", "REB", "AST"):
+        assert not module.column_for_market(
+            f"DVP_{component}_ALLOWED_L10", "PRA"
+        ), component
 
     # MIN reads no matchup column: there is no DVP_MIN_*, and a market with
     # no member of the family must get nothing rather than everything.
@@ -788,3 +795,193 @@ def test_each_market_is_offered_only_its_own_matchup_columns():
         "every column under test and every delta would answer a different "
         "question than the one asked"
     )
+
+
+# --- combination markets -------------------------------------------------
+
+def test_the_pra_pair_is_emitted_and_nothing_else_is():
+    """
+    PR, PA and RA were in the extraction plan and are deliberately absent.
+    They are not markets here, so nothing could read them and
+    feature_ab._dvp_for_market has no market to route them to — six columns
+    computed on every build for nobody, which is the state AGENTS.md records
+    four feature layers sitting in.
+    """
+    from src.features.dvp import DVP_COMBOS
+
+    assert set(DVP_COMBOS) == {"PRA"}
+    table = build_opponent_allowed(league())
+    assert ALLOWED_TEMPLATE.format(stat="PRA") in table.columns
+    assert INDEX_TEMPLATE.format(stat="PRA") in table.columns
+    for absent in ("PR", "PA", "RA"):
+        assert ALLOWED_TEMPLATE.format(stat=absent) not in table.columns
+
+
+def test_every_combo_is_a_market_this_project_models():
+    """
+    THE GUARD THAT KEEPS THE RULE A RULE rather than a comment in DVP_COMBOS.
+    Adding a combo without adding the market fails here, and so does removing
+    PRA from the market tuples while the combo stays — the second being the
+    direction a comment cannot catch at all.
+    """
+    from src.features.dvp import DVP_COMBOS
+    from src.models.labels import LAUNCH_MARKETS, POST_LAUNCH_MARKETS
+
+    markets = set(LAUNCH_MARKETS) | set(POST_LAUNCH_MARKETS)
+    for combo in DVP_COMBOS:
+        assert combo in markets, (
+            f"DVP_COMBOS emits {combo} and no market reads it; either add the "
+            f"market to labels.py or drop the combo"
+        )
+
+
+def test_the_combo_allowed_column_is_the_sum_of_its_parts_when_nothing_is_missing():
+    """
+    The claim the extraction plan rested on — "allowed means add" — stated as
+    an assertion. It holds here because every component is present on every
+    row, which is also true of the real archive panel: PTS, REB and AST are
+    null on 0 of its 214,381 rows, and the two constructions agree to 7.1e-15.
+    """
+    table = build_opponent_allowed(league())
+    parts = [
+        table[ALLOWED_TEMPLATE.format(stat=s)] for s in ("PTS", "REB", "AST")
+    ]
+    naive = parts[0] + parts[1] + parts[2]
+    combo = table[ALLOWED_TEMPLATE.format(stat="PRA")]
+    both = naive.notna() & combo.notna()
+    assert both.any()
+    assert int(naive.isna().sum()) == int(combo.isna().sum())
+    np.testing.assert_allclose(naive[both], combo[both], rtol=0, atol=1e-9)
+
+
+def test_a_missing_component_makes_the_naive_sum_wrong_and_the_combo_null():
+    """
+    THE REASON THE SUM HAPPENS PER PLAYER-GAME. "Allowed means add" holds only
+    while the three means share a denominator, and both of this layer's
+    aggregations skip nulls PER COLUMN. Null one player's assists in one game
+    and PTS_mean + AST_mean stops being the mean of (PTS + AST) over one
+    population — while still being a perfectly plausible number.
+
+    Reachable rather than hypothetical: the live panel comes from
+    `player_game_logs`, where pts, reb and ast are each independently
+    nullable.
+
+    IT TAKES TWO CONDITIONS, AND THE FIRST VERSION OF THIS TEST HAD ONLY ONE.
+    Nulling a component is not enough: `league()` gives every player in a
+    bucket the same line, so dropping one from the AST denominator leaves the
+    mean at 4 and the two constructions still agree exactly. The divergence
+    needs the bucket to be HETEROGENEOUS as well, which is the real-world
+    case and is asserted in both directions below.
+    """
+    def _naive_vs_combo(panel):
+        table = build_opponent_allowed(panel)
+        allowed = [ALLOWED_TEMPLATE.format(stat=s) for s in ("PTS", "REB", "AST")]
+        naive = table[allowed[0]] + table[allowed[1]] + table[allowed[2]]
+        combo = table[ALLOWED_TEMPLATE.format(stat="PRA")]
+        both = naive.notna() & combo.notna()
+        assert both.any(), "the fixture no longer produces comparable rows"
+        return int(((naive[both] - combo[both]).abs() > 1e-9).sum())
+
+    guards = league().index[league()[STARTING_POSITION_COLUMN] == "G"]
+
+    # A missing component in a UNIFORM bucket: no divergence, because the
+    # smaller denominator averages the same number.
+    uniform = league()
+    uniform.loc[guards[3], "AST"] = np.nan
+    assert _naive_vs_combo(uniform) == 0
+
+    # The same missing component once that player's line differs from his
+    # bucket-mates': his PTS stays in the PTS denominator and his whole PRA
+    # leaves the PRA denominator, so the two stop agreeing.
+    mixed = league()
+    mixed.loc[guards[3], "PTS"] = 40.0
+    mixed.loc[guards[3], "AST"] = np.nan
+    assert _naive_vs_combo(mixed) > 0, (
+        "the naive sum and the per-game sum agree even with a component "
+        "missing from a heterogeneous bucket, so this test is not exercising "
+        "the mask it exists for"
+    )
+
+
+def test_the_combo_index_is_re_derived_and_never_a_sum_of_indices():
+    """
+    The caveat the extraction plan named, as a measurement. `_INDEX` columns
+    are RATIOS: adding three of them, each divided by a different league
+    baseline, gives a quantity centred on 3 with no interpretation. On the
+    real panel the summed trio has mean 3.009 against DVP_PRA_INDEX_L10's
+    1.001, and they correlate only 0.917 — so it is not even a monotone
+    restatement of the right number.
+    """
+    table = build_opponent_allowed(league(concede={
+        "AAA": {"G": 30.0, "F": 10.0, "C": 10.0},
+        "BBB": {"G": 10.0, "F": 10.0, "C": 10.0},
+    }))
+    index = table[INDEX_TEMPLATE.format(stat="PRA")].dropna()
+    assert len(index)
+    # Centred on 1, like every other index column in this layer.
+    assert 0.5 < index.mean() < 1.5, index.mean()
+    summed = sum(
+        table[INDEX_TEMPLATE.format(stat=s)] for s in ("PTS", "REB", "AST")
+    ).dropna()
+    assert len(summed)
+    assert summed.mean() > 2.0, (
+        "the summed trio is not centred near 3, so this fixture no longer "
+        "demonstrates why the index must be re-derived"
+    )
+
+
+def test_tonights_conceded_pra_is_never_in_tonights_number():
+    """
+    `.shift(1)` is this project's first rule and a new column is exactly where
+    it gets forgotten. Built in the idiom of
+    `test_tonights_concession_is_never_in_tonights_number`, which is the
+    version that bites: spike ONE game and require that game's own value to be
+    unchanged while a LATER game's value moves.
+
+    The first attempt at this test asserted a constant conceded level instead,
+    and a constant reads the same shifted or not — deleting `.shift(1)` left
+    it passing.
+    """
+    panel = league(rounds=14)
+    spiked = panel.copy()
+    target = spiked[
+        (spiked["OPPONENT_ABBREVIATION"] == "BBB")
+        & (spiked["GAME_DATE"] == pd.Timestamp("2025-11-06"))
+    ].index
+    assert len(target) > 0
+    spiked.loc[target, "PTS"] = 99.0
+
+    col = ALLOWED_TEMPLATE.format(stat="PRA")
+    keys = ["PLAYER_ID", "GAME_ID"]
+    base = attach_dvp_features(panel, required=True).set_index(keys)[col]
+    after = attach_dvp_features(spiked, required=True).set_index(keys)[col]
+    rows = panel.loc[target].set_index(keys).index
+    pd.testing.assert_series_equal(base.loc[rows], after.loc[rows])
+    # And it DOES reach a later game, or the column would be inert.
+    assert (after > base + 1e-9).any()
+
+
+def test_a_panel_missing_a_component_stat_emits_no_combo_at_all():
+    """
+    A PRA built from points and rebounds alone would be a column named for a
+    sum it does not contain. The base stats it CAN compute still come out.
+    """
+    panel = league().drop(columns=["AST"])
+    table = build_opponent_allowed(panel)
+    assert ALLOWED_TEMPLATE.format(stat="PRA") not in table.columns
+    assert INDEX_TEMPLATE.format(stat="PRA") not in table.columns
+    assert ALLOWED_TEMPLATE.format(stat="PTS") in table.columns
+    assert ALLOWED_TEMPLATE.format(stat="REB") in table.columns
+
+
+def test_the_combo_reaches_the_panel_through_the_layer_entry_point():
+    """
+    build_opponent_allowed producing a column is not the same as the panel
+    carrying it — the join is a separate step and drops what it is not given.
+    """
+    out = attach_dvp_features_layer(league())
+    for template in (ALLOWED_TEMPLATE, INDEX_TEMPLATE):
+        col = template.format(stat="PRA")
+        assert col in out.columns
+        assert out[col].notna().any(), f"{col} is null on every row"
+    assert set(DVP_FEATURE_COLS) <= set(out.columns)

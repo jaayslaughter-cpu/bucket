@@ -90,6 +90,48 @@ of the fourth guard it faced rather than on anything about the team. Here the
 per-game bucket mean is computed FIRST, one value per (defender, game,
 bucket), and the ten-game window is then ten of the defender's games.
 
+COMBINATION MARKETS, AND THE ONE THING THAT MAKES THEM WRONG. ``PRA`` is a
+market here (``labels.POST_LAUNCH_MARKETS``) and gets ``DVP_PRA_ALLOWED_L10``
+and ``DVP_PRA_INDEX_L10``. Two rules, both of which a naive implementation
+breaks:
+
+  * THE SUM HAPPENS PER PLAYER-GAME, not over the finished ``_ALLOWED``
+    columns. "Allowed means add" holds only while the means share a
+    denominator, and both aggregations here skip nulls per column — so a
+    player-game with points but no assists sits in one mean's denominator and
+    not the other's, and a bucket with eight games of points and ten of
+    rebounds averages two different sets of games. Summing inside the
+    player-game, masked to rows where every part is known, makes one column
+    that then travels the identical path a base stat travels.
+  * THE INDEX IS RE-DERIVED, NEVER SUMMED. ``_INDEX`` columns are RATIOS.
+    Adding three ratios whose denominators are three different league
+    baselines produces a number with no interpretation at all. ``DVP_PRA_
+    INDEX_L10`` is ``DVP_PRA_ALLOWED_L10`` divided by what the league allowed
+    THAT BUCKET in PRA, computed by the same ``_bucket_relative_index`` as
+    every other index column.
+
+``PR``, ``PA`` and ``RA`` are deliberately absent — see ``DVP_COMBOS``.
+
+AND THE PRIOR FOR THE COMBO IS WEAKER THAN FOR ANY OF ITS PARTS, measured on
+the real panel and stated here so the column is not read as more promising
+than it is. Combining averages the position split away, because the component
+splits point in opposite directions:
+
+           C      F      G    max/min
+  REB    7.31   4.63   3.36    2.17
+  AST    1.87   2.10   3.65    1.96
+  PTS   10.92  11.44  12.89    1.18
+  PRA   20.09  18.16  19.91    1.11
+
+Centres concede rebounds, guards concede assists, and the sum cancels most of
+both: PRA is the FLATTEST of the four across buckets. The index column follows
+— its within-bucket dispersion is the smallest of the set (sd 0.115 against
+REB's 0.133 and AST's 0.198), so there is less matchup to find. Coverage is
+the same 81.7% / 81.4% as the rest of the layer, and neither new column is in
+the 0.83-0.99 redundancy band against anything PRA already reads (the top
+correlate is ``MKT_IMPLIED_TEAM_TOTAL`` at 0.29). Cheap and correct; a smaller
+expected effect than the REB arm found.
+
 LEAKAGE, in the three places it could enter:
 
   1. The player's bucket is expanding-shifted over his own prior starts.
@@ -121,31 +163,43 @@ BUCKET — is comparable across all three. The index is the modelling column
 and the raw value is kept for reporting, which is the reverse of the
 defence layer's split for a stated reason.
 
-NOT WIRED INTO ANY MODEL YET. Absent from ``labels.default_feature_cols`` on
-purpose; ``scripts/feature_ab.py --layer dvp --wire-under-test`` is where a
-defence-versus-position term earns its place or does not.
+MEASURED, AND STILL NOT WIRED INTO ANY MODEL. It is absent from
+``labels.default_feature_cols``, and the reason has changed twice, so the
+current one is worth stating exactly.
 
-AND IT IS TRAINING-ONLY TODAY, which is stated here rather than discovered
-later. ``STARTING_POSITION`` reaches the panel only from the Kaggle archive
-ingest (``scripts/ingest_training_pack.py``). The live path builds its panel
-from ``player_game_logs`` via ``repository.load_player_panel``, that table has
-no position column, and the live puller has none to write: the header list of
-``src/ingestion/boxscores.py``'s ``leaguegamelog`` payload, recorded in
-``tests/test_boxscore_ingest.py``, carries no starting lineup. (That list was
-checked rather than assumed, because the first draft of this note asserted the
-same endpoint had no PF column and the header list says it does — which is how
-``fouls`` came to reach the live path and this layer does not.) So on a live
-slate this layer finds no ``STARTING_POSITION``, logs that it is skipping, and
-adds no columns, which is the designed behaviour for a missing input rather
-than a silent zero.
+``--layer dvp --wire-under-test --markets REB --folds 4`` came back BETTER on
+every fold for four of the five models, at 1.3-2.5x the fold spread, and
+``DVP_REB_INDEX_L10`` sits at 0.025 against ``DEF_RATING_L10`` — very nearly
+orthogonal to the team-level number that hands every player in a game the same
+value, which is the question this layer was built to settle. Calibrated ECE
+did not improve. Numbers, the three-season slice's cost and the collinearity
+table: ``docs/fouls_and_dvp.md`` section 3a. ``PRA``, whose ``DVP_PRA_*`` pair
+is new, has not been run; no other market has either.
 
-Closing the gap needs a WRITER first, not a column. A ``starting_position``
-column would sit empty on every row, and a column nothing writes states a fact
-the system does not have. The candidate source is
-``src/ingestion/espn_game.py``, whose ``BoxScoreRow`` is player-level and
-carries a ``stats`` dict and a ``did_not_play`` flag, or ``boxscoresummaryv3``
-where ``stats.nba.com`` is reachable. Until one of them is wired, DvP is a
-research column measured on history.
+What blocks wiring now is neither the evidence nor a missing writer. It is
+that THE PULL HAS NEVER RUN. ``STARTING_POSITION`` used to reach the panel
+only from the Kaggle archive ingest; ``src/ingestion/starting_positions.py``,
+``migrations/008_player_game_log_starting_position.sql`` and
+``scripts/pull_starting_positions.py`` are now the live writer, and
+``repository.load_player_panel`` reads the column back. But ``stats.nba.com``
+is denied at this environment's proxy, so ``player_game_logs.starting_position``
+is NULL on every row today, this layer still finds nothing on a live slate,
+and it logs that it is skipping and adds no columns — the designed behaviour
+for a missing input rather than a silent zero. The section 3a measurement was
+also made on an ARCHIVE panel, which is not the panel production builds from.
+
+So the order is: run the pull where nba.com is reachable, rebuild the live
+panel, confirm non-null coverage there, re-run the arm on a panel carrying
+real positions, and only then change ``labels.py``. Wiring it before that
+would train trees to split on a column that arrives empty in production.
+``docs/fouls_and_dvp.md`` section 5 is the writer; ``AGENTS.md`` section 7
+carries both facts.
+
+(An earlier version of this note named ``src/ingestion/espn_game.py`` and
+``boxscoresummaryv3`` as the candidate sources. Neither was used, and section
+5 says why: the summary endpoint has no starting lineup in it at all, and
+ESPN's own module records that it cannot reach the live endpoint to settle
+which of two documented payload layouts it returns.)
 
 RESEARCH ONLY. Nothing here is a betting signal.
 """
@@ -181,6 +235,26 @@ BUCKET_ALIASES: dict[str, str] = {
 
 DVP_STATS: tuple[str, ...] = ("PTS", "REB", "AST", "FG3M", "STL", "BLK")
 
+# Combination markets, as {combo: the stats it is the sum of}.
+#
+# ONLY PRA, AND THE OMISSION IS THE DECISION. The extraction plan this came
+# from (docs/external_repo_review_2026-10-05.md item 3) asked for PR, PA and
+# RA as well. They are not markets in this project: labels.LAUNCH_MARKETS is
+# (PTS, REB, AST) and labels.POST_LAUNCH_MARKETS is (FG3M, STL, BLK, PRA), so
+# nothing can read a DVP_PR_* column and feature_ab's _dvp_for_market has no
+# market to route it to. Adding the three of them would compute six columns on
+# every build for nobody -- the exact state AGENTS.md records four feature
+# layers sitting in, with 71 numeric columns no market read.
+#
+# This dict is the one place to turn one on, and
+# tests/test_dvp.py::test_every_combo_is_a_market_this_project_models is the
+# guard that keeps the rule a rule rather than a comment: adding a key here
+# without adding the market fails, and so does removing PRA from the markets
+# while this key stays.
+DVP_COMBOS: dict[str, tuple[str, ...]] = {
+    "PRA": ("PTS", "REB", "AST"),
+}
+
 ROLL_WINDOW = 10
 # Five of the defender's games, not the three defense.py uses. UNFITTED, and
 # a judgement rather than a measurement: each entry in this window is itself a
@@ -193,10 +267,14 @@ ROLL_MIN_PERIODS = 5
 ALLOWED_TEMPLATE = "DVP_{stat}_ALLOWED_L10"
 INDEX_TEMPLATE = "DVP_{stat}_INDEX_L10"
 
+#: Base stats first, then the combos, so the order of DVP_FEATURE_COLS is
+#: stable as combos are added or removed.
+DVP_EMITTED_STATS: tuple[str, ...] = (*DVP_STATS, *DVP_COMBOS)
+
 DVP_FEATURE_COLS: tuple[str, ...] = (
     POS_BUCKET_COLUMN,
-    *(ALLOWED_TEMPLATE.format(stat=s) for s in DVP_STATS),
-    *(INDEX_TEMPLATE.format(stat=s) for s in DVP_STATS),
+    *(ALLOWED_TEMPLATE.format(stat=s) for s in DVP_EMITTED_STATS),
+    *(INDEX_TEMPLATE.format(stat=s) for s in DVP_EMITTED_STATS),
 )
 
 # Panel columns without which there is no defence-versus-position to describe.
@@ -370,6 +448,29 @@ def build_opponent_allowed(panel: pd.DataFrame) -> pd.DataFrame:
         work[stat] = pd.to_numeric(panel[stat], errors="coerce")
     work = work.dropna(subset=["team_abbr", "game_date"])
 
+    # Combination markets, summed per player-game before either aggregation.
+    # A combo whose parts are not all in the panel is NOT emitted: a PRA
+    # built from points and rebounds alone would be a column named for a sum
+    # it does not contain.
+    combos = {
+        combo: parts for combo, parts in DVP_COMBOS.items()
+        if all(part in stats for part in parts)
+    }
+    for combo, parts in combos.items():
+        work[combo] = _combo_per_player_game(work, parts)
+    dropped = sorted(set(DVP_COMBOS) - set(combos))
+    if dropped:
+        logger.info(
+            "DvP layer: combo column(s) %s not emitted — the panel is missing "
+            "at least one component stat, and a sum of some of the parts is "
+            "not the market it is named for.", dropped,
+        )
+    # From here on a combo is indistinguishable from a base stat: the same
+    # per-game mean, the same shift-1 rolling window, and the same as-of
+    # league baseline behind its index. That is the point of summing above
+    # rather than adding the finished columns.
+    stats = [*stats, *combos]
+
     # Every (defender, game) pair the panel knows about, whether or not a
     # bucket was observed in it.
     games = (
@@ -424,6 +525,51 @@ def build_opponent_allowed(panel: pd.DataFrame) -> pd.DataFrame:
         len(out), known, 100.0 * known / max(len(out), 1), ROLL_MIN_PERIODS,
     )
     return out
+
+
+def _combo_per_player_game(work: pd.DataFrame, parts: tuple[str, ...]) -> pd.Series:
+    """
+    A combo stat summed PER PLAYER-GAME, null unless every part is known.
+
+    WHY NOT JUST ADD THE FINISHED ``_ALLOWED`` COLUMNS, which is what the
+    extraction plan proposed and what ``minutes_weighted.py`` does for its own
+    combo aliases. "Allowed means add" is true only while the three means share
+    a denominator, and this layer has TWO places they can stop doing so:
+
+      * the per-game bucket mean is ``groupby(...).mean()``, which skips nulls
+        PER COLUMN. A player-game with points but no assists lands in the PTS
+        mean's denominator and not the AST mean's, so PTS_mean + AST_mean is no
+        longer the mean of (PTS + AST) over one population.
+      * the ten-game window is ``.rolling(min_periods=5).mean()``, which also
+        skips per column. A bucket with eight games of points and ten of
+        rebounds averages two different sets of games, and the sum of those is
+        a number about no particular ten games.
+
+    Summing inside the player-game, before either aggregation, removes both:
+    one masked column then travels the identical path a base stat travels, and
+    the mask is what makes the population the same one.
+
+    MEASURED, AND IT CHANGES NOTHING ON TODAY'S PANEL, which is worth saying
+    plainly rather than implying a bug was fixed. PTS, REB and AST are null on
+    0 of the archive panel's 214,381 rows, so the two constructions agree to
+    7.1e-15 on all 56,729 rows where both are known -- floating point, not
+    disagreement. This is a GUARD, and the thing it guards against is
+    reachable rather than hypothetical: the live panel comes from
+    ``player_game_logs``, where ``pts``, ``reb`` and ``ast`` are each
+    independently nullable, so a source that reported some and not others
+    would produce exactly the partial row described above.
+
+    ``tests/test_dvp.py`` pins both halves -- the identity when nothing is
+    missing, and the DIVERGENCE when something is, which is the only reason
+    the sum happens here rather than over the finished columns.
+
+    The mask is the project's standing rule, not a new one: ``fouls.py`` masks
+    its per-minute numerator and denominator to games where both are known,
+    for the same reason.
+    """
+    present = work[list(parts)].notna().all(axis=1)
+    total = work[list(parts)].sum(axis=1, min_count=len(parts))
+    return total.where(present)
 
 
 def _bucket_relative_index(frame: pd.DataFrame, col: str) -> pd.Series:
