@@ -100,3 +100,9 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 *.db
+
+# shufinskiy/nba_data exports (MIT) — shot charts and matchup assignments.
+# Hundreds of MB of third-party data per family; re-downloadable from
+# https://github.com/shufinskiy/nba_data. Keep the directories, not the CSVs.
+data/external/shot_detail/*.csv
+data/external/matchups/*.csv

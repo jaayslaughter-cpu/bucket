@@ -142,6 +142,42 @@ LAYERS: dict[str, Layer] = {
             "PACE_ROLL correlates 0.82 but no model reads it)."
         ),
     ),
+    "shot_zones": Layer(
+        (
+            "SZ_DIST_AVG_L5", "SZ_DIST_AVG_L10",
+            "SZ_RIM_RATE_L5", "SZ_RIM_RATE_L10",
+            "SZ_PAINT_RATE_L5", "SZ_PAINT_RATE_L10",
+            "SZ_MID_RATE_L5", "SZ_MID_RATE_L10",
+            "SZ_THREE_RATE_L5", "SZ_THREE_RATE_L10",
+            "SZ_CORNER3_RATE_L5", "SZ_CORNER3_RATE_L10",
+            "SZ_DUNK_LAYUP_RATE_L5", "SZ_DUNK_LAYUP_RATE_L10",
+            "SZ_SELF_CREATED_RATE_L5", "SZ_SELF_CREATED_RATE_L10",
+            "SZ_MADE_PCT_L5", "SZ_MADE_PCT_L10",
+        ),
+        note=(
+            "Shot location and type from the NBA's own shotchartdetail "
+            "export, 97.8% of the panel against the PBP_* shot-mix family's "
+            "59.1%. Where both exist they agree at |r| 0.92-0.998, so this "
+            "arm is really asking WHICH family to keep, not whether shot mix "
+            "helps -- running it against --layer pbp is the comparison that "
+            "matters. PAINT, CORNER3, SELF_CREATED and MADE_PCT have no PBP "
+            "counterpart at all. No market reads these, so use "
+            "--wire-under-test."
+        ),
+    ),
+    "matchup": Layer(
+        ("MU_PTS_PER_MIN_L10", "MU_PTS_PER_MIN_INDEX_L10"),
+        note=(
+            "Opponent defence weighted by the minutes its defenders actually "
+            "spend on assignment, from the NBA's own matchup tracking -- no "
+            "position proxy and no team total. Only the PTS_PER_MIN pair is "
+            "under test: the FG% pair it also computes correlates 0.96 with "
+            "DEF_FG_PCT_ALLOWED_L10 and is excluded, measured. The question "
+            "is whether per-assigned-minute points beat DEF_RATING_L10 "
+            "(|r| 0.77 between them). No market reads these, so use "
+            "--wire-under-test."
+        ),
+    ),
     "fouls": Layer(
         ("PF_L5", "PF_L10", "PF_SEASON", "PF_PER_MIN_L10", "PF_TROUBLE_RATE_L10"),
         note=(
