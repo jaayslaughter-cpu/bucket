@@ -286,6 +286,76 @@ _STAT_PREFIXES = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA")
 # labels._DEFENSE_BY_MARKET and must not be handed to a market it is not for.
 _UNIVERSAL_DEFENSE_COLS = frozenset({"DEF_RATING_L10", "DEF_PACE_L10"})
 
+# The three stats PRA is the sum of, so a PRA arm sees all three matchups.
+# Mirrors labels._DEFENSE_BY_MARKET["PRA"].
+_PRA_COMPONENTS = frozenset({"PTS", "REB", "AST"})
+
+
+def column_for_market(column: str, market: str) -> bool:
+    """
+    Should ``--wire-under-test`` offer this column to ``market``'s arm?
+
+    PER MARKET, not every column to every market. A first version appended all
+    of them to all of them, so a PTS run was handed AST_HL and REB_HL_SHRINK
+    -- which is not the question being asked, and is not what labels.py does
+    either: every dict there is keyed by market. A column carrying another
+    market's stat prefix is skipped; MIN_*, MINUTES_*, TS_PCT_*,
+    USAGE_PROXY_* and the rest are market-neutral and go to all.
+
+    MODULE LEVEL, and this is the function the run itself calls. It used to be
+    a closure inside _run, which meant the only thing a test could reach was
+    the helper it delegates to -- so deleting the delegation went unnoticed.
+    Both the rule and the wiring are now covered by
+    tests/test_dvp.py::test_each_market_is_offered_only_its_own_matchup_columns.
+    """
+    from src.models.labels import _DEFENSE_BY_MARKET
+
+    market = market.upper()
+    # A DEF_* column is not market-neutral just because it carries no stat
+    # prefix: labels._DEFENSE_BY_MARKET assigns each one to the markets it
+    # bears on, and DEF_REB_ALLOWED_PER100_L10 belongs to REB and PRA, not to
+    # PTS. Treating the whole family as neutral meant `--layer defense
+    # --wire-under-test --markets PTS` fed a points model the rebound and
+    # assist defence columns -- not the question being asked, and the same
+    # defect as the stat-prefix one below.
+    if column.startswith("DEF_"):
+        if column in _UNIVERSAL_DEFENSE_COLS:
+            return True
+        return column in set(_DEFENSE_BY_MARKET.get(market, ()))
+    # DVP_* carries its stat in the MIDDLE, not at the front, so the prefix
+    # loop below does not see it: DVP_REB_ALLOWED_L10 starts with neither
+    # "REB_" nor "OPP_REB_". Without this branch every market received all
+    # twelve, and `--layer dvp --markets PTS` fed a points model the rebound,
+    # assist and block matchup columns -- the identical defect the DEF_ branch
+    # above exists to fix, reproduced in a launched run before being caught.
+    if column.startswith("DVP_"):
+        return _dvp_for_market(column, market)
+    for stat in _STAT_PREFIXES:
+        if stat == market:
+            continue
+        if column.startswith(f"{stat}_") or column.startswith(f"OPP_{stat}_"):
+            return False
+    return True
+
+
+def _dvp_for_market(column: str, market: str) -> bool:
+    """
+    Does this DVP_* column belong in ``market``'s arm?
+
+    MODULE LEVEL ON PURPOSE, so the routing rule has a test
+    (tests/test_dvp.py::test_each_market_is_offered_only_its_own_matchup_columns)
+    rather than living only inside the closure that uses it. The rule it
+    encodes is not obvious from the column names: DVP_* carries its stat in
+    the MIDDLE, so DVP_REB_ALLOWED_L10 starts with neither "REB_" nor
+    "OPP_REB_" and the stat-prefix filter in _run does not see it at all.
+    """
+    if not column.startswith("DVP_"):
+        return True
+    stat = column[len("DVP_"):].split("_", 1)[0]
+    if market.upper() == "PRA":
+        return stat in _PRA_COMPONENTS
+    return stat == market.upper()
+
 
 METRICS = (
     ("brier_score", "Brier raw"),
@@ -430,7 +500,7 @@ def _run(
     # produced a table of exact zeros -- a correct answer to a question
     # nobody meant to ask. Say so instead of printing it.
     import src.models.compare as compare_module
-    from src.models.labels import _DEFENSE_BY_MARKET, default_feature_cols
+    from src.models.labels import default_feature_cols
 
     if args.wire_under_test:
         # compare.py binds default_feature_cols at import, so the patch has to
@@ -440,35 +510,10 @@ def _run(
         # as a subtractive arm does.
         _base = compare_module.default_feature_cols
 
-        # PER MARKET, not every column to every market. A first version appended
-        # all of them to all of them, so a PTS run was handed AST_HL and
-        # REB_HL_SHRINK -- which is not the question being asked, and is not what
-        # labels.py does either: every dict there is keyed by market. A column
-        # carrying another market's stat prefix is skipped; MIN_*, MINUTES_*,
-        # TS_PCT_*, USAGE_PROXY_* and the rest are market-neutral and go to all.
-        def _for_market(column: str, market: str) -> bool:
-            # A DEF_* column is not market-neutral just because it carries no
-            # stat prefix: labels._DEFENSE_BY_MARKET assigns each one to the
-            # markets it bears on, and DEF_REB_ALLOWED_PER100_L10 belongs to REB
-            # and PRA, not to PTS. Treating the whole family as neutral meant
-            # `--layer defense --wire-under-test --markets PTS` fed a points
-            # model the rebound and assist defence columns -- not the question
-            # being asked, and the same defect as the stat-prefix one below.
-            if column.startswith("DEF_"):
-                if column in _UNIVERSAL_DEFENSE_COLS:
-                    return True
-                return column in set(_DEFENSE_BY_MARKET.get(market, ()))
-            for stat in _STAT_PREFIXES:
-                if stat == market:
-                    continue
-                if column.startswith(f"{stat}_") or column.startswith(f"OPP_{stat}_"):
-                    return False
-            return True
-
         def _widened(market, _base=_base, _extra=tuple(under_test)):
             cols = list(_base(market))
             for c in _extra:
-                if c not in cols and _for_market(c, market.upper()):
+                if c not in cols and column_for_market(c, market.upper()):
                     cols.append(c)
             return cols
 
@@ -478,9 +523,10 @@ def _run(
             _patched.append((compare_module, _base))
         compare_module.default_feature_cols = _widened  # type: ignore[assignment]
         print(f"--wire-under-test: up to {len(under_test)} column(s) added to "
-              f"each market's feature list for this run only, skipping any that "
-              f"carry another market's stat prefix. Nothing is written to "
-              f"src/models/labels.py.")
+              f"each market's feature list for this run only, routed per "
+              f"market by column_for_market -- a column carrying another "
+              f"market's stat, in its prefix or inside a DEF_/DVP_ name, is "
+              f"skipped. Nothing is written to src/models/labels.py.")
 
     resolver = (
         compare_module.default_feature_cols if args.wire_under_test

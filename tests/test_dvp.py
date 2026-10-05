@@ -612,3 +612,80 @@ def test_the_join_survives_either_dtype_of_team_code():
         assert out[col].notna().sum() > 0, dtype
         # And the panel's own dtype is handed back unchanged.
         assert out["OPPONENT_ABBREVIATION"].dtype == panel["OPPONENT_ABBREVIATION"].dtype
+
+
+# --- the A/B arm must ask the right question ----------------------------
+
+def test_each_market_is_offered_only_its_own_matchup_columns():
+    """
+    DVP_* carries its stat in the MIDDLE — DVP_REB_ALLOWED_L10 starts with
+    neither "REB_" nor "OPP_REB_" — so feature_ab's stat-prefix filter does
+    not see it, and without an explicit branch every market received all
+    twelve columns. A points model handed the rebound, assist and block
+    matchup columns is not measuring "does defence-versus-position help
+    points"; it is the identical defect the DEF_ branch in that filter was
+    written to fix, and it was reproduced in a launched run before being
+    caught.
+
+    PRA takes the three it is the sum of, which is how
+    labels._DEFENSE_BY_MARKET already treats it.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_fab2", "scripts/feature_ab.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # column_for_market is the function the run itself calls. An earlier
+    # version of this test exercised only the _dvp_for_market helper it
+    # delegates to, and deleting the delegation left the test passing.
+    under_test = module.LAYERS["dvp"].columns
+    for market, expected in (
+        ("PTS", {"DVP_PTS_ALLOWED_L10", "DVP_PTS_INDEX_L10"}),
+        ("REB", {"DVP_REB_ALLOWED_L10", "DVP_REB_INDEX_L10"}),
+        ("AST", {"DVP_AST_ALLOWED_L10", "DVP_AST_INDEX_L10"}),
+        ("FG3M", {"DVP_FG3M_ALLOWED_L10", "DVP_FG3M_INDEX_L10"}),
+        ("STL", {"DVP_STL_ALLOWED_L10", "DVP_STL_INDEX_L10"}),
+        ("BLK", {"DVP_BLK_ALLOWED_L10", "DVP_BLK_INDEX_L10"}),
+    ):
+        got = {c for c in under_test if module.column_for_market(c, market)}
+        assert got == expected, (market, sorted(got))
+
+    pra = {c for c in under_test if module.column_for_market(c, "PRA")}
+    assert pra == {
+        "DVP_PTS_ALLOWED_L10", "DVP_PTS_INDEX_L10",
+        "DVP_REB_ALLOWED_L10", "DVP_REB_INDEX_L10",
+        "DVP_AST_ALLOWED_L10", "DVP_AST_INDEX_L10",
+    }, sorted(pra)
+
+    # MIN reads no matchup column: there is no DVP_MIN_*, and a market with
+    # no member of the family must get nothing rather than everything.
+    assert not {c for c in under_test if module.column_for_market(c, "MIN")}
+
+    # The routing does not disturb the families already handled: DEF_* still
+    # goes by labels._DEFENSE_BY_MARKET, and the market-neutral PF_* columns
+    # still reach every market, because foul propensity bears on minutes
+    # rather than on any one stat.
+    assert module.column_for_market("DEF_RATING_L10", "PTS") is True
+    assert module.column_for_market("DEF_REB_ALLOWED_PER100_L10", "PTS") is False
+    assert module.column_for_market("DEF_REB_ALLOWED_PER100_L10", "REB") is True
+    assert all(
+        module.column_for_market(c, m)
+        for c in module.LAYERS["fouls"].columns
+        for m in ("PTS", "REB", "AST")
+    )
+
+    # AND THE CALL SITE, which is the half that decides what the models
+    # actually train on. This assertion is STRUCTURAL and says so: the
+    # widening closure lives inside _run and only a full A/B run reaches it,
+    # so what is pinned here is that the closure consults the routing
+    # function at all. Removing the filter from it is otherwise invisible to
+    # every test in this file -- which was true until this was added.
+    import inspect
+
+    source = inspect.getsource(module._run)
+    assert "column_for_market(c, market.upper())" in source, (
+        "_widened no longer routes per market; every market would receive "
+        "every column under test and every delta would answer a different "
+        "question than the one asked"
+    )
