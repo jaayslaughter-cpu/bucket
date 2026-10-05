@@ -195,15 +195,25 @@ def default_feature_cols(market: str) -> list[str]:
 # +0.00125, better in only 1 of 4 folds), though every ECE delta is smaller
 # than its own fold spread, so that is a thing to watch and not a finding.
 #
-# IT IS STILL NOT WIRED, AND THE REASON IS NOT THE EVIDENCE. STARTING_POSITION
-# has no writer on the live path: the archive ingest supplies it,
-# player_game_logs has no position column, and nothing filling that table has
-# one to write. On a live slate both DVP_REB_* columns are null on every row,
-# so wiring them here would train trees to split on a column that arrives
+# IT IS STILL NOT WIRED, AND THE REASON IS NOT THE EVIDENCE. The reason used
+# to be that STARTING_POSITION had no writer on the live path. It has one now
+# -- src/ingestion/starting_positions.py, migration 008 and
+# scripts/pull_starting_positions.py -- and what remains is narrower and still
+# blocking:
+#
+#   1. THE PULL HAS NEVER BEEN RUN. stats.nba.com is denied at this
+#      environment's proxy, so player_game_logs.starting_position is NULL on
+#      every row today and attach_dvp_features still abstains on a live panel.
+#   2. THE MEASUREMENT ABOVE WAS MADE ON AN ARCHIVE PANEL, which is not the
+#      panel production builds from.
+#
+# Wiring these columns now would train trees to split on a column that arrives
 # empty in production -- the teammate_cascade.py failure mode this project has
-# documented once already. The gate is a position writer, then a rebuilt live
-# panel, then a re-run of this arm on a panel that has it. Numbers, the
-# collinearity table and the slice's cost: docs/fouls_and_dvp.md section 3a.
+# documented once already. The order is: run the pull where nba.com is
+# reachable, rebuild the live panel, confirm non-null coverage there, re-run
+# this arm on a panel that carries real positions, and only then change the
+# tuples below. Numbers, the collinearity table, the slice's cost and the
+# writer: docs/fouls_and_dvp.md sections 3a and 5.
 #
 # OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
 # POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which

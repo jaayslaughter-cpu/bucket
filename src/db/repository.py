@@ -66,6 +66,29 @@ def upsert_team_game_stats(df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def _normalised_start_positions(values: Any) -> pd.Series | None:
+    """``STARTING_POSITION`` as G/F/C/None, or None when the caller has none.
+
+    Returning None (rather than an all-null Series) when the column is absent
+    keeps `pd.DataFrame` from inventing a column name, and is what
+    `df.get("STARTING_POSITION")` already gives back for a panel built before
+    the archive ingest asked for it.
+
+    Normalising here and not just trusting the caller is the point: the
+    archive emits G/F/C, the live writer emits G/F/C, and anything else --
+    'PG', 'F-C', a stray empty string -- is a LISTED position or a bench row,
+    neither of which is a starting designation. migration 008's CHECK would
+    reject the first and silently accept the second.
+    """
+    if values is None:
+        return None
+    from src.features.dvp import normalise_bucket
+
+    return pd.Series(
+        [normalise_bucket(v) for v in values], index=values.index, dtype="object"
+    )
+
+
 def upsert_player_game_logs(df: pd.DataFrame) -> int:
     """
     Write the player panel to Postgres, keyed on (game, player).
@@ -115,6 +138,15 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         # zero. See migrations/006_player_game_log_fouls.sql for why a zero
         # default would be a fabrication rather than a convenience.
         "pf": pd.to_numeric(df.get("PF"), errors="coerce"),
+        # The position the player STARTED at, when the caller has one. The
+        # league game log does not carry it, so on the live path this is
+        # normally absent here and filled later by
+        # update_starting_positions(); a panel rebuilt from the Kaggle
+        # archive DOES carry it, and then it rides along with the rest.
+        # Normalised rather than trusted: a listed position reaching this
+        # column would change what POS_BUCKET means downstream, and
+        # migration 008's CHECK only admits G, F and C.
+        "starting_position": _normalised_start_positions(df.get("STARTING_POSITION")),
         "source": "nba_stats_leaguegamelog",
     })
 
@@ -138,16 +170,108 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
             index_elements=["nba_game_id", "nba_player_id"],
             set_={
                 c: stmt.excluded[c]
+                # EVERY written column belongs here. `pf` did not, which
+                # made the docstring's "re-ingesting a season corrects rows"
+                # false for it alone: a season ingested before
+                # boxscores.COLUMN_MAP asked for PF kept pf NULL forever, and
+                # the only way to find out was to re-ingest and look. Found
+                # while adding starting_position by the same route, which
+                # would have inherited the same silence.
                 for c in (
                     "player_name", "game_date", "season", "team_abbr",
                     "opponent_abbr", "is_home", "is_neutral_site", "minutes",
-                    "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "source",
+                    "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf",
+                    "starting_position", "source",
                 )
             },
         )
         session.execute(stmt)
     logger.info("Upserted %d player game-log rows", len(rows))
     return len(rows)
+
+
+def update_starting_positions(frame: pd.DataFrame) -> dict[str, int]:
+    """
+    Write starting positions onto player-game rows that already exist.
+
+    THIS IS THE WRITER src/features/dvp.py WAS WAITING FOR. The league game
+    log that fills the rest of `player_game_logs` carries no position, so the
+    traditional box score is pulled separately
+    (src/ingestion/starting_positions.py) and joined on here by
+    (nba_game_id, nba_player_id).
+
+    IT UPDATES AND NEVER INSERTS, which is the whole design. A position with
+    no game log behind it would be a row with a bucket and no statistics --
+    enough to shift an opponent's allowed-to-bucket average while contributing
+    nothing to it. Those rows are COUNTED and reported as `unmatched` rather
+    than created or dropped silently, because a large unmatched count means
+    the ids disagree between two endpoints and that is worth seeing.
+
+    Returns {"matched", "updated", "unmatched", "cleared"}. `cleared` counts
+    rows the caller asked to set to NULL: permitted, because a corrected
+    payload that moves a player from starter to bench has to be able to say
+    so, and a writer that could only ever fill would make that uncorrectable.
+    """
+    required = {"GAME_ID", "PLAYER_ID", "STARTING_POSITION"}
+    if frame is None or frame.empty:
+        logger.warning(
+            "No starting positions to write — refusing to report a successful write"
+        )
+        return {"matched": 0, "updated": 0, "unmatched": 0, "cleared": 0}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"DATA_NOT_AVAILABLE: starting positions missing {sorted(missing)}"
+        )
+
+    work = pd.DataFrame({
+        "nba_game_id": frame["GAME_ID"].astype(str),
+        "nba_player_id": frame["PLAYER_ID"].astype(str),
+        "starting_position": _normalised_start_positions(frame["STARTING_POSITION"]),
+    }).drop_duplicates(subset=["nba_game_id", "nba_player_id"], keep="last")
+
+    wanted = {
+        (r["nba_game_id"], r["nba_player_id"]): r["starting_position"]
+        for r in _records(work)
+    }
+
+    matched = updated = cleared = 0
+    with session_scope() as session:
+        stmt = select(PlayerGameLog).where(
+            PlayerGameLog.nba_game_id.in_({g for g, _ in wanted})
+        )
+        for row in session.execute(stmt).scalars().all():
+            key = (row.nba_game_id, row.nba_player_id)
+            if key not in wanted:
+                continue
+            matched += 1
+            value = wanted[key]
+            if row.starting_position == value:
+                continue
+            if value is None:
+                cleared += 1
+            row.starting_position = value
+            updated += 1
+
+    unmatched = len(wanted) - matched
+    if unmatched:
+        logger.warning(
+            "starting positions: %d of %d (game, player) pairs had no "
+            "player_game_logs row and were NOT inserted — a bucket without a "
+            "box score would move an opponent's allowed average without "
+            "contributing to it",
+            unmatched, len(wanted),
+        )
+    logger.info(
+        "Starting positions: %d matched, %d updated, %d cleared, %d unmatched",
+        matched, updated, cleared, unmatched,
+    )
+    return {
+        "matched": matched,
+        "updated": updated,
+        "unmatched": unmatched,
+        "cleared": cleared,
+    }
 
 
 def _lookup_neutral_site(work: pd.DataFrame) -> pd.Series:
@@ -305,6 +429,13 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             # and cannot on a zero, which is why migration 006 writes neither
             # a default nor a backfill.
             "PF": r.pf,
+            # The starting position, so src/features/dvp.py reaches the LIVE
+            # path and not only a panel rebuilt from the archive. NULL on
+            # every row written before starting_positions.py ran, and NULL on
+            # every bench appearance after it -- the layer cannot tell those
+            # apart and does not need to, since both mean "no bucket from
+            # this game".
+            "STARTING_POSITION": r.starting_position,
         }
         for r in result
     ])

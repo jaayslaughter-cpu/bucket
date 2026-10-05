@@ -144,10 +144,25 @@ def synthetic_panel(n_players: int = 4, n_games: int = 24) -> pd.DataFrame:
                 # test_the_synthetic_panel_carries_what_the_repository_returns
                 # requires this fixture to carry everything it returns -- that
                 # guard is what caught the column being added without it.
-                # There is deliberately no STARTING_POSITION: the live panel
-                # has none, so the DvP layer is expected to abstain here, and
-                # a fixture that supplied one would hide that.
                 "PF": float(rng.integers(0, 6)),
+                # The starting position. This comment used to read "there is
+                # deliberately no STARTING_POSITION: the live panel has none",
+                # and that was true until migration 008 and
+                # src/ingestion/starting_positions.py gave the live path a
+                # writer. load_player_panel returns it now, so the same guard
+                # that caught PF caught this one too -- which is the second
+                # time that assertion has earned its place.
+                #
+                # One position per player, stable across his games, because
+                # dvp.assign_position_buckets takes the expanding MODAL of a
+                # player's PRIOR starts and a fixture that reassigned him
+                # nightly would exercise the tie-breaking rather than the
+                # layer. This fixture has one player per team-game, so it
+                # cannot and does not stand in for the five-starters
+                # semantics gate in starting_positions.py -- that gate is
+                # tested against payload fixtures in
+                # tests/test_starting_positions.py.
+                "STARTING_POSITION": ["G", "F", "C", "G"][p % 4],
             })
     return pd.DataFrame(rows)
 

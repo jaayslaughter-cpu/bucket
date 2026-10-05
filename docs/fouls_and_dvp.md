@@ -369,19 +369,22 @@ spellings of one number either.
 
 ### It is measured and still not wired
 
-`STARTING_POSITION` has **no writer on the live path** (see the end of this
-page). The archive ingest supplies it; `player_game_logs` has no position
-column and nothing filling that table has one to write. So on a live slate
-both of these columns are null on every row, and a model trained with a
-feature that is absent in production is worse than one trained without it —
-the trees would have learned splits on a column that arrives empty.
+The reason used to be that `STARTING_POSITION` had no writer on the live path.
+**Section 5 is that writer.** What remains is narrower and still blocking:
 
-The gate on shipping DvP is therefore **a position writer, not more
-evidence**. The order is: add the writer, rebuild the live panel, confirm
-non-null coverage there, re-run this arm on a panel that has it, and only then
-touch `labels.py`. Wiring it now on the strength of the table above would ship
-a dead column, which is the `teammate_cascade.py` failure mode this project
-has already documented once.
+1. the pull has never been run, because stats.nba.com is denied at this
+   environment's proxy, so the column is NULL on every row today;
+2. the measurement above was made on an **archive** panel, which is not the
+   panel production builds from.
+
+A model trained with a feature that is absent in production is worse than one
+trained without it — the trees would have learned splits on a column that
+arrives empty. So the order is unchanged except that its first step is done:
+run the pull where nba.com is reachable, rebuild the live panel, confirm
+non-null coverage there, re-run this arm on a panel that has real positions,
+and only then touch `labels.py`. Wiring it on the strength of the table above
+would ship a dead column, which is the `teammate_cascade.py` failure mode this
+project has already documented once.
 
 ## 4. Database
 
@@ -410,16 +413,165 @@ wanting, and believed, when the source was on disk. It was caught by
 `scripts/verify_wiring.py`, whose dangling-reference check flagged that the
 docstring cited `src/ingestion/nba_stats.py`, a module that does not exist.
 
-**DvP does not, and that is a known gap rather than a surprise.**
-`STARTING_POSITION` reaches the panel only from the archive ingest. The live
-path builds its panel from `player_game_logs`, which has no position column,
-and nothing writing to that table has one to write: the NBA stats league game
-log does not report a starting lineup. On a live slate the layer logs that it
-is skipping and adds no columns. Closing it needs a **writer** first — a
-column nothing fills states a fact the system does not have — and the
-candidates are `src/ingestion/espn_game.py` (`BoxScoreRow` is player-level)
-or `boxscoresummaryv3` where `stats.nba.com` is reachable. Until then DvP is a
-research column measured on history.
+**DvP did not, and section 5 is how that was closed.** The paragraph that
+used to sit here said `STARTING_POSITION` reached the panel only from the
+archive ingest, that `player_game_logs` had no position column and nothing
+writing to it had one to write, and that closing it needed a **writer** first
+— "a column nothing fills states a fact the system does not have". It named
+two candidates, `src/ingestion/espn_game.py` and `boxscoresummaryv3`. Neither
+is the one used; section 5 says why.
+
+It also said "the NBA stats league game log does not report a starting
+lineup", and that part is still true and still the reason this is a separate
+pass rather than another column in `boxscores.COLUMN_MAP`.
+
+## 5. The position writer
+
+The gap section 3a left open was the writer, and this is it. Four pieces, in
+the order a row travels:
+
+| piece | what it does |
+|---|---|
+| `src/ingestion/starting_positions.py` | pulls the NBA's own traditional box score, one call per game, and normalises it to `(GAME_ID, TEAM_ID, PLAYER_ID, STARTING_POSITION)` |
+| `migrations/008_player_game_log_starting_position.sql` | `player_game_logs.starting_position`, `VARCHAR(1)`, nullable, `CHECK IN ('G','F','C')`, `NOT VALID`, no backfill |
+| `repository.update_starting_positions` | writes it onto rows that already exist, and never inserts |
+| `scripts/pull_starting_positions.py` | the runnable pass: fetch → gate → cache → write |
+
+### Why the traditional box score and not the two candidates named earlier
+
+The paragraph this page used to end on named `src/ingestion/espn_game.py` and
+`boxscoresummaryv3`. Neither is what got used.
+
+- **`boxscoresummaryv3`** is the wrong endpoint. Its `InactivePlayers` set is
+  who was OUT; its summary sets are game-level. No starting lineup.
+- **ESPN** does carry a per-player box score, and the module's own docstring
+  records that it "cannot reach the live endpoint to settle which [of two
+  documented layouts] the summary returns". Taking a *second* unverifiable
+  payload shape as the source for a column whose meaning is already the thing
+  in doubt would compound the uncertainty rather than resolve it. ESPN also
+  uses its own athlete ids, so it would need the name crosswalk too.
+- **`boxscoretraditionalv3`** names the field directly and in the right
+  vocabulary. The column list is not from memory: it is in the installed
+  library's own `expected_data`, at
+  `nba_api/stats/endpoints/boxscoretraditionalv3.py` — `gameId`, `teamId`,
+  `personId`, `position`. v2 spells it `START_POSITION` and is the fallback,
+  not the default, because the library's own module says v2 "is deprecated"
+  and its data "is no longer being published ... as of the 2025-26 NBA
+  season" — a season in this panel. The same reasoning as
+  `inactive_players.py`'s endpoint preference, for the same reason.
+
+### The one claim the fixtures cannot settle, and what is done about it
+
+v3 renamed v2's `START_POSITION` to `position`, and **stats.nba.com is denied
+at this environment's proxy** (`CONNECT tunnel failed, response 403`), so
+nothing here can confirm the rename kept the meaning. Two readings:
+
+- *starting* position — blank for everyone who came off the bench, which is
+  what v2 plainly was and what the archive's column is;
+- *listed* position — filled in for all twelve or thirteen players who
+  dressed.
+
+They are **different quantities**. If `position` were the listed one, DvP
+would quietly start bucketing everyone who appeared instead of the five who
+started; `POS_BUCKET` would stop meaning what section 3a measured it meaning;
+every number downstream would still look plausible.
+
+So the uncertainty is a **refusal, not an assumption**.
+`check_starting_position_semantics` counts filled positions per team-game and
+requires exactly five — not a heuristic, a rule of the sport. A
+listed-position payload lands at eleven or more and is rejected by name, with
+the count, on the first game pulled, before anything is written.
+`scripts/pull_starting_positions.py` exits 3 and writes nothing;
+`tests/test_dvp.py::test_a_payload_that_fails_the_semantics_gate_is_never_written`
+pins that behaviourally. A team-game *short* of five is a different message,
+because too few means rows are missing rather than that fewer players started.
+
+An earlier version of that ordering test compared the two calls' positions in
+the file with `body.index(...)`. A mutation that ran the gate on `frame.copy()`
+and left a second call in place walked straight past it. The test is now
+behavioural: a listed-position payload reaches the database never, whichever
+line comes first.
+
+### Three ways a position is NULL, and why they are not distinguished
+
+| | meaning | how often |
+|---|---|---|
+| blank in the payload | the player did not start | ~8 of 13 rows |
+| unrecognised spelling | counted, logged, never guessed | rare |
+| no row pulled for this game | the pull has not covered it | all of them, today |
+
+The feature layer treats all three the same way, which is why the column does
+not try to tell them apart: `attach_dvp_features` has no bucket either way and
+abstains. What it must never do is receive an empty string, because that
+*parses* — a bench player would look like a reported position. Hence
+`VARCHAR(1)` with a three-value `CHECK`, and normalisation through
+`dvp.normalise_bucket` in the ingest **and again** in
+`repository.update_starting_positions`: the second is not belt-and-braces, it
+is the only guard on a caller that did not come through the ingest.
+
+### It is not the leakage caveat `inactive_players.py` carries
+
+Both read a pregame fact out of a post-game box score, so the resemblance is
+worth being explicit about. That module's caveat is real — tonight's inactive
+list is used for tonight's game, so a late scratch is information a decision
+made at line-set time could not have had. Nothing here works that way:
+
+- the bucket a **predicted** row is given comes from `assign_position_buckets`,
+  the expanding modal of that player's **prior** starts, shifted. Tonight's
+  designation is not an input to tonight's row at all.
+- the bucket a **completed** game is counted under (`_aggregation_bucket`) is
+  the observed one, and the allowed-against-bucket averages built from it are
+  rolled and shifted before they reach a feature, so a game is only counted
+  into a window that closes before the row reading it.
+
+A late lineup change therefore costs this layer accuracy about a past game's
+label, not foresight about a future one. Data quality, not leakage. Section 2b
+is the auditor's own run over the layer.
+
+### It updates and never inserts
+
+A position with no game log behind it would be a row with a bucket and no
+statistics — enough to shift an opponent's allowed-against-that-bucket average
+while contributing nothing to it. Those pairs are **counted and reported** as
+`unmatched`, not created and not dropped in silence, because a large unmatched
+count means the two endpoints disagree about ids and that is worth seeing.
+Clearing a position to NULL *is* permitted and counted separately: a corrected
+payload that moves a player from starter to bench has to be able to say so.
+
+### A defect found on the way in
+
+`upsert_player_game_logs` carried `pf` in its insert payload and **not** in
+its `ON CONFLICT DO UPDATE` set. Its own docstring says "re-ingesting a season
+corrects rows rather than duplicating them", and for `pf` alone that was
+false: a season ingested before `boxscores.COLUMN_MAP` asked for fouls kept
+`pf` NULL forever, and re-ingesting could not fix it. Found only because
+`starting_position` was about to go in by the same route and would have
+inherited the same silence. Both are in the conflict set now, and
+`test_the_upsert_carries_starting_position_and_updates_it_on_conflict` asserts
+both halves for both columns.
+
+### What is still not done
+
+The pull has never been run. Running it needs a machine where nba.com is
+reachable:
+
+```
+# where nba.com is reachable
+python -m scripts.pull_starting_positions --season 2025-26 --limit 5 --dry-run
+python -m scripts.pull_starting_positions --season 2025-26 --no-write
+
+# where the database is
+python -m scripts.pull_starting_positions --season 2025-26 --from-cache
+```
+
+`--limit 5 --dry-run` first, deliberately: five games is enough for the
+five-starters gate to settle what `position` means, and costs five calls
+rather than 1,230 if the answer is the wrong one.
+
+Then the live panel is rebuilt, non-null coverage is confirmed on it, and the
+section 3a arm is re-run on a panel carrying real positions. Only after that
+does `labels.py` change. Until then DvP remains measured on history and inert
+in production, and `AGENTS.md` section 7 says so.
 
 No position column was added to any model. `STARTING_POSITION` is a panel
 column read at feature-build time; `POS_BUCKET` is derived from it and written

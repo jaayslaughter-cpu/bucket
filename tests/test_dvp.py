@@ -541,24 +541,95 @@ def test_no_market_reads_a_dvp_column_yet():
         assert not listed & set(DVP_FEATURE_COLS), market
 
 
-def test_the_live_table_still_has_no_position_column_which_is_what_blocks_wiring():
+def test_the_live_table_now_has_the_position_column_the_writer_fills():
     """
-    The tripwire for the test above. `attach_dvp_features` needs
-    STARTING_POSITION; only the archive ingest supplies it. If a position
-    writer ever reaches `player_game_logs`, this goes red — which is the
-    signal to re-run the REB arm on a live-shaped panel and reopen the wiring
-    decision, not to delete the assertion.
+    THIS TEST IS THE SUCCESSOR TO A TRIPWIRE THAT FIRED. Its predecessor
+    asserted `player_game_logs` had NO position column and said, in its own
+    docstring, that going red would be "the signal to re-run the REB arm on a
+    live-shaped panel and reopen the wiring decision, not to delete the
+    assertion." Migration 008 and src/ingestion/starting_positions.py landed;
+    it went red; this is the re-pointed assertion, not a deleted one.
+
+    What it pins now is the half that can actually rot: the column exists AND
+    the panel the live path builds from reads it back. A column written and
+    never read is the same inert state DvP was already in, one layer down.
     """
+    import inspect
+
+    from src.db import repository
     from src.db.models import PlayerGameLog
     from src.features.dvp import STARTING_POSITION_COLUMN
 
     columns = {c.name for c in PlayerGameLog.__table__.columns}
-    assert STARTING_POSITION_COLUMN.lower() not in columns
-    assert not [c for c in columns if "position" in c or c in {"pos", "start_pos"}], (
-        "a position column reached player_game_logs, so DvP may no longer be "
-        "null on the live path; re-measure and revisit "
-        "test_no_market_reads_a_dvp_column_yet"
+    assert STARTING_POSITION_COLUMN.lower() in columns
+    assert (
+        f'"{STARTING_POSITION_COLUMN}": r.starting_position'
+        in inspect.getsource(repository.load_player_panel)
+    ), "the column is written but never read back onto the panel"
+
+
+def test_something_actually_fills_the_position_column():
+    """
+    "A column nothing fills states a fact the system does not have" is this
+    repository's own phrasing, from migration 006. The writer exists
+    (`repository.update_starting_positions`); this pins that a runnable entry
+    point CALLS it, which is the shape `teammate_cascade.py` and the four
+    unread form layers were both missing.
+    """
+    from pathlib import Path
+
+    from src.db import repository
+
+    assert hasattr(repository, "update_starting_positions")
+    script = Path(__file__).parent.parent / "scripts" / "pull_starting_positions.py"
+    body = script.read_text(encoding="utf-8")
+    assert "update_starting_positions(frame)" in body, (
+        "the writer exists but nothing calls it — which is the state DvP was "
+        "in to begin with, one layer up"
     )
+
+
+def test_a_payload_that_fails_the_semantics_gate_is_never_written(monkeypatch, tmp_path):
+    """
+    BEHAVIOURAL, because the first version of this assertion was not and did
+    not hold up. It compared the two calls' positions in the file with
+    `body.index(...)`, and a mutation that moved the gate to run on
+    `frame.copy()` while leaving a second call in place walked straight past
+    it. What matters is not which line comes first but that a listed-position
+    payload reaches the database never.
+    """
+    import pandas as pd
+
+    import scripts.pull_starting_positions as pull
+    from src.ingestion.starting_positions import save_starting_positions
+
+    # Every player who dressed carries a position: eight per team, not five.
+    # The signature of a LISTED position rather than a starting one.
+    rows = []
+    for team in ("1610612747", "1610612738"):
+        for i in range(8):
+            rows.append({
+                "GAME_ID": "0022500123", "TEAM_ID": team,
+                "PLAYER_ID": f"{team}{i}", "STARTING_POSITION": "G",
+            })
+    save_starting_positions(pd.DataFrame(rows), "2025-26", root=tmp_path)
+    monkeypatch.setattr(
+        pull, "load_cached_starting_positions",
+        lambda season, root=None: pd.read_parquet(
+            tmp_path / "starting_positions_2025-26.parquet"
+        ),
+    )
+
+    wrote: list[object] = []
+    import src.db.repository as repository
+
+    monkeypatch.setattr(
+        repository, "update_starting_positions", lambda f: wrote.append(f)
+    )
+
+    code = pull.main(["--season", "2025-26", "--from-cache"])
+    assert code == 3, "a failed gate must stop the run"
+    assert wrote == [], "a listed-position payload reached the database"
 
 
 def test_the_layer_is_registered_with_feature_ab_so_it_can_be_measured():

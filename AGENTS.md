@@ -58,10 +58,13 @@ A/B. A column correlating above ~0.97 with one the model already reads is a
 second copy of one number, and this repository has excluded whole feature
 families on that basis — see `src/models/labels.py` `_EXCLUDED_AS_REDUNDANT`
 and `docs/minutes_weighted.md` for a layer that is built, measurable, and
-deliberately not shipped. `docs/fouls_and_dvp.md` is the same decision taken
-twice more, and also records the opposite lesson: both of those layers were
-first judged impossible here because no panel on disk carried a foul count or
-a position, and both columns were in the source file all along.
+deliberately not shipped. `docs/fouls_and_dvp.md` records the opposite
+lesson: both of those layers were first judged impossible here because no
+panel on disk carried a foul count or a position, and both columns were in the
+source file all along. It also records what happens when the A/B comes back
+the other way — DvP improved REB's Brier on every one of four folds for four
+of five models — and that a measured win is still not a shipped feature while
+the column is null in production.
 
 ---
 
@@ -198,6 +201,21 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   absence. `espn_availability.fetch_roster` would cover that and needs the
   name crosswalk this repository does not have. `docs/integration_audit.md`
   §1.1.
+- **No starting position has ever been pulled.** `player_game_logs` has the
+  column (migration 008), `src/ingestion/starting_positions.py` is the writer
+  and `scripts/pull_starting_positions.py` is the pass that runs it, but
+  stats.nba.com is denied at this environment's proxy, so the column is NULL
+  on every row today and `src/features/dvp.py` still abstains on a live panel.
+  Two things follow and neither is a code change: the pull has to run where
+  nba.com is reachable, and the one claim the fixtures cannot settle — that
+  `boxscoretraditionalv3.position` is a STARTING position and not a listed one
+  — is enforced as a refusal on the first real response rather than assumed.
+  `docs/fouls_and_dvp.md` section 5.
+- **DvP is measured on REB and wired for nothing.** The arm was run on an
+  archive panel, which is not the panel production builds from. Wiring it
+  needs the pull above to have happened and the arm re-run on a panel that
+  carries real positions. `src/models/labels.py`, `docs/fouls_and_dvp.md`
+  section 3a.
 - **Every board row carries today's date whatever game it describes.**
   `research_slate_from_predictions` drops the detail row's `game_date` and
   stamps its `slate_date` parameter instead. `docs/integration_audit.md` §2.2.

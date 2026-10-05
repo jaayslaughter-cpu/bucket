@@ -219,6 +219,21 @@ class PlayerGameLog(Base):
     # kaggle_nba.COLUMN_ALIASES); rows written before they did stay null,
     # because what was never fetched cannot be recovered from what was stored.
     pf: Mapped[int | None] = mapped_column(Integer)
+    # The position the player STARTED at: G, F or C, NULL for a bench
+    # appearance or a row whose source did not report one. It is NOT the
+    # player's listed position -- a different quantity, filled in for everyone
+    # who dressed rather than for the five who started, and writing it here
+    # would change what src/features/dvp.py's POS_BUCKET means for every row.
+    # src/ingestion/starting_positions.py refuses a payload whose filled count
+    # per team-game is not five, which is what keeps the two apart.
+    #
+    # Filled by a SEPARATE pass from the rest of this table: the league game
+    # log that supplies the counting stats carries no position, so the
+    # traditional box score is fetched per game and
+    # repository.update_starting_positions writes it onto rows that exist.
+    # VARCHAR(1) and a CHECK in migration 008 so a listed position like 'PG'
+    # cannot land here even if the normaliser were bypassed.
+    starting_position: Mapped[str | None] = mapped_column(String(1))
 
     source: Mapped[str] = mapped_column(String(32))
     raw_json: Mapped[dict | None] = mapped_column(JSONB)
