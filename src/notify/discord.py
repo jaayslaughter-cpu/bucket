@@ -316,6 +316,33 @@ def build_decision_board_embed(
             f"· {len(candidates) - len(considered)} abstained"
         )
 
+    # THE DATES THE ROWS ACTUALLY DESCRIBE. A board is built from a scored
+    # VALIDATION WINDOW, so its rows can be about any day that window covers --
+    # and the title carries slate_date, which reads as "tonight". Until this
+    # check existed a card titled with today's date could be entirely February
+    # backtest rows with nothing saying so. This is the loudest place that can
+    # be said, so it is said first, before any row.
+    off_slate = sorted({
+        str(seen) for seen in (
+            getattr(c, "game_date", None) for c in considered
+        ) if seen and str(seen) != str(slate_date)
+    })
+    undated = sum(1 for c in considered if not getattr(c, "game_date", None))
+    if off_slate:
+        lines.insert(0, (
+            f"⚠️ **NOT TONIGHT'S SLATE.** {len(off_slate)} other game date(s) "
+            f"appear below ({', '.join(off_slate[:4])}"
+            f"{', …' if len(off_slate) > 4 else ''}). These are BACKTEST rows "
+            f"scored from a past validation window, not projections for "
+            f"{slate_date or 'the slate date'}."
+        ))
+    if undated:
+        lines.insert(0, (
+            f"⚠️ **{undated} row(s) carry no game date**, so which game they "
+            f"describe cannot be shown. The heading date is when this board "
+            f"was built, not when the games are played."
+        ))
+
     fields: list[dict[str, Any]] = []
     for c in considered[:max_rows]:
         basis = getattr(c, "decision_basis", "unavailable")
@@ -336,6 +363,14 @@ def build_decision_board_embed(
                 f"`{basis}` — model {_prob(getattr(c, 'model_prob', None))}. "
                 "No priced market, so no EV and no market check on this one."
             )
+        # Per row, and only when it is not the slate date: repeating today's
+        # date on every row would be noise, while an off-slate date on one row
+        # is the thing a reader has to see.
+        row_date = getattr(c, "game_date", None)
+        if row_date and str(row_date) != str(slate_date):
+            value += f"\n⚠️ game date **{row_date}**, not {slate_date}."
+        elif not row_date:
+            value += "\n⚠️ no game date on this row."
         fields.append({"name": name, "value": value, "inline": False})
 
     embed = {

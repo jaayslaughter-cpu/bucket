@@ -402,13 +402,29 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
         if features is None:
             report.skip("scored probabilities are in [0, 1] or null", "no feature frame")
             return
-        from main import MODEL_ARTIFACT_DEFAULT, score_prob_over
-        scored = score_prob_over(features, pd.DataFrame(), ROOT / MODEL_ARTIFACT_DEFAULT)
+        # THROUGH THE RESOLVER, not through MODEL_ARTIFACT_DEFAULT. This used to
+        # score against the legacy default path -- a directory that does not
+        # exist -- so the check abstained on EVERY run no matter what was
+        # trained or what $PROPIQ_MODEL pointed at, and then reported "no model
+        # artifact" as the reason. A check that cannot pass is worse than no
+        # check: it reads as "this was tested". It also blamed the wrong thing,
+        # because the call below passes an EMPTY prop_lines frame and P(Over)
+        # needs lines as well as a model.
+        from main import resolve_model_artifact, score_prob_over
+        artifact, how = resolve_model_artifact()
+        if artifact is None:
+            report.skip("scored probabilities are in [0, 1] or null",
+                        f"nothing to score with: {how}")
+            return
+        scored = score_prob_over(features, pd.DataFrame(), artifact)
         vals = pd.to_numeric(pd.Series(scored), errors="coerce").dropna()
         if vals.empty:
-            report.skip("scored probabilities are in [0, 1] or null",
-                        "no model artifact, so every row abstained — which is the "
-                        "documented behaviour, not a range violation")
+            report.skip(
+                "scored probabilities are in [0, 1] or null",
+                f"resolved {artifact} via {how}, and every row still abstained — "
+                "this call passes no prop lines, and P(Over) needs a line as "
+                "well as a model. Not a range violation.",
+            )
             return
         bad = vals[(vals < 0) | (vals > 1)]
         if len(bad):
@@ -1053,8 +1069,12 @@ def section_6(report: Report) -> None:
             report.ok(
                 "a slate that has not been played can produce rows",
                 f"forward_slate wired into main.py; schedule={has_schedule}, "
-                f"roster helper present={has_roster} (unused on purpose — it "
-                "would need the name crosswalk that does not exist)",
+                f"roster helper present={has_roster}. fetch_roster is still "
+                "uncalled, and the reason has changed: the ESPN-name crosswalk "
+                "it needed now EXISTS (src/ingestion/id_crosswalk.py), so "
+                "wiring it is a decision rather than a blocker. The lineup "
+                "comes from the panel instead, which needs no name match at "
+                "all.",
             )
     g(_forward)
 

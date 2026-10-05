@@ -483,3 +483,318 @@ def test_the_image_pins_a_timezone_and_a_volume_backed_report_path():
     dockerfile = (pathlib.Path(__file__).parent.parent / "Dockerfile").read_text()
     assert "ENV TZ=" in dockerfile
     assert "PROPIQ_CALIBRATION_REPORT=/app/data/" in dockerfile
+
+
+# ---------------------------------------------------------------------------
+# B3 — the board window. Two hardcoded 2025 dates used to be the fallback.
+# ---------------------------------------------------------------------------
+
+def test_the_default_window_is_anchored_on_today_not_on_two_2025_dates(monkeypatch):
+    """
+    THE DEFECT: run_board fell back to train_end="2025-01-15" /
+    validation_end="2025-02-15". compare_models_on_panel scores
+    (train_end, validation_end], so every board row described a game in early
+    February 2025, the board stamped each one with today's slate date, and the
+    window receded one day further into the past on every run.
+    """
+    from datetime import date
+
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+
+    window = worker.board_window(today=date(2026, 10, 5))
+    assert window["validation_end"] == "2026-10-05"
+    assert window["train_end"] == "2026-10-04"
+    assert window["is_backtest"] is False
+    assert window["lag_days"] == 0
+    assert "2025-01-15" not in window.values()
+    assert "2025-02-15" not in window.values()
+
+
+def test_the_window_scores_exactly_today(monkeypatch):
+    """
+    fixed_cutoff_split fits on `<= train_end` and scores
+    `(train_end, validation_end]`, so yesterday/today scores today's rows and
+    nothing else. forward_slate writes one row per scheduled game for today.
+    """
+    from datetime import date, timedelta
+
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+
+    today = date(2026, 1, 20)
+    window = worker.board_window(today=today)
+    train = date.fromisoformat(window["train_end"])
+    validation = date.fromisoformat(window["validation_end"])
+    assert validation == today
+    assert validation - train == timedelta(days=1)
+
+
+def test_the_window_moves_with_the_day(monkeypatch):
+    """A fixed fallback does not. That was the whole bug."""
+    from datetime import date
+
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+
+    first = worker.board_window(today=date(2026, 3, 1))
+    later = worker.board_window(today=date(2026, 3, 2))
+    assert first["validation_end"] != later["validation_end"]
+    assert later["validation_end"] == "2026-03-02"
+
+
+def test_an_explicit_override_still_wins(monkeypatch):
+    """A backtest board is a legitimate thing to build; that is what these are
+    for. What it must no longer do is happen by accident."""
+    from datetime import date
+
+    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2025-01-15")
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2025-02-15")
+    window = worker.board_window(today=date(2026, 10, 5))
+    assert window["train_end"] == "2025-01-15"
+    assert window["validation_end"] == "2025-02-15"
+    assert set(window["overridden"]) == {
+        "PROPIQ_BOARD_TRAIN_END", "PROPIQ_BOARD_VALIDATION_END"
+    }
+
+
+def test_a_past_window_is_reported_as_a_backtest_with_its_lag(monkeypatch, caplog):
+    """
+    The old fallback was silent. A board whose rows describe games already
+    played must say so and name how stale it is.
+    """
+    import logging
+    from datetime import date
+
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2025-02-15")
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    with caplog.at_level(logging.WARNING):
+        window = worker.board_window(today=date(2026, 10, 5))
+    assert window["is_backtest"] is True
+    assert window["lag_days"] == 597
+    blob = caplog.text
+    assert "BACKTEST" in blob
+    assert "597" in blob
+
+
+def test_a_window_ending_today_is_not_called_a_backtest(monkeypatch):
+    from datetime import date
+
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-05")
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    window = worker.board_window(today=date(2026, 10, 5))
+    assert window["is_backtest"] is False
+
+
+def test_an_unparseable_override_is_passed_through_rather_than_crashing(
+    monkeypatch, caplog
+):
+    """A worker that will not start cannot report anything."""
+    import logging
+    from datetime import date
+
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "not-a-date")
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    with caplog.at_level(logging.WARNING):
+        window = worker.board_window(today=date(2026, 10, 5))
+    assert window["validation_end"] == "not-a-date"
+    assert window["lag_days"] is None
+    assert window["is_backtest"] is False
+    assert "not an ISO date" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B1 — the artifact preflight. Its absence used to surface only at inference.
+# ---------------------------------------------------------------------------
+
+def test_no_resolvable_artifact_is_an_error_at_boot_naming_every_path(
+    monkeypatch, caplog
+):
+    """
+    THE DEFECT: without an artifact the pipeline does not fail. score_prob_over
+    returns an all-null Series, every row abstains, the slate job exits 0, and
+    a fresh container with an unseeded volume looks healthy while publishing
+    nothing. The question has to be asked at boot.
+    """
+    import logging
+
+    monkeypatch.delenv("PROPIQ_MODEL", raising=False)
+    monkeypatch.setattr(
+        "main.resolve_model_artifact",
+        lambda *a, **k: (None, "no artifact found: tried A, B and C"),
+    )
+    with caplog.at_level(logging.ERROR):
+        info = worker.check_model_artifact()
+    assert info["resolved"] is False
+    assert "tried A, B and C" in info["reason"]
+    assert "NO SCORING ARTIFACT RESOLVED" in caplog.text
+    assert "ABSTAIN" in caplog.text
+
+
+def test_a_path_that_is_set_but_absent_is_an_error_not_a_silence(
+    monkeypatch, caplog, tmp_path
+):
+    """The likeliest first-deploy misconfiguration: PROPIQ_MODEL set, volume
+    unseeded."""
+    import logging
+
+    missing = tmp_path / "not_there" / "xgboost_PTS.json"
+    monkeypatch.setattr(
+        "main.resolve_model_artifact", lambda *a, **k: (missing, "PROPIQ_MODEL")
+    )
+    with caplog.at_level(logging.ERROR):
+        info = worker.check_model_artifact()
+    assert info["exists"] is False
+    assert "DOES NOT EXIST" in caplog.text
+
+
+def test_an_artifact_with_no_sidecar_is_an_error(monkeypatch, caplog, tmp_path):
+    """Scoring refuses it anyway — the feature_cols are unknown — so saying so
+    at boot is the difference between a named cause and a silent abstention."""
+    import logging
+
+    artifact = tmp_path / "xgboost_PTS.json"
+    artifact.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "main.resolve_model_artifact", lambda *a, **k: (artifact, "glob")
+    )
+    with caplog.at_level(logging.ERROR):
+        info = worker.check_model_artifact()
+    assert info["sidecar"] is False
+    assert "NO .meta.json SIDECAR" in caplog.text
+
+
+def _artifact(tmp_path, rows: int):
+    import json
+
+    artifact = tmp_path / "xgboost_PTS.json"
+    artifact.write_text("{}", encoding="utf-8")
+    (tmp_path / "xgboost_PTS.meta.json").write_text(
+        json.dumps({
+            "feature_cols": ["a", "b", "c"],
+            "target_market": "PTS",
+            "train_row_count": rows,
+            "train_start_date": "2018-01-01",
+            "train_end_date": "2026-04-12",
+            "feature_schema_version": "fs_v1_shift1_l2",
+            "saved_at_utc": "2026-10-05T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def test_a_demo_sized_artifact_is_flagged_rather_than_scored_quietly(
+    monkeypatch, caplog, tmp_path
+):
+    """
+    The worst outcome in this file: a model fit on ~1,000 synthetic rows
+    scoring a live slate produces confident-looking numbers rather than
+    abstentions. This repository's demo artifacts were fit on 968 rows.
+    """
+    import logging
+
+    artifact = _artifact(tmp_path, rows=968)
+    monkeypatch.setattr(
+        "main.resolve_model_artifact", lambda *a, **k: (artifact, "glob")
+    )
+    with caplog.at_level(logging.ERROR):
+        info = worker.check_model_artifact()
+    assert info["implausible_train_rows"] is True
+    assert "968" in caplog.text
+    assert str(worker.MIN_PLAUSIBLE_TRAIN_ROWS) in caplog.text
+
+
+def test_a_real_sized_artifact_reports_itself_and_raises_no_alarm(
+    monkeypatch, caplog, tmp_path
+):
+    import logging
+
+    artifact = _artifact(tmp_path, rows=214_381)
+    monkeypatch.setattr(
+        "main.resolve_model_artifact", lambda *a, **k: (artifact, "glob")
+    )
+    with caplog.at_level(logging.INFO):
+        info = worker.check_model_artifact()
+    assert info["resolved"] and info["exists"] and info["sidecar"]
+    assert "implausible_train_rows" not in info
+    assert info["train_row_count"] == 214_381
+    assert info["market"] == "PTS"
+    assert info["feature_count"] == 3
+    # One artifact scores one market, and the log says which.
+    assert "fit for PTS only" in caplog.text
+    assert "ERROR" not in caplog.text.upper().replace("ERRORS", "")
+
+
+def test_the_preflight_never_takes_the_boot_down(monkeypatch):
+    """Same policy as check_state_dir: a worker that refuses to start cannot
+    report anything, and the settlement job is still useful with no model."""
+    def _boom(*a, **k):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr("main.resolve_model_artifact", _boom)
+    info = worker.check_model_artifact()
+    assert info["resolved"] is False
+
+
+def test_both_boot_probes_run_before_the_scheduler_is_built():
+    """A redeploy breaks the same two things: the volume's permissions and
+    whether anything was ever put on it."""
+    import inspect
+
+    source = inspect.getsource(worker.main)
+    assert "check_state_dir()" in source
+    assert "check_model_artifact()" in source
+    assert source.index("check_model_artifact()") < source.index("build_scheduler()")
+
+
+def test_run_board_actually_uses_the_rolling_window(monkeypatch):
+    """
+    THE HELPER IS NOT THE WIRING. board_window can be correct while run_board
+    ignores it, and every test above would still pass — the first version of
+    this file had exactly that gap, and replacing run_board's call with the two
+    hardcoded 2025 dates left it green.
+
+    So this captures what build_slate_board is actually handed.
+    """
+    from datetime import date, timedelta
+
+    import src.pipeline.slate_board as slate_board_module
+    from src.utils import timezones
+
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+
+    today = date(2026, 10, 5)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: today)
+
+    seen: dict[str, object] = {}
+
+    class _Result:
+        def as_dict(self):
+            return {"written_rows": 0}
+
+    def _fake_build(panel, **kwargs):
+        seen.update(kwargs)
+        return _Result()
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _fake_build)
+
+    import pandas as pd
+
+    import src.db.repository as repo
+    monkeypatch.setattr(
+        repo, "load_player_panel",
+        lambda *a, **k: pd.DataFrame({"PLAYER_ID": ["1"], "GAME_DATE": [today]}),
+    )
+
+    out = worker.run_board()
+    assert out["status"] == "OK"
+    assert seen["validation_end"] == str(today)
+    assert seen["train_end"] == str(today - timedelta(days=1))
+    assert seen["train_end"] != "2025-01-15"
+    assert seen["validation_end"] != "2025-02-15"
+    # And the window travels with the result, so a log line says WHICH days
+    # were scored rather than only how many rows came back.
+    assert out["window"]["validation_end"] == str(today)
+    assert out["window"]["is_backtest"] is False

@@ -165,6 +165,161 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     return {"path": str(target), "writable": True}
 
 
+#: Below this many training rows an artifact is almost certainly the synthetic
+#: demo one. The demo artifacts in this repository were fit on 968 rows; the
+#: real panel is 214,381. A deployed worker scoring a live slate with a model
+#: fit on a thousand synthetic rows is the worst outcome in this file, because
+#: it produces confident-looking numbers rather than abstentions.
+MIN_PLAUSIBLE_TRAIN_ROWS = 5_000
+
+
+def check_model_artifact() -> dict[str, Any]:
+    """
+    Resolve the scoring artifact AT BOOT and say what was found.
+
+    WHY THIS IS A BOOT CHECK AND NOT LEFT TO INFERENCE. Without an artifact
+    the pipeline does not fail: ``score_prob_over`` returns an all-null Series
+    with a reason, every row abstains, the slate job exits 0, and the only
+    trace is one INFO line in the middle of a run. A fresh container with an
+    unseeded volume therefore ingests the slate, writes projections with no
+    probabilities, dispatches nothing useful and looks healthy. That is the
+    single most expensive failure mode this worker has, and it is invisible
+    until somebody asks why the board has been empty for a week.
+
+    So the question is asked at boot, in the first lines of the log, next to
+    ``check_state_dir`` -- the two things a redeploy breaks.
+
+    THREE THINGS ARE REPORTED, not one:
+
+      * nothing resolved      -> ERROR, with every path the resolver tried.
+      * resolved but absent   -> ERROR: $PROPIQ_MODEL pointing at a path the
+                                 volume does not have is the likeliest
+                                 misconfiguration, and it is silent otherwise.
+      * resolved and present  -> INFO with the sidecar's own account of itself,
+                                 and an ERROR -- not a warning -- when
+                                 ``train_row_count`` is small enough that this
+                                 is the demo artifact. Scoring a live slate
+                                 with a model fit on a thousand synthetic rows
+                                 is worse than abstaining, so it is logged at
+                                 the level that says so.
+
+    Warns, never raises, for the same reason ``check_state_dir`` does: a worker
+    that refuses to start cannot report anything, and the settlement job is
+    still useful with no model. The slate still runs; it just abstains, and now
+    it says so before it starts rather than after.
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        # ENV_MODEL comes from main too, so the name this reports is the name
+        # the resolver actually reads rather than a second copy of the string.
+        from main import ENV_MODEL, resolve_model_artifact
+    except Exception as exc:  # noqa: BLE001 — the probe must not take the boot down
+        logger.error("Could not import the model resolver (%s).", exc)
+        return {"resolved": False, "error": str(exc)}
+
+    # The RESOLUTION is guarded too, not just the import. An earlier version
+    # wrapped only the import, so a resolver that raised -- an unreadable
+    # config, a permission error on the artifacts directory -- took the boot
+    # down, which contradicts this function's whole policy. Caught by
+    # tests/test_scheduler_worker.py::test_the_preflight_never_takes_the_boot_down.
+    try:
+        path, how = resolve_model_artifact()
+    except Exception as exc:  # noqa: BLE001 — the probe must not take the boot down
+        logger.error(
+            "The model resolver raised (%s), so whether an artifact exists is "
+            "UNKNOWN. The slate will abstain if there is none. Treat this as a "
+            "missing artifact until the cause is fixed.", exc,
+        )
+        return {"resolved": False, "error": str(exc)}
+
+    if path is None:
+        logger.error(
+            "NO SCORING ARTIFACT RESOLVED. %s Every row will ABSTAIN: the slate "
+            "job will ingest, build features and write projections with NO "
+            "probability, exit 0 and look healthy. Train one and put it where "
+            "the resolver looks, or point $%s at it on the mounted volume.",
+            how, ENV_MODEL,
+        )
+        return {"resolved": False, "reason": how}
+
+    target = Path(path)
+    if not target.exists():
+        logger.error(
+            "SCORING ARTIFACT %s DOES NOT EXIST (resolved via %s). Every row "
+            "will abstain. If this came from $%s, the path is set but the file "
+            "is not on the volume -- which is the likeliest first-deploy "
+            "misconfiguration and is otherwise silent.",
+            target, how, ENV_MODEL,
+        )
+        return {"resolved": True, "path": str(target), "exists": False, "how": how}
+
+    meta_path = target.with_suffix(".meta.json")
+    info: dict[str, Any] = {
+        "resolved": True, "path": str(target), "exists": True, "how": how,
+    }
+    if not meta_path.exists():
+        logger.error(
+            "ARTIFACT %s HAS NO .meta.json SIDECAR, so the feature_cols used at "
+            "training time are unknown and scoring refuses it. Every row will "
+            "abstain.", target,
+        )
+        info["sidecar"] = False
+        return info
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.error("Could not read the sidecar %s (%s).", meta_path, exc)
+        info["sidecar"] = False
+        info["error"] = str(exc)
+        return info
+
+    rows = meta.get("train_row_count")
+    info.update(
+        sidecar=True,
+        market=meta.get("target_market"),
+        train_row_count=rows,
+        train_start_date=meta.get("train_start_date"),
+        train_end_date=meta.get("train_end_date"),
+        feature_count=len(meta.get("feature_cols") or []),
+        feature_schema_version=meta.get("feature_schema_version"),
+        saved_at_utc=meta.get("saved_at_utc"),
+    )
+    logger.info(
+        "Scoring artifact: %s (via %s) | market=%s | %s feature(s) | trained on "
+        "%s row(s) from %s to %s | schema=%s | saved %s",
+        target.name, how, info["market"], info["feature_count"], rows,
+        info["train_start_date"], info["train_end_date"],
+        info["feature_schema_version"], info["saved_at_utc"],
+    )
+
+    # ONE MARKET PER ARTIFACT. score_prob_over takes a single model_path, so
+    # whichever market this was fit for is the only one that can carry a
+    # probability this run. Said here because the resolver's glob picks the
+    # NEWEST artifact, which is not necessarily the market anyone intended.
+    if info["market"]:
+        logger.info(
+            "This artifact is fit for %s only; every other market abstains this "
+            "run, and the recorder skips a row with no probability.",
+            info["market"],
+        )
+
+    if isinstance(rows, int) and rows < MIN_PLAUSIBLE_TRAIN_ROWS:
+        logger.error(
+            "ARTIFACT %s WAS TRAINED ON ONLY %d ROWS, below the %d-row floor "
+            "that separates a real fit from this repository's synthetic demo "
+            "artifacts (fit on 968). If this is the demo model it will produce "
+            "confident-looking probabilities for a live slate, which is worse "
+            "than abstaining. Verify what is on the volume.",
+            target.name, rows, MIN_PLAUSIBLE_TRAIN_ROWS,
+        )
+        info["implausible_train_rows"] = True
+
+    return info
+
+
 def run_slate(argv: list[str] | None = None) -> int:
     """One slate run: ingest, build features, score, gate, persist, record.
 
@@ -193,6 +348,98 @@ def run_slate(argv: list[str] | None = None) -> int:
     return int(code)
 
 
+def board_window(today: Any | None = None) -> dict[str, Any]:
+    """
+    The train/validation window the board is built over, as of TODAY.
+
+    THIS USED TO BE TWO HARDCODED 2025 DATES and that was the other half of the
+    most misleading defect in the project. ``run_board`` fell back to
+    ``train_end="2025-01-15"`` / ``validation_end="2025-02-15"`` whenever the
+    env vars were unset, and ``compare_models_on_panel`` scores the window
+    ``(train_end, validation_end]`` -- so every board row described a game in
+    early February 2025, the board stamped each one with today's slate date,
+    and the window receded one day further into the past on every run. A
+    deployed worker would have published the same stale fortnight forever,
+    getting less relevant daily, and nothing reported it.
+
+    THE CORRECT WINDOW FOR A LIVE SLATE is anchored on the Pacific calendar
+    day, because that is what a slate is (``utils.timezones``):
+
+        validation_end = today      the rows to score. forward_slate writes
+                                    one row per (player, scheduled game) for
+                                    today, so today IS the slate.
+        train_end      = yesterday  fit on everything already played. The
+                                    split is `<= train_end` to fit and
+                                    `(train_end, validation_end]` to score, so
+                                    yesterday/today scores exactly today.
+
+    AN EXPLICIT OVERRIDE STILL WINS, because a backtest board is a legitimate
+    thing to build and that is what the env vars are for. What it no longer
+    does is happen by accident: an override whose validation_end is in the past
+    is reported as a backtest, with the lag named, so a card built from one
+    cannot be mistaken for tonight.
+    """
+    from datetime import timedelta
+
+    from src.utils.timezones import pacific_calendar_date
+
+    anchor = today or pacific_calendar_date()
+    default_validation = str(anchor)
+    default_train = str(anchor - timedelta(days=1))
+
+    train_end = (os.environ.get(ENV_BOARD_TRAIN_END) or "").strip() or default_train
+    validation_end = (
+        (os.environ.get(ENV_BOARD_VALIDATION_END) or "").strip() or default_validation
+    )
+    overridden = sorted(
+        name for name, value in (
+            (ENV_BOARD_TRAIN_END, os.environ.get(ENV_BOARD_TRAIN_END)),
+            (ENV_BOARD_VALIDATION_END, os.environ.get(ENV_BOARD_VALIDATION_END)),
+        ) if (value or "").strip()
+    )
+
+    lag_days: int | None = None
+    try:
+        from datetime import date as _date
+
+        parsed = _date.fromisoformat(validation_end)
+        lag_days = (anchor - parsed).days
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not an ISO date; it is passed through unchanged and "
+            "compare_models_on_panel will decide what to do with it.",
+            ENV_BOARD_VALIDATION_END, validation_end,
+        )
+
+    is_backtest = bool(lag_days is not None and lag_days > 0)
+    if is_backtest:
+        logger.warning(
+            "BOARD IS A BACKTEST, NOT TONIGHT'S SLATE: validation_end=%s is %d "
+            "day(s) before today (%s), so every row describes a game already "
+            "played. Each row carries its own game_date and the dispatch embed "
+            "says so, but nothing here can make a past window current. Unset %s "
+            "to score today instead.",
+            validation_end, lag_days, anchor,
+            " and ".join(overridden) or ENV_BOARD_VALIDATION_END,
+        )
+    else:
+        logger.info(
+            "Board window: fit <= %s, score (%s, %s] -- anchored on the Pacific "
+            "calendar day%s.",
+            train_end, train_end, validation_end,
+            f" (overridden by {' and '.join(overridden)})" if overridden else "",
+        )
+
+    return {
+        "train_end": train_end,
+        "validation_end": validation_end,
+        "anchor_date": str(anchor),
+        "overridden": overridden,
+        "lag_days": lag_days,
+        "is_backtest": is_backtest,
+    }
+
+
 def run_board() -> dict[str, Any]:
     """
     Build the recommendation board CSV that dispatch reads.
@@ -218,8 +465,9 @@ def run_board() -> dict[str, Any]:
             [m.strip() for m in raw_markets.split(",") if m.strip()]
             if raw_markets else list(DEFAULT_MARKETS)
         )
-        train_end = os.environ.get(ENV_BOARD_TRAIN_END) or "2025-01-15"
-        validation_end = os.environ.get(ENV_BOARD_VALIDATION_END) or "2025-02-15"
+        window = board_window()
+        train_end = window["train_end"]
+        validation_end = window["validation_end"]
         try:
             min_ev = float(os.environ.get(ENV_MIN_EV) or 0.0)
         except ValueError:
@@ -241,7 +489,11 @@ def run_board() -> dict[str, Any]:
             min_ev=min_ev,
         )
         logger.info("Board: %s", result.as_dict())
-        return {"status": "OK", **result.as_dict()}
+        # The window travels with the result so a caller -- and the log line
+        # above -- can see WHICH days were scored, not just how many rows came
+        # back. A board of 40 rows is the same shape whether it describes
+        # tonight or a fortnight in 2025.
+        return {"status": "OK", **result.as_dict(), "window": window}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Board build raised; the scheduler stays up.")
         return {"status": "FAILED", "error": str(exc), "out": board_csv}
@@ -553,6 +805,10 @@ def main() -> int:
     )
     cap_thread_counts()
     check_state_dir()
+    # Asked at boot, beside the state directory, because a redeploy breaks the
+    # same two things: the volume's permissions and whether anything was ever
+    # put on it. See check_model_artifact for why inference is too late.
+    check_model_artifact()
 
     scheduler = build_scheduler()
     for job in describe(scheduler):

@@ -159,6 +159,24 @@ class ResearchSlateRow(BaseModel):
     """One research board row for a player-market (no auto-bet)."""
 
     slate_date: str
+    # THE DATE OF THE GAME THIS ROW DESCRIBES, which is not slate_date.
+    #
+    # slate_date is WHEN THE BOARD WAS BUILT; it is stamped from a parameter
+    # and is the same on every row of a run. This field is the game's own
+    # Pacific calendar date, carried from the detail row that produced it.
+    #
+    # They used to be the only date, and that was the most misleading defect
+    # in the project: compare_models_on_panel scores a VALIDATION WINDOW, so a
+    # board built today from a window ending in February 2025 produced rows
+    # about February games, every one stamped with today's date and nothing
+    # saying otherwise. A reader could not tell a prediction for tonight from a
+    # backtest row. verify_wiring's "a board row keeps the date of the game it
+    # describes" is the check that fails if this is dropped again.
+    #
+    # None when the detail row carried no date. It deliberately does NOT fall
+    # back to slate_date -- inheriting the stamp is the bug, and a null says
+    # "unknown" where a copy would say "today".
+    game_date: str | None = None
     event_id: str
     player_id: str
     player_name: str | None = None
@@ -384,12 +402,33 @@ def research_slate_from_predictions(
             if raw_eligibility else []
         )
         warnings.extend(eligibility)
+        # The game's OWN date, from the detail row compare_models_on_panel
+        # wrote it onto. Never slate_date: see the field's note.
+        raw_game_date = chosen.get("game_date")
+        game_date = str(raw_game_date) if raw_game_date else None
+        if game_date and game_date != slate_date:
+            # A row about another day is not wrong -- a backtest board is a
+            # legitimate thing to build -- but it must say so, because the only
+            # other signal a reader gets is a slate_date that reads as today.
+            warnings.append(
+                f"This row describes a game on {game_date}, not the board's "
+                f"slate date {slate_date}. It is a backtest row, not a "
+                f"projection for the slate date."
+            )
+        elif not game_date:
+            warnings.append(
+                "The detail row carried no game date, so this row cannot say "
+                "which game it describes; slate_date is when the board was "
+                "built, not when the game is played."
+            )
+
         preferred = None
         if po is not None and pu is not None:
             preferred = "over" if po >= pu else "under"
         board.append(
             ResearchSlateRow(
                 slate_date=slate_date,
+                game_date=game_date,
                 event_id=str(event_id or ""),
                 player_id=str(player_id or ""),
                 player_name=chosen.get("player_name"),

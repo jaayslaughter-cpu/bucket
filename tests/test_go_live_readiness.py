@@ -264,11 +264,29 @@ def test_the_model_resolver_reaches_the_scheduled_worker():
 
 def test_the_open_list_is_numbered_without_gaps():
     """
-    Renumbering on a closure is easy to get wrong, and a gap or a duplicate
-    makes every cross-reference to an O-number ambiguous.
+    Contiguous and unduplicated — but NOT required to start at 1.
+
+    This used to assert ``range(1, len+1)``, which forced a renumbering every
+    time the lowest-numbered item closed. That is the opposite of what the
+    cross-references need: an O-number is cited from test docstrings, commit
+    messages and other docs, and renumbering silently repoints every one of
+    them at a different item.
+
+    IT HAS ALREADY HAPPENED, which is why this is now spelled out rather than
+    enforced the other way. ``tests/test_forward_slate.py`` opens "O1 — rows
+    for a slate that has not been played" and ``tests/test_under_and_push.py``
+    opens "O8 — the under and the push", while this page's current O8 is
+    self-referential evaluation. Those identifiers were reused after an
+    earlier closure round, so a bare "O8" in an old docstring and a bare "O8"
+    here are two different items. Numbers are stable from here on: a closed
+    item moves to the closed table keeping its number, and the open list is
+    allowed to start wherever it starts.
     """
     found = sorted(int(n) for n in set(re.findall(r"\*\*O(\d+)\*\*", TEXT)))
-    assert found == list(range(1, len(found) + 1)), f"O-numbers have gaps: {found}"
+    assert found, "the open list is empty; if that is true, say so in prose"
+    assert found == list(range(found[0], found[0] + len(found))), (
+        f"O-numbers are not contiguous: {found}"
+    )
     rows = len(re.findall(r"^\| \*\*O\d+\*\* \|", TEXT, re.M))
     assert rows == len(found), (
         f"{rows} table row(s) but {len(found)} distinct O-number(s) — a "

@@ -38,28 +38,43 @@ Promoted to the top, because this is the part that drives work. Each line is a
 FAIL or WARN from `scripts/verify_wiring`, so it is checkable rather than
 asserted.
 
+**O-numbers are stable and are never reused.** A closed item keeps its number
+and moves to the table below, so the open list starts at O4 rather than being
+renumbered — renumbering silently repoints every cross-reference at a
+different item. That has already happened once: `tests/test_forward_slate.py`
+opens "O1 — rows for a slate that has not been played" and
+`tests/test_under_and_push.py` opens "O8 — the under and the push", from an
+earlier numbering, so a bare O-number in a test docstring older than
+2026-10-05 may not mean what it means here. Cite the item, not just the
+number.
+
 | # | Open item | Where it is established |
 |---|---|---|
-| **O1** | **Every board row carries today's date whatever game it describes.** `research_slate_from_predictions` drops the detail row's `game_date` and stamps its `slate_date` parameter. | §2.2 |
-| **O2** | **The board's train/validation window is pinned to two 2025 dates** that never advance, and `run_board` re-fits every model on every slate job. | §2.3 |
-| **O3** | **`src/ingestion/id_crosswalk.py` does not exist** and three modules name it as the fix for name-format mismatch; the exact-name join silently records zero gradeable rows when formats differ. | §1.2, §3 |
-| **O4** | **Model artifacts do not survive a redeploy** — ephemeral filesystem, no volume declared. A platform step, not a code change. | `docs/railway_deployment_audit.md` §4 |
+| **O4** | **Model artifacts do not survive a redeploy** — ephemeral filesystem; the volume is declared in the Dockerfile but must be mounted and SEEDED by hand. There is no boot-time fetch from object storage and the Dockerfile no longer claims there is. `scheduler_worker.check_model_artifact()` now reports an unseeded volume as an ERROR at boot instead of letting every row abstain silently. A platform step, not a code change. | `docs/railway_deployment_audit.md` §4 |
 | **O5** | **A slate-level EV verdict is persisted as a per-row claim** (`market_status`). | §2.4 |
 | **O6** | **`Game.tipoff_utc` has no writer.** The column exists and nothing populates it, so any tip-anchored scheduling has no times to anchor to. | `grep tipoff_utc src/` |
 | **O7** | **Eight config blocks are declared and never read**, so editing the YAML changes nothing. | `docs/railway_deployment_audit.md` §2 |
 | **O8** | **Self-referential evaluation.** `RESEARCH_LINE` is `{stat}_L10` and `over_hit` is measured against that same rolling history, so Brier and log-loss measure form against form until a posted-line archive drives line-aware training. | `src/models/labels.py`, `docs/DATA_GAPS.md` |
 | **O9** | **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp two-way NBA player-prop benchmark feed in reach, so nothing cross-checks the model's own number and the publication gate treats every board as model-sourced. Blocked externally, not by this repository. | `src/quant/dfs_entry.py`, `src/quant/publication_gate.py` |
 
-**The two that gated everything else are closed** (see below), so a deployed
-worker can now reach rows and a model. **O1 is what remains of the misleading
-class**: a board row carrying today's date whatever game it describes could
-mislead a reader rather than merely disappoint one, and it is the next thing to
-fix.
+**The misleading class is now empty.** O1 and O2 were the two defects that
+could mislead a reader rather than merely disappoint one, and both are closed
+below. What remains (O4-O9) either narrows the output or is blocked outside
+this repository; none of it publishes a claim that is not true.
+
+**O3 was listed open here after it had been closed**, which is its own small
+version of the same problem — a readiness page that outlives its facts teaches
+the wrong map. `src/ingestion/id_crosswalk.py` exists, three modules route
+through it, and `verify_wiring`'s name-mismatch guard passes. It is in the
+closed table below where it belongs.
 
 ### Closed since this page was reconciled
 
 | Was | Closed |
 |---|---|
+| **O1 — every board row carried today's date whatever game it described.** `research_slate_from_predictions` stamped its `slate_date` parameter and never read the detail row's own `game_date` (written at `compare.py:839`); `ResearchSlateRow` had no game-date field at all. A board built today from a window ending 2025-02-15 produced February rows, each stamped today, with nothing saying otherwise — a reader could not tell a projection from a backtest row | 2026-10-05. `game_date` is carried on `ResearchSlateRow` AND `BettingDecisionCandidate`, so it reaches the CSV dispatch reads and the Discord embed a person sees. It deliberately does **not** fall back to `slate_date` — inheriting the stamp is the bug, and a null says "unknown" where a copy would say "today". An off-slate row warns naming both dates; the embed banners the card and marks each row. `tests/test_board_game_date.py` (14 tests); `verify_wiring`'s board-date guard went FAIL → PASS |
+| **O2 — the board's train/validation window was pinned to two 2025 dates.** `run_board` fell back to `train_end="2025-01-15"` / `validation_end="2025-02-15"`, and `compare_models_on_panel` scores `(train_end, validation_end]`, so the window receded one day further into the past on every run and nothing reported it | 2026-10-05. `scheduler_worker.board_window()` anchors on the Pacific calendar day: fit `<= yesterday`, score `(yesterday, today]`, which is exactly the rows `forward_slate` wrote for today's scheduled games. An explicit override still wins, because a backtest board is a legitimate thing to build — what it no longer does is happen by accident: a `validation_end` in the past is logged as a backtest with its lag in days, and the window travels on `run_board`'s result. `verify_wiring`'s window guard went WARN → PASS |
+| **O3 — `src/ingestion/id_crosswalk.py` did not exist** and three modules named it as the fix for name-format mismatch | 2026-10-04, and this page went on listing it as open until 2026-10-05. The module is deterministic rather than fuzzy (NFKD, combining marks stripped, then EQUAL): no cutoff separates `Jokic`/`Jokić` at 81.8-91.7 from `Jalen`/`Jaylen Williams` at 96.6. The port found a live safety bug in `scratches._normalise`, which was lowercase-only, so a player ESPN reported OUT was labelled AVAILABLE |
 | **No rows existed for a slate that had not been played.** `load_player_panel` reads completed box scores and `_filter_to_slate` keeps only the slate date, so a 09:00 PT run found an empty intersection and exited 0 with `success_no_data` — every day, without looking broken | 2026-10-04. `src/pipeline/forward_slate.py` adds one row per (player, scheduled game) from the ESPN schedule's **pre-tip** games plus each team's recent appearances in the panel, carrying **no box-score stat** so the rolling features read each player's own prior real games and the forward row has nothing of its own to leak. The lineup comes from the panel rather than `fetch_roster` on purpose: a roster fetch would need the ESPN-name → NBA-name crosswalk that still does not exist (O3). A denied schedule leaves the panel untouched and says so. `PROPIQ_FORWARD_SLATE` turns it off. |
 | **A scheduled run could not find a model even when one was trained.** Scoring defaulted to `models/xgb_prop_over.json`, a directory that does not exist; `train-stats` writes to the comparison `artifacts_dir`; `run_slate` passes no `--model` | 2026-10-04. `main.resolve_model_artifact` tries `--model`, then `PROPIQ_MODEL`, then the newest `xgboost_*.json` in `artifacts_dir` **that has its `.meta.json` sidecar**, then the legacy path — and returns a reason naming every path it tried. The worker needs no argv plumbing: it calls `main.main([])` in-process, so the env var reaches the resolver directly. `artifact_registry` is deliberately **not** read; nothing writes to it, and resolving through a dead module is how `oddspapi` survived in the source precedence for months. |
 | **The schedule and roster sources were unwired.** `espn_schedule.load_slate` was imported only by the CLI and `fetch_roster` by nothing | 2026-10-04 for the schedule, via the forward slate above. `fetch_roster` is **still uncalled**, and now deliberately: see the crosswalk note. |

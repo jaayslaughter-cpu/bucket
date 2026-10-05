@@ -79,8 +79,22 @@ ENV PROPIQ_PARLAY_LEDGER=postgres
 #                              a fresh container this is empty and EVERY ROW
 #                              ABSTAINS — the pipeline runs, writes nothing
 #                              useful, and does not look broken. Not shipped in
-#                              this image; train into the volume or fetch from
-#                              object storage at boot.
+#                              this image: TRAIN INTO THE VOLUME, or put the
+#                              artifact plus its .meta.json sidecar there and
+#                              point $PROPIQ_MODEL at it.
+#
+#                              THERE IS NO BOOT-TIME FETCH. An earlier version
+#                              of this comment said "or fetch from object
+#                              storage at boot", and no such code exists in
+#                              this repository — no S3 client, no Supabase
+#                              Storage client, nothing that downloads a model.
+#                              Saying otherwise invited a first deploy that
+#                              assumed the container would help itself.
+#                              scheduler_worker.check_model_artifact() probes
+#                              for the artifact at boot and names what it
+#                              found, so an unseeded volume is an ERROR in the
+#                              first lines of the log rather than a silent
+#                              abstention every night.
 #   calibration.json           the evidence the publication gate reads. The
 #                              settlement job writes it at 03:30 PT and the
 #                              slate job reads it at 09:00 PT; on the ephemeral
