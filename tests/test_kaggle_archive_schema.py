@@ -200,3 +200,77 @@ def test_a_missing_crosswalk_file_is_refused_by_name(tmp_path):
     pd.DataFrame({"teamId": [1]}).to_csv(bad, index=False)
     with pytest.raises(KaggleNbaError, match="missing"):
         load_team_crosswalk(bad)
+
+
+# --- 4. the two columns the contract used to drop -------------------------
+#
+# `foulsPersonal` and `startingPosition` are both in ARCHIVE_COLUMNS above and
+# were both dropped at the panel boundary, because COLUMN_ALIASES did not list
+# them. Every derived artifact then truthfully reported no foul count and no
+# position anywhere in the tree, and two feature layers were judged impossible
+# on that evidence. See docs/fouls_and_dvp.md section 0.
+
+
+def test_the_real_archive_header_maps_personal_fouls_and_the_starting_position():
+    """
+    Against the GENUINE column list, not a convenient subset. If either
+    mapping is removed, src/features/fouls.py and src/features/dvp.py go
+    silent on every panel without anything failing.
+    """
+    report = describe_schema(pd.DataFrame(columns=ARCHIVE_COLUMNS))
+    assert report.mapped["PF"] == "foulsPersonal"
+    assert report.mapped["STARTING_POSITION"] == "startingPosition"
+
+
+def test_personal_fouls_come_through_as_a_number(tmp_path):
+    rows = _archive_rows()
+    rows["foulsPersonal"] = [3, 5]
+    panel = normalize_player_box_scores(
+        rows, team_crosswalk=_crosswalk(tmp_path)
+    )
+    assert panel["PF"].tolist() == [3.0, 5.0]
+    assert pd.api.types.is_numeric_dtype(panel["PF"])
+
+
+def test_the_starting_position_is_left_as_a_label_not_coerced_to_a_number(tmp_path):
+    """
+    It holds G, F and C. Coercing it would null the whole column, and "PF" in
+    this column means power forward rather than a foul count.
+    """
+    rows = _archive_rows()
+    rows["startingPosition"] = ["F", None]
+    panel = normalize_player_box_scores(
+        rows, team_crosswalk=_crosswalk(tmp_path)
+    )
+    assert panel["STARTING_POSITION"].tolist()[0] == "F"
+    assert pd.isna(panel["STARTING_POSITION"].tolist()[1])
+
+
+def test_an_export_without_either_column_is_still_accepted(tmp_path):
+    """
+    Both are OPTIONAL. An export that lacks them means the layers reading them
+    abstain, not that the archive is rejected.
+    """
+    report = describe_schema(_archive_rows())
+    assert "PF" in report.missing_optional
+    assert "STARTING_POSITION" in report.missing_optional
+    assert not report.missing_required
+    panel = normalize_player_box_scores(
+        _archive_rows(), team_crosswalk=_crosswalk(tmp_path)
+    )
+    assert "PF" not in panel.columns
+    assert "STARTING_POSITION" not in panel.columns
+
+
+def test_the_player_foul_column_is_not_the_team_foul_column():
+    """
+    src/ingestion/bigdataball.py writes a `pf` onto TeamGameStat and it is a
+    TEAM total. PlayerGameLog.pf is the player's own. Reading one as the other
+    would put five players' fouls on one player.
+    """
+    from src.db.models import PlayerGameLog, TeamGameStat
+
+    assert "pf" in PlayerGameLog.__table__.columns
+    assert "pf" in TeamGameStat.__table__.columns
+    assert PlayerGameLog.__table__.name != TeamGameStat.__table__.name
+    assert PlayerGameLog.__table__.columns["pf"].nullable

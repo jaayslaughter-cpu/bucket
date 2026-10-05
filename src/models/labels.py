@@ -161,6 +161,23 @@ def default_feature_cols(market: str) -> list[str]:
 # shipped, so `--layer minutes_weighted --wire-under-test` can settle it.
 # Full write-up with the per-column table: docs/minutes_weighted.md.
 #
+# TWO MORE LAYERS ARE IN THE SAME STATE, for the opposite reason: not measured
+# redundant, just not measured. src/features/fouls.py (the player's prior foul
+# history) and src/features/dvp.py (opponent defence split by the position it
+# is defending) are built on every panel that carries PF and
+# STARTING_POSITION, and no market below reads a column from either. Measured
+# the same way as the table above, every one of their columns is well clear of
+# the redundancy band -- the worst is PF_SEASON at 0.631 against MIN_SEASON,
+# and a count accumulated over playing time should correlate with playing
+# time; DVP_*_INDEX_L10 tops out at 0.389, against the team-level DEF_* column
+# covering the same stat, where DEF_RATING_INDEX_L10 sits at 0.999 against
+# DEF_RATING_L10. So they are not copies of anything listed here. Whether they
+# improve a Brier score is unknown, and `--layer fouls` / `--layer dvp`, both
+# with --wire-under-test, are the arms that settle it. The halflife and
+# usage_volume results below are the reason correlation alone does not:
+# redundancy was PREDICTED from |r| and then tested, and the test is what the
+# exclusion rests on. Write-up: docs/fouls_and_dvp.md.
+#
 # OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
 # POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which
 # is the exact confound DEF_PACE_L10 was published separately to avoid, so the

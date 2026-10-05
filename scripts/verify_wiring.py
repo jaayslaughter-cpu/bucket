@@ -139,6 +139,15 @@ def synthetic_panel(n_players: int = 4, n_games: int = 24) -> pd.DataFrame:
                 "TOV": float(rng.integers(0, 5)),
                 "FGA": float(rng.integers(8, 24)),
                 "FTA": float(rng.integers(0, 9)),
+                # Personal fouls, so the fouls layer runs in this check too.
+                # load_player_panel returns PF, and
+                # test_the_synthetic_panel_carries_what_the_repository_returns
+                # requires this fixture to carry everything it returns -- that
+                # guard is what caught the column being added without it.
+                # There is deliberately no STARTING_POSITION: the live panel
+                # has none, so the DvP layer is expected to abstain here, and
+                # a fixture that supplied one would hide that.
+                "PF": float(rng.integers(0, 6)),
             })
     return pd.DataFrame(rows)
 

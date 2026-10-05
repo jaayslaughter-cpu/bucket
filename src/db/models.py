@@ -209,6 +209,16 @@ class PlayerGameLog(Base):
     stl: Mapped[int | None] = mapped_column(Integer)
     blk: Mapped[int | None] = mapped_column(Integer)
     tov: Mapped[int | None] = mapped_column(Integer)
+    # PERSONAL fouls, the player's own. TeamGameStat.pf above is a TEAM total
+    # written by src/ingestion/bigdataball: same name, different measurement,
+    # and conflating them would put five players' fouls on one player.
+    # Nullable with no default because a source that does not report fouls
+    # must leave the column unknown -- a zero would read as a clean game, and
+    # src/features/fouls.py builds a minutes-risk signal out of exactly this
+    # number. Both ingests now fetch it (boxscores.COLUMN_MAP and
+    # kaggle_nba.COLUMN_ALIASES); rows written before they did stay null,
+    # because what was never fetched cannot be recovered from what was stored.
+    pf: Mapped[int | None] = mapped_column(Integer)
 
     source: Mapped[str] = mapped_column(String(32))
     raw_json: Mapped[dict | None] = mapped_column(JSONB)

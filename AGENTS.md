@@ -42,7 +42,7 @@ the first question about any change, not the last.
 
 - Every grouped rolling feature is `.shift(1)` within player-season. No
   exceptions, including the ones that look harmless.
-- `src/features/builder.py:570` `assert_no_lookahead()` runs over whatever the
+- `src/features/builder.py:581` `assert_no_lookahead()` runs over whatever the
   layers produced and is not optional.
 - Season grouping comes from `src/features/season.py`. A layer that needs a
   season key and has none derives it **privately** and drops it before
@@ -58,7 +58,10 @@ A/B. A column correlating above ~0.97 with one the model already reads is a
 second copy of one number, and this repository has excluded whole feature
 families on that basis — see `src/models/labels.py` `_EXCLUDED_AS_REDUNDANT`
 and `docs/minutes_weighted.md` for a layer that is built, measurable, and
-deliberately not shipped.
+deliberately not shipped. `docs/fouls_and_dvp.md` is the same decision taken
+twice more, and also records the opposite lesson: both of those layers were
+first judged impossible here because no panel on disk carried a foul count or
+a position, and both columns were in the source file all along.
 
 ---
 

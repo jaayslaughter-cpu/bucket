@@ -166,10 +166,21 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
         # haircut, and must not be mistaken for part of the multiplier that
         # already folds into {stat}_L2.
         ("src.features.fatigue_load", "attach_fatigue_load_layer", "fatigue_load"),
-        # minutes_weighted LAST, because it is the only layer here whose columns
-        # are deliberately NOT in the feature contract: |r| 0.976-0.992 against
-        # {STAT}_L5 puts them inside the band the halflife family was excluded
-        # for. They are built so feature_ab can measure them under test; see the
+        # fouls and dvp are the player's prior foul history and
+        # defence-versus-position. Like minutes_weighted below they are NOT in
+        # the feature contract -- whether either earns a place is a
+        # feature_ab measurement, not an assumption -- so they sit here at the
+        # end with it rather than among the layers labels.py reads. Both are
+        # self-contained: fouls reads PF, dvp reads STARTING_POSITION and the
+        # raw box score, and neither depends on a column an earlier layer
+        # creates, so their position in this list is not load-bearing.
+        ("src.features.fouls", "attach_foul_features_layer", "fouls"),
+        ("src.features.dvp", "attach_dvp_features_layer", "dvp"),
+        # minutes_weighted LAST, because of the three unwired layers here its
+        # columns are the closest to ones the contract already carries and so
+        # the likeliest to be mistaken for shipped features: |r| 0.976-0.992
+        # against {STAT}_L5 puts them inside the band the halflife family was
+        # excluded for. They are built so feature_ab can measure them under test; see the
         # module docstring for the numbers and labels.py for the comparison.
         ("src.features.minutes_weighted", "attach_minutes_weighted_features", "minutes_weighted"),
     ):

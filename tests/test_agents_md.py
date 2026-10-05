@@ -26,7 +26,7 @@ CITATIONS = [
     ("src/quant/advisory_sizing.py", 114, '"AUTO_PLACED": False'),
     ("src/quant/contracts.py", 187, 'context.status != "VALID"'),
     ("src/quant/publication_gate.py", 150, "def calibration_gate"),
-    ("src/features/builder.py", 570, "def assert_no_lookahead"),
+    ("src/features/builder.py", 581, "def assert_no_lookahead"),
     ("src/features/builder.py", 74, "from src.models.compare import load_comparison_config"),
     ("src/features/fatigue_load.py", 284, "from src.models.compare import load_comparison_config"),
     ("tests/test_publication_gate.py", 66, "for forbidden in"),

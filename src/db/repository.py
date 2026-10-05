@@ -108,6 +108,13 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         "stl": pd.to_numeric(df.get("STL"), errors="coerce"),
         "blk": pd.to_numeric(df.get("BLK"), errors="coerce"),
         "tov": pd.to_numeric(df.get("TOV"), errors="coerce"),
+        # Personal fouls. df.get returns None when the panel has no PF, and
+        # pd.to_numeric(None) gives an all-null column -- which is the right
+        # answer for a panel built before boxscores.COLUMN_MAP started asking
+        # the endpoint for PF: the row leaves pf unknown rather than claiming
+        # zero. See migrations/006_player_game_log_fouls.sql for why a zero
+        # default would be a fabrication rather than a convenience.
+        "pf": pd.to_numeric(df.get("PF"), errors="coerce"),
         "source": "nba_stats_leaguegamelog",
     })
 
@@ -119,7 +126,7 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         raise ValueError("DATA_NOT_AVAILABLE: no player-log rows survived date parsing")
 
     # Integer columns in the model; a float like 30.0 would be rejected.
-    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov"):
+    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf"):
         work[col] = work[col].astype("Int64")
 
     work["is_neutral_site"] = _lookup_neutral_site(work)
@@ -291,6 +298,13 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             "STL": r.stl,
             "BLK": r.blk,
             "TOV": r.tov,
+            # Personal fouls, so src/features/fouls.py reaches the LIVE path
+            # and not only a panel rebuilt from the archive. NULL on every row
+            # written before boxscores.COLUMN_MAP began requesting PF, which
+            # is what the layer's abstention is for: it can abstain on a null
+            # and cannot on a zero, which is why migration 006 writes neither
+            # a default nor a backfill.
+            "PF": r.pf,
         }
         for r in result
     ])

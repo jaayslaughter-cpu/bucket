@@ -142,6 +142,35 @@ LAYERS: dict[str, Layer] = {
             "PACE_ROLL correlates 0.82 but no model reads it)."
         ),
     ),
+    "fouls": Layer(
+        ("PF_L5", "PF_L10", "PF_SEASON", "PF_PER_MIN_L10", "PF_TROUBLE_RATE_L10"),
+        note=(
+            "The player's own prior foul history. Six fouls ends a night, so "
+            "this asks whether foul propensity carries minutes risk the "
+            "minutes columns do not already describe. Needs a panel built "
+            "after PF was mapped -- from the archive's foulsPersonal or the "
+            "league game log's PF, both of which were carried and neither of "
+            "which was requested until now. No market reads these columns, "
+            "so run it with --wire-under-test."
+        ),
+    ),
+    "dvp": Layer(
+        (
+            "DVP_PTS_ALLOWED_L10", "DVP_REB_ALLOWED_L10", "DVP_AST_ALLOWED_L10",
+            "DVP_FG3M_ALLOWED_L10", "DVP_STL_ALLOWED_L10", "DVP_BLK_ALLOWED_L10",
+            "DVP_PTS_INDEX_L10", "DVP_REB_INDEX_L10", "DVP_AST_INDEX_L10",
+            "DVP_FG3M_INDEX_L10", "DVP_STL_INDEX_L10", "DVP_BLK_INDEX_L10",
+        ),
+        note=(
+            "Opponent defence split by the position it is defending -- the "
+            "first column in this panel that varies by who the player is as "
+            "well as by whom he faces. The question it settles is whether it "
+            "adds anything to DEF_RATING_L10, which hands every player in a "
+            "game the same number. Covers the 87.2% of rows with an as-of "
+            "position bucket; no market reads these columns, so run it with "
+            "--wire-under-test."
+        ),
+    ),
     # The four layers that ran on every build while no market read a column
     # they produce. Both arms are subtractive: the real panel already carries
     # every column, so the control is the panel without them.

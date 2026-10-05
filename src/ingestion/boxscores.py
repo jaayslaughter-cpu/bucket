@@ -78,6 +78,15 @@ COLUMN_MAP = {
     "STL": "STL",
     "BLK": "BLK",
     "TOV": "TOV",
+    # Personal fouls. The endpoint has carried this all along -- it sits
+    # between TOV and PTS in the LeagueGameLog header list, as recorded in
+    # tests/test_boxscore_ingest.py -- and this map simply did not ask for it,
+    # so the LIVE panel had no foul count while the Kaggle archive did.
+    # src/features/fouls.py builds a minutes-risk signal from it: six fouls
+    # ends a night. Listed here rather than treated as optional for the same
+    # reason FGA and FTA are: a payload that has stopped carrying a standard
+    # column should make this parser refuse, not quietly narrow the panel.
+    "PF": "PF",
 }
 
 
@@ -197,7 +206,7 @@ def parse_league_game_log(payload: dict[str, Any], *, season: str) -> pd.DataFra
     out["IS_HOME"] = is_home
 
     for col in ("MIN", "PTS", "REB", "AST", "FG3M", "FG3A", "FGM", "FGA",
-                "FTM", "FTA", "OREB", "DREB", "STL", "BLK", "TOV"):
+                "FTM", "FTA", "OREB", "DREB", "STL", "BLK", "TOV", "PF"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
     unparsed = int(out["OPPONENT_ABBREVIATION"].isna().sum())
