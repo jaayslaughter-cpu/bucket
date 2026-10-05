@@ -268,34 +268,46 @@ def test_the_model_resolver_reaches_the_scheduled_worker():
     )
 
 
-def test_the_open_list_is_numbered_without_gaps():
+def test_every_o_number_is_unique_and_resolves_to_exactly_one_row():
     """
-    Contiguous and unduplicated — but NOT required to start at 1.
+    UNIQUE AND RESOLVABLE. Contiguity is deliberately NOT required, and this
+    test has now been wrong in both directions, which is why this is spelled
+    out at length rather than left as an assertion.
 
-    This used to assert ``range(1, len+1)``, which forced a renumbering every
-    time the lowest-numbered item closed. That is the opposite of what the
-    cross-references need: an O-number is cited from test docstrings, commit
-    messages and other docs, and renumbering silently repoints every one of
-    them at a different item.
+    FIRST it asserted ``range(1, len+1)``, forcing a renumbering every time the
+    lowest-numbered item closed. That is the opposite of what cross-references
+    need: an O-number is cited from test docstrings, commit messages and other
+    docs, and renumbering silently repoints every one of them at a different
+    item. It had already happened -- ``tests/test_forward_slate.py`` opens
+    "O1 - rows for a slate that has not been played" and
+    ``tests/test_under_and_push.py`` opens "O8 - the under and the push", while
+    this page's current O8 is self-referential evaluation, so a bare O-number
+    in a docstring older than 2026-10-05 may not mean what it means here.
 
-    IT HAS ALREADY HAPPENED, which is why this is now spelled out rather than
-    enforced the other way. ``tests/test_forward_slate.py`` opens "O1 — rows
-    for a slate that has not been played" and ``tests/test_under_and_push.py``
-    opens "O8 — the under and the push", while this page's current O8 is
-    self-referential evaluation. Those identifiers were reused after an
-    earlier closure round, so a bare "O8" in an old docstring and a bare "O8"
-    here are two different items. Numbers are stable from here on: a closed
-    item moves to the closed table keeping its number, and the open list is
-    allowed to start wherever it starts.
+    THEN it asserted contiguity from wherever the list started, which was no
+    better: closing O5 while O4 and O6 remain open leaves a gap, and that gap
+    is CORRECT. O5 is closed, not missing. Requiring contiguity would force
+    exactly the renumbering the previous paragraph is about.
+
+    So what is checked is the invariant that actually holds under stable
+    numbering: every number appears EXACTLY ONCE as a table row, and nothing
+    cited in the prose is missing from the tables. A duplicate or a dangling
+    citation is a real error; a gap is a closed item.
     """
-    found = sorted(int(n) for n in set(re.findall(r"\*\*O(\d+)\*\*", TEXT)))
-    assert found, "the open list is empty; if that is true, say so in prose"
-    assert found == list(range(found[0], found[0] + len(found))), (
-        f"O-numbers are not contiguous: {found}"
+    import collections
+
+    rows = re.findall(r"^\| \*\*O(\d+)\*\* \|", TEXT, re.M)
+    assert rows, "no O-numbered table rows at all"
+
+    duplicated = [n for n, c in collections.Counter(rows).items() if c > 1]
+    assert not duplicated, (
+        f"O-number(s) {duplicated} appear in more than one table row, so a "
+        "citation to them is ambiguous"
     )
-    rows = len(re.findall(r"^\| \*\*O\d+\*\* \|", TEXT, re.M))
-    assert rows == len(found), (
-        f"{rows} table row(s) but {len(found)} distinct O-number(s) — a "
-        "reference in the prose points at an item that is not in the table"
+
+    cited = {int(n) for n in re.findall(r"\*\*O(\d+)\*\*", TEXT)}
+    tabled = {int(n) for n in rows}
+    assert cited <= tabled, (
+        f"O-number(s) {sorted(cited - tabled)} are cited in the prose but have "
+        "no table row"
     )
-    assert found, "the open list is empty; if that is true, say so in prose"

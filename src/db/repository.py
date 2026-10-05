@@ -347,6 +347,11 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
             "prob_under": r.get("PROB_UNDER"),
             "prob_push": r.get("PROB_PUSH"),
             "market_status": r.get("MARKET_STATUS", "DATA_NOT_AVAILABLE"),
+            # The reason behind the status, kept beside it rather than folded
+            # into `notes`: notes already carries the under/push refusal, and
+            # two unrelated reasons in one free-text column cannot be read
+            # apart. See Projection.market_status_reason.
+            "market_status_reason": r.get("MARKET_STATUS_REASON"),
             "notes": r.get("NOTES"),
         })
 
@@ -364,7 +369,8 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
                     "run_id", "baseline_projection", "fatigue_multiplier",
                     "fatigue_notes", "final_projection", "line", "prob_over",
                     "prob_under", "prob_push",
-                    "model_version", "market_status", "ev_per_dollar", "notes",
+                    "model_version", "market_status", "market_status_reason",
+                    "ev_per_dollar", "notes",
                 )
             },
         )

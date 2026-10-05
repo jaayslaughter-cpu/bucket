@@ -457,13 +457,41 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
                        f"PROB_OVER written for {claimed}, but the artifact's "
                        "target_market is PTS")
         else:
+            # AND THE OTHER HALF, which this check used to report as a
+            # permanent WARN: that one artifact meant one market per RUN, so
+            # the remaining markets could never carry a probability and the
+            # recorder skipped them. assemble_projections now takes a
+            # market -> Series MAPPING, and score_prob_over_by_market fills it
+            # by resolving xgboost_{MARKET}.json per market. So the question is
+            # no longer "does one model overclaim" alone -- it is also "can
+            # several models each claim their own".
             others = sorted(set(proj["MARKET"]) - {"PTS"})
-            report.warn(
-                "a one-market model does not claim the other markets",
-                f"correct: PROB_OVER only for PTS. But score_prob_over takes ONE "
-                f"model_path, so {others} can never carry a probability in a single "
-                "run, and the recorder skips a row with no probability.",
+            multi = {}
+            for market in ("PTS", *others[:2]):
+                series = pd.Series(0.55, index=features.index)
+                series.attrs["target_market"] = market
+                multi[market] = series
+            many = assemble_projections(
+                features, multi, {"status": "DATA_NOT_AVAILABLE", "by_key": {}},
+                stats=DEFAULT_STATS,
             )
+            claimed_many = sorted(
+                many.loc[many["PROB_OVER"].notna(), "MARKET"].unique()
+            )
+            if claimed_many != sorted(multi):
+                report.bad(
+                    "a one-market model does not claim the other markets",
+                    f"a {len(multi)}-market mapping produced probabilities for "
+                    f"{claimed_many}; each market must carry its own and only "
+                    "its own",
+                )
+            else:
+                report.ok(
+                    "a one-market model does not claim the other markets",
+                    f"one Series -> only PTS; a mapping of {len(multi)} markets "
+                    f"-> {claimed_many}, each from its own artifact. Markets "
+                    f"with no artifact stay null rather than borrowing one.",
+                )
     g(_one_market)
 
 

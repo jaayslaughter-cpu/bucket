@@ -314,7 +314,16 @@ class Projection(Base):
     prob_push: Mapped[float | None] = mapped_column(Float)
     model_version: Mapped[str | None] = mapped_column(String(64))
 
+    # PER ROW, from this row's own prop line. It used to be the slate-wide EV
+    # verdict written onto every row, so one priced prop out of three hundred
+    # labelled all three hundred READY_FOR_EVALUATION -- a claim about a
+    # different row, in the only form this column is ever read.
     market_status: Mapped[str] = mapped_column(String(32), default="DATA_NOT_AVAILABLE")
+    # WHY the status is what it is, because DATA_NOT_AVAILABLE has two causes
+    # that a reader must not confuse: NO LINE reached this row, or a line was
+    # posted and the gate refused it. "Nobody priced this player" and "a price
+    # was posted and could not be de-vigged" are different facts.
+    market_status_reason: Mapped[str | None] = mapped_column(Text)
     ev_per_dollar: Mapped[float | None] = mapped_column(Float)
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

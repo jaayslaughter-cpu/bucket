@@ -603,39 +603,165 @@ def score_prob_over(
         return null
 
 
+def score_prob_over_by_market(
+    features: pd.DataFrame,
+    prop_lines: pd.DataFrame,
+    *,
+    explicit: Path | str | None = None,
+    markets: tuple[str, ...] = DEFAULT_STATS,
+) -> dict[str, pd.Series]:
+    """
+    One artifact per market, so every market can carry a probability.
+
+    WHY THIS EXISTS. ``score_prob_over`` takes ONE ``model_path`` and
+    ``assemble_projections`` writes its output only onto the market the
+    artifact's sidecar names -- correctly, since copying a points model's
+    P(Over) onto the rebound frame would publish one market's probability as
+    another's. But the consequence was that a single run could never produce a
+    probability for more than ONE market: AST, REB and FG3M rows came out
+    null, and ``settlement.recorder`` skips a row with no probability, so
+    three of the four markets were unrecordable and ungradeable no matter how
+    many models had been trained. ``verify_wiring`` reported this as a WARN on
+    every run.
+
+    ``resolve_model_artifact`` already takes a ``market`` and globs
+    ``xgboost_{MARKET}.json``; nothing called it that way. This does.
+
+    AN EXPLICIT ARTIFACT STILL MEANS ONE MARKET. ``--model`` and
+    ``$PROPIQ_MODEL`` name a specific file, and that file was fit for one
+    market -- so it is resolved and scored ONCE, and the market comes from its
+    own sidecar rather than from the loop. Looping an explicit path over every
+    market would score the same booster four times and hand three of the
+    results to markets it was not fit for, which is the exact mistake the
+    sidecar check exists to prevent.
+
+    A market with no artifact is SKIPPED, not filled. Its rows keep a null
+    probability, which is what they already were.
+    """
+    if explicit:
+        scored = score_prob_over(features, prop_lines, Path(explicit))
+        market = scored.attrs.get("target_market")
+        if not market:
+            logger.info(
+                "An explicit artifact was given but its market is unknown, so "
+                "no market receives these probabilities."
+            )
+            return {}
+        return {str(market): scored}
+
+    out: dict[str, pd.Series] = {}
+    missing: list[str] = []
+    for market in markets:
+        path, how = resolve_model_artifact(market=market)
+        if path is None:
+            missing.append(market)
+            continue
+        scored = score_prob_over(features, prop_lines, path)
+        resolved_market = scored.attrs.get("target_market")
+        if not resolved_market:
+            continue
+        if str(resolved_market).upper() != market.upper():
+            # The glob is per market, so this should not happen -- but a
+            # mislabelled sidecar would otherwise route one market's
+            # probabilities to another, silently, which is the whole failure
+            # this function is shaped around.
+            logger.warning(
+                "Artifact %s resolved for %s (via %s) but its sidecar says "
+                "%s. Skipping it rather than attributing it to the wrong "
+                "market.", path, market, how, resolved_market,
+            )
+            continue
+        out[market.upper()] = scored
+
+    if missing:
+        logger.info(
+            "No artifact for %s, so those rows carry no probability and the "
+            "recorder will skip them. Train one per market: it is one file per "
+            "market by design, not one model for all of them.", missing,
+        )
+    logger.info(
+        "Scored %d of %d market(s): %s", len(out), len(markets), sorted(out)
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # [8] EV gate — call the real gate, record the verdict
 # ---------------------------------------------------------------------------
 
+#: What a projection row's MARKET_STATUS is when no prop line reached it at
+#: all. Distinguished from a line the gate REFUSED, because "nobody posted a
+#: price for this player" and "a price was posted and could not be de-vigged"
+#: are different facts and a reader acting on either deserves the right one.
+GATE_NO_LINE_REASON = (
+    "No prop line was matched to this row, so there was no posted price for "
+    "the gate to evaluate."
+)
+
+
 def evaluate_ev_gate(prop_lines: pd.DataFrame, game_markets: pd.DataFrame) -> dict[str, Any]:
     """
-    Ask quant.contracts.market_ev_gate whether EV may be computed.
+    Ask quant.contracts.market_ev_gate whether EV may be computed, PER ROW.
 
-    It requires status == VALID *and* both over/under American odds.
-    Pick'em multipliers and BigDataBall game lines satisfy neither for
-    player props, so the expected verdict today is DATA_NOT_AVAILABLE.
-    That abstention is the correct output, not a bug — recording it
-    explicitly stops a consumer reading "no EV shown" as "no edge found".
+    It requires status == VALID, both over/under American odds, and a finite
+    posted line. Pick'em multipliers are ROUTED rather than refused -- see
+    ``contracts.PICKEM_ENTRY_ROUTE`` -- and BigDataBall game lines are not
+    player props at all, so an abstention is a common and correct output here.
+    Recording it explicitly stops a consumer reading "no EV shown" as "no edge
+    found".
+
+    TWO DEFECTS THIS FUNCTION HAD, both of which made its answer meaningless
+    rather than merely pessimistic:
+
+    1. IT DID NOT PASS THE LINE. ``MarketContext.line`` defaulted to None and
+       this loop never set it, while ``market_ev_gate`` refuses a context with
+       no finite line -- "EV is a claim about a probability at a specific
+       number". So every row abstained for the one reason that was this
+       function's own doing, and a perfect two-way price would have abstained
+       too. ``market``, ``player_name``, ``is_pickem`` and
+       ``payout_multiplier`` were dropped on the same floor, so pick'em rows
+       were never routed either.
+
+    2. IT RETURNED ONE STATUS FOR THE WHOLE SLATE. The loop counts ready and
+       abstained per row and then collapses them, and
+       ``assemble_projections`` wrote that single value onto EVERY row, where
+       ``repository.persist_projections`` stores it per row as
+       ``market_status``. One ready prop out of three hundred therefore
+       labelled all three hundred READY_FOR_EVALUATION. The gate's question is
+       about ONE market -- it reads one context -- so a per-row answer is the
+       only kind it has; the aggregate is a summary for a log line.
+
+    ``by_key`` is the per-row answer, keyed on ``(player_name, market)`` --
+    the same key ``_attach_prop_lines`` joins LINE on, so a row that got a
+    line gets that line's verdict and cannot be handed another row's.
     """
     from src.quant.contracts import MarketContext, market_ev_gate
 
+    empty: dict[str, Any] = {
+        "status": "DATA_NOT_AVAILABLE",
+        "reason": "No prop lines captured.",
+        "ready": 0,
+        "abstained": 0,
+        "by_key": {},
+    }
     if prop_lines.empty:
-        return {
-            "status": "DATA_NOT_AVAILABLE",
-            "reason": "No prop lines captured.",
-            "ready": 0,
-            "abstained": 0,
-        }
+        return empty
 
     ready = abstained = 0
     first_reason: str | None = None
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for _, row in prop_lines.iterrows():
         ctx = MarketContext(
             game_id=str(row.get("nba_game_id") or "unknown"),
+            market=row.get("market"),
+            player_name=row.get("player_name"),
+            line=row.get("line"),
             source=row.get("source"),
             captured_at_utc=row.get("captured_at_utc"),
             over_odds_american=row.get("over_odds_american"),
             under_odds_american=row.get("under_odds_american"),
+            payout_multiplier=row.get("payout_multiplier"),
+            is_pickem=bool(row.get("is_pickem") or False),
             status=row.get("status", "DATA_NOT_AVAILABLE"),
         )
         verdict = market_ev_gate(ctx)
@@ -645,19 +771,32 @@ def evaluate_ev_gate(prop_lines: pd.DataFrame, game_markets: pd.DataFrame) -> di
             abstained += 1
             first_reason = first_reason or verdict.get("reason")
 
+        name, market = row.get("player_name"), row.get("market")
+        if name and market:
+            # Last write wins, matching _attach_prop_lines' own
+            # drop_duplicates(keep="last"): the freshest capture for a
+            # (player, market) is the one whose line is joined, so it must
+            # also be the one whose verdict is.
+            by_key[(str(name), str(market))] = {
+                "status": verdict["status"],
+                "reason": verdict.get("reason"),
+                "route": verdict.get("route"),
+            }
+
     logger.info("EV gate: %d ready, %d abstained.%s", ready, abstained,
                 f" Reason: {first_reason}" if abstained else "")
     if ready == 0:
         logger.info(
             "No prop EV computed. BigDataBall supplies GAME spread/total/ML, not "
-            "two-way player-prop American odds — an approved two-way prop feed "
-            "two-way player-prop feed (PropLine) is required to satisfy the gate."
+            "two-way player-prop American odds — an approved two-way "
+            "player-prop feed (PropLine) is required to satisfy the gate."
         )
     return {
         "status": "READY_FOR_EVALUATION" if ready else "DATA_NOT_AVAILABLE",
         "ready": ready,
         "abstained": abstained,
         "reason": first_reason,
+        "by_key": by_key,
     }
 
 
@@ -686,7 +825,7 @@ def _fatigue_notes(features: pd.DataFrame) -> pd.Series:
 
 def assemble_projections(
     features: pd.DataFrame,
-    prob_over: pd.Series,
+    prob_over: "pd.Series | dict[str, pd.Series]",
     ev_verdict: dict[str, Any],
     prop_lines: pd.DataFrame | None = None,
     stats: tuple[str, ...] = DEFAULT_STATS,
@@ -711,13 +850,44 @@ def assemble_projections(
     for, taken from its artifact metadata. Copying one model's probability
     into every market frame published a points model's P(Over) as the
     rebound, assist and threes probability too.
+
+    ``prob_over`` IS A MAPPING OF MARKET -> SERIES, and a bare Series is still
+    accepted. The mapping is what lets more than one market carry a
+    probability in a single run: with a Series, whichever single market its
+    ``attrs["target_market"]`` names is the only one that can, and every other
+    market's rows come out null -- which the recorder then skips. See
+    ``score_prob_over_by_market``. A Series keeps working because the tests
+    and ``scripts/verify_wiring`` pass one, and because an explicit --model is
+    genuinely one artifact for one market.
+
+    MARKET_STATUS IS PER ROW, from ``ev_verdict["by_key"]``, joined on the
+    same ``(player_name, market)`` key as LINE. It used to be the slate-wide
+    aggregate written onto every row, so one ready prop out of three hundred
+    labelled all three hundred READY_FOR_EVALUATION.
     """
-    scored_market = prob_over.attrs.get("target_market") if hasattr(prob_over, "attrs") else None
-    if scored_market is None and prob_over.notna().any():
-        logger.warning(
-            "P(Over) has no target market attached — leaving PROB_OVER null rather "
-            "than attributing one market's probabilities to all of them."
+    if isinstance(prob_over, dict):
+        by_market: dict[str, pd.Series] = {
+            str(k).upper(): v for k, v in prob_over.items()
+        }
+    else:
+        scored_market = (
+            prob_over.attrs.get("target_market")
+            if hasattr(prob_over, "attrs") else None
         )
+        if scored_market is None and prob_over.notna().any():
+            logger.warning(
+                "P(Over) has no target market attached — leaving PROB_OVER null "
+                "rather than attributing one market's probabilities to all of them."
+            )
+            by_market = {}
+        elif scored_market is None:
+            by_market = {}
+        else:
+            by_market = {str(scored_market).upper(): prob_over}
+
+    gate_by_key: dict[tuple[str, str], dict[str, Any]] = (
+        ev_verdict.get("by_key") or {}
+    )
 
     frames = []
     for stat in stats:
@@ -736,11 +906,10 @@ def assemble_projections(
             "FATIGUE_MULTIPLIER": features[FATIGUE_COL],
             "FATIGUE_NOTES": _fatigue_notes(features),
             "PROB_OVER": (
-                prob_over.values
-                if scored_market == stat
+                by_market[stat.upper()].values
+                if stat.upper() in by_market
                 else [None] * len(features)
             ),
-            "MARKET_STATUS": ev_verdict["status"],
         }))
 
     if not frames:
@@ -749,6 +918,9 @@ def assemble_projections(
 
     out = pd.concat(frames, ignore_index=True)
     out["LINE"] = _attach_prop_lines(out, prop_lines)
+    out["MARKET_STATUS"], out["MARKET_STATUS_REASON"] = _market_status_per_row(
+        out, gate_by_key
+    )
     # Assigned HERE rather than inside the helper so the keys are visible at
     # the assembly site: tests/test_projection_roundtrip.py reads this function
     # to check that every key persist_projections reads is actually produced,
@@ -761,11 +933,59 @@ def assemble_projections(
     out["NOTES"] = reason
 
     matched = int(out["LINE"].notna().sum())
+    scored_rows = int(pd.to_numeric(out["PROB_OVER"], errors="coerce").notna().sum())
+    ready_rows = int((out["MARKET_STATUS"] == "READY_FOR_EVALUATION").sum())
     logger.info(
-        "Assembled %d projection rows across %d markets (%d with a matched prop line)",
-        len(out), len(frames), matched,
+        "Assembled %d projection rows across %d markets (%d with a matched prop "
+        "line, %d with a probability from %s, %d READY_FOR_EVALUATION per row)",
+        len(out), len(frames), matched, scored_rows,
+        sorted(by_market) or "no market", ready_rows,
     )
     return out
+
+
+def _market_status_per_row(
+    projections: pd.DataFrame,
+    gate_by_key: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Each row's OWN gate verdict, and the reason behind it.
+
+    THE DEFECT THIS REPLACES. ``MARKET_STATUS`` was ``ev_verdict["status"]`` --
+    one slate-wide value, assigned to every row, and persisted per row by
+    ``repository.persist_projections`` as ``market_status``. A slate with one
+    priced prop and two hundred and ninety-nine unpriced ones labelled all
+    three hundred READY_FOR_EVALUATION. Anything reading the column row by row
+    -- which is the only way it is stored -- was reading a claim about a
+    different row.
+
+    THREE OUTCOMES, and the distinction between the last two is the point:
+
+      * the gate's own verdict, where a prop line was matched to this row;
+      * DATA_NOT_AVAILABLE because NO LINE reached this row at all;
+      * DATA_NOT_AVAILABLE because a line WAS posted and the gate refused it.
+
+    "Nobody posted a price for this player" and "a price was posted and could
+    not be de-vigged" are different facts. Collapsing them is how a reader
+    concludes a market is unavailable when it is actually unpriceable, or the
+    reverse.
+    """
+    names = projections.get("PLAYER_NAME")
+    markets = projections.get("MARKET")
+    statuses: list[str] = []
+    reasons: list[str | None] = []
+    for name, market in zip(names, markets):
+        verdict = gate_by_key.get((str(name), str(market)))
+        if verdict is None:
+            statuses.append("DATA_NOT_AVAILABLE")
+            reasons.append(GATE_NO_LINE_REASON)
+            continue
+        statuses.append(str(verdict.get("status") or "DATA_NOT_AVAILABLE"))
+        reasons.append(verdict.get("reason"))
+    return (
+        pd.Series(statuses, index=projections.index, dtype="object"),
+        pd.Series(reasons, index=projections.index, dtype="object"),
+    )
 
 
 def _under_push_and_reason(
@@ -1032,18 +1252,40 @@ def main(argv: list[str] | None = None) -> int:
                 record_run(run_id, status="success_no_data", stage_summary=stage_summary)
             return 0
 
-        model_path, resolved_by = resolve_model_artifact(args.model)
-        if model_path is None:
-            logger.warning("P(Over) will be skipped: %s", resolved_by)
+        # ONE ARTIFACT PER MARKET. An explicit --model/$PROPIQ_MODEL is one
+        # file fit for one market and is honoured as such; otherwise every
+        # market resolves its own xgboost_{MARKET}.json, so a run is no longer
+        # limited to a single market's probabilities. See
+        # score_prob_over_by_market for why an explicit path is NOT looped.
+        explicit = args.model or (os.environ.get(ENV_MODEL) or "").strip() or None
+        if explicit:
+            model_path, resolved_by = resolve_model_artifact(args.model)
+            if model_path is None:
+                logger.warning("P(Over) will be skipped: %s", resolved_by)
+            else:
+                logger.info(
+                    "Scoring model: %s (resolved by %s) — one artifact, so one "
+                    "market carries a probability this run.",
+                    model_path, resolved_by,
+                )
+            stage_summary["model"] = {
+                "path": str(model_path) if model_path else None,
+                "resolved_by": resolved_by,
+            }
         else:
-            logger.info("Scoring model: %s (resolved by %s)", model_path, resolved_by)
-        stage_summary["model"] = {
-            "path": str(model_path) if model_path else None,
-            "resolved_by": resolved_by,
-        }
-        prob_over = score_prob_over(features, prop_df, model_path)
+            stage_summary["model"] = {"resolved_by": "per market"}
+
+        prob_over = score_prob_over_by_market(
+            features, prop_df, explicit=explicit, markets=DEFAULT_STATS
+        )
+        stage_summary["model"]["markets_scored"] = sorted(prob_over)
         ev_verdict = evaluate_ev_gate(prop_df, market_df)
-        stage_summary["ev_gate"] = ev_verdict
+        # by_key is one entry per priced (player, market) and is joined onto
+        # the rows; it does not belong in a run summary that goes to the
+        # database as JSON, where it would be hundreds of keys of duplication.
+        stage_summary["ev_gate"] = {
+            k: v for k, v in ev_verdict.items() if k != "by_key"
+        }
 
         projections = assemble_projections(features, prob_over, ev_verdict, prop_lines=prop_df)
         stage_summary["projections"] = {"rows": len(projections)}
