@@ -255,18 +255,133 @@ what — `src/features/schedule.py` is untouched by this work.
 Neither layer is in `src/models/labels.py::default_feature_cols`, and
 **correlation is not the measurement that decides it**. The halflife and
 usage-volume families were both predicted redundant from `|r|` and then
-*tested*, and the test is what the exclusion rests on. The honest status of
-these two layers is: the columns exist, they are leakage-safe, they are not
-copies of anything the contract already carries, and whether they improve a
-Brier score is unmeasured.
+*tested*, and the test is what the exclusion rests on.
+
+For **fouls** the honest status is unchanged: the columns exist, they are
+leakage-safe, they are not copies of anything the contract already carries,
+and whether they improve a Brier score is unmeasured.
 
 ```
 python -m scripts.feature_ab --layer fouls --wire-under-test --markets PTS,REB,AST
-python -m scripts.feature_ab --layer dvp   --wire-under-test --markets PTS,REB,AST
 ```
 
-Record the result here and in `labels.py` when it is run. Until then neither
-is a feature, and nothing downstream reads either.
+For **DvP** it has now been run, for REB. Section 3a has the numbers. The
+short version: the layer helps, by a small and direction-consistent amount,
+and it is still not wired — for a reason that has nothing to do with the
+measurement.
+
+## 3a. DvP, measured — REB only
+
+```
+python -m scripts.feature_ab --layer dvp --wire-under-test --markets REB --folds 4 \
+    --panel <panel>.parquet --seasons-only 2022-23,2023-24,2024-25
+```
+
+4 chronological folds, train cutoffs stepping 14 days from 2025-01-15, the
+last validation window ending 2025-03-29. 76,585 panel rows; ~17,988 distinct
+validation rows. REB reads exactly two of the twelve columns —
+`DVP_REB_ALLOWED_L10` and `DVP_REB_INDEX_L10` — because `column_for_market`
+routes a `DVP_*` column by the stat in the middle of its name. Coverage on the
+slice: 85.1% for `_ALLOWED`, 84.7% for `_INDEX`.
+
+| model | metric | off | on | delta | fold sd | folds better |
+|---|---|---|---|---|---|---|
+| catboost | Brier raw | 0.23722 | 0.23635 | **-0.00087** | 0.00065 | 4/4 |
+| catboost | Brier cal | 0.23675 | 0.23576 | **-0.00099** | 0.00077 | 4/4 |
+| ensemble | Brier raw | 0.23670 | 0.23600 | **-0.00070** | 0.00034 | 4/4 |
+| ensemble | Brier cal | 0.23633 | 0.23573 | **-0.00061** | 0.00048 | 4/4 |
+| line_aware | Brier raw | 0.23928 | 0.23863 | **-0.00065** | 0.00034 | 4/4 |
+| line_aware | Brier cal | 0.23896 | 0.23842 | **-0.00054** | 0.00022 | 4/4 |
+| xgboost | Brier raw | 0.23694 | 0.23628 | -0.00066 | 0.00053 | 3/4 |
+| xgboost | Brier cal | 0.23646 | 0.23585 | **-0.00061** | 0.00052 | 4/4 |
+| distribution | Brier raw | 0.24869 | 0.24869 | +0.00000 | 0.00000 | 0/4 |
+
+Lower is better. The bar `feature_ab` prints under every table is that a mean
+delta smaller than the fold-to-fold sd is not evidence. By that bar the
+accuracy gain clears it for `ensemble` (2.1x sd raw), `line_aware` (2.0x raw,
+2.5x calibrated) and `catboost` calibrated (1.3x), and the direction is the
+same in all four folds for four of the five models. In absolute terms it is
+0.0006–0.0010 of Brier on a base of 0.237 — a 0.3–0.4% relative improvement.
+Small, repeatable, and not nothing; nobody should read it as more than that.
+
+**Calibration did not improve, and may have got slightly worse.** Calibrated
+ECE: catboost +0.00165 (sd 0.00438, 2/4 folds better), ensemble +0.00097
+(sd 0.00472, 2/4), line_aware +0.00125 (sd 0.00300, **1/4**), xgboost -0.00230
+(sd 0.00651, 2/3). Every one of those deltas is smaller than its own fold
+spread, so none of them is evidence in either direction — but the sign is
+adverse in three of four models and `line_aware` was better in only one fold
+of four. Recorded as a thing to watch, not as a finding.
+
+**`distribution` is a built-in null arm.** It moved by exactly 0.00000 on
+every metric, 0/4 folds, because it fits a parametric distribution over a
+fixed feature set and never sees a new column. An A/B harness that leaked a
+difference through some shared path — a shared scaler, a reused split, a
+cached frame — would move this row too. It did not.
+
+### Why the three-season slice, and what it cost
+
+Full-panel runs were attempted three times and never finished inside this
+environment's uptime. The slice is a deliberate narrowing, and it is not free,
+but it costs much less than it looks:
+
+| | full panel | 2022-23 → 2024-25 |
+|---|---|---|
+| rows | 214,381 | 76,585 |
+| line_aware source rows before the cutoff | 169,358 | 67,325 |
+| line_aware rows kept after the 600,000 augmented-row cap | 66,666 (from 2022-03-08) | 66,666 (from 2022-10-22) |
+| rows dropped by the cap | 102,692 | 659 |
+
+`line_aware` trains on **the same 66,666-row budget either way** — the cap
+already truncated the full panel to a window starting 2022-03-08, and the
+slice starts 2022-10-22. So for the model whose delta was most consistent
+across folds, the slice changed which seven months sit at the start of the
+window and nothing else. `catboost`, `xgboost` and the `ensemble` over them
+are the arms that genuinely lost data: 169,358 source rows down to 67,325,
+about 60%. They still improved, 4/4 or 3/4. A fuller panel would plausibly
+move the deltas; the direction is what this run establishes, not the size.
+
+### Not a copy of anything wired
+
+Measured on the same 76,585 rows, against REB's own wired numeric features.
+The project's exclusion band is 0.83–0.99.
+
+| new column | strongest correlate | next |
+|---|---|---|
+| `DVP_REB_ALLOWED_L10` | `REB_L10` / `REB_SEASON` 0.437 | `REB_L2` / `REB_BASELINE` 0.434, `REB_L5` 0.414, `DEF_REB_ALLOWED_PER100_L10` 0.154 |
+| `DVP_REB_INDEX_L10` | `DEF_REB_ALLOWED_PER100_L10` 0.388 | `DEF_PACE_L10` 0.132, `DEF_RATING_L10` **0.025** |
+
+Nothing is in the band. Two readings worth keeping:
+
+- `DVP_REB_ALLOWED_L10` correlates ~0.44 with the player's *own* rebound
+  history. That is the mechanism, not leakage: the number a player faces is
+  the allowance to *his* position bucket, so a centre is handed the C-bucket
+  figure and centres rebound more. It therefore carries some player-identity
+  signal alongside the matchup signal, which is an argument for not shipping
+  it alone.
+- `DVP_REB_INDEX_L10` sits at **0.025** against `DEF_RATING_L10`. That is the
+  question this layer was built to settle — whether splitting opponent defence
+  by the position it is defending adds anything to a team-level number that
+  hands every player in a game the same value — and the answer is that the
+  position-relative index is very nearly orthogonal to it.
+
+The two new columns correlate 0.410 with each other, so they are not two
+spellings of one number either.
+
+### It is measured and still not wired
+
+`STARTING_POSITION` has **no writer on the live path** (see the end of this
+page). The archive ingest supplies it; `player_game_logs` has no position
+column and nothing filling that table has one to write. So on a live slate
+both of these columns are null on every row, and a model trained with a
+feature that is absent in production is worse than one trained without it —
+the trees would have learned splits on a column that arrives empty.
+
+The gate on shipping DvP is therefore **a position writer, not more
+evidence**. The order is: add the writer, rebuild the live panel, confirm
+non-null coverage there, re-run this arm on a panel that has it, and only then
+touch `labels.py`. Wiring it now on the strength of the table above would ship
+a dead column, which is the `teammate_cascade.py` failure mode this project
+has already documented once.
 
 ## 4. Database
 

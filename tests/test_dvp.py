@@ -522,15 +522,43 @@ def test_an_empty_panel_is_not_a_crash():
 
 def test_no_market_reads_a_dvp_column_yet():
     """
-    Whether a defence-versus-position term adds anything to DEF_RATING_L10 is
-    a measurement. scripts/feature_ab.py --layer dvp --wire-under-test is
-    where it gets made.
+    THE MEASUREMENT HAS NOW BEEN MADE, and the reason this stays unwired
+    changed with it. `--layer dvp --wire-under-test --markets REB --folds 4`
+    came back better on every fold for four of five models, at 1.3-2.5x the
+    fold spread (docs/fouls_and_dvp.md section 3a). So "unmeasured" is no
+    longer the answer, and a docstring that still said so would be this
+    project's most-repeated defect.
+
+    What blocks it is the WRITER, pinned by the companion test below: the live
+    panel is built from `player_game_logs`, which has no position column, so
+    both DVP_REB_* columns are null on every live row. Wiring them would train
+    trees to split on a column that arrives empty in production.
     """
     from src.models.labels import default_feature_cols
 
     for market in ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN"):
         listed = set(default_feature_cols(market))
         assert not listed & set(DVP_FEATURE_COLS), market
+
+
+def test_the_live_table_still_has_no_position_column_which_is_what_blocks_wiring():
+    """
+    The tripwire for the test above. `attach_dvp_features` needs
+    STARTING_POSITION; only the archive ingest supplies it. If a position
+    writer ever reaches `player_game_logs`, this goes red — which is the
+    signal to re-run the REB arm on a live-shaped panel and reopen the wiring
+    decision, not to delete the assertion.
+    """
+    from src.db.models import PlayerGameLog
+    from src.features.dvp import STARTING_POSITION_COLUMN
+
+    columns = {c.name for c in PlayerGameLog.__table__.columns}
+    assert STARTING_POSITION_COLUMN.lower() not in columns
+    assert not [c for c in columns if "position" in c or c in {"pos", "start_pos"}], (
+        "a position column reached player_game_logs, so DvP may no longer be "
+        "null on the live path; re-measure and revisit "
+        "test_no_market_reads_a_dvp_column_yet"
+    )
 
 
 def test_the_layer_is_registered_with_feature_ab_so_it_can_be_measured():
