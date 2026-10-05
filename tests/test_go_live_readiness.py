@@ -179,8 +179,14 @@ def test_the_results_card_exists_and_the_page_says_how_it_is_sent():
     body = (ROOT / "src" / "notify" / "discord.py").read_text(encoding="utf-8")
     builders = re.findall(r"^def (build_\w+_embed)", body, re.M)
     assert "build_win_loss_embed" in builders, "the page claims a fifth builder"
-    assert len(builders) == 5, (
-        f"the page says five builders; there are {len(builders)}: {builders}"
+    # SIX NOW. build_prelock_correction_embed is the sixth, added with the
+    # tip-anchored pre-lock check: it is the only surface here that RETRACTS
+    # something already published, which an abstention embed cannot express.
+    # The count is asserted rather than left open because a builder nobody
+    # sends is how four of these sat unreachable before.
+    assert "build_prelock_correction_embed" in builders
+    assert len(builders) == 6, (
+        f"the page says six builders; there are {len(builders)}: {builders}"
     )
     worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
     settle = worker[worker.index("def run_settlement"):]

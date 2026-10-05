@@ -19,13 +19,24 @@ schedule would put the late West Coast games of one slate into the next day's
 run for part of the year and not the rest, which is the kind of off-by-one that
 silently changes what a backtest is measuring.
 
-WHAT IT DOES NOT DO, AND WHY NOT. It does not re-anchor itself to the day's
-first tip-off. That would need a schedule feed, every data host is denied from
-the environment this was written in, and a scheduler whose timing logic has
-never once been exercised against real data is worse than a fixed one: it looks
-adaptive and is untested. The fixed anchors below are deliberately early enough
-to precede any tip and late enough to follow any finish. Re-anchoring is a
-change to make when the schedule feed is reachable and can be tested.
+THREE JOBS, AND ONE OF THEM IS TIP-ANCHORED. The two daily cron entries are
+still fixed Pacific clocks -- deliberately early enough to precede any tip and
+late enough to follow any finish -- because the slate build and the settlement
+sweep are whole-day operations and nothing is gained by moving them.
+
+What used to be missing is the third kind, and this docstring used to explain
+its absence: "it does not re-anchor itself to the day's first tip-off. That
+would need a schedule feed, every data host is denied from the environment this
+was written in". The feed is reachable now -- ``espn_schedule`` parses
+``tipoff_utc`` and the forward slate already depends on it -- so
+``schedule_prelock_jobs`` arms ONE one-shot job per game at that game's own
+tip-off minus 35 minutes, and ``run_prelock`` re-checks availability for it.
+
+Per GAME rather than per slate, because tip-offs are staggered across an
+evening: a single slate-wide re-check is early for the late games and late for
+the early ones. And it checks availability ONLY -- it refits nothing and
+re-prices nothing, since the one thing that both changes in the last hour and
+matters is who is dressing.
 
 CONCURRENCY. Both jobs run with ``max_instances=1`` and ``coalesce=True``: a run
 that overruns its window is not joined by a second copy, and a backlog of missed
@@ -41,7 +52,7 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger("propiq.scheduler")
@@ -64,6 +75,8 @@ ENV_BOARD_TRAIN_END = "PROPIQ_BOARD_TRAIN_END"
 ENV_BOARD_VALIDATION_END = "PROPIQ_BOARD_VALIDATION_END"
 ENV_MIN_EV = "PROPIQ_MIN_EV"
 ENV_RESULTS_CARD = "PROPIQ_RESULTS_CARD"
+ENV_PRELOCK = "PROPIQ_PRELOCK"
+ENV_PRELOCK_LEAD = "PROPIQ_PRELOCK_LEAD_MINUTES"
 
 DEFAULT_CALIBRATION_REPORT = "outputs/calibration.json"
 DEFAULT_BOARD_CSV = "outputs/decision_board.csv"
@@ -78,6 +91,23 @@ DEFAULT_SETTLE_HOUR, DEFAULT_SETTLE_MINUTE = 3, 30
 # has moved on and running late would project games that have already tipped.
 SLATE_MISFIRE_GRACE_SECONDS = 60 * 60
 SETTLE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+
+# MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
+# 30-45 minute window: late enough that ESPN's injury report has settled, early
+# enough that a withdrawal is still actionable. Bounded 5..180 -- below 5 the
+# fetch and the post may not finish before tip, and past 180 it is not a
+# pre-lock check, it is a second morning run.
+DEFAULT_PRELOCK_LEAD_MINUTES = 35
+PRELOCK_LEAD_MIN, PRELOCK_LEAD_MAX = 5, 180
+
+# A pre-lock check that missed its slot by more than this is useless: the game
+# has tipped and the lineup is public. Deliberately SHORTER than the lead time
+# so a late fire cannot post after tip.
+PRELOCK_MISFIRE_GRACE_SECONDS = 10 * 60
+
+#: Set in main() so the daily planner can add one-shot jobs to the scheduler
+#: that is actually running. Tests pass a scheduler explicitly instead.
+_SCHEDULER: Any | None = None
 
 
 def _int_env(name: str, default: int, *, low: int, high: int) -> int:
@@ -489,6 +519,24 @@ def run_board() -> dict[str, Any]:
             min_ev=min_ev,
         )
         logger.info("Board: %s", result.as_dict())
+        # Arm tonight's tip-anchored re-checks now that a board exists for them
+        # to correct. Before the board there is nothing to withdraw.
+        #
+        # GUARDED SEPARATELY from the board build it sits inside. run_board's
+        # own except would catch a failure here and return
+        # {"status": "FAILED"} for the BOARD -- reporting a successful board as
+        # failed because an unrelated arming step did, which is the kind of
+        # misattributed status that sends somebody looking in the wrong place.
+        # The board is the durable output; the re-checks are an addition to it.
+        try:
+            schedule_prelock_jobs()
+        except Exception as exc:  # noqa: BLE001 — must not fail the board
+            logger.exception(
+                "Could not arm tonight's pre-lock re-checks (%s). The board "
+                "above STANDS and was written; what is lost is the tip-off "
+                "availability re-check, so late scratches will not be "
+                "withdrawn tonight.", exc,
+            )
         # The window travels with the result so a caller -- and the log line
         # above -- can see WHICH days were scored, not just how many rows came
         # back. A board of 40 rows is the same shape whether it describes
@@ -599,6 +647,325 @@ def run_dispatch() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Dispatch raised; the scheduler stays up.")
         return {"status": "FAILED", "error": str(exc)}
+
+
+def prelock_lead_minutes() -> int:
+    """Minutes before tip for the availability re-check, bounded and logged."""
+    return _int_env(
+        ENV_PRELOCK_LEAD, DEFAULT_PRELOCK_LEAD_MINUTES,
+        low=PRELOCK_LEAD_MIN, high=PRELOCK_LEAD_MAX,
+    )
+
+
+def schedule_prelock_jobs(
+    scheduler: Any | None = None,
+    *,
+    slate: Any | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """
+    Arm one availability re-check per game, each at that game's own tip-off.
+
+    THIS IS THE JOB THE WORKER DID NOT HAVE. ``build_scheduler`` registers two
+    CRON entries, and this module's own opening docstring says why that is not
+    enough: "a cron expression is fixed to a clock and an NBA slate is not:
+    tip-offs move by hours". It then shipped two fixed clocks anyway, because
+    the schedule feed was out of reach when it was written. It is in reach now
+    -- ``espn_schedule`` parses ``tipoff_utc`` and the forward slate already
+    depends on it -- so the tip-anchored half can exist.
+
+    ONE JOB PER GAME, NOT ONE PER SLATE. Tip-offs are staggered across an
+    evening; a single slate-wide re-check is early for the late games and late
+    for the early ones. Each job is a one-shot ``date`` trigger at
+    ``tipoff - lead``, so every game is checked on its own clock.
+
+    WHAT IS REFUSED, each for a stated reason rather than silently:
+
+      * a game with no ``tipoff_utc``  -> cannot be anchored, so no job. The
+        alternative is guessing a tip time, and a check that fires at the
+        wrong moment is worse than none.
+      * a game that is not PREGAME     -> it has tipped or finished; the
+        lineup is already public.
+      * a slot already in the past     -> firing immediately for a game that
+        tips in ten minutes would post a "pre-lock" card after lock. Reported
+        as skipped WITH the slot, because on a mid-day redeploy this is the
+        normal and correct outcome for the early games.
+
+    IDEMPOTENT. The job id is derived from the Pacific slate date and the ESPN
+    event id, with ``replace_existing=True``, so arming at boot and again
+    after the slate job cannot double-post.
+    """
+    target = scheduler if scheduler is not None else _SCHEDULER
+    if target is None:
+        logger.warning(
+            "No scheduler to arm pre-lock jobs on. They are added by main() at "
+            "boot and after each slate; a direct call needs one passed in."
+        )
+        return {"status": "DATA_NOT_AVAILABLE", "reason": "no scheduler"}
+
+    if not _flag(ENV_PRELOCK, True):
+        logger.info("Pre-lock checks off (%s=false). No tip-anchored jobs.", ENV_PRELOCK)
+        return {"status": "SKIPPED", "reason": "pre-lock disabled", "armed": 0}
+
+    lead = prelock_lead_minutes()
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+
+    try:
+        if slate is None:
+            from src.ingestion.espn_schedule import load_slate
+
+            slate = load_slate()
+    except Exception as exc:  # noqa: BLE001 — a denied feed is a state, not a crash
+        logger.warning(
+            "Could not read today's schedule (%s), so NO pre-lock check is armed. "
+            "The morning board still stands; it simply will not be re-checked "
+            "against late scratches tonight.", exc,
+        )
+        return {"status": "DATA_NOT_AVAILABLE", "reason": str(exc), "armed": 0}
+
+    from datetime import timedelta
+
+    games = list(getattr(slate, "pregame_only", None) or [])
+    armed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for game in games:
+        event_id = str(getattr(game, "espn_event_id", "") or "")
+        home = getattr(game, "home_team", None)
+        away = getattr(game, "away_team", None)
+        label = " @ ".join([p for p in (away, home) if p]) or event_id or "?"
+        tipoff = getattr(game, "tipoff_utc", None)
+
+        if tipoff is None:
+            skipped.append({"game": label, "reason": "no tip-off time"})
+            continue
+        if tipoff.tzinfo is None:
+            tipoff = tipoff.replace(tzinfo=timezone.utc)
+
+        run_at = tipoff - timedelta(minutes=lead)
+        if run_at <= moment:
+            skipped.append({
+                "game": label,
+                "reason": f"slot {run_at.isoformat()} already passed",
+            })
+            continue
+
+        slate_day = getattr(game, "slate_date_pt", None) or ""
+        job_id = f"prelock:{slate_day}:{event_id or label}"
+        target.add_job(
+            run_prelock,
+            trigger="date",
+            run_date=run_at,
+            kwargs={
+                "event_id": event_id,
+                "home": home,
+                "away": away,
+                "tipoff_iso": tipoff.isoformat(),
+            },
+            id=job_id,
+            name=f"Pre-lock availability re-check — {label}",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=PRELOCK_MISFIRE_GRACE_SECONDS,
+            replace_existing=True,
+        )
+        armed.append({
+            "game": label, "run_at": run_at.isoformat(), "tipoff": tipoff.isoformat(),
+        })
+
+    logger.info(
+        "Pre-lock: armed %d of %d pre-tip game(s) at tip-off minus %d minutes. "
+        "Skipped %d: %s",
+        len(armed), len(games), lead, len(skipped),
+        [s["reason"] for s in skipped[:4]] or "none",
+    )
+    return {
+        "status": "OK", "armed": len(armed), "lead_minutes": lead,
+        "jobs": armed, "skipped": skipped,
+    }
+
+
+def run_prelock(
+    *,
+    event_id: str,
+    home: str | None = None,
+    away: str | None = None,
+    tipoff_iso: str | None = None,
+) -> dict[str, Any]:
+    """
+    Re-check availability for ONE game 30-45 minutes before its tip-off.
+
+    WHY THIS JOB EXISTS. The board is built at 09:00 PT. Tip-offs are six to
+    twelve hours later, and the thing that changes in between is who is
+    dressing: ESPN's injury report settles in the last hour, and a
+    recommendation on a player who will not dress is not a weak
+    recommendation, it is a row that should not exist.
+    ``src/pipeline/scratches.py`` was written for exactly this and its
+    docstring names the gap -- "Nothing dropped a projection when a player was
+    ruled out AFTER that projection was written" -- but nothing ever called it
+    on a schedule. This is the caller.
+
+    WHAT IT DELIBERATELY DOES NOT DO: refit a model, rebuild the board, or
+    re-price anything. Refitting 35 minutes before tip would be absurd, and
+    re-pricing needs a live odds feed this project does not have (the board's
+    own source precedence lists one feed and this environment cannot reach
+    it). The one thing that both changes in this window and matters is
+    availability, so that is the only thing checked, and saying so is better
+    than implying a full re-evaluation.
+
+    SCOPED TO ONE GAME on purpose. Tip-offs are staggered across an evening,
+    so a single slate-wide re-check would be too early for the late games and
+    too late for the early ones. One job per game, anchored to that game's own
+    tip, is the only version of this that is on time for every game.
+
+    AN UNUSABLE FEED IS REPORTED, NOT TREATED AS A CLEAN SLATE. That is the
+    rule the scratch filter turns on and the one an earlier version of
+    ``projected_available`` got backwards. A failed check posts a card saying
+    the check failed; it does not post silence, because silence reads as
+    "nothing changed".
+
+    Never raises. Returns a status dict, like every other job here.
+    """
+    game = " @ ".join([p for p in (away, home) if p]) or str(event_id)
+    if not _flag(ENV_PRELOCK, True):
+        logger.info("Pre-lock check off (%s). Nothing done for %s.", ENV_PRELOCK, game)
+        return {"status": "SKIPPED", "reason": "pre-lock disabled", "game": game}
+
+    from src.notify.discord import DiscordDispatchError
+
+    try:
+        from pathlib import Path
+
+        import pandas as pd
+
+        from src.notify.discord import (
+            DiscordConfig,
+            build_prelock_correction_embed,
+            send_embeds,
+        )
+        from src.pipeline.scratches import (
+            AVAILABILITY_COLUMN,
+            DETAIL_COLUMN,
+            UNKNOWN,
+            WITHHELD,
+            apply_scratch_filter,
+        )
+
+        board_csv = Path(os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV)
+        if not board_csv.exists():
+            logger.info(
+                "Pre-lock %s: no board at %s, so there is nothing to withdraw.",
+                game, board_csv,
+            )
+            return {"status": "SKIPPED", "reason": "no board", "game": game}
+
+        frame = pd.read_csv(board_csv)
+        if frame.empty:
+            return {"status": "SKIPPED", "reason": "empty board", "game": game}
+
+        # ONLY THIS GAME'S ROWS, and only the ones that were RECOMMENDED. A
+        # row already abstained needs no withdrawal, and the other games have
+        # their own jobs at their own tip-offs.
+        teams = {t for t in (home, away) if t}
+        mine = frame
+        if teams and "player_team" in frame.columns:
+            in_game = frame["player_team"].isin(teams)
+            if "opponent" in frame.columns:
+                in_game = in_game | frame["opponent"].isin(teams)
+            mine = frame[in_game]
+        if "decision_status" in mine.columns:
+            mine = mine[mine["decision_status"] == "RECOMMENDED"]
+        if mine.empty:
+            logger.info(
+                "Pre-lock %s: no recommended row on the board for this game.", game
+            )
+            return {"status": "SKIPPED", "reason": "no recommended rows", "game": game}
+
+        work = mine.copy()
+        # apply_scratch_filter reads PLAYER_NAME; the board CSV is lowercase.
+        work["PLAYER_NAME"] = work.get("player_name")
+        result = apply_scratch_filter(work)
+
+        annotated = result.projections
+        rows = [
+            type("Row", (), {
+                **{k: (None if pd.isna(v) else v) for k, v in r.items()},
+                "availability_detail": (
+                    None if pd.isna(r.get(DETAIL_COLUMN)) else r.get(DETAIL_COLUMN)
+                ),
+            })()
+            for r in annotated.to_dict("records")
+        ]
+        withheld = [
+            r for r in rows if getattr(r, AVAILABILITY_COLUMN, None) == WITHHELD
+        ]
+        unknown = [
+            r for r in rows if getattr(r, AVAILABILITY_COLUMN, None) == UNKNOWN
+        ]
+
+        tipoff_display = _tipoff_display(tipoff_iso)
+        logger.info(
+            "Pre-lock %s (tip %s): %d recommended row(s) checked, %d withdrawn, "
+            "%d unknown, feed verified=%s.",
+            game, tipoff_display or "unknown", len(rows), len(withheld),
+            len(unknown), result.verified,
+        )
+
+        # NOTHING TO SAY IS STILL SAID, unless abstentions are muted: a clear
+        # check is the evidence that the check ran, and on a night with a
+        # withdrawal the absence of a card on the other games is what tells a
+        # reader those were checked too.
+        nothing_changed = result.verified and not withheld and not unknown
+        if nothing_changed and not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+            return {
+                "status": "OK", "game": game, "checked": len(rows),
+                "withheld": 0, "unknown": 0, "sent": False,
+            }
+
+        webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
+        if not _flag(ENV_DISPATCH, webhook_configured):
+            logger.info("Dispatch off — pre-lock result for %s not sent.", game)
+            return {
+                "status": "OK", "game": game, "checked": len(rows),
+                "withheld": len(withheld), "unknown": len(unknown), "sent": False,
+            }
+
+        embed = build_prelock_correction_embed(
+            game=game,
+            tipoff_display=tipoff_display,
+            withheld=withheld,
+            unknown=unknown,
+            verified=result.verified,
+            reason=result.reason,
+        )
+        sent = send_embeds([embed], config=DiscordConfig(dry_run=False))
+        return {
+            "status": sent.status, "game": game, "checked": len(rows),
+            "withheld": len(withheld), "unknown": len(unknown), "sent": True,
+        }
+    except DiscordDispatchError as exc:
+        logger.error("Pre-lock dispatch refused for %s: %s", game, exc)
+        return {"status": "REFUSED", "error": str(exc), "game": game}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Pre-lock check raised for %s; the scheduler stays up.", game)
+        return {"status": "FAILED", "error": str(exc), "game": game}
+
+
+def _tipoff_display(tipoff_iso: str | None) -> str | None:
+    """Tip-off as a Pacific wall-clock string, or None if it cannot be parsed."""
+    if not tipoff_iso:
+        return None
+    try:
+        from src.utils.timezones import to_pacific
+
+        return to_pacific(datetime.fromisoformat(tipoff_iso)).strftime(
+            "%-I:%M %p %Z"
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("Could not render tip-off %r: %s", tipoff_iso, exc)
+        return None
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -811,6 +1178,15 @@ def main() -> int:
     check_model_artifact()
 
     scheduler = build_scheduler()
+    # Published so the daily planner can add one-shot jobs to the scheduler
+    # that is actually running, rather than to one it was handed once.
+    global _SCHEDULER
+    _SCHEDULER = scheduler
+    # ARMED AT BOOT, not only after the 09:00 slate. A container that starts at
+    # 16:00 would otherwise leave every game tonight unchecked, which is
+    # exactly when a redeploy is most likely and exactly when the morning board
+    # is most stale.
+    schedule_prelock_jobs(scheduler)
     for job in describe(scheduler):
         logger.info("scheduled %s", job)
     logger.info(

@@ -798,3 +798,451 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
     # were scored rather than only how many rows came back.
     assert out["window"]["validation_end"] == str(today)
     assert out["window"]["is_backtest"] is False
+
+
+# ---------------------------------------------------------------------------
+# B4 — the tip-anchored pre-lock re-check. The worker had no such job at all.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+class _Game:
+    """One SlateGame, in the shape schedule_prelock_jobs reads."""
+
+    def __init__(self, event_id, tipoff, *, home="BOS", away="LAL",
+                 slate_date_pt="2026-10-05"):
+        self.espn_event_id = event_id
+        self.tipoff_utc = tipoff
+        self.home_team = home
+        self.away_team = away
+        self.slate_date_pt = slate_date_pt
+
+
+class _Slate:
+    def __init__(self, games):
+        self._games = games
+
+    @property
+    def pregame_only(self):
+        return self._games
+
+
+NOW = datetime(2026, 10, 5, 18, 0, tzinfo=timezone.utc)
+
+
+def _tip(hours: float) -> datetime:
+    return NOW + timedelta(hours=hours)
+
+
+def test_one_job_is_armed_per_game_at_that_games_own_tipoff(monkeypatch):
+    """
+    NOT one slate-wide check. Tip-offs are staggered across an evening, so a
+    single re-check is early for the late games and late for the early ones.
+    This module's own docstring says a cron expression cannot express a slate;
+    it then shipped two fixed clocks because the schedule feed was out of
+    reach. It is in reach now.
+    """
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("PROPIQ_PRELOCK_LEAD_MINUTES", raising=False)
+    sched = FakeScheduler()
+    slate = _Slate([
+        _Game("401", _tip(2)),
+        _Game("402", _tip(5), home="MIA", away="DEN"),
+    ])
+    out = worker.schedule_prelock_jobs(sched, slate=slate, now=NOW)
+
+    assert out["status"] == "OK"
+    assert out["armed"] == 2
+    assert len(sched.jobs) == 2
+    # Each job's run_date is ITS OWN tip minus the lead, so the two differ.
+    runs = sorted(j["run_date"] for j in sched.jobs)
+    assert runs[0] == _tip(2) - timedelta(minutes=35)
+    assert runs[1] == _tip(5) - timedelta(minutes=35)
+    assert runs[0] != runs[1]
+
+
+def test_the_lead_is_inside_the_thirty_to_forty_five_minute_window():
+    assert 30 <= worker.DEFAULT_PRELOCK_LEAD_MINUTES <= 45
+
+
+def test_the_lead_is_configurable(monkeypatch):
+    monkeypatch.setenv("PROPIQ_PRELOCK_LEAD_MINUTES", "45")
+    sched = FakeScheduler()
+    out = worker.schedule_prelock_jobs(
+        sched, slate=_Slate([_Game("401", _tip(3))]), now=NOW
+    )
+    assert out["lead_minutes"] == 45
+    assert sched.jobs[0]["run_date"] == _tip(3) - timedelta(minutes=45)
+
+
+def test_an_unusable_lead_falls_back_rather_than_refusing(monkeypatch):
+    monkeypatch.setenv("PROPIQ_PRELOCK_LEAD_MINUTES", "9999")
+    out = worker.schedule_prelock_jobs(
+        FakeScheduler(), slate=_Slate([_Game("401", _tip(3))]), now=NOW
+    )
+    assert out["lead_minutes"] == worker.DEFAULT_PRELOCK_LEAD_MINUTES
+
+
+def test_a_game_with_no_tipoff_is_skipped_with_its_reason(monkeypatch):
+    """Guessing a tip time would fire the check at the wrong moment, which is
+    worse than not firing it."""
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    sched = FakeScheduler()
+    out = worker.schedule_prelock_jobs(
+        sched, slate=_Slate([_Game("401", None)]), now=NOW
+    )
+    assert out["armed"] == 0
+    assert not sched.jobs
+    assert "no tip-off time" in out["skipped"][0]["reason"]
+
+
+def test_a_slot_already_past_is_skipped_not_fired_immediately(monkeypatch):
+    """
+    On a mid-day redeploy this is the normal outcome for the early games. A
+    "pre-lock" card posted after lock is worse than no card.
+    """
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    sched = FakeScheduler()
+    out = worker.schedule_prelock_jobs(
+        sched,
+        slate=_Slate([_Game("401", _tip(0.25)), _Game("402", _tip(4))]),
+        now=NOW,
+    )
+    assert out["armed"] == 1
+    assert len(sched.jobs) == 1
+    assert "already passed" in out["skipped"][0]["reason"]
+
+
+def test_a_naive_tipoff_is_treated_as_utc_rather_than_crashing(monkeypatch):
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    # Deliberately naive: the point of the test is that a tz-less tip-off
+    # from a feed is read as UTC rather than raising on the subtraction.
+    naive = datetime(2026, 10, 5, 23, 0)  # noqa: DTZ001
+    out = worker.schedule_prelock_jobs(
+        FakeScheduler(), slate=_Slate([_Game("401", naive)]), now=NOW
+    )
+    assert out["armed"] == 1
+
+
+def test_arming_twice_replaces_rather_than_duplicates(monkeypatch):
+    """main() arms at boot and run_board arms again after the slate. Without a
+    stable id that would post two cards per game."""
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    sched = FakeScheduler()
+    slate = _Slate([_Game("401", _tip(3))])
+    worker.schedule_prelock_jobs(sched, slate=slate, now=NOW)
+    worker.schedule_prelock_jobs(sched, slate=slate, now=NOW)
+    ids = [j["id"] for j in sched.jobs]
+    assert len(set(ids)) == 1
+    assert all(j["replace_existing"] for j in sched.jobs)
+    assert ids[0] == "prelock:2026-10-05:401"
+
+
+def test_the_jobs_cannot_overlap_and_will_not_fire_long_after_tip(monkeypatch):
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    sched = FakeScheduler()
+    worker.schedule_prelock_jobs(
+        sched, slate=_Slate([_Game("401", _tip(3))]), now=NOW
+    )
+    job = sched.jobs[0]
+    assert job["max_instances"] == 1
+    # Shorter than the lead, so a late fire cannot land after tip-off.
+    assert job["misfire_grace_time"] < worker.DEFAULT_PRELOCK_LEAD_MINUTES * 60
+
+
+def test_the_game_identity_reaches_the_job(monkeypatch):
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    sched = FakeScheduler()
+    worker.schedule_prelock_jobs(
+        sched, slate=_Slate([_Game("401", _tip(3), home="BOS", away="LAL")]), now=NOW
+    )
+    kwargs = sched.jobs[0]["kwargs"]
+    assert kwargs["event_id"] == "401"
+    assert kwargs["home"] == "BOS"
+    assert kwargs["away"] == "LAL"
+    assert kwargs["tipoff_iso"].startswith("2026-10-05")
+    assert sched.jobs[0]["func"] is worker.run_prelock
+
+
+def test_a_denied_schedule_arms_nothing_and_says_so(monkeypatch, caplog):
+    """The morning board still stands; it simply will not be re-checked."""
+    import logging
+
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+
+    def _boom(*a, **k):
+        raise RuntimeError("espn denied")
+
+    monkeypatch.setattr("src.ingestion.espn_schedule.load_slate", _boom)
+    sched = FakeScheduler()
+    with caplog.at_level(logging.WARNING):
+        out = worker.schedule_prelock_jobs(sched, now=NOW)
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert out["armed"] == 0
+    assert not sched.jobs
+    assert "espn denied" in caplog.text
+
+
+def test_the_checks_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("PROPIQ_PRELOCK", "false")
+    sched = FakeScheduler()
+    out = worker.schedule_prelock_jobs(
+        sched, slate=_Slate([_Game("401", _tip(3))]), now=NOW
+    )
+    assert out["status"] == "SKIPPED"
+    assert not sched.jobs
+
+
+def test_the_planner_is_armed_at_boot_and_after_the_board(monkeypatch):
+    """
+    A container starting at 16:00 would otherwise leave every game tonight
+    unchecked — exactly when a redeploy is likeliest and the morning board is
+    most stale. And arming only at boot would miss a schedule change.
+    """
+    import inspect
+
+    main_src = inspect.getsource(worker.main)
+    assert "schedule_prelock_jobs(scheduler)" in main_src
+    assert main_src.index("_SCHEDULER = scheduler") < main_src.index(
+        "schedule_prelock_jobs(scheduler)"
+    )
+    board_src = inspect.getsource(worker.run_board)
+    assert "schedule_prelock_jobs()" in board_src
+
+
+def test_a_direct_call_with_no_scheduler_reports_rather_than_crashing(monkeypatch):
+    monkeypatch.setattr(worker, "_SCHEDULER", None)
+    out = worker.schedule_prelock_jobs(slate=_Slate([_Game("401", _tip(3))]), now=NOW)
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+
+
+# --- run_prelock: the job itself ---------------------------------------
+
+def _board(tmp_path, players=(("A. Player", "LAL", "BOS", "RECOMMENDED"),)):
+    import pandas as pd
+
+    frame = pd.DataFrame([
+        {
+            "slate_date": "2026-10-05", "game_date": "2026-10-05",
+            "event_id": "0022500001", "player_id": f"200000{i}",
+            "player_name": name, "player_team": team, "opponent": opp,
+            "target_market": "PTS", "side": "over", "line": 24.5,
+            "decision_status": status, "model_prob": 0.56,
+        }
+        for i, (name, team, opp, status) in enumerate(players)
+    ])
+    path = tmp_path / "decision_board.csv"
+    frame.to_csv(path, index=False)
+    return path
+
+
+class _Report:
+    """An espn_availability.AvailabilityReport, in the shape the filter reads."""
+
+    def __init__(self, injuries, status="OK"):
+        self.status = status
+        self.injuries = injuries
+        self.notes: list[str] = []
+
+
+class _Injury:
+    def __init__(self, player_name, status="OUT", detail=None):
+        self.player_name = player_name
+        self.status = status
+        self.status_raw = status
+        self.detail = detail
+
+
+def test_a_player_ruled_out_after_the_board_is_withdrawn(monkeypatch, tmp_path):
+    """
+    THE WHOLE POINT. scratches.py was written for this and its docstring names
+    the gap — "Nothing dropped a projection when a player was ruled out AFTER
+    that projection was written" — and nothing ever called it on a schedule.
+    """
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_board(tmp_path)))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries",
+        lambda **k: _Report([_Injury("A. Player", "OUT", "Out (knee)")]),
+    )
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["status"] == "OK"
+    assert out["checked"] == 1
+    assert out["withheld"] == 1
+
+
+def test_a_healthy_slate_withdraws_nobody(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_board(tmp_path)))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries", lambda **k: _Report([])
+    )
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["withheld"] == 0
+
+
+def test_a_diacritic_difference_still_withdraws_the_right_player(
+    monkeypatch, tmp_path
+):
+    """
+    ESPN publishes "Nikola Jokić" and the panel carries "Nikola Jokic". Before
+    the crosswalk those did not compare equal and the filter withheld NOBODY —
+    a live safety bug, not a cosmetic one. The match is exact on a normalised
+    name, never fuzzy.
+    """
+    path = _board(tmp_path, players=(("Nikola Jokic", "DEN", "LAL", "RECOMMENDED"),))
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(path))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries",
+        lambda **k: _Report([_Injury("Nikola Jokić", "OUT", "Out")]),
+    )
+    out = worker.run_prelock(event_id="401", home="LAL", away="DEN")
+    assert out["withheld"] == 1
+
+
+def test_only_this_games_rows_are_checked(monkeypatch, tmp_path):
+    """The other games have their own jobs at their own tip-offs."""
+    path = _board(tmp_path, players=(
+        ("A. Player", "LAL", "BOS", "RECOMMENDED"),
+        ("B. Player", "MIA", "DEN", "RECOMMENDED"),
+    ))
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(path))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries",
+        lambda **k: _Report([_Injury("B. Player", "OUT")]),
+    )
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["checked"] == 1       # only the LAL/BOS row
+    assert out["withheld"] == 0      # B. Player is another game's problem
+
+
+def test_an_already_abstained_row_needs_no_withdrawal(monkeypatch, tmp_path):
+    path = _board(tmp_path, players=(("A. Player", "LAL", "BOS", "ABSTAIN"),))
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(path))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["status"] == "SKIPPED"
+    assert out["reason"] == "no recommended rows"
+
+
+def test_an_unusable_feed_is_reported_and_clears_nobody(monkeypatch, tmp_path):
+    """
+    The rule the whole scratch filter turns on. A failed check must not read
+    as a healthy slate, and must not be silent either — silence reads as
+    "nothing changed".
+    """
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_board(tmp_path)))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+
+    def _denied(**k):
+        raise RuntimeError("espn denied")
+
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries", _denied
+    )
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["status"] == "OK"
+    assert out["withheld"] == 0      # nothing is withdrawn
+    # ...and nothing is cleared: the embed for this case says the check FAILED.
+    from src.notify.discord import build_prelock_correction_embed
+
+    blob = repr(build_prelock_correction_embed(
+        game="LAL @ BOS", tipoff_display=None, verified=False,
+        reason="injury feed unreachable",
+    ))
+    assert "FAILED" in blob
+    assert "not a healthy slate" in blob
+
+
+def test_no_board_means_nothing_to_withdraw(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(tmp_path / "absent.csv"))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    out = worker.run_prelock(event_id="401")
+    assert out["status"] == "SKIPPED"
+    assert out["reason"] == "no board"
+
+
+def test_the_job_can_be_turned_off(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_board(tmp_path)))
+    monkeypatch.setenv("PROPIQ_PRELOCK", "false")
+    out = worker.run_prelock(event_id="401")
+    assert out["status"] == "SKIPPED"
+    assert out["reason"] == "pre-lock disabled"
+
+
+def test_the_job_never_takes_the_worker_down(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_board(tmp_path)))
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+
+    def _boom(*a, **k):
+        raise RuntimeError("filter exploded")
+
+    monkeypatch.setattr("src.pipeline.scratches.apply_scratch_filter", _boom)
+    out = worker.run_prelock(event_id="401", home="BOS", away="LAL")
+    assert out["status"] == "FAILED"
+
+
+def test_it_refits_nothing_and_reprices_nothing(monkeypatch):
+    """
+    Refitting 35 minutes before tip would be absurd, and re-pricing needs a
+    live odds feed this project cannot reach. The job must stay an
+    availability check, so this pins what it does NOT touch.
+    """
+    import inspect
+
+    source = inspect.getsource(worker.run_prelock)
+    for forbidden in (
+        "compare_models_on_panel", "build_slate_board", "build_feature_matrix",
+        "resolve_market", "score_prob_over", "board_window",
+    ):
+        assert forbidden not in source, f"run_prelock reaches for {forbidden}"
+
+
+def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    run_board's own broad except would catch an arming failure and return
+    {"status": "FAILED"} for the BOARD — reporting a written board as failed
+    because an unrelated step did. The board is the durable output.
+    """
+    import logging
+
+    import pandas as pd
+
+    import src.db.repository as repo
+    import src.pipeline.slate_board as slate_board_module
+
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+
+    class _Result:
+        def as_dict(self):
+            return {"written_rows": 3}
+
+    monkeypatch.setattr(
+        slate_board_module, "build_slate_board", lambda panel, **k: _Result()
+    )
+    monkeypatch.setattr(
+        repo, "load_player_panel",
+        lambda *a, **k: pd.DataFrame({"PLAYER_ID": ["1"], "GAME_DATE": ["2026-10-05"]}),
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("scheduler rejected the job")
+
+    monkeypatch.setattr(worker, "schedule_prelock_jobs", _boom)
+
+    with caplog.at_level(logging.ERROR):
+        out = worker.run_board()
+    assert out["status"] == "OK", "a written board must not be reported as failed"
+    assert out["written_rows"] == 3
+    assert "board above STANDS" in caplog.text
