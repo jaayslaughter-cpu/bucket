@@ -110,11 +110,22 @@ these are the ones the worker reads.
 Apply the migrations against the target database before the first run:
 
 ```
-migrations/002_prop_results.sql      # settlement ledger + views
-migrations/003_capture_vs_ingest_time.sql
-migrations/004_parlay_ledger.sql     # parlay_tickets, parlay_legs
-migrations/005_projection_under_push.sql  # projections.prob_under, prob_push
+python -m scripts.migrate_db                    # what this database has
+python -m scripts.migrate_db --apply --dry-run  # what WOULD be applied
+python -m scripts.migrate_db --apply            # apply, in one transaction
 ```
+
+**This list used to be written out here, and that was the defect.** It named
+002 through 005 and went stale the moment 006 was added, so the only way to
+learn whether a database had 007 was to query for the column it adds and
+infer. `scripts/migrate_db.py` reads the directory, applies what is missing in
+version order, and records each file with a checksum in a `schema_migrations`
+table — so the database answers the question instead of a document. Status
+reporting is the default; `--apply` is required to change anything.
+
+A file edited after it was applied is refused by name rather than re-run: the
+checksum catches the one divergence a version number cannot see. There is no
+`alembic`; `src/db/migrations.py`'s docstring says why that was the choice.
 
 `python main.py --init-db` creates the ORM-defined tables and exits. The SQL
 migrations carry the CHECK constraints and views that `create_all` does not.
@@ -151,7 +162,7 @@ Four things still need a machine, and none of them is continuous:
 | | When | Why |
 |---|---|---|
 | `python -m scripts.validate_docker` | once, before the first deploy | the build and the six in-image checks need a Docker daemon |
-| `migrations/*.sql` + `python main.py --init-db` | once, per database | applied against the target database by hand |
+| `python -m scripts.migrate_db --apply` + `python main.py --init-db` | once, per database, and again after any new migration | the runner records what it applied, so re-running is a safe no-op |
 | training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or upload the artifacts to object storage and fetch them at boot |
 | recording a stake | whenever you place a bet | PropIQ never places one and never writes a stake. ROI exists only if you log it |
 

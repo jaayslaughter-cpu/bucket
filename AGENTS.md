@@ -201,6 +201,14 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   absence. `espn_availability.fetch_roster` would cover that and needs the
   name crosswalk this repository does not have. `docs/integration_audit.md`
   §1.1.
+- **No database has had the migration runner pointed at it.**
+  `src/db/migrations.py` and `scripts/migrate_db.py` apply `migrations/*.sql`
+  in version order and record each file with a checksum in
+  `schema_migrations`, and the ledger logic is tested against SQLite — but no
+  Postgres is reachable from this checkout, so the one thing still unverified
+  is whether Postgres accepts the hand-written DDL in files 002-008. Only
+  Postgres can answer that. `python -m scripts.migrate_db` reports before it
+  applies anything.
 - **No starting position has ever been pulled.** `player_game_logs` has the
   column (migration 008), `src/ingestion/starting_positions.py` is the writer
   and `scripts/pull_starting_positions.py` is the pass that runs it, but

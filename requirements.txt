@@ -10,7 +10,13 @@ pyarrow>=15.0.0           # parquet copies of the outputs/ exports
 # --- database (Postgres / Supabase) ---
 SQLAlchemy>=2.0.30
 psycopg[binary]>=3.1.18   # Postgres driver; [binary] avoids needing libpq locally
-alembic>=1.13.0           # schema migrations
+# NO alembic. It was pinned here with the comment "schema migrations" and
+# there was no alembic.ini, no env.py and no module importing it -- a
+# declaration that told a reader the migrations were managed when they were
+# not. src/db/migrations.py and scripts/migrate_db.py are what manage them:
+# the hand-written SQL in migrations/ is applied in version order and recorded
+# in a schema_migrations ledger with a checksum per file. Reasoning for
+# choosing that over wiring alembic is in src/db/migrations.py's docstring.
 
 # --- excel / licensed exports (BigDataBall workbook) ---
 openpyxl>=3.1.0

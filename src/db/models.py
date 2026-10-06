@@ -500,3 +500,44 @@ class ParlayLegRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class SchemaMigration(Base):
+    """
+    Which `migrations/*.sql` file has been applied to THIS database.
+
+    WHY THIS EXISTS. Nothing recorded it. The SQL migrations are applied by
+    hand (`psql "$DATABASE_URL" -f migrations/00N_*.sql`), `docs/deploy_railway.md`
+    listed which ones to run, and that list went stale the moment 006 was
+    added — so the only way to know whether a database had 007 was to query
+    for the column it adds and infer. Two databases could disagree and look
+    identical.
+
+    IT IS DEFINED HERE, AS A MODEL, RATHER THAN AS HAND-WRITTEN DDL in the
+    runner. A ledger with two definitions — one in `create_all`, one in the
+    thing that reads it — is the same two-sides-of-one-contract failure this
+    project keeps finding, and SQLAlchemy emitting the DDL per dialect is also
+    what lets the runner be tested against SQLite while production stays
+    Postgres.
+
+    THERE IS NO `migrations/009_schema_migrations.sql`, deliberately. A ledger
+    that itself has to be applied by hand before anything can be recorded
+    reproduces the problem it was built to solve. `migrations.ensure_ledger`
+    creates it with `checkfirst=True`.
+
+    `checksum` is the sha256 of the file's bytes as applied. A file edited
+    after the fact is the one failure mode a version number cannot catch: the
+    database and the repository disagree while every version row looks
+    present and correct. `migrations.detect_drift` reports it and the runner
+    refuses to continue, because re-running an applied migration is not the
+    fix.
+    """
+
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    filename: Mapped[str] = mapped_column(String(128), nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )

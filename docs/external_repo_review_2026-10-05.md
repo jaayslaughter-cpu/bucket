@@ -358,9 +358,42 @@ ceiling began the search past it, the growth loop never ran, and the guard
 could not fire — an uninvertible price came back as a confident mean. The test
 that asserted the refusal got an answer instead.
 
-**5. A `schema_migrations` table (LOW).** Nothing records which of
-`migrations/002`–`007` have been applied. Either drop `alembic` from
-`requirements.txt` or wire it; declaring and not using it is the defect.
+**5. A `schema_migrations` table (LOW). DONE, both halves.**
+`src/db/migrations.py` + `scripts/migrate_db.py` apply the files in version
+order and record each with a sha256 in a `schema_migrations` table;
+`alembic` is dropped from `requirements.txt` and `pyproject.toml`. Tests:
+`tests/test_db_migrations.py`.
+
+The item offered "either drop `alembic` or wire it". **Dropping was right and
+wiring was not**, for a reason the item did not have: these migrations are not
+mechanical DDL. 006 and 008 are each ~60 lines of reasoning about why a column
+is nullable and why a default would be a fabrication, and that reasoning is
+the valuable part of the file. Converting them to `op.add_column` revisions
+would either lose it or duplicate it somewhere it can drift. Alembic earns its
+keep when migrations are generated from model diffs; here they are written by
+hand on purpose, and what was missing was never the authoring tool. It was the
+ledger.
+
+**What the item under-specified, and what the implementation added.**
+
+- **The checksum, not just the version.** A version number cannot catch a file
+  edited AFTER it was applied: every row looks present and correct while the
+  repository and the database have diverged. Drift is a refusal, not a
+  warning — re-running an applied migration is not the fix, and guessing which
+  half of an edited file is already in place is worse.
+- **One transaction for the whole run.** A migration that applied and then
+  failed to record would be re-run against a schema it had already changed.
+  Each file and its ledger row commit together or not at all.
+- **No `009_schema_migrations.sql`.** A ledger that itself has to be applied by
+  hand before anything can be recorded reproduces the problem it solves. The
+  runner creates it from the ORM model with `checkfirst=True`, which also lets
+  the whole thing be tested against SQLite while production stays Postgres.
+- **Status is the default.** A migration tool whose no-argument behaviour
+  changes the schema is one typo away from the wrong `DATABASE_URL`.
+- **`docs/deploy_railway.md` was the real victim.** It carried the
+  authoritative list of migrations to run, named 002–005, and had been stale
+  since 006. It now points at the runner, because a database answering the
+  question cannot go stale.
 
 **Not recommended:** Optuna (optimises the wrong layer while feature value is
 unmeasured), Sports-EV-Bot's DvP or per-market families (leaky), its

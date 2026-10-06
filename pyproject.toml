@@ -29,7 +29,9 @@ ml = [
 db = [
     "SQLAlchemy>=2.0.30",
     "psycopg[binary]>=3.1.18",
-    "alembic>=1.13.0",
+    # alembic was declared here and never used: no alembic.ini, no env.py, no
+    # importer. src/db/migrations.py manages the hand-written SQL instead --
+    # see its docstring for why that was the choice rather than wiring alembic.
     "openpyxl>=3.1.0",
     "PyYAML>=6.0",
 ]
