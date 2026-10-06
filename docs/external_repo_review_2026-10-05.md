@@ -318,11 +318,45 @@ averages the position split away. `PRA`'s between-bucket ratio is 1.11, the
 flattest of the four, because rebounds (C-heavy, 2.17x) and assists (G-heavy,
 1.96x) cancel. The arm has not been run.
 
-**4. Fix our own line-diff with dispersion, not their factors (MEDIUM).**
-Replace `_line_adjust_fair_prob`'s flat `0.03` with a CDF evaluation from
-`residuals.over_under_push_from_dispersion`, and correct the docstring that
-claims a log shift the code does not perform. Falls back to the current
-heuristic where no dispersion is available, and says which it used.
+**4. Fix our own line-diff with dispersion, not their factors (MEDIUM).
+DONE.** `src/quant/line_diff.py` now inverts the fitted distribution at the
+book's line to recover the mean the book's price implies, then re-evaluates at
+the pick'em line. `LineDiffResult.method` is `"dispersion"` or `"heuristic"`,
+with `method_reason` naming why the fallback ran. The "soft log-ish shift"
+docstring is corrected: the fallback is strictly linear and there is no
+logarithm in the module. Tests: `tests/test_line_diff_dispersion.py`.
+
+What the fix buys, measured: the same one-point move is worth **+0.162** of
+fair probability off a 4.5 line and **+0.069** off a 24.5 line, where the flat
+`0.03` said the same thing for both. The heuristic understated both, badly at
+low lines.
+
+**Three things this item did not know, found while doing it.**
+
+- **It was fixing a dormant path.** `adjusted_fair_prob_over` is read by
+  nothing outside the module's own tests, and `enrich_row_with_pickem` — the
+  only caller of `pickem_vs_book_line_diff` — has no caller of its own. So the
+  flat `0.03` was not mispricing anything in production. Worth doing before
+  something reaches for it; not worth describing as a pricing fix.
+- **A separate incoherence, in the function being replaced.** `side="under"`
+  flipped the shift's sign, so one pair of lines and one price returned
+  `adjusted_fair_prob_over` of 0.5408 for the over and 0.4808 for the under.
+  P(over) at a line is a property of the line. It is now side-independent, and
+  `side` is gone from the private helper's signature — a parameter that cannot
+  change the answer invites the belief that it can. Nothing in production
+  changes: the one call site hardcodes `"over"`.
+- **The comparison had to be made conditional on no push.** A two-way book
+  price de-vigs to a two-outcome probability — a push is voided, not priced —
+  while `over_under_push_from_dispersion` correctly reports three. Comparing
+  them directly would understate the book's view at every whole-number line by
+  exactly the push mass. Half-point lines coincide, which is why this is easy
+  to miss.
+
+**And one bug of mine, caught by its own test.** The inversion's mean ceiling
+capped the bracket's *growth* but not its *start*, so a line above half the
+ceiling began the search past it, the growth loop never ran, and the guard
+could not fire — an uninvertible price came back as a confident mean. The test
+that asserted the refusal got an answer instead.
 
 **5. A `schema_migrations` table (LOW).** Nothing records which of
 `migrations/002`–`007` have been applied. Either drop `alembic` from

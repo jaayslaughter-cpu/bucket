@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from src.models.arbitration import arbitrate_probabilities
 from src.models.edge_grades import research_edge_letter_grade
 from src.models.projection_card import build_projection_card
+from src.models.residuals import CountDispersion
 from src.quant.contracts import MarketContext, PropMarketSnapshot, market_ev_gate
 from src.quant.ev_engine import EvEngine
 from src.quant.historical_store import BetLifecycleRecord, HistoricalStore
@@ -308,8 +309,18 @@ def enrich_row_with_pickem(
     pickem_line: float | None,
     pickem_source: str | None,
     book_market: MarketContext | PropMarketSnapshot | None = None,
+    dispersion: CountDispersion | None = None,
 ) -> ResearchSlateRow:
-    """Attach pick'em line; line-diff only when book is VALID."""
+    """
+    Attach pick'em line; line-diff only when book is VALID.
+
+    ``dispersion`` is passed straight through to the line-diff helper, where
+    supplying it replaces a flat per-point probability shift with an inverted
+    distribution evaluation. A caller that has loaded a trained artifact has
+    one (``CountDispersion.from_dict`` on its metadata); the board path does
+    not, and the helper's ``method`` field records which arithmetic ran rather
+    than leaving the two indistinguishable.
+    """
     out = row.model_copy(deep=True)
     out.pickem_line = pickem_line
     out.pickem_source = pickem_source
@@ -318,7 +329,9 @@ def enrich_row_with_pickem(
     if book_market is None:
         out.warnings.append("Pick'em line present; book VALID line-diff unavailable")
         return out
-    diff = pickem_vs_book_line_diff(pickem_line, book_market, side="over")
+    diff = pickem_vs_book_line_diff(
+        pickem_line, book_market, side="over", dispersion=dispersion
+    )
     if diff.status == "OK":
         out.pickem_line_diff = diff.line_diff
     else:
