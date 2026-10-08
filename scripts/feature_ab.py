@@ -68,10 +68,43 @@ class Layer:
         self.note = note
 
     def arms(
-        self, panel: pd.DataFrame, cfg: dict[str, Any]
+        self,
+        panel: pd.DataFrame,
+        cfg: dict[str, Any],
+        *,
+        allow_partial: bool = False,
     ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-        """Return (control, treatment, columns_under_test)."""
+        """Return (control, treatment, columns_under_test).
+
+        A PANEL THAT PREDATES A COLUMN THIS LAYER NOW DECLARES IS A REFUSAL,
+        and that is the whole point of ``allow_partial``. The subtractive
+        branch below triggers on ANY declared column being present, so a panel
+        built before ``DVP_PRA_*`` existed measured the twelve older DvP
+        columns and said "Layer 'dvp' under test: [...]" with a list that
+        looked complete. `--markets PRA` happened to be caught downstream by
+        "no market reads any dvp column"; `--markets REB` would have run for
+        an hour and produced a confident measurement OF THE OLD LAYER. The
+        panel is a build artifact and the column list is code, so they drift
+        the moment a layer gains a column.
+
+        Partial presence is sometimes legitimate: ``build_opponent_allowed``
+        emits only the stats the panel carries, so a panel without BLK really
+        has no ``DVP_BLK_*``. That is what the override is for -- passed
+        deliberately, named in the output, rather than guessed at here.
+        """
         present = [c for c in self.columns if c in panel.columns]
+        missing = [c for c in self.columns if c not in panel.columns]
+        if present and missing and not allow_partial:
+            raise RuntimeError(
+                f"this panel carries {len(present)} of the {len(self.columns)} "
+                f"columns this layer declares and is missing {missing}. The "
+                f"arm would be subtractive over the {len(present)} it has and "
+                f"would report a measurement of a DIFFERENT column set than "
+                f"the one in the code — most likely the panel was built before "
+                f"those columns existed, so rebuild it. If the absence is "
+                f"real (a panel genuinely without the source stat), pass "
+                f"--allow-partial-layer to measure what is there."
+            )
         if present:
             # Subtractive: the panel has them, so the control is the panel
             # without them. Used for layers that are attached during the
@@ -511,6 +544,12 @@ def _run(
                          "FOR THIS RUN ONLY, so a column that is not yet wired "
                          "can be measured before it is shipped. Without this, a "
                          "layer no market reads cannot be compared at all.")
+    ap.add_argument("--allow-partial-layer", action="store_true",
+                    help="Measure a layer whose panel carries only SOME of the "
+                         "columns it declares. Refused by default: the usual "
+                         "cause is a panel built before a column was added, "
+                         "and the arm would report a confident measurement of "
+                         "the older column set.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -539,7 +578,9 @@ def _run(
         print("DEMO PANEL — synthetic players. These numbers test wiring, not accuracy.\n")
 
     try:
-        control, treatment, under_test = layer.arms(panel, cfg)
+        control, treatment, under_test = layer.arms(
+            panel, cfg, allow_partial=args.allow_partial_layer
+        )
     except Exception as exc:  # noqa: BLE001 — a missing input is the answer, not a crash
         print(f"ERROR: cannot build the '{args.layer}' arms: {exc}", file=sys.stderr)
         return 2

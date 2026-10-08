@@ -129,8 +129,17 @@ both: PRA is the FLATTEST of the four across buckets. The index column follows
 REB's 0.133 and AST's 0.198), so there is less matchup to find. Coverage is
 the same 81.7% / 81.4% as the rest of the layer, and neither new column is in
 the 0.83-0.99 redundancy band against anything PRA already reads (the top
-correlate is ``MKT_IMPLIED_TEAM_TOTAL`` at 0.29). Cheap and correct; a smaller
-expected effect than the REB arm found.
+correlate is ``MKT_IMPLIED_TEAM_TOTAL`` at 0.29).
+
+MEASURED, AND IT DOES NOT HELP. The arm was run: ``line_aware`` Brier is worse
+on 4 of 4 folds at 2.8-4x the fold spread, ``catboost`` calibrated likewise at
+0/4, and ``ensemble`` and ``xgboost`` are nil. Raw ECE improves, which is the
+pattern ``labels._EXCLUDED_AS_REDUNDANT`` already documents for two excluded
+families and is read the same way — Brier is the metric these calls are made
+on. These columns stay unwired, as ``minutes_weighted``'s do: built,
+measurable, measured and deliberately not shipped. ``DVP_COMBOS`` is the one
+line to change if they should stop being computed at all. Numbers:
+``docs/fouls_and_dvp.md`` section 3b.
 
 LEAKAGE, in the three places it could enter:
 

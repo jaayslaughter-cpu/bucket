@@ -489,6 +489,97 @@ and only then touch `labels.py`. Wiring it on the strength of the table above
 would ship a dead column, which is the `teammate_cascade.py` failure mode this
 project has already documented once.
 
+## 3b. DvP, measured — PRA. It does not help.
+
+```
+python -m scripts.feature_ab --layer dvp --wire-under-test --markets PRA --folds 4 \
+    --panel <panel>.parquet --seasons-only 2022-23,2023-24,2024-25
+```
+
+Same shape as the REB arm in section 3a, so the two are directly comparable:
+4 chronological folds from 2025-01-15, 76,585 panel rows, ~18,179 distinct
+validation rows. PRA reads exactly `DVP_PRA_ALLOWED_L10` and
+`DVP_PRA_INDEX_L10`; coverage 85.1% / 84.7%.
+
+| model | metric | off | on | delta | fold sd | folds better |
+|---|---|---|---|---|---|---|
+| line_aware | Brier raw | 0.23813 | 0.23861 | **+0.00048** | 0.00017 | **0/4** |
+| line_aware | Brier cal | 0.23805 | 0.23849 | **+0.00044** | 0.00011 | **0/4** |
+| catboost | Brier cal | 0.23875 | 0.23914 | **+0.00039** | 0.00030 | **0/4** |
+| catboost | Brier raw | 0.23896 | 0.23914 | +0.00018 | 0.00020 | 1/4 |
+| ensemble | Brier raw | 0.23820 | 0.23826 | +0.00006 | 0.00012 | 1/4 |
+| ensemble | Brier cal | 0.23806 | 0.23809 | +0.00003 | 0.00026 | 1/4 |
+| xgboost | Brier raw | 0.23845 | 0.23849 | +0.00004 | 0.00021 | 1/4 |
+| xgboost | Brier cal | 0.23876 | 0.23870 | −0.00006 | 0.00019 | 3/4 |
+| distribution | Brier raw | 0.25029 | 0.25029 | +0.00000 | 0.00000 | 0/4 |
+
+Higher is worse. **`line_aware` is worse on every one of four folds at 2.8–4×
+the fold spread**, which is the clearest signal in the table and points the
+wrong way. `catboost` calibrated is worse at 1.3× sd, also 0/4. `ensemble` and
+`xgboost` are nil — deltas at or inside their own fold noise. Nothing here
+improves Brier.
+
+Compare section 3a, run identically: REB was **better** on 4 of 4 folds for
+four of five models at 1.3–2.5× sd. PRA is the mirror image.
+
+`distribution` moved by exactly 0.00000 again, 0/4 — the built-in null arm
+confirming the harness is not leaking a difference through a shared path.
+
+### Calibration went the other way, and that does not rescue it
+
+| model | metric | delta | fold sd | folds better |
+|---|---|---|---|---|
+| ensemble | ECE raw | −0.00253 | 0.00138 | 3/3 |
+| xgboost | ECE raw | −0.00195 | 0.00159 | **4/4** |
+| line_aware | ECE raw | −0.00182 | 0.00324 | 3/4 |
+| catboost | ECE cal | −0.00390 | 0.00160 | 2/2 |
+| xgboost | ECE cal | +0.00485 | 0.00035 | 0/2 |
+
+**This repository has met this pattern before and already decided how to read
+it.** `labels._EXCLUDED_AS_REDUNDANT`'s note records the halflife and
+usage_volume families doing the same thing — "consistently IMPROVED calibrated
+ECE while leaving Brier flat or worse" — and then refuses the tempting
+explanation:
+
+> Brier is not a discrimination metric: it decomposes into calibration and
+> resolution, so a worse Brier alongside a better ECE does NOT establish that
+> these columns cost resolution and bought calibration. An earlier version of
+> this comment claimed exactly that. Without a Murphy decomposition the honest
+> statement is the measurement itself.
+
+The same applies here, and the same decision rule follows: **Brier is the
+metric these calls are made on**, because it scores the probability as a whole.
+Brier is worse. The columns are not wired.
+
+### The prior was right, and my statement of it was too soft
+
+Section 2's "Combination markets" predicted a weaker effect than REB's from
+the measured geometry: combining averages the position split away, because
+rebounds are centre-heavy (2.17× across buckets) and assists guard-heavy
+(1.96×) and the sum cancels most of both, leaving PRA the flattest of the four
+at **1.11** with the smallest within-bucket index dispersion (sd 0.115). What
+that section said was "a smaller expected effect than the REB arm found".
+
+The measured answer is not smaller — it is **adverse**. A column carrying
+little signal is not merely weak in a gradient-boosted model; it is one more
+split candidate competing with features that do carry signal, and the fold
+evidence says that cost is real for `line_aware`. The honest version of that
+prediction would have been "possibly harmful", and it was not written that way.
+
+### What happens to the columns
+
+They stay, unwired, exactly as `minutes_weighted` does — built, measurable,
+measured, and deliberately not shipped (`docs/minutes_weighted.md`). Deleting
+them would delete the subject of the evidence, and the next person to think
+"combo DvP is an easy win" would have nothing to read. `DVP_COMBOS` is the one
+line to change if they should stop being computed.
+
+The arm that remains unrun is whether the three component `_INDEX` columns
+carry something `DVP_PRA_INDEX_L10` cannot: they are ratios and do not add, so
+the combo cannot express *which* stat a defence concedes. That is a different
+question from this one, and this result makes it less interesting rather than
+more.
+
 ## 4. Database
 
 `migrations/006_player_game_log_fouls.sql` adds `player_game_logs.pf`,

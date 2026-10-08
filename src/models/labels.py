@@ -195,6 +195,27 @@ def default_feature_cols(market: str) -> list[str]:
 # +0.00125, better in only 1 of 4 folds), though every ECE delta is smaller
 # than its own fold spread, so that is a thing to watch and not a finding.
 #
+# PRA WAS THEN RUN IDENTICALLY AND DOES NOT HELP. Its DVP_PRA_* pair is a
+# combination market (dvp.DVP_COMBOS), 4 folds, same slice, ~18,179 distinct
+# validation rows:
+#
+#   line_aware  Brier raw  +0.00048 (sd 0.00017)  0/4 folds better
+#   line_aware  Brier cal  +0.00044 (sd 0.00011)  0/4
+#   catboost    Brier cal  +0.00039 (sd 0.00030)  0/4
+#   ensemble    Brier raw  +0.00006 (sd 0.00012)  1/4
+#   xgboost     Brier raw  +0.00004 (sd 0.00021)  1/4
+#
+# line_aware is worse on every fold at 2.8-4x the fold spread; the rest are
+# nil. Raw ECE improved (xgboost -0.00195 at 4/4, ensemble -0.00253 at 3/3),
+# which is the SAME pattern the halflife and usage_volume note below records
+# and the same reading applies: without a Murphy decomposition the honest
+# statement is the measurement, and Brier is the metric these calls are made
+# on. The measured geometry predicted a weak effect -- PRA's between-bucket
+# spread is 1.11 against REB's 2.17, because centre-heavy rebounds and
+# guard-heavy assists cancel in the sum -- and the arm came back adverse
+# rather than merely weak. Not wired. Write-up: docs/fouls_and_dvp.md
+# section 3b.
+#
 # IT IS STILL NOT WIRED, AND THE REASON IS NOT THE EVIDENCE. The reason used
 # to be that STARTING_POSITION had no writer on the live path. It has one now
 # -- src/ingestion/starting_positions.py, migration 008 and

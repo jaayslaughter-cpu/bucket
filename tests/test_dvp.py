@@ -985,3 +985,85 @@ def test_the_combo_reaches_the_panel_through_the_layer_entry_point():
         assert col in out.columns
         assert out[col].notna().any(), f"{col} is null on every row"
     assert set(DVP_FEATURE_COLS) <= set(out.columns)
+
+
+def test_a_panel_predating_a_layers_new_column_is_refused_not_measured():
+    """
+    THE TRAP THIS CLOSES COST A RUN. `Layer.arms` goes subtractive the moment
+    ANY declared column is on the panel, so a panel built before DVP_PRA_*
+    existed measured the twelve older DvP columns and announced "Layer 'dvp'
+    under test: [...]" with a list that read as complete.
+
+    `--markets PRA` was caught downstream by "no market reads any dvp column",
+    because PRA reads none of the twelve. `--markets REB` would have run for
+    an hour and produced a confident measurement OF THE OLD LAYER, which is
+    the version of this bug that does not announce itself. The panel is a
+    build artifact and the column list is code; they drift the moment a layer
+    gains a column.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_fab3", "scripts/feature_ab.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    panel = attach_dvp_features_layer(league())
+    stale = panel.drop(columns=[ALLOWED_TEMPLATE.format(stat="PRA"),
+                                INDEX_TEMPLATE.format(stat="PRA")])
+
+    with pytest.raises(RuntimeError, match="was built before those columns"):
+        module.LAYERS["dvp"].arms(stale, {})
+
+    # The message has to name what is missing, or the reader cannot act on it.
+    try:
+        module.LAYERS["dvp"].arms(stale, {})
+    except RuntimeError as exc:
+        assert "DVP_PRA_ALLOWED_L10" in str(exc)
+        assert "DVP_PRA_INDEX_L10" in str(exc)
+
+    # A COMPLETE panel is not refused, which is the other half: a guard that
+    # fired on the normal case would just be turned off.
+    control, treatment, under_test = module.LAYERS["dvp"].arms(panel, {})
+    assert ALLOWED_TEMPLATE.format(stat="PRA") in under_test
+    assert ALLOWED_TEMPLATE.format(stat="PRA") not in control.columns
+    assert ALLOWED_TEMPLATE.format(stat="PRA") in treatment.columns
+
+
+def test_a_genuinely_absent_source_stat_can_still_be_measured_deliberately():
+    """
+    Partial presence is sometimes real: `build_opponent_allowed` emits only
+    the stats the panel carries, so a panel without BLK genuinely has no
+    DVP_BLK_*. The override exists for that, and is passed deliberately
+    rather than guessed at.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_fab4", "scripts/feature_ab.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    panel = attach_dvp_features_layer(league().drop(columns=["BLK"]))
+    assert ALLOWED_TEMPLATE.format(stat="BLK") not in panel.columns
+
+    with pytest.raises(RuntimeError, match="missing"):
+        module.LAYERS["dvp"].arms(panel, {})
+
+    _, _, under_test = module.LAYERS["dvp"].arms(panel, {}, allow_partial=True)
+    assert ALLOWED_TEMPLATE.format(stat="PRA") in under_test
+    assert ALLOWED_TEMPLATE.format(stat="BLK") not in under_test
+
+
+def test_the_cli_exposes_the_override_and_passes_it_to_the_arm():
+    """A guard with no way past it gets removed rather than overridden."""
+    import importlib.util
+    import inspect
+
+    spec = importlib.util.spec_from_file_location("_fab5", "scripts/feature_ab.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    source = inspect.getsource(module._run)
+    assert "allow_partial=args.allow_partial_layer" in source, (
+        "the flag is parsed but never reaches Layer.arms, so passing it would "
+        "silently do nothing"
+    )

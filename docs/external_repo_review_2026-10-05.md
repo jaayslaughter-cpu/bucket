@@ -316,7 +316,21 @@ and correlates with it at only 0.917, so it is not even a monotone restatement.
 Also measured, and worth stating against this item's "small win": combining
 averages the position split away. `PRA`'s between-bucket ratio is 1.11, the
 flattest of the four, because rebounds (C-heavy, 2.17x) and assists (G-heavy,
-1.96x) cancel. The arm has not been run.
+1.96x) cancel.
+
+**The arm has now been run and the answer is no.** `line_aware` Brier is worse
+on 4 of 4 folds at 2.8–4x the fold spread, `catboost` calibrated likewise at
+0/4, `ensemble` and `xgboost` are nil, and raw ECE improves — the same
+Brier-worse / ECE-better pattern `labels._EXCLUDED_AS_REDUNDANT` already
+documents for two excluded families, read the same way, because Brier is the
+metric these calls are made on. Not wired; the columns stay as
+`minutes_weighted`'s do. Full table: `docs/fouls_and_dvp.md` section 3b.
+
+So this item's "small win" was optimistic, and so was my own restatement of it:
+the geometry predicted a weak effect and I wrote exactly that, where the
+measured answer is **adverse**. A column carrying little signal is not merely
+weak in a gradient-boosted model — it is one more split candidate competing
+with features that do carry signal.
 
 **4. Fix our own line-diff with dispersion, not their factors (MEDIUM).
 DONE.** `src/quant/line_diff.py` now inverts the fitted distribution at the
