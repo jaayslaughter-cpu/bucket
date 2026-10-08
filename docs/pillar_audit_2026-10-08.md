@@ -318,7 +318,18 @@ the volume mount, the restart policy or the healthcheck.
 
 **P2 — correctness and honesty items, none deploy-blocking.**
 
-10. **`PRA_L5` / `PRA_L10` / `PRA_SEASON` have two definitions and the second
+10. **~~`PRA_L5` / `PRA_L10` / `PRA_SEASON` have two definitions and the second
+    silently wins.~~ FIXED 2026-10-08** — and it was worse than written below:
+    **five** columns were overwritten, not three (`PRA_BASELINE` and `PRA_L2`
+    as well), and `PRA_L2_PACE` was left holding the *discarded* definition, so
+    it disagreed with the `PRA_L2` shipped beside it on 8 of 14 rows in a
+    fixture with one partial game — including rows where `PACE_MULTIPLIER` was
+    exactly 1.0. `builder.attach_pra_from_components` is now the single
+    implementation, called from both places; the layer keeps only the four
+    suffixes nothing else produces. Every value on the archive panel is
+    unchanged. Original finding, for the record:
+
+    **`PRA_L5` / `PRA_L10` / `PRA_SEASON` have two definitions and the second
     silently wins.** `build_feature_matrix` derives `PRA = PTS + REB + AST`
     and rolls it, commenting "a NaN in any component propagates deliberately:
     a partial sum would read as a real total" — then the registered

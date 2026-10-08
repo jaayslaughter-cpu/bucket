@@ -109,26 +109,49 @@ def attach_halflife_shrink_features(
     return drop_season_key(out)
 
 
+#: The suffixes THIS LAYER owns: the ones no other producer makes. The core
+#: set -- L5, L10, SEASON, BASELINE, L2, L2_PACE -- belongs to
+#: ``builder.build_feature_matrix``, which builds PRA's members of it from the
+#: components itself.
+PRA_LAYER_SUFFIXES: tuple[str, ...] = ("L15", "HL", "HL_SHRINK", "L2_HL")
+
+
 def attach_pra_component_rollups(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Additive PRA aggregates from PTS/REB/AST rollups (no new shift logic).
+    Additive PRA aggregates for the HALFLIFE suffixes (no new shift logic).
+
+    IT USED TO REWRITE FIVE COLUMNS IT DID NOT OWN. Its suffix list ran from
+    L5 through L2_HL, and ``build_feature_matrix`` had already produced
+    PRA_L5, PRA_L10, PRA_SEASON, PRA_BASELINE and PRA_L2 by rolling the PRA
+    column -- so this layer silently replaced them with a different
+    definition, in the middle of a block whose own comment says "Each of these
+    ONLY adds columns; none rewrites the core L2/L5/L10/BASELINE set above".
+
+    Both definitions agreed on every row of the archive panel (PTS, REB and
+    AST are null on 0 of its 214,381) and differed on a live panel, where
+    ``player_game_logs.pts/reb/ast`` are independently nullable. The visible
+    damage was PRA_L2_PACE: the builder computed it from the PRA_L2 it had
+    just made, this layer then replaced PRA_L2 and not PRA_L2_PACE, and the
+    two disagreed on 8 of 14 rows in a fixture with one partial game --
+    including rows where PACE_MULTIPLIER was exactly 1.0.
+
+    The definition that survived is the one this layer used, for the reasons
+    in ``builder.attach_pra_from_components``, which is now the single
+    implementation and is called from both places. This function keeps only
+    the suffixes nothing else produces, so the block's claim about itself is
+    true again.
 
     Safe when component columns exist; otherwise leaves PRA columns absent.
+    The raw ``PRA`` label is NOT written here -- the builder owns it, and
+    writing it twice from two places is the defect this function is being
+    narrowed to avoid repeating.
     """
     out = df.copy()
     if not {"PTS", "REB", "AST"}.issubset(out.columns):
         return out
-    out["PRA"] = (
-        pd.to_numeric(out["PTS"], errors="coerce")
-        + pd.to_numeric(out["REB"], errors="coerce")
-        + pd.to_numeric(out["AST"], errors="coerce")
-    )
-    for suffix in ("L5", "L10", "L15", "SEASON", "BASELINE", "L2", "HL", "HL_SHRINK", "L2_HL"):
-        cols = [f"PTS_{suffix}", f"REB_{suffix}", f"AST_{suffix}"]
-        if all(c in out.columns for c in cols):
-            out[f"PRA_{suffix}"] = (
-                pd.to_numeric(out[cols[0]], errors="coerce")
-                + pd.to_numeric(out[cols[1]], errors="coerce")
-                + pd.to_numeric(out[cols[2]], errors="coerce")
-            )
-    return out
+
+    # Lazily imported: builder imports this module inside its own closures, so
+    # a module-scope import here would close the cycle.
+    from src.features.builder import attach_pra_from_components
+
+    return attach_pra_from_components(out, PRA_LAYER_SUFFIXES)

@@ -26,8 +26,8 @@ CITATIONS = [
     ("src/quant/advisory_sizing.py", 114, '"AUTO_PLACED": False'),
     ("src/quant/contracts.py", 187, 'context.status != "VALID"'),
     ("src/quant/publication_gate.py", 150, "def calibration_gate"),
-    ("src/features/builder.py", 581, "def assert_no_lookahead"),
-    ("src/features/builder.py", 74, "from src.models.compare import load_comparison_config"),
+    ("src/features/builder.py", 665, "def assert_no_lookahead"),
+    ("src/features/builder.py", 121, "from src.models.compare import load_comparison_config"),
     ("src/features/fatigue_load.py", 284, "from src.models.compare import load_comparison_config"),
     ("tests/test_publication_gate.py", 66, "for forbidden in"),
     ("main.py", 4, "NBA ONLY"),
@@ -151,7 +151,7 @@ def test_the_layering_exception_is_exactly_the_two_sites_it_documents():
             if re.search(r"(from|import)\s+src\.(models|quant)\b", line):
                 sites.append((path.relative_to(ROOT).as_posix(), i))
     assert sites == [
-        ("src/features/builder.py", 74),
+        ("src/features/builder.py", 121),
         ("src/features/fatigue_load.py", 284),
     ], f"the features layer's imports of models/quant have changed: {sites}"
 
@@ -159,7 +159,7 @@ def test_the_layering_exception_is_exactly_the_two_sites_it_documents():
 def test_the_two_exceptions_are_lazy_imports_of_a_config_reader():
     """The exception is narrow on purpose: a config loader, imported inside a
     function so it cannot create an import cycle, and never a fitter."""
-    for path, line in (("src/features/builder.py", 74),
+    for path, line in (("src/features/builder.py", 121),
                        ("src/features/fatigue_load.py", 284)):
         raw = (ROOT / path).read_text(encoding="utf-8").splitlines()[line - 1]
         assert raw.startswith("        ") or raw.startswith("    "), (

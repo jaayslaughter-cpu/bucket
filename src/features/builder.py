@@ -35,6 +35,53 @@ logger = logging.getLogger(__name__)
 # Counting stats that get the full rolling treatment.
 ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN")
 
+#: The three stats PRA is the sum of.
+PRA_COMPONENTS: tuple[str, ...] = ("PTS", "REB", "AST")
+
+
+def attach_pra_from_components(
+    df: "pd.DataFrame", suffixes: "tuple[str, ...]"
+) -> "pd.DataFrame":
+    """
+    ``PRA_{suffix} = PTS_{suffix} + REB_{suffix} + AST_{suffix}``, in one place.
+
+    THIS FUNCTION EXISTS BECAUSE THERE WERE TWO DEFINITIONS AND THE SECOND
+    SILENTLY WON. The rolling loop below used to roll the PRA column itself,
+    producing PRA_L5/L10/SEASON and then PRA_BASELINE/L2 from them; the
+    registered ``halflife.pra_rollups`` layer then OVERWROTE five of those with
+    the sums of the component columns. Both looked right, both were plausible,
+    and they agreed on every row of the archive panel — PTS, REB and AST are
+    null on 0 of its 214,381 rows — so the divergence was invisible on the only
+    data anybody had looked at. On the LIVE panel, where
+    ``player_game_logs.pts/reb/ast`` are independently nullable, they differ.
+
+    WHICH ONE SURVIVED, AND WHY IT IS THIS ONE. Rolling the PRA column drops a
+    whole game when ANY component is missing. Summing per suffix keeps each
+    component's own denominator, which is both more data and the correct
+    estimator: ``E[PTS + REB + AST] = E[PTS] + E[REB] + E[AST]`` whichever rows
+    estimated each term. It is also strictly more robust at a baseline, because
+    each component falls back through its own ``.fillna`` chain — summing first
+    propagates a NaN across all three and the blend then has nothing to fall
+    back on, which was measured to turn a real number into a null.
+
+    THE RAW ``PRA`` LABEL IS THE OPPOSITE CASE and still propagates. A label
+    that is a partial sum would read as a real total and would train the model
+    on a wrong target. A FEATURE is an estimate of an expectation; a LABEL is
+    the thing that happened. The old comment conflated them.
+
+    Suffixes whose component columns are not all present are skipped rather
+    than part-summed.
+    """
+    for suffix in suffixes:
+        cols = [f"{stat}_{suffix}" for stat in PRA_COMPONENTS]
+        if not all(c in df.columns for c in cols):
+            continue
+        total = pd.to_numeric(df[cols[0]], errors="coerce")
+        for col in cols[1:]:
+            total = total + pd.to_numeric(df[col], errors="coerce")
+        df[f"PRA_{suffix}"] = total
+    return df
+
 # Layer-1 blend. Recent form dominates, season average stabilises a short
 # sample. Unfitted starting weights, not estimated parameters.
 BASELINE_WEIGHTS = {"L5": 0.5, "L10": 0.3, "SEASON": 0.2}
@@ -402,9 +449,15 @@ def build_feature_matrix(
 
     # PRA is the exact sum of three real columns, not an estimate, so it is
     # derived here rather than listed as a supported market that cannot in
-    # fact be labelled. Deriving it before the rolling loop gives it the same
-    # shift-1 treatment as every other stat. A NaN in any component
-    # propagates deliberately: a partial sum would read as a real total.
+    # fact be labelled. A NaN in any component propagates deliberately: this
+    # is the LABEL, and a partial sum would read as a real total and train the
+    # model on a wrong target.
+    #
+    # ITS ROLLING FEATURES ARE BUILT THE OTHER WAY, from the components rather
+    # than from this column, and the distinction is the point:
+    # attach_pra_from_components says why. An earlier version of this comment
+    # described the propagation as applying to the features too, which was the
+    # opposite of what shipped.
     if {"PTS", "REB", "AST"}.issubset(df.columns) and "PRA" not in df.columns:
         df["PRA"] = (
             pd.to_numeric(df["PTS"], errors="coerce")
@@ -428,11 +481,17 @@ def build_feature_matrix(
         )
     for stat in present:
         df[stat] = pd.to_numeric(df[stat], errors="coerce")
+    # PRA is coerced above, because it is a label and a market, but it is NOT
+    # rolled: its rollups are sums of the components'. One definition, in
+    # attach_pra_from_components.
+    for stat in [s for s in present if s != "PRA"]:
         for window in (5, 10):
             df[f"{stat}_L{window}"] = by_player[stat].transform(
                 _prior_window_mean, window=window
             )
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
+    if "PRA" in present:
+        df = attach_pra_from_components(df, ("L5", "L10", "SEASON"))
 
     # Layers that depend on an external frame being supplied, recorded so the
     # schema version reflects what a run actually had.
@@ -528,7 +587,7 @@ def build_feature_matrix(
             "unaffected and makes no pace claim."
         )
 
-    for stat in present:
+    for stat in [s for s in present if s != "PRA"]:
         blended = (
             BASELINE_WEIGHTS["L5"] * df[f"{stat}_L5"]
             + BASELINE_WEIGHTS["L10"] * df[f"{stat}_L10"]
@@ -540,12 +599,37 @@ def build_feature_matrix(
         df[f"{stat}_L2"] = df[f"{stat}_BASELINE"] * df["fatigue_multiplier"]
         if has_pace:
             df[f"{stat}_L2_PACE"] = df[f"{stat}_L2"] * df["PACE_MULTIPLIER"]
+    # PRA's members of the same set, from the components, for the reason in
+    # attach_pra_from_components. Blending the SUMMED rollups instead would not
+    # reproduce these: each component gets its own .fillna fallback, where a
+    # sum carries one NaN into all three and the blend has nothing left to fall
+    # back on.
+    #
+    # PRA_L2_PACE IS WHY THIS MATTERS BEYOND TIDINESS. It used to be computed
+    # here from the PRA_L2 this loop had just built, and the layer then
+    # overwrote PRA_L2 and not PRA_L2_PACE -- so the two disagreed on 8 of 14
+    # rows in a fixture with one partial game, including rows where
+    # PACE_MULTIPLIER was exactly 1.0. Two columns that are the same number up
+    # to a multiplier, holding different definitions, side by side.
+    if "PRA" in present:
+        df = attach_pra_from_components(df, ("BASELINE", "L2"))
+        if has_pace:
+            df = attach_pra_from_components(df, ("L2_PACE",))
 
     # --- additive feature layers (waves 2, 4b, 5a) ------------------------
     # Each of these ONLY adds columns; none rewrites the core L2/L5/L10/
     # BASELINE set above. They run here, after the season baselines exist,
     # because hot_hand measures recent form against {stat}_SEASON and would
     # otherwise have nothing to compare to.
+    #
+    # THAT SENTENCE WAS FALSE FOR OVER A YEAR. halflife.pra_rollups rewrote
+    # PRA_L5, PRA_L10, PRA_SEASON, PRA_BASELINE and PRA_L2 with its own
+    # definition, so the core set this comment claimed was owned above was
+    # half-owned here. It now adds the suffixes nothing else produces --
+    # L15, HL, HL_SHRINK, L2_HL -- and rewrites nothing, which is what makes
+    # the claim true rather than aspirational.
+    # tests/test_pra_single_definition.py pins it for every layer, not just
+    # that one.
     #
     # A layer that fails is logged and skipped rather than taking the whole
     # matrix down: these are enrichments, and losing one should narrow the
