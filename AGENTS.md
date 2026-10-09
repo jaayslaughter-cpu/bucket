@@ -130,7 +130,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:195`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:230`
 `load_master_guideline()` returns `None` and the caller logs it. The
 `.example` beside it is a placeholder shape, not the real file.
 
@@ -209,6 +209,13 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   is whether Postgres accepts the hand-written DDL in files 002-008. Only
   Postgres can answer that. `python -m scripts.migrate_db` reports before it
   applies anything.
+- **The panel refreshes itself, but it has never fetched here.** The slate
+  pulls this season's player game logs and upserts them before reading the
+  panel (`main.refresh_player_logs`, step [3b]), and `main.panel_freshness`
+  measures how far the newest completed game trails the slate whatever the
+  refresh reported. Neither has run against a reachable nba.com from this
+  checkout, because the proxy denies it — the failure path is exercised, the
+  success path is tested only against injected payloads.
 - **No starting position has ever been pulled.** `player_game_logs` has the
   column (migration 008), `src/ingestion/starting_positions.py` is the writer
   and `scripts/pull_starting_positions.py` is the pass that runs it, but

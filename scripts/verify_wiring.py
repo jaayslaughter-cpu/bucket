@@ -225,15 +225,30 @@ def section_1(report: Report) -> pd.DataFrame | None:
     g = guard(report, "every registered feature layer actually adds columns")
 
     def _layers() -> None:
+        # IN SEQUENCE, CUMULATIVELY, WHICH IS HOW build_feature_matrix RUNS
+        # THEM. This loop used to hand each layer the RAW panel in isolation,
+        # which cannot evaluate a layer whose inputs another layer produces:
+        # halflife.pra_rollups reads PTS_HL, which halflife.shrink creates one
+        # position earlier, so in isolation it correctly added nothing and was
+        # reported inert.
+        #
+        # It had been passing for the wrong reason. That layer also re-derived
+        # the raw PRA label, which WAS a new column on the bare fixture, so the
+        # check saw an addition and said nothing -- and the addition it saw was
+        # a duplicate write that has since been removed as a defect in its own
+        # right. A check satisfied by the thing it should have flagged is worse
+        # than one that fails.
+        working = panel.copy()
         inert = []
         for label, attach in _ADDITIVE_FEATURE_LAYERS:
-            before = set(panel.columns)
+            before = set(working.columns)
             try:
-                out = attach(panel.copy())
+                out = attach(working.copy())
             except Exception as exc:  # noqa: BLE001
                 inert.append(f"{label} (raised {type(exc).__name__})")
                 continue
             added = set(out.columns) - before
+            working = out
             if not added:
                 inert.append(f"{label} (added nothing)")
                 continue

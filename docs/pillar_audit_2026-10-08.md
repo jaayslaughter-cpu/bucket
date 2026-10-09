@@ -288,10 +288,17 @@ the volume mount, the restart policy or the healthcheck.
    checkout. Without one every row abstains. Train into the mounted volume, or
    set `PROPIQ_MODEL` to a seeded path.
    `scripts/nba_model_cli.py train-stats --market PTS --start-date … --end-date …`
-2. **Schedule the box-score ingest, or accept a frozen panel.** `boxscores.py`
-   is not in the automated path. Either add an ingest step ahead of
-   `run_slate`, or document that the panel is refreshed by hand — but it
-   cannot stay implicit, because a stale panel looks exactly like a quiet one.
+2. **~~Schedule the box-score ingest, or accept a frozen panel.~~ FIXED
+   2026-10-09.** The slate now refreshes `player_game_logs` before it reads
+   the panel (`main.refresh_player_logs`, step [3b]) — one `leaguegamelog`
+   request per run, bounded to games on or before the slate date, failing
+   loudly without stopping the run. And because a refresh can fail or be
+   switched off, `main.panel_freshness` measures the lag from the panel itself
+   and logs `PANEL IS STALE` past a configurable limit, so the "looks exactly
+   like a quiet one" half is closed too. Both land in the `pipeline_runs` row.
+   **Still unverified here:** nba.com is denied at this proxy, so the failure
+   path is exercised for real and the success path only against injected
+   payloads.
 3. **Set `PROPIQ_PARLAY_LEDGER=postgres`.** The csv default writes the ledger
    to an ephemeral disk.
 4. **Build the image once on a machine with a daemon.**

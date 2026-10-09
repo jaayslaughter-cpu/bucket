@@ -163,6 +163,7 @@ Four things still need a machine, and none of them is continuous:
 |---|---|---|
 | `python -m scripts.validate_docker` | once, before the first deploy | the build and the six in-image checks need a Docker daemon |
 | `python -m scripts.migrate_db --apply` + `python main.py --init-db` | once, per database, and again after any new migration | the runner records what it applied, so re-running is a safe no-op |
+| `nba_model_cli ingest-logs --persist` | **no longer needed per day** | the slate refreshes `player_game_logs` itself (step [3b]). Still useful once to seed history, and to backfill seasons the slate does not touch |
 | training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or upload the artifacts to object storage and fetch them at boot |
 | recording a stake | whenever you place a bet | PropIQ never places one and never writes a stake. ROI exists only if you log it |
 

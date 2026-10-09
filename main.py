@@ -40,7 +40,8 @@ Execution order:
     [1] preflight         -> DB reachable, guideline present?
     [2] ingest_market     -> BigDataBall -> game_market_lines (GAME markets)
     [3] ingest_props      -> pick'em boards -> prop_line_snapshots
-    [4] load_player_panel -> DB -> raw panel
+   [3b] refresh_logs      -> NBA league game log -> player_game_logs
+    [4] load_player_panel -> DB -> raw panel, then panel_freshness
     [5] features          -> build_feature_matrix (fatigue applied INSIDE)
     [6] verify_fatigue    -> assert it happened; fail loud if not
     [7] score             -> XGBoost P(Over) if a fitted model exists
@@ -95,6 +96,15 @@ MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
 
 ENV_MODEL = "PROPIQ_MODEL"
 ENV_FORWARD_SLATE = "PROPIQ_FORWARD_SLATE"
+#: Refresh `player_game_logs` from the NBA stats API before building the panel.
+#: On by default: the alternative is a panel frozen at whatever was last
+#: ingested by hand, which is the defect this exists to close.
+ENV_LOG_REFRESH = "PROPIQ_REFRESH_PLAYER_LOGS"
+#: How many days the newest COMPLETED game in the panel may trail the slate
+#: before the run says so. Three, because games are daily in season and the
+#: All-Star break is the only legitimate longer gap.
+ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"
+DEFAULT_MAX_PANEL_LAG_DAYS = 3
 
 
 def _flag_env(name: str, default: bool) -> bool:
@@ -105,6 +115,31 @@ def _flag_env(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _int_env(name: str, default: int, *, low: int, high: int) -> int:
+    """
+    A bounded integer env var, defaulting rather than raising.
+
+    Same contract as ``scheduler_worker._int_env`` and deliberately a second
+    small implementation rather than an import: main.py does not depend on the
+    worker, and inverting that for four lines would make the orchestrator
+    require APScheduler to parse a number.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if not low <= value <= high:
+        logger.warning(
+            "%s=%d is outside [%d, %d]; using %d", name, value, low, high, default
+        )
+        return default
+    return value
 
 
 def resolve_model_artifact(
@@ -272,6 +307,199 @@ def ingest_market_lines(
 # ---------------------------------------------------------------------------
 # [3] prop lines
 # ---------------------------------------------------------------------------
+
+def season_label_for(slate_date: str) -> str:
+    """
+    ``"2026-01-15"`` -> ``"2025-26"``, the label the endpoint and panel use.
+
+    The August cut comes from ``features.season.season_start_year`` rather
+    than being re-derived here: a second copy of that rule is how two parts of
+    a project end up disagreeing about which season January belongs to.
+    """
+    from src.features.season import season_start_year
+
+    # errors="coerce", so an unreadable date becomes NaT and is refused by the
+    # message below. Letting pd.Timestamp raise would surface pandas'
+    # DateParseError -- which IS a ValueError, so a caller catching ValueError
+    # still works, but the reader gets "Unknown datetime string format"
+    # instead of being told which input the season could not be read from.
+    parsed = pd.to_datetime(pd.Series([slate_date]), errors="coerce")
+    start = season_start_year(parsed).iloc[0]
+    if pd.isna(start):
+        raise ValueError(f"DATA_NOT_AVAILABLE: cannot read a season from {slate_date!r}")
+    start = int(start)
+    return f"{start}-{str(start + 1)[-2:]}"
+
+
+def refresh_player_logs(slate_date: str, *, persist: bool = True) -> dict[str, Any]:
+    """
+    Pull this season's player game logs and upsert them before the panel loads.
+
+    WHY THIS STEP EXISTS. It did not, and that was the sharpest finding of the
+    2026-10-08 audit. Step [4] reads `player_game_logs`; the only writer was
+    ``nba_model_cli ingest-logs --persist``, which nothing scheduled. So on a
+    deployed container the panel sat frozen at whatever was last ingested BY
+    HAND and every rolling feature aged silently, because a stale panel is
+    indistinguishable from a quiet one. The slate refreshes it now.
+
+    ONE REQUEST PER RUN. ``leaguegamelog`` returns every player-game for a
+    season, so a daily refresh is a single call, not one per game. That is why
+    this is affordable at the top of every slate.
+
+    ``use_cache=False`` IS THE WHOLE POINT, and is easy to get wrong:
+    ``load_player_game_logs`` is cache-first, so the default would hand back
+    yesterday's parquet and fetch nothing, leaving exactly the staleness this
+    step was added to remove while reporting a successful refresh. The cache
+    is still WRITTEN, so it keeps working as an offline fallback for the CLI.
+
+    BOUNDED TO THE SLATE DATE. A run for a past date must not write games
+    played after it. ``load_player_panel`` already bounds the panel at query
+    level, so this is the second line, not the only one — but it means a
+    backfill writes only what was knowable then, rather than relying on every
+    future reader to filter correctly.
+
+    BEST EFFORT. A denied or unreachable nba.com is reported as FAILED and the
+    run continues on the panel already in the database, because abstaining on
+    stale data beats not running at all. What it must never do is continue
+    QUIETLY: the failure lands in ``stage_summary`` and therefore in the
+    ``pipeline_runs`` row, and the staleness check below measures the
+    consequence independently.
+    """
+    if not _flag_env(ENV_LOG_REFRESH, True):
+        logger.info(
+            "%s is off — the panel will be whatever was last ingested by hand.",
+            ENV_LOG_REFRESH,
+        )
+        return {"status": "SKIPPED", "reason": f"{ENV_LOG_REFRESH} is off"}
+    if not persist:
+        return {
+            "status": "SKIPPED",
+            "reason": "--no-db: there is nothing to upsert into",
+        }
+
+    try:
+        season = season_label_for(slate_date)
+    except ValueError as exc:
+        logger.error("Player-log refresh skipped: %s", exc)
+        return {"status": "FAILED", "reason": str(exc)}
+
+    from src.ingestion.boxscores import (
+        BoxScoreFetchError,
+        BoxScoreLoadConfig,
+        load_player_game_logs,
+    )
+
+    config = BoxScoreLoadConfig(seasons=(season,), use_cache=False)
+    try:
+        fetched = load_player_game_logs(config)
+    except BoxScoreFetchError as exc:
+        logger.error(
+            "Player-log refresh FAILED for %s: %s. The run continues on the "
+            "panel already in the database; see panel_freshness below for how "
+            "old that is.", season, exc,
+        )
+        return {"status": "FAILED", "season": season, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — a surprise here must not stop the slate
+        logger.error("Player-log refresh FAILED for %s: %r", season, exc)
+        return {"status": "FAILED", "season": season, "reason": repr(exc)}
+
+    if fetched.empty:
+        return {"status": "FAILED", "season": season,
+                "reason": "the endpoint returned no rows"}
+
+    dates = pd.to_datetime(fetched["GAME_DATE"], errors="coerce")
+    upper = pd.Timestamp(slate_date)
+    keep = dates <= upper
+    held_back = int((~keep).sum())
+    bounded = fetched.loc[keep]
+    if bounded.empty:
+        return {
+            "status": "SKIPPED", "season": season,
+            "reason": (
+                f"every one of the {len(fetched)} fetched row(s) is dated after "
+                f"{slate_date}, so this is a slate before the season's first game"
+            ),
+            "rows_after_slate_held_back": held_back,
+        }
+
+    from src.db.repository import upsert_player_game_logs
+
+    try:
+        written = int(upsert_player_game_logs(bounded))
+    except Exception as exc:  # noqa: BLE001 — report, never claim a write
+        logger.error("Player logs fetched but the database write failed: %r", exc)
+        return {"status": "FAILED", "season": season,
+                "reason": f"upsert failed: {exc!r}", "rows_fetched": int(len(bounded))}
+
+    newest = pd.to_datetime(bounded["GAME_DATE"], errors="coerce").max()
+    out = {
+        "status": "OK",
+        "season": season,
+        "rows_fetched": int(len(bounded)),
+        "rows_written": written,
+        "games": int(bounded["GAME_ID"].nunique()),
+        "players": int(bounded["PLAYER_ID"].nunique()),
+        "newest_game_date": None if pd.isna(newest) else str(newest.date()),
+        "rows_after_slate_held_back": held_back,
+    }
+    logger.info(
+        "Player logs refreshed: %d row(s) upserted for %s, newest game %s%s",
+        written, season, out["newest_game_date"],
+        f", {held_back} row(s) after {slate_date} held back" if held_back else "",
+    )
+    return out
+
+
+def panel_freshness(panel: pd.DataFrame, slate_date: str) -> dict[str, Any]:
+    """
+    How far the newest COMPLETED game trails the slate, and whether to say so.
+
+    THE REFRESH ABOVE IS NOT ENOUGH ON ITS OWN. It can fail, be switched off,
+    or succeed against a season that has not started, and in each case the run
+    proceeds on an old panel. This measures the consequence from the panel
+    itself rather than trusting the step that was supposed to fix it — the
+    only reading that cannot be fooled by a refresh which reported success and
+    fetched nothing.
+
+    MUST BE CALLED BEFORE ``attach_forward_slate``. Forward rows are dated ON
+    the slate and carry no box score, so a panel measured after they are
+    attached always looks perfectly fresh. That is the one ordering mistake
+    that would turn this check into decoration.
+    """
+    if panel is None or panel.empty:
+        return {"status": "EMPTY", "lag_days": None, "newest_game_date": None}
+
+    dates = pd.to_datetime(panel.get("GAME_DATE"), errors="coerce")
+    newest = dates.max()
+    if pd.isna(newest):
+        return {"status": "UNDATED", "lag_days": None, "newest_game_date": None}
+
+    lag = int((pd.Timestamp(slate_date).normalize() - newest.normalize()).days)
+    limit = _int_env(ENV_MAX_PANEL_LAG, DEFAULT_MAX_PANEL_LAG_DAYS, low=0, high=400)
+    stale = lag > limit
+    out = {
+        "status": "STALE" if stale else "OK",
+        "newest_game_date": str(newest.date()),
+        "lag_days": lag,
+        "max_lag_days": limit,
+        "rows": int(len(panel)),
+    }
+    if stale:
+        logger.warning(
+            "PANEL IS STALE: the newest completed game is %s, %d day(s) before "
+            "the %s slate, over the %d-day limit. Every rolling feature is "
+            "that far out of date. A refresh that failed or is switched off is "
+            "the usual cause; %s",
+            out["newest_game_date"], lag, slate_date, limit,
+            "see player_log_refresh in this run's summary.",
+        )
+    else:
+        logger.info(
+            "Panel freshness: newest completed game %s, %d day(s) before the "
+            "slate.", out["newest_game_date"], lag,
+        )
+    return out
+
 
 def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) -> pd.DataFrame:
     """
@@ -1176,7 +1404,23 @@ def main(argv: list[str] | None = None) -> int:
         from src.db.repository import load_player_panel
 
         slate_pt = args.date or str(pacific_calendar_date())
+
+        # [3b] REFRESH THE PANEL'S SOURCE BEFORE READING IT. Until 2026-10-09
+        # this step did not exist: load_player_panel below read whatever had
+        # last been ingested by hand, so a deployed container projected from a
+        # frozen panel and nothing said so.
+        stage_summary["player_log_refresh"] = refresh_player_logs(
+            slate_pt, persist=persist
+        )
+
         panel = load_player_panel(slate_date=slate_pt)
+
+        # MEASURED FROM THE PANEL, AND BEFORE attach_forward_slate. Forward
+        # rows are dated on the slate and carry no box score, so freshness
+        # taken after they are attached always reads as perfect. This is also
+        # the check that catches a refresh which reported success and fetched
+        # nothing.
+        stage_summary["panel_freshness"] = panel_freshness(panel, slate_pt)
 
         # ROWS FOR GAMES THAT HAVE NOT BEEN PLAYED (readiness item O1).
         #
