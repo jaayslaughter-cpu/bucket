@@ -203,6 +203,107 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
 MIN_PLAUSIBLE_TRAIN_ROWS = 5_000
 
 
+def check_parlay_ledger() -> dict[str, Any]:
+    """
+    Report WHICH parlay ledger this process will write to, at boot.
+
+    WHY A COMMENT WAS NOT ENOUGH. The Dockerfile sets
+    ``PROPIQ_PARLAY_LEDGER=postgres`` with a comment saying why, and
+    ``open_parlay_log``'s docstring says "SET IT TO postgres ON A CONTAINER".
+    Neither is a check. A deploy that does not build from that Dockerfile — a
+    buildpack, a plain ``python scheduler_worker.py`` on a VM, or the variable
+    overridden in a platform dashboard — gets the CSV ledger on an ephemeral
+    filesystem, and every ticket's at-bet-time probability and EV is destroyed
+    by the next redeploy. The trace left behind is nothing at all: the CSV
+    writes succeed.
+
+    A ticket is the only record of what was predicted BEFORE a game, which is
+    the one thing that cannot be recomputed afterwards. So the choice is said
+    out loud next to ``check_model_artifact`` — the other thing a redeploy
+    breaks silently.
+
+    THE LEVELS ARE THE POINT.
+
+      * postgres, database configured  -> INFO. The deployed shape.
+      * postgres, NO database          -> ERROR. The variable is set and the
+                                          first write will fail; better said
+                                          now than at the first ticket.
+      * csv, database configured       -> ERROR. Almost certainly a deployment
+                                          that will lose its ledger. Saying
+                                          this at WARNING would be read as
+                                          acceptable, and it is not.
+      * csv, no database               -> INFO. A local run with no Postgres
+                                          is legitimately csv, and naming the
+                                          consequence is all that is owed.
+
+    Warns, never raises, for the reason ``check_model_artifact`` gives: a
+    worker that refuses to start cannot report anything.
+    """
+    try:
+        from src.quant.parlay_log import ENV_LEDGER_BACKEND, resolve_ledger_choice
+    except Exception as exc:  # noqa: BLE001 — the probe must not take the boot down
+        logger.error("Could not import the ledger resolver (%s).", exc)
+        return {"ledger": None, "error": str(exc)}
+
+    try:
+        # The SAME resolver open_parlay_log uses, so this cannot report a
+        # backend other than the one that will be opened.
+        choice = resolve_ledger_choice()
+    except Exception as exc:  # noqa: BLE001 — a typo here must not stop settlement
+        logger.error(
+            "%s is not a usable ledger backend (%s). Every parlay write will "
+            "raise until it is corrected.", ENV_LEDGER_BACKEND, exc,
+        )
+        return {"ledger": None, "error": str(exc)}
+
+    database_configured = True
+    try:
+        from src.db.session import get_database_url
+
+        get_database_url()
+    except Exception:  # noqa: BLE001 — absence is the signal, not an error here
+        database_configured = False
+
+    out = {
+        "ledger": choice,
+        "database_configured": database_configured,
+        "env_var": ENV_LEDGER_BACKEND,
+    }
+
+    if choice == "postgres" and database_configured:
+        logger.info(
+            "Parlay ledger: postgres (%s). Tickets survive a redeploy.",
+            ENV_LEDGER_BACKEND,
+        )
+        out["status"] = "OK"
+    elif choice == "postgres":
+        logger.error(
+            "Parlay ledger is set to postgres (%s) but no database is "
+            "configured, so the first parlay write will fail. Set DATABASE_URL "
+            "or switch the ledger to csv deliberately.", ENV_LEDGER_BACKEND,
+        )
+        out["status"] = "UNUSABLE"
+    elif database_configured:
+        logger.error(
+            "Parlay ledger is CSV (%s unset or 'csv') while a database IS "
+            "configured. On a container that filesystem is ephemeral and "
+            "data/** is gitignored, so every ticket's at-bet-time probability "
+            "and EV is destroyed by the next redeploy — the one record that "
+            "cannot be recomputed. Set %s=postgres.",
+            ENV_LEDGER_BACKEND, ENV_LEDGER_BACKEND,
+        )
+        out["status"] = "EPHEMERAL"
+    else:
+        logger.info(
+            "Parlay ledger: csv, and no database is configured — a local run. "
+            "Tickets live under data/external/parlay_log and will not survive "
+            "a container redeploy; set %s=postgres where they must.",
+            ENV_LEDGER_BACKEND,
+        )
+        out["status"] = "LOCAL"
+    return out
+
+
 def check_model_artifact() -> dict[str, Any]:
     """
     Resolve the scoring artifact AT BOOT and say what was found.
@@ -1176,6 +1277,7 @@ def main() -> int:
     # same two things: the volume's permissions and whether anything was ever
     # put on it. See check_model_artifact for why inference is too late.
     check_model_artifact()
+    check_parlay_ledger()
 
     scheduler = build_scheduler()
     # Published so the daily planner can add one-shot jobs to the scheduler

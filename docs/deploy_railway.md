@@ -89,7 +89,7 @@ these are the ones the worker reads.
 | Variable | Why |
 |---|---|
 | `DATABASE_URL` | Required. Use the **pooler** URL (port 6543 on Supabase) — these are short-lived jobs and the direct port exhausts connections. |
-| `PROPIQ_PARLAY_LEDGER=postgres` | Already set in the image. Without it the ledger writes CSVs to an ephemeral disk and a redeploy destroys every ticket's at-bet-time probability and EV. |
+| `PROPIQ_PARLAY_LEDGER=postgres` | Already set in the image (Dockerfile line 73). Without it the ledger writes CSVs to an ephemeral disk and a redeploy destroys every ticket's at-bet-time probability and EV. Since 2026-10-09 the worker reports which backend it resolved in the first lines of its log, at ERROR when it is csv while a database is configured — the shape that loses tickets silently, because the CSV writes succeed. |
 | `PROPLINE_API_KEY` | The odds source. Without it no line is captured, so every row abstains for want of a market. |
 | `PROPIQ_MODEL` | Which fitted artifact to score with. Unset, `main.resolve_model_artifact` tries the comparison `artifacts_dir` for the newest `xgboost_*.json` that has its `.meta.json` sidecar. Set it when the artifact is on the mounted volume. |
 | `PROPIQ_FORWARD_SLATE` | Default **on**. Adds rows for games that have not been played, from the ESPN schedule plus each team's recent appearances in the panel. Without it a 09:00 PT run has no rows for tonight — the panel is completed box scores only. |

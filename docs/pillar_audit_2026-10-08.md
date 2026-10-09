@@ -299,8 +299,22 @@ the volume mount, the restart policy or the healthcheck.
    **Still unverified here:** nba.com is denied at this proxy, so the failure
    path is exercised for real and the success path only against injected
    payloads.
-3. **Set `PROPIQ_PARLAY_LEDGER=postgres`.** The csv default writes the ledger
-   to an ephemeral disk.
+3. **~~Set `PROPIQ_PARLAY_LEDGER=postgres`.~~ THIS ITEM WAS WRONG.** The
+   Dockerfile has set `ENV PROPIQ_PARLAY_LEDGER=postgres` all along — line 73,
+   with a comment explaining why — so the image never relied on the csv
+   default. The audit read `open_parlay_log`'s default and its "SET IT TO
+   postgres ON A CONTAINER" docstring and inferred the variable was unset,
+   without checking the Dockerfile that sets it. Inspect, do not assume,
+   applied to my own audit.
+
+   What was genuinely missing, and was added 2026-10-09: **a runtime check**.
+   A deploy that does not build from that Dockerfile — a buildpack, a plain
+   `python scheduler_worker.py` on a VM, or the variable overridden in a
+   platform dashboard — gets the CSV ledger on an ephemeral filesystem and
+   loses every ticket at the next redeploy, leaving no trace, because the CSV
+   writes succeed. `scheduler_worker.check_parlay_ledger()` now reports the
+   backend at boot beside `check_model_artifact()`, at ERROR when it is csv
+   while a database is configured.
 4. **Build the image once on a machine with a daemon.**
    `python -m scripts.validate_docker` runs the build and six in-image checks.
 5. **Apply the migrations and verify Postgres accepts them.**
