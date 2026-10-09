@@ -126,16 +126,38 @@ def test_nothing_found_returns_a_reason_naming_every_path_tried(monkeypatch, tmp
     assert "train-stats" in reason, "the reason should say how to produce one"
 
 
-def test_a_broken_comparison_config_does_not_take_the_resolver_down(monkeypatch, tmp_path):
+def test_a_broken_comparison_config_does_not_take_the_resolver_down(monkeypatch):
+    """
+    A broken config must not change the ANSWER, which is what "does not take
+    the resolver down" actually means: ``resolve_model_artifact`` catches the
+    failure and falls back to the same hardcoded `artifacts_dir` the config
+    names, so resolution continues unchanged.
+
+    THIS TEST USED TO ASSERT `path is None`, and it passed for a reason that
+    had nothing to do with the config: the checkout had no trained artifact, so
+    the resolver found nothing either way. Seeding real artifacts turned it
+    red, which is the test telling the truth at last — the fallback resolves,
+    and a `None` here would mean a broken config had silently disabled scoring.
+
+    Asserted as "same as with a working config" rather than against a path, so
+    it holds whether or not this checkout has been seeded.
+    """
     import src.models.compare as compare
+
+    working_path, working_reason = resolve_model_artifact()
 
     monkeypatch.setattr(
         compare, "load_comparison_config",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad yaml")),
     )
-    path, reason = resolve_model_artifact()
-    assert path is None
-    assert "data/external/model_runs/comparison" in reason
+    broken_path, broken_reason = resolve_model_artifact()
+
+    assert broken_path == working_path, (
+        "a broken comparison config changed which artifact is resolved; the "
+        "fallback is supposed to equal the configured directory"
+    )
+    assert "data/external/model_runs/comparison" in broken_reason
+    assert broken_reason == working_reason
 
 
 # --- scoring handles the absence ------------------------------------------

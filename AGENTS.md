@@ -191,10 +191,18 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
   container abstains on every row without looking broken. That one is a
   platform step, not a code change. `docs/railway_deployment_audit.md` §4.
-- **No model has been trained in this checkout.** The resolution is wired —
-  `main.resolve_model_artifact` finds the newest trained artifact — but there
-  is nothing yet to resolve, so every row abstains for want of a model rather
-  than for want of wiring. `docs/integration_audit.md` §2.1.
+- **A trained artifact is not a committed one.** PTS, REB and AST were fitted
+  on the archive panel on 2026-10-09 and verified end to end — the resolver
+  finds them, `check_model_artifact()` reports INFO rather than the demo
+  ERROR, and all three score a production-shaped frame with probabilities in
+  [0, 1]. But `data/**` is gitignored, so they live only where they were
+  trained: a fresh checkout and a fresh container both have none and abstain
+  on every row. Seeding is a volume or object-storage step, not a commit.
+  `docs/deploy_railway.md` §4b.
+- **The seeded fit ignores the two most recent seasons.** `train-stats` splits
+  its window 2/3 chronologically, so a 2018-01-01 → 2026-04-12 run fits to
+  2023-12-13 and validates on the rest. A deliberate holdout, and not what you
+  want for an artifact scoring tonight.
 - **A forward slate rests on who played recently, not on a roster.**
   `src/pipeline/forward_slate.py` builds tonight's rows from each team's recent
   appearances in the panel, which misses a player returning from a long

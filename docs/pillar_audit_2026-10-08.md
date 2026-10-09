@@ -284,10 +284,24 @@ the volume mount, the restart policy or the healthcheck.
 
 **P0 — the deploy produces nothing without these.**
 
-1. **Train and seed a model artifact.** No `xgboost_*.json` exists in this
-   checkout. Without one every row abstains. Train into the mounted volume, or
-   set `PROPIQ_MODEL` to a seeded path.
-   `scripts/nba_model_cli.py train-stats --market PTS --start-date … --end-date …`
+1. **~~Train and seed a model artifact.~~ TRAINED 2026-10-09; seeding the
+   volume is still a platform step.** PTS, REB and AST artifacts were fitted on
+   the 214,381-row archive panel (142,713 train rows each, 31–38 features,
+   negbin dispersion) and verified end to end: the resolver finds them,
+   `check_model_artifact()` reports INFO rather than the demo ERROR, and all
+   three score a production-shaped frame — 1,276 of 1,278 rows, probabilities
+   in [0, 1], means 0.485–0.502. `verify_wiring` went 29 → 30 passed.
+
+   **Two blockers surfaced doing it, both now fixed.** `train-stats` had no
+   `--panel`, so the one command that produces the artifact could not run
+   where stats.nba.com is denied — this environment and any CI. And
+   `main.py`'s `--bigdataball` default named `..._Team-Stats__1_.xlsx`, a file
+   that does not exist, so `python main.py` failed at step [2] with defaults
+   and the workbook's `DEF_*`/`MKT_*`/Elo columns never reached the builder.
+
+   **What remains is not training.** `data/**` is gitignored, so the artifacts
+   cannot be committed: they have to be trained into the mounted volume or
+   copied onto it. Procedure and the two traps: `docs/deploy_railway.md` §4b.
 2. **~~Schedule the box-score ingest, or accept a frozen panel.~~ FIXED
    2026-10-09.** The slate now refreshes `player_game_logs` before it reads
    the panel (`main.refresh_player_logs`, step [3b]) — one `leaguegamelog`

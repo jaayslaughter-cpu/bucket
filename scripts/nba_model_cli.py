@@ -489,9 +489,20 @@ def train_stats(
         help="Comma-separated seasons, e.g. 2024-25,2025-26 (default: the loader's)",
     ),
     season_type: str = typer.Option(None, "--season-type", help="e.g. 'Regular Season'"),
+    panel: str = typer.Option(
+        None, "--panel",
+        help="A prebuilt feature matrix (parquet) to train from, instead of "
+             "the loader's own. Required where stats.nba.com is unreachable.",
+    ),
     verbose: bool = False,
 ) -> None:
-    """Fit XGBoost + CatBoost adapters for one market (artifacts under model_runs)."""
+    """Fit XGBoost + CatBoost adapters for one market (artifacts under model_runs).
+
+    ``--panel`` takes an already-built feature matrix, which `evaluate` and
+    `scripts/feature_ab.py` both already accepted and this command did not --
+    so on any machine where stats.nba.com is denied, the one command that
+    produces the artifact the whole pipeline needs could not be run at all.
+    """
     _setup_logging(verbose)
     from src.models.compare import (
         build_components,
@@ -505,8 +516,8 @@ def train_stats(
     if market not in {"PTS", "REB", "AST"}:
         typer.echo("Launch markets are PTS/REB/AST only", err=True)
         raise SystemExit(1)
-    panel, is_demo = _load_real_or_demo(demo, seasons, season_type)
-    work = prepare_market_panel(panel, market)
+    frame, is_demo = _load_real_or_demo(demo, seasons, season_type, panel)
+    work = prepare_market_panel(frame, market)
     work = work[(work["GAME_DATE"] >= start_date) & (work["GAME_DATE"] <= end_date)]
     cols, _dropped = resolve_feature_cols(work, list(default_feature_cols(market)))  # type: ignore[arg-type]
     if not cols:

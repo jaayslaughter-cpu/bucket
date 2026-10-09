@@ -130,6 +130,51 @@ checksum catches the one divergence a version number cannot see. There is no
 `python main.py --init-db` creates the ORM-defined tables and exits. The SQL
 migrations carry the CHECK constraints and views that `create_all` does not.
 
+## 4b. Seeding the scoring artifact
+
+`data/external/model_runs/` is empty on a fresh container and **every row
+abstains** until it is not. `scheduler_worker.check_model_artifact()` reports
+that as an ERROR in the first lines of the log, so the state is visible — but
+only seeding fixes it.
+
+One command per launch market, run where the panel is:
+
+```
+python -m scripts.nba_model_cli train-stats --market PTS \
+    --panel <feature-matrix>.parquet --start-date 2018-01-01 --end-date <today>
+python -m scripts.nba_model_cli train-stats --market REB --panel ...  (same)
+python -m scripts.nba_model_cli train-stats --market AST --panel ...  (same)
+```
+
+Artifacts land under `artifacts_dir` from `config/model_comparison.yaml`
+(`data/external/model_runs/comparison`), which is where the scoring resolver
+looks. `--panel` takes a prebuilt feature matrix and exists because the
+loader's own path needs stats.nba.com — denied in CI and in the cloud sessions
+this project is developed from, where the artifact previously could not be
+trained at all. `scripts/ingest_training_pack.py` builds the matrix.
+
+Each market writes `xgboost_{M}.json` + `.mean.json` + `.meta.json`,
+`catboost_{M}.cbm` + `.mean.cbm` + `.meta.json`, and `distribution_{M}.json`.
+The `.meta.json` sidecar is the feature contract the scorer checks before using
+the booster; a permuted column list is rejected rather than silently
+re-ordered.
+
+**THE ARTIFACTS ARE GITIGNORED** (`data/**`), so they travel by volume or
+object storage, never by a commit.
+
+**Two things to check after seeding**, both measured on the 2026-10-09 seed:
+
+- The contract must be buildable where it scores. A PTS contract trained with
+  the BigDataBall workbook present resolves **38** columns; a live panel built
+  without the workbook resolves **27**, and the 11 missing ones (Elo, `MKT_*`,
+  `DEF_*`) come from the workbook alone. Train and score with the same inputs,
+  or the contract check rejects the artifact on every row.
+- `train-stats` splits the window **2/3 chronologically**, so
+  `--start-date 2018-01-01 --end-date 2026-04-12` fits only to **2023-12-13**
+  and validates on the remaining 2.4 seasons. A deliberate holdout, not a bug —
+  but not what you want for an artifact scoring tonight. Narrow the window, or
+  accept that the fit ignores the two most recent seasons.
+
 ## 5. What runs, and when
 
 | Job | Time (PT) | What it does |

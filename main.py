@@ -1354,10 +1354,17 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Slate date YYYY-MM-DD in {DISPLAY_TZ_NAME} (default: today Pacific)",
     )
     parser.add_argument("--init-db", action="store_true", help="Create tables then exit")
+    # THE DEFAULT POINTED AT A FILE THAT DOES NOT EXIST until 2026-10-09:
+    # "..._Team-Stats__1_.xlsx", where the export is "..._Team-Stats.xlsx".
+    # load_bigdataball_workbook raises FileNotFoundError on a missing path, so
+    # the whole slate failed with defaults -- loudly, which is the one mercy,
+    # but it also means the team/market frames never reached
+    # build_feature_matrix, and the DEF_*, MKT_* and Elo columns a trained
+    # artifact's feature contract names could not be built at all.
     parser.add_argument("--bigdataball", type=str,
                         default=os.environ.get(
                             "BIGDATABALL_XLSX",
-                            "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats__1_.xlsx"))
+                            "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx"))
     parser.add_argument(
         "--model", type=str, default=None,
         help="Fitted artifact to score with. Omitted: resolve_model_artifact "
