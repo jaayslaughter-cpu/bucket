@@ -95,6 +95,17 @@ MASTER_GUIDELINE_DEFAULT_PATH = Path("config/master_guideline_props.yaml")
 MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
 
 ENV_MODEL = "PROPIQ_MODEL"
+
+#: The licensed BigDataBall team-stats workbook. NAMED HERE rather than inline
+#: in the argparse default so the deployment probe can ask whether it is
+#: present: a missing workbook raises FileNotFoundError at step [2] and FAILS
+#: THE WHOLE SLATE, and the image deliberately excludes `data/` and `*.xlsx`,
+#: so a fresh container has no workbook and every scheduled run fails at 09:00
+#: PT with nothing having said so at boot. Two readers of one string.
+ENV_BIGDATABALL = "BIGDATABALL_XLSX"
+DEFAULT_BIGDATABALL_XLSX = (
+    "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx"
+)
 ENV_FORWARD_SLATE = "PROPIQ_FORWARD_SLATE"
 #: Refresh `player_game_logs` from the NBA stats API before building the panel.
 #: On by default: the alternative is a panel frozen at whatever was last
@@ -1363,8 +1374,7 @@ def main(argv: list[str] | None = None) -> int:
     # artifact's feature contract names could not be built at all.
     parser.add_argument("--bigdataball", type=str,
                         default=os.environ.get(
-                            "BIGDATABALL_XLSX",
-                            "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx"))
+                            ENV_BIGDATABALL, DEFAULT_BIGDATABALL_XLSX))
     parser.add_argument(
         "--model", type=str, default=None,
         help="Fitted artifact to score with. Omitted: resolve_model_artifact "

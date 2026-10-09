@@ -110,30 +110,19 @@ def test_the_bigdataball_default_names_a_file_the_repo_actually_uses():
     old default was wrong CONTAINS it, so the test failed on the explanation
     of its own fix. The mirror image of a comment masking a defect, and the
     same lesson: read the code, not the prose around it.
+
+    UPDATED 2026-10-09. The path and the variable name moved out of the
+    argparse call into `main.DEFAULT_BIGDATABALL_XLSX` / `ENV_BIGDATABALL`, so
+    that `scripts/railway_healthcheck` can ask whether the workbook is present
+    without carrying a second copy of the filename. This test previously read
+    two string literals out of the `add_argument` call and failed on that
+    change, although the change strengthened exactly what it guards — so it now
+    checks the constant AND that the parser still reads it.
     """
-    import ast
+    import main
 
-    tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
-    default: str | None = None
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "add_argument"):
-            continue
-        if not (node.args and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "--bigdataball"):
-            continue
-        for kw in node.keywords:
-            if kw.arg != "default":
-                continue
-            # default=os.environ.get("BIGDATABALL_XLSX", "<path>")
-            assert isinstance(kw.value, ast.Call), "the default is no longer overridable"
-            literals = [a.value for a in kw.value.args if isinstance(a, ast.Constant)]
-            assert literals and literals[0] == "BIGDATABALL_XLSX"
-            default = literals[1] if len(literals) > 1 else None
-
-    assert default, "could not read the --bigdataball default from main.py"
+    default = main.DEFAULT_BIGDATABALL_XLSX
+    assert main.ENV_BIGDATABALL == "BIGDATABALL_XLSX"
     assert "__1_" not in default, (
         f"the default workbook path is back to a name that does not exist: {default!r}"
     )
@@ -141,9 +130,33 @@ def test_the_bigdataball_default_names_a_file_the_repo_actually_uses():
 
 
 def test_the_workbook_default_is_overridable_by_environment():
-    """A licensed export lives wherever the operator put it."""
-    source = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert 'os.environ.get(\n                            "BIGDATABALL_XLSX"' in source
+    """
+    A licensed export lives wherever the operator put it.
+
+    AST-walked over the `--bigdataball` default, which must still be
+    `os.environ.get(ENV_BIGDATABALL, DEFAULT_BIGDATABALL_XLSX)` — the two names,
+    not two fresh literals. This read a raw substring of the source including
+    its indentation until 2026-10-09, which reformatting alone could break and
+    a comment could satisfy.
+    """
+    import ast
+
+    tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+    call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == "--bigdataball"
+    )
+    default = next(kw.value for kw in call.keywords if kw.arg == "default")
+    assert isinstance(default, ast.Call), "the default is no longer overridable"
+    assert isinstance(default.func, ast.Attribute) and default.func.attr == "get"
+    names = [a.id for a in default.args if isinstance(a, ast.Name)]
+    assert names == ["ENV_BIGDATABALL", "DEFAULT_BIGDATABALL_XLSX"], (
+        f"the default reads {names} instead of the two module constants, so the "
+        f"probe and the orchestrator can now disagree about the workbook path"
+    )
 
 
 def test_a_missing_workbook_raises_rather_than_building_a_panel_without_it():

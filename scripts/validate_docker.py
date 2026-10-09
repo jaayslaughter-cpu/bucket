@@ -125,6 +125,36 @@ def _is_ignored(path: str, rules: list[tuple[str, bool]]) -> bool:
     return ignored
 
 
+def _check_shell_entrypoint(root: Path, script: Path, report: "Report") -> None:
+    """
+    Every `python -m <module>` and `python <file>.py` the start script runs.
+
+    WHY THIS IS WORTH A CHECK. A start script is the one file in the image that
+    nothing imports and no test calls, so a renamed module inside it is found
+    by booting the container — in front of the platform's deploy log, after the
+    build has already succeeded. Resolving the names against the tree is cheap
+    and catches exactly that.
+    """
+    body = script.read_text(encoding="utf-8")
+    missing: list[str] = []
+
+    for module in re.findall(r"python\s+-m\s+([A-Za-z0-9_.]+)", body):
+        as_path = root / (module.replace(".", "/") + ".py")
+        as_pkg = root / module.replace(".", "/") / "__init__.py"
+        if not as_path.is_file() and not as_pkg.is_file():
+            missing.append(f"-m {module}")
+
+    for name in re.findall(r"python\s+([A-Za-z0-9_./-]+\.py)", body):
+        if not (root / name).is_file():
+            missing.append(name)
+
+    if missing:
+        report.bad(f"{script.name} runs only things that exist",
+                   f"not in the tree: {missing}")
+    else:
+        report.ok(f"{script.name} runs only things that exist")
+
+
 def preflight(report: Report, root: Path = ROOT) -> None:
     """``root`` is a parameter so the checks can be exercised against a
     synthetic tree; see tests/test_validate_docker.py."""
@@ -143,13 +173,26 @@ def preflight(report: Report, root: Path = ROOT) -> None:
         report.bad("CMD is present", "no CMD instruction")
     else:
         parts = [p.strip().strip('"') for p in cmd.group(1).split(",")]
-        target = next((p for p in parts if p.endswith(".py")), None)
+        # A SHELL ENTRYPOINT IS LEGITIMATE and used to fail this check. The CMD
+        # is `bash scripts/start.sh`, which migrates, probes and then execs the
+        # worker; requiring a .py here would have reported "names no .py
+        # entrypoint" for the correct image. So the target is any file the CMD
+        # names that is in the tree, and a .sh target is followed: a start
+        # script referring to a module that does not exist is exactly the
+        # failure this check is for, and it is invisible until the container
+        # boots.
+        target = next(
+            (p for p in parts if p.endswith((".py", ".sh"))), None
+        )
         if target is None:
-            report.bad("CMD names a script", f"CMD {parts} names no .py entrypoint")
+            report.bad("CMD names a script",
+                       f"CMD {parts} names no .py or .sh entrypoint")
         elif not (root / target).is_file():
             report.bad("CMD target exists", f"CMD runs {target}, which is not in the tree")
         else:
             report.ok(f"CMD target exists ({target})")
+            if target.endswith(".sh"):
+                _check_shell_entrypoint(root, root / target, report)
 
     # 2. no secret baked in. Scanned on the JOINED body, because an ENV with
     #    line continuations puts its later assignments on lines that do not

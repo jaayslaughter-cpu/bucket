@@ -1,15 +1,31 @@
 # PropIQ Analytics — NBA only. RESEARCH_ONLY.
 # Equivalent to: pip install -e ".[ml,db,dev]"
+#
+# UPPER BOUNDS, added 2026-10-09, and they must stay IN STEP WITH pyproject.toml
+# -- this file is read by Nixpacks and pyproject by the Dockerfile, so two
+# dependency declarations that disagree build two different images from one
+# commit. tests/test_railway_deploy.py compares the caps.
+#
+# Why cap at all: the trained artifacts live on a MOUNTED VOLUME that survives
+# a redeploy while the image does not, so an uncapped rebuild pairs a fresh
+# major version with a booster saved by an older one. Majors only, not exact
+# pins -- `python:3.11-slim` installs no build toolchain, so every dependency
+# must arrive as a wheel, and exact pins across a scientific stack eventually
+# name a version with no wheel and turn a deploy into a compile.
 
 # --- core data ---
-pandas>=2.2.0
-numpy>=1.26.0
-scipy>=1.12.0
-pyarrow>=15.0.0           # parquet copies of the outputs/ exports
+pandas>=2.2.0,<4
+numpy>=1.26.0,<3
+scipy>=1.12.0,<2
+pyarrow>=15.0.0           # parquet copies of the outputs/ exports. UNCAPPED
+                          # deliberately: it releases a major roughly
+                          # quarterly and the read/write surface used here has
+                          # been stable across all of them, so a cap would
+                          # expire faster than it protected anything.
 
 # --- database (Postgres / Supabase) ---
-SQLAlchemy>=2.0.30
-psycopg[binary]>=3.1.18   # Postgres driver; [binary] avoids needing libpq locally
+SQLAlchemy>=2.0.30,<3
+psycopg[binary]>=3.1.18,<4   # Postgres driver; [binary] avoids needing libpq locally
 # NO alembic. It was pinned here with the comment "schema migrations" and
 # there was no alembic.ini, no env.py and no module importing it -- a
 # declaration that told a reader the migrations were managed when they were
@@ -19,32 +35,35 @@ psycopg[binary]>=3.1.18   # Postgres driver; [binary] avoids needing libpq local
 # choosing that over wiring alembic is in src/db/migrations.py's docstring.
 
 # --- excel / licensed exports (BigDataBall workbook) ---
-openpyxl>=3.1.0
+openpyxl>=3.1.0,<4
 
 # --- modeling ---
-xgboost>=2.0.0            # existing baseline
-catboost>=1.2             # challenger
-scikit-learn>=1.4.0       # metrics + probability calibration
+xgboost>=2.0.0,<4          # existing baseline
+catboost>=1.2,<2           # challenger
+scikit-learn>=1.4.0,<2     # metrics + probability calibration
 
 # --- cli ---
-typer>=0.12
+typer>=0.12,<1
 
 # --- ingestion / http ---
-requests>=2.31.0
-httpx>=0.27.0
+requests>=2.31.0,<3
+httpx>=0.27.0,<1
 
 # --- validation / config ---
-pydantic>=2.6.0
-PyYAML>=6.0.1
-python-dotenv>=1.0.1
+pydantic>=2.6.0,<3
+PyYAML>=6.0.1,<7
+python-dotenv>=1.0.1,<2
 
 # --- name matching ---
-rapidfuzz>=3.6.0
+rapidfuzz>=3.6.0,<4
 
 # --- dev / test ---
-pytest>=8.0.0
-pytest-socket>=0.7.0     # CI runs with --disable-socket; see .github/workflows/tests.yml
-ruff>=0.5.0
+pytest>=8.0.0,<9
+pytest-socket>=0.7.0,<1   # CI runs with --disable-socket; see .github/workflows/tests.yml
+ruff>=0.5.0               # a linter, not a runtime dependency: an upgrade
+                          # cannot change what a saved model does, so it is
+                          # the one line here that is deliberately uncapped
+                          # apart from pyarrow.
 
 # ---------------------------------------------------------------------------
 # DEPLOYED WORKER
@@ -56,4 +75,4 @@ ruff>=0.5.0
 #
 # Build from the Dockerfile so there is one build path. This line is the
 # belt-and-braces for the day someone points Railway at Nixpacks anyway.
-APScheduler>=3.10
+APScheduler>=3.10,<4

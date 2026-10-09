@@ -137,11 +137,40 @@ def test_13_the_feature_contract_is_checked_at_serve_time():
     assert "verify_feature_contract" in (ROOT / "main.py").read_text(encoding="utf-8")
 
 
-def test_43_the_pooling_claims_are_still_true():
+def test_43_the_pooling_claims_are_still_true(monkeypatch):
+    """
+    THE EFFECTIVE POOL, not the source literals.
+
+    This read `"pool_size=5" in body` until 2026-10-09, when the values became
+    env-overridable (`pool_size=_int_env("PROPIQ_DB_POOL_SIZE", 5, ...)`) and
+    the literal disappeared while the default did not. The test failed on a
+    change that strengthened what it was guarding — and, being a substring
+    check, it would equally have passed on a COMMENT saying `pool_size=5`,
+    which is the trap this repository has hit five times. So it now reads the
+    kwargs that reach `create_engine`.
+    """
+    import src.db.session as session
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        session, "create_engine",
+        lambda url, **kw: captured.update(kw, url=url) or object(),
+    )
+    monkeypatch.setattr(session, "_engine", None)
+    monkeypatch.delenv("PROPIQ_DB_POOL_SIZE", raising=False)
+    monkeypatch.delenv("PROPIQ_DB_MAX_OVERFLOW", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com:6543/postgres")
+    session.get_engine()
+    session._engine = None
+
+    assert captured["pool_pre_ping"] is True
+    assert captured["pool_size"] == 5
+    assert captured["max_overflow"] == 5
+    # sslmode is appended by the URL builder, not passed as a kwarg.
+    assert "sslmode=require" in captured["url"]
+
     body = (ROOT / "src" / "db" / "session.py").read_text(encoding="utf-8")
-    for claim in ("pool_pre_ping=True", "pool_size=5", "max_overflow=5",
-                  "expire_on_commit=False", "sslmode=require"):
-        assert claim in body, f"the page calls 4.3 PASS but {claim} is gone"
+    assert "expire_on_commit=False" in body
 
 
 def test_the_two_corrections_are_kept_rather_than_quietly_dropped():

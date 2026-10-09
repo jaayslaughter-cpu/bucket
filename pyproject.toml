@@ -4,39 +4,64 @@ version = "0.0.0"
 description = "PropIQ Analytics — pre-game NBA player-prop research (RESEARCH_ONLY)"
 readme = "README.md"
 requires-python = ">=3.11"
+# UPPER BOUNDS, added 2026-10-09. Every one of these was `>=` with no cap, so
+# a `docker build` resolved whatever PyPI served that day. That is a deployment
+# problem specific to this project: the trained artifacts live on a MOUNTED
+# VOLUME that survives a redeploy while the image does not, so an uncapped
+# rebuild pairs a fresh major version with a booster saved by an older one. A
+# probability that moved because the serving library changed is
+# indistinguishable, downstream, from one that moved because the player did.
+#
+# MAJORS ONLY, not exact pins. `python:3.11-slim` installs no build toolchain,
+# so every dependency must arrive as a wheel; exact pins across a scientific
+# stack eventually name a version with no wheel for the platform and turn a
+# deploy into a compile. The caps stop the class of breakage that actually
+# happens and leave patch and minor upgrades alone.
+#
+# `src/models/runtime_versions.py` records the versions a model was trained
+# under into its `.meta.json`, and the loader warns when a MAJOR differs — so
+# the pairing is visible even if these bounds are relaxed.
 dependencies = [
-    "pydantic>=2.0",
-    "pandas>=2.0",
-    "numpy>=1.26",
-    "scipy>=1.11",
-    "rapidfuzz>=3.0",
-    "python-dotenv>=1.0",
-    "requests>=2.25.0",
+    "pydantic>=2.0,<3",
+    "pandas>=2.0,<4",
+    "numpy>=1.26,<3",
+    "scipy>=1.11,<2",
+    "rapidfuzz>=3.0,<4",
+    "python-dotenv>=1.0,<2",
+    "requests>=2.25.0,<3",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pdfplumber>=0.11",
+    "pytest>=8.0,<9",
+    "pdfplumber>=0.11,<1",
 ]
 ml = [
-    "xgboost>=2.0",
-    "scikit-learn>=1.3",
-    "catboost>=1.2",
-    "PyYAML>=6.0",
-    "typer>=0.12",
+    # xgboost and scikit-learn are the two that matter most: the booster and
+    # the calibrators are both SAVED, and both libraries have changed their
+    # load path across majors.
+    "xgboost>=2.0,<4",
+    "scikit-learn>=1.3,<2",
+    "catboost>=1.2,<2",
+    "PyYAML>=6.0,<7",
+    "typer>=0.12,<1",
 ]
 db = [
-    "SQLAlchemy>=2.0.30",
-    "psycopg[binary]>=3.1.18",
+    "SQLAlchemy>=2.0.30,<3",
+    "psycopg[binary]>=3.1.18,<4",
     # alembic was declared here and never used: no alembic.ini, no env.py, no
     # importer. src/db/migrations.py manages the hand-written SQL instead --
     # see its docstring for why that was the choice rather than wiring alembic.
-    "openpyxl>=3.1.0",
-    "PyYAML>=6.0",
+    "openpyxl>=3.1.0,<4",
+    "PyYAML>=6.0,<7",
 ]
 stats = [
-    "nba_api>=1.4",
+    "nba_api>=1.4,<2",
+    # pyarrow is deliberately UNCAPPED. It releases a major roughly quarterly
+    # and the parquet read/write surface this project uses has been stable
+    # across all of them, so a cap here would expire faster than it protected
+    # anything. Nothing saved by this project is written by pyarrow's own
+    # format version.
     "pyarrow>=14.0",
 ]
 edge = [
@@ -45,7 +70,10 @@ edge = [
 # The deployed worker. Kept out of the base install so a local checkout that
 # only runs the CLI does not pull a scheduler it never starts.
 deploy = [
-    "APScheduler>=3.10",
+    # <4 IS THE IMPORTANT ONE. APScheduler 4 is a rewrite: `BlockingScheduler`
+    # moves, the trigger API changes, and `scheduler_worker.build_scheduler`
+    # would fail at import — on a redeploy, with the previous image gone.
+    "APScheduler>=3.10,<4",
 ]
 
 [build-system]

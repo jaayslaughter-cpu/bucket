@@ -103,6 +103,12 @@ ENV PROPIQ_PARLAY_LEDGER=postgres
 #                              for a reason that is not the real one.
 ENV PROPIQ_CALIBRATION_REPORT=/app/data/calibration.json
 
+# THE SCHEMA IS APPLIED AT BOOT by scripts/start.sh, which hard-fails the
+# container when a migration cannot be applied. Set PROPIQ_MIGRATE_ON_BOOT=false
+# where a separate release step owns the schema and this worker must not touch
+# it. `scripts/migrate_db` keeps its read-only default for the case where a
+# human is typing; `scripts/run_migrations` is the applying front door.
+
 # THE VOLUME MOUNT SHADOWS THE chown ABOVE. /app/data is created and chowned to
 # propiq at build time, but a volume mounted there at RUN time replaces it with
 # whatever the platform provisions — commonly root-owned. This container runs as
@@ -111,4 +117,15 @@ ENV PROPIQ_CALIBRATION_REPORT=/app/data/calibration.json
 # permissions problem. scheduler_worker.check_state_dir() probes it at boot and
 # names it; see docs/deploy_railway.md for the fix if it fires.
 
-CMD ["python", "scheduler_worker.py"]
+# THE START SEQUENCE IS A SCRIPT, NOT THIS LINE. scripts/start.sh applies the
+# pending migrations, runs the deployment healthcheck, and then execs the
+# worker. The order matters and getting it wrong is silent: a schema behind the
+# code surfaces at 09:00 PT as a failed insert, hours after the deploy looked
+# successful. `exec` in that script keeps the worker as PID 1 so SIGTERM
+# reaches its handler, which shuts the scheduler down AFTER the running job
+# rather than being SIGKILLed mid-slate.
+#
+# railway.json repeats this as `startCommand` because the platform's own
+# setting wins over the image's CMD when one is set, and a start command typed
+# into a dashboard is not in version control.
+CMD ["bash", "scripts/start.sh"]

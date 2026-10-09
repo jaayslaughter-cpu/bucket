@@ -89,6 +89,12 @@ DEFAULT_SETTLE_HOUR, DEFAULT_SETTLE_MINUTE = 3, 30
 
 # A job that misses its window by less than this still runs; past it, the slate
 # has moved on and running late would project games that have already tipped.
+#: The fallback grace for a job added WITHOUT its own. APScheduler's own
+#: default is one second; fifteen minutes is long enough that a brief overrun
+#: does not silently drop a job and short enough that nothing stale fires.
+#: Every job registered here sets its own, so this only governs the next one.
+DEFAULT_MISFIRE_GRACE_SECONDS = 15 * 60
+
 SLATE_MISFIRE_GRACE_SECONDS = 60 * 60
 SETTLE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 
@@ -149,6 +155,29 @@ def cap_thread_counts() -> int | None:
         os.environ.setdefault(variable, str(cap))
     logger.info("Thread pools capped at %d per process", cap)
     return cap
+
+
+def board_markets() -> list[str]:
+    """
+    Which markets this deployment builds a board for.
+
+    SPLIT OUT so the slate and the deploy healthcheck cannot disagree. The
+    parsing lived inside ``run_board`` and was unreachable from anywhere else,
+    so ``scripts/railway_healthcheck`` would have had to re-implement it --
+    and a healthcheck that probes PTS/REB/AST while the worker is configured
+    for PTS alone reports a failure that is not one, or misses one that is.
+    This repository has now found that defect three times (the parlay ledger
+    read twice, PRA defined twice); one reader is the fix.
+
+    An empty or unparseable ``PROPIQ_BOARD_MARKETS`` falls back to the
+    pipeline's own defaults rather than to an empty list, which would silently
+    build nothing.
+    """
+    from src.pipeline.slate_board import DEFAULT_MARKETS
+
+    raw = (os.environ.get(ENV_BOARD_MARKETS) or "").strip()
+    parsed = [m.strip().upper() for m in raw.split(",") if m.strip()]
+    return parsed or list(DEFAULT_MARKETS)
 
 
 def check_state_dir(path: str | None = None) -> dict[str, Any]:
@@ -589,13 +618,9 @@ def run_board() -> dict[str, Any]:
     """
     board_csv = os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV
     try:
-        from src.pipeline.slate_board import DEFAULT_MARKETS, build_slate_board
+        from src.pipeline.slate_board import build_slate_board
 
-        raw_markets = (os.environ.get(ENV_BOARD_MARKETS) or "").strip()
-        markets = (
-            [m.strip() for m in raw_markets.split(",") if m.strip()]
-            if raw_markets else list(DEFAULT_MARKETS)
-        )
+        markets = list(board_markets())
         window = board_window()
         train_end = window["train_end"]
         validation_end = window["validation_end"]
@@ -1215,7 +1240,27 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
                 "APScheduler is not installed. This worker needs the deploy "
                 "extra: pip install -e '.[deploy]'"
             ) from exc
-        scheduler = BlockingScheduler(timezone=DISPLAY_TZ)
+        # job_defaults, because APScheduler's OWN DEFAULT misfire grace is
+        # ONE SECOND. Every add_job below passes its grace explicitly, so the
+        # defaults change nothing today -- they exist for the next job someone
+        # adds. A job registered without those kwargs would be silently
+        # skipped by a two-second delay, which on a BlockingScheduler sharing
+        # a thread pool with a running slate is an ordinary occurrence, and
+        # "the job did not run" is indistinguishable from "the job ran and
+        # found nothing".
+        #
+        # coalesce=True so a container that was down through several firings
+        # runs each job ONCE on return rather than catching up N times --
+        # re-running a slate four times would re-dispatch the same card four
+        # times.
+        scheduler = BlockingScheduler(
+            timezone=DISPLAY_TZ,
+            job_defaults={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": DEFAULT_MISFIRE_GRACE_SECONDS,
+            },
+        )
 
     slate_hour = _int_env(ENV_SLATE_HOUR, DEFAULT_SLATE_HOUR, low=0, high=23)
     slate_minute = _int_env(ENV_SLATE_MINUTE, DEFAULT_SLATE_MINUTE, low=0, high=59)

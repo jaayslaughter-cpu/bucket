@@ -130,7 +130,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:230`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:241`
 `load_master_guideline()` returns `None` and the caller logs it. The
 `.example` beside it is a placeholder shape, not the real file.
 
@@ -191,6 +191,28 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
   container abstains on every row without looking broken. That one is a
   platform step, not a code change. `docs/railway_deployment_audit.md` §4.
+  Since 2026-10-09 it is at least no longer *silent*:
+  `resolve_state_root()` in `src/utils/volume.py` reads
+  `RAILWAY_VOLUME_MOUNT_PATH` and reports how it chose,
+  `scripts/seed_volume.py` does the copying, and
+  `scripts/railway_healthcheck.py` exits NONZERO on an unseeded volume. Still
+  nobody's code can mount a volume, and **there is no boot-time fetch** — no
+  S3 client, no storage client, nothing that downloads a model.
+  `docs/deploy_railway.md`.
+- **A missing BigDataBall workbook fails the whole slate.** `ingest_market_lines`
+  is not guarded: `FileNotFoundError` at step [2], a FAILED `pipeline_runs` row,
+  exit 1. The image excludes `data/` and `*.xlsx` deliberately — a licensed
+  export does not belong in an image layer — so a container nobody uploaded one
+  to fails every scheduled run. Failing loudly is correct (without the workbook
+  the Elo, `MKT_*` and `DEF_*` columns cannot be built at all, and a quietly
+  narrower matrix would be rejected by the contract check per row instead); what
+  was missing was anyone asking before 09:00 PT, which
+  `scripts/railway_healthcheck.py` now does.
+  `docs/automation_audit_2026-10-09.md` M1.
+- **Nothing retrains on a schedule.** The artifact is a fixed snapshot and the
+  panel moves daily. Deliberate: an unattended retrain replaces the artifact
+  that produced the probabilities now in the database, mid-season, with nobody
+  looking at the validation numbers. `docs/automation_audit_2026-10-09.md` G3.
 - **A trained artifact is not a committed one.** PTS, REB and AST were fitted
   on the archive panel on 2026-10-09 and verified end to end — the resolver
   finds them, `check_model_artifact()` reports INFO rather than the demo

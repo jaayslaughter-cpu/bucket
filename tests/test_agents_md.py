@@ -31,7 +31,7 @@ CITATIONS = [
     ("src/features/fatigue_load.py", 284, "from src.models.compare import load_comparison_config"),
     ("tests/test_publication_gate.py", 66, "for forbidden in"),
     ("main.py", 4, "NBA ONLY"),
-    ("main.py", 230, "def load_master_guideline"),
+    ("main.py", 241, "def load_master_guideline"),
     ("src/ingestion/propline.py", 15, "refused here"),
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/utils/timezones.py", 12, 'STORAGE_TZ_NAME = "UTC"'),

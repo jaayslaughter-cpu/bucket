@@ -4,7 +4,7 @@ RESEARCH_ONLY. The deployed worker runs research jobs on a clock. It places no
 wager, contacts no operator's order API, and sizes no stake.
 
 Read `docs/railway_deployment_audit.md` first for what was wrong and what is
-still wrong. **One blocker remains** and it is at the bottom of this page.
+still wrong. **Two blockers remain** and they are at the bottom of this page.
 
 ---
 
@@ -16,6 +16,57 @@ Deploy as a **worker**, not a web service.
 marked unhealthy for never listening, and the platform will restart it in a
 loop — which looks like a crashing app and is not one. This is the most likely
 way a first deploy goes wrong.
+
+Three files in the repository root now carry that, so it is version-controlled
+rather than typed into a dashboard:
+
+| File | What it fixes |
+|---|---|
+| `railway.json` | `builder: DOCKERFILE`, `startCommand: bash scripts/start.sh`, `numReplicas: 1`, and **no `healthcheckPath`** — a worker that binds no port would be polled, fail, and restart forever |
+| `Procfile` | the buildpack fallback. Declares `worker:` and deliberately **no `web:`** |
+| `scripts/start.sh` | the start sequence: migrate → probe → `exec` the worker |
+
+**`numReplicas` must stay 1.** APScheduler's `max_instances=1` is per-process,
+so a second replica is a second scheduler with its own clock: two ingests, two
+boards, two Discord dispatches of the same card, two settlement passes. There
+is no distributed lock in this project.
+`tests/test_railway_deploy.py::test_exactly_one_replica_is_configured`.
+
+## 1b. What happens at boot
+
+`scripts/start.sh`, in this order, and the two failure policies differ on
+purpose:
+
+1. **`python -m scripts.run_migrations`** — applies pending migrations in one
+   transaction. **Hard-fails the container.** A schema behind the code does not
+   announce itself; it surfaces at 09:00 PT as a failed insert, hours after the
+   deploy looked successful. Exiting nonzero makes the platform show a failed
+   deploy, which is the honest signal. Set `PROPIQ_MIGRATE_ON_BOOT=false` where
+   a separate release step owns the schema.
+2. **`python -m scripts.railway_healthcheck`** — probes the volume, the
+   artifacts, the migration ledger, the parlay ledger and the calibration path.
+   **Reports and carries on.** It is strict (an unseeded volume is a FAILURE
+   there) and the worker's own policy is the opposite and also correct: a
+   worker that refuses to start cannot report anything, and the settlement job
+   is still useful with no model.
+3. **`exec python scheduler_worker.py`** — `exec` so the worker is PID 1 and
+   SIGTERM reaches its handler, which shuts the scheduler down *after* the
+   running job rather than being SIGKILLed mid-slate.
+
+Run the probe yourself when you want the exit code to mean something:
+
+```
+railway run python -m scripts.railway_healthcheck          # 0 OK / 1 FAILURE
+railway run python -m scripts.railway_healthcheck --json
+python -m scripts.railway_healthcheck --skip-db            # no database needed
+```
+
+It calls the real resolvers — `src.utils.volume.resolve_state_root`,
+`main.resolve_model_artifact`, `src.db.migrations.status`,
+`parlay_log.resolve_ledger_choice`, `scheduler_worker.board_markets` — rather
+than globbing paths of its own. A probe that invents its own layout reports
+FAILURE on a correct deployment, which is worse than no probe: it gets the
+deployment "fixed" in the direction of its own mistake.
 
 ## 2. Build
 
@@ -33,10 +84,11 @@ python -m scripts.validate_docker          # preflight, build, six smoke checks
 python -m scripts.validate_docker --preflight   # the daemon-free half
 ```
 
-The preflight half runs anywhere and passes today (7 checks: the CMD target
-exists, no credential is defaulted in a layer, every installed extra is
-declared, the uid is the one this page tells you to chown to, and the ignore
-file is evaluated by matching rather than grepped). The build and the six
+The preflight half runs anywhere and passes today (8 checks: the CMD target
+exists, every `python -m` inside it resolves to a real module, no credential is
+defaulted in a layer, every installed extra is declared, the uid is the one
+this page tells you to chown to, and the ignore file is evaluated by matching
+rather than grepped). The build and the six
 in-image checks are what remain, and two of them exist to test **this page**:
 they mount a mode-0555 directory at `/app/data` and require
 `check_state_dir()` to report it unwritable, then mount a writable one and
@@ -64,6 +116,31 @@ Mount a persistent volume at **`/app/data`**. Two things need it:
 |---|---|
 | `data/external/model_runs/comparison/` | the trained artifacts `score_prob_over` loads. Empty on a fresh container → **every row abstains**, and the pipeline does not look broken |
 | `/app/data/calibration.json` | the evidence the publication gate reads. Settlement writes it 03:30 PT, the slate reads it 09:00 PT — on the ephemeral layer a redeploy between the two withholds every card for a reason that is not the real one |
+
+**`RAILWAY_VOLUME_MOUNT_PATH` is now read.** Until 2026-10-09 it was read
+nowhere in this repository: every path was relative to the working directory,
+which is correct in the image *only because* the Dockerfile puts the volume at
+`/app/data`. A deploy that mounted it anywhere else wrote to the container
+filesystem instead, succeeded, and lost everything at the next redeploy — the
+same silent shape as the parlay ledger's CSV default.
+`src/utils/volume.resolve_state_root()` resolves, most explicit first:
+
+1. `PROPIQ_STATE_DIR` — an operator override, ahead of everything;
+2. `RAILWAY_VOLUME_MOUNT_PATH` — the platform's own answer;
+3. `/app/data` when the directory exists — the Dockerfile's mount point;
+4. `<repo>/data` — a developer machine with no volume.
+
+It returns *how* it chose, not just the path, and the healthcheck prints it.
+"`/app/data` via `RAILWAY_VOLUME_MOUNT_PATH`" and "`/app/data` because the
+directory exists" are the same path and different deployments; only one of them
+survives a redeploy, and the probe WARNs on the second.
+
+Nothing was relocated: `artifacts_dir` is still
+`data/external/model_runs/comparison`, which under a volume at `/app/data` is
+already on the volume. **There is no `/app/data/models/` directory** — this
+project writes `xgboost_{MARKET}.json` plus a `.meta.json` sidecar into
+`artifacts_dir` and nothing else, so a tool looking for `.joblib` or `.pkl`
+files under `models/` finds nothing on a correctly seeded volume.
 
 **THE TRAP: a mounted volume shadows the image's `chown`.** The Dockerfile
 creates `/app/data` and chowns it to `propiq` (uid 10001), but a volume mounted
@@ -104,16 +181,46 @@ these are the ones the worker reads.
 | `PROPIQ_CALIBRATION_REPORT` | Where the settlement job writes the evidence and the slate job reads it. Default `outputs/calibration.json`. **On a container this must be on the persistent volume**, or the morning run will not see what last night graded. |
 | `PROPIQ_BOARD_CSV` | Default `outputs/decision_board.csv`. |
 | `PROPIQ_BOARD_TRAIN_END` / `_VALIDATION_END` / `PROPIQ_BOARD_MARKETS` / `PROPIQ_MIN_EV` | Board build parameters, matching the `decision-board` CLI defaults. |
+| `PROPIQ_STATE_DIR` | Override where durable state resolves to, ahead of `RAILWAY_VOLUME_MOUNT_PATH`. Unset is right on Railway; set it on a host that mounts the volume somewhere the platform does not announce. |
+| `PROPIQ_MIGRATE_ON_BOOT` | Default **on**. `scripts/start.sh` applies pending migrations before the worker starts and hard-fails the container if it cannot. Set false where a release step owns the schema. |
+| `PROPIQ_DB_POOL_RECYCLE` | Default 1800s. SQLAlchemy's own default is *never*, and this worker leaves a pooled connection idle for the eighteen hours between 09:00 and 03:30. |
+| `PROPIQ_DB_CONNECT_TIMEOUT` | Default 10s, passed to libpq. **Without it there is no bound**: a pooler that accepts the TCP connection and never completes the handshake blocks the caller forever, and the slate job has no timeout of its own — it would hang past every tip-off and be noticed as a worker that produced nothing, with no error anywhere. |
+| `PROPIQ_DB_POOL_SIZE` / `_MAX_OVERFLOW` / `_POOL_TIMEOUT` | Defaults 5 / 5 / 30. Bounded; an out-of-range or mistyped value falls back rather than raising. |
+
+### Variables this page deliberately does **not** list
+
+Three were asked for and are not here, because documenting a variable the code
+does not read is how an operator comes to believe a key is in use:
+
+| Asked for | Why not |
+|---|---|
+| `SPORTSDATA_API_KEY` | **Appears nowhere in this repository.** No client, no reader, no default. The odds source is `PROPLINE_API_KEY`. |
+| `THE_ODDS_API_KEY` | Same, and worse: the Odds API (`ODDS_API_KEY`) is recorded as a **banned sportsbook source** in `docs/external_feature_harvest.md` and `docs/pickem_props.md`. Setting it would not wire anything up; listing it would advertise a source this project has decided against. |
+| `TZ=America/Los_Angeles` | The image sets `TZ=Etc/UTC` **on purpose** and that should not change. Storage is UTC throughout, and every slate cutoff is a Pacific *calendar day* that `scheduler_worker` gets by passing `America/Los_Angeles` to APScheduler explicitly — so the schedule does not depend on `TZ` at all. What `TZ` governs is the naive `datetime.now()` calls elsewhere, which should stay UTC and reproducible. Setting it to Pacific would make those calls shift twice a year while the stored timestamps did not, and the resulting off-by-an-hour rows would look like data, not like a setting. |
 
 ## 4. Database
 
-Apply the migrations against the target database before the first run:
+**On a container this is automatic**: `scripts/start.sh` runs
+`python -m scripts.run_migrations` before the worker starts and hard-fails the
+container if a migration cannot be applied. What follows is the manual path,
+and what the boot step does.
 
 ```
 python -m scripts.migrate_db                    # what this database has
 python -m scripts.migrate_db --apply --dry-run  # what WOULD be applied
 python -m scripts.migrate_db --apply            # apply, in one transaction
+python -m scripts.run_migrations                # the same thing, applying by default
+python -m scripts.run_migrations --dry-run
 ```
+
+**Two front doors, one implementation.** `scripts/run_migrations.py` calls
+`scripts.migrate_db.main` with `--apply` prepended and contains nothing else —
+it does not import `src.db.migrations` and `tests/test_railway_deploy.py`
+AST-walks it to keep that true. The reason for two is the default, not the
+logic: `migrate_db` must stay read-only where a human is typing, because a
+migration tool that writes by default is one typo away from the wrong
+`DATABASE_URL`; a container start command is the opposite case, where nobody
+is there to pass a flag.
 
 **This list used to be written out here, and that was the defect.** It named
 002 through 005 and went stale the moment 006 was added, so the only way to
@@ -169,6 +276,33 @@ re-ordered.
 **THE ARTIFACTS ARE GITIGNORED** (`data/**`), so they travel by volume or
 object storage, never by a commit.
 
+### Moving them onto the volume
+
+```
+python -m scripts.seed_volume                                       # what is there
+python -m scripts.seed_volume --from data/external/model_runs/comparison
+python -m scripts.seed_volume --from data/external/model_runs/comparison --apply
+```
+
+The destination is `src.utils.volume.artifact_dir_on(state_root)`, which reads
+the same `artifacts_dir` the scoring resolver does — a seeding tool that wrote
+to a directory of its own choosing would report success and leave the resolver
+finding nothing.
+
+**One market is several files, and it copies all of them.** `xgb_adapter.load`
+sets `mean_model = None` when `.mean.json` is absent and only warns, so a
+volume seeded with the booster alone returns **null projections beside live
+probabilities** — the failure that looks most like a working deployment. Each
+accepted market copies its whole family (`*_PTS.*`), which carries the mean
+head, the sidecar, `distribution_PTS.json` and the CatBoost pair.
+
+It refuses, rather than copying: an artifact with no `.meta.json` sidecar
+(scoring is refused without the feature contract, so it is a file and not a
+model); an artifact fit on fewer than 5,000 rows, which is the synthetic demo
+one, unless `--allow-demo`; and overwriting anything already on the volume
+without `--force`, because that artifact produced every probability now in the
+database.
+
 **Two things to check after seeding**, both measured on the 2026-10-09 seed:
 
 - The contract must be buildable where it scores. A PTS contract trained with
@@ -215,9 +349,9 @@ Four things still need a machine, and none of them is continuous:
 | | When | Why |
 |---|---|---|
 | `python -m scripts.validate_docker` | once, before the first deploy | the build and the six in-image checks need a Docker daemon |
-| `python -m scripts.migrate_db --apply` + `python main.py --init-db` | once, per database, and again after any new migration | the runner records what it applied, so re-running is a safe no-op |
+| `python main.py --init-db` | once, per database | creates the ORM-defined tables. The SQL migrations are applied **at boot** by `scripts/start.sh`, so they are no longer a step here — `python -m scripts.migrate_db` remains the way to *inspect* what a database has |
 | `nba_model_cli ingest-logs --persist` | **no longer needed per day** | the slate refreshes `player_game_logs` itself (step [3b]). Still useful once to seed history, and to backfill seasons the slate does not touch |
-| training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or upload the artifacts to object storage and fetch them at boot |
+| training model artifacts | once, then whenever you retrain | `data/external/model_runs/` is empty on a fresh container and **every row abstains**. Train into the mounted volume, or train locally and `python -m scripts.seed_volume --from ... --apply` against it. There is still **no boot-time fetch** in this repository — no S3 client, no storage client, nothing that downloads a model |
 | recording a stake | whenever you place a bet | PropIQ never places one and never writes a stake. ROI exists only if you log it |
 
 **Yes, if you do not deploy.** Running `python scheduler_worker.py` on your own
@@ -261,19 +395,35 @@ empty board instead of saying so.
 
 ---
 
-## The remaining blocker
+## The remaining blockers
 
-**Model artifacts do not survive a redeploy.** `score_prob_over` loads them
-from `data/external/model_runs/comparison/`, which is on the container's
-ephemeral filesystem with no volume declared. On a fresh container it is empty
-and **every row abstains** — the pipeline runs, writes nothing useful, and does
-not look broken.
+Two, and both are now *visible* rather than silent — which is a different thing
+from being fixed.
 
-Two ways to clear it, both outside this repository:
+**1. The volume still has to be mounted and seeded by a person.** Nothing in
+this repository can mount a volume or put a model on one. What changed on
+2026-10-09 is that the state root is resolved from
+`RAILWAY_VOLUME_MOUNT_PATH` and reported, `scripts/seed_volume.py` exists to do
+the copying, and `scripts/railway_healthcheck.py` exits **nonzero** on an
+unseeded volume — so the "pipeline runs, writes nothing useful, does not look
+broken" state now fails a deploy gate instead of producing a week of empty
+boards. Mount at `/app/data`, seed, and run the probe before trusting a slate.
 
-1. Mount a persistent volume at `/app/data` in the platform, and train once
-   into it.
-2. Fetch the artifacts from object storage at boot, before the first slate.
+**There is still no boot-time fetch.** No S3 client, no storage client, nothing
+in this repository downloads a model. An earlier version of this page offered
+"fetch from object storage at boot" as option 2; that code does not exist and
+listing it invited a first deploy that assumed the container would help itself.
 
-Until one is done, treat a deployment as a wiring test rather than a shadow
-run.
+**2. The image has never been built.** `docker build` has not run against this
+Dockerfile once — the environment it was written in has a docker client, no
+daemon, and a network policy that denies the package index. The preflight half
+of `python -m scripts.validate_docker` passes (8 checks, including that the new
+`bash scripts/start.sh` entrypoint exists and that every `python -m` inside it
+resolves to a real module); the build and the six in-image checks are what
+remain, and two of those exist to test *this page* — they mount a mode-0555
+directory at `/app/data` and require `check_state_dir()` to report it
+unwritable. Until that runs, the `chown` trap above is documented and not
+demonstrated.
+
+Until both are cleared, treat a deployment as a wiring test rather than a
+shadow run.
