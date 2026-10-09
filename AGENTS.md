@@ -199,10 +199,15 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   trained: a fresh checkout and a fresh container both have none and abstain
   on every row. Seeding is a volume or object-storage step, not a commit.
   `docs/deploy_railway.md` §4b.
-- **The seeded fit ignores the two most recent seasons.** `train-stats` splits
-  its window 2/3 chronologically, so a 2018-01-01 → 2026-04-12 run fits to
-  2023-12-13 and validates on the rest. A deliberate holdout, and not what you
-  want for an artifact scoring tonight.
+- **More training history beats recency, measured.** Narrowing the window to
+  recent seasons was requested, measured and declined: the ensemble's
+  calibrated Brier degrades monotonically as the start date moves forward
+  (0.24098 full window → 0.24268 from 2024-10, one common validation window).
+  What was wrong was the 2/3-by-row split, which threw away a third of
+  whatever history it was given; `train-stats --train-end` separates the two
+  and the seed now fits 200,678 rows to 2026-01-13 rather than 142,713 to
+  2023-12-13. One window, one market, one fold — the direction is established
+  and the magnitudes are indicative. `docs/training_window.md`.
 - **A forward slate rests on who played recently, not on a roster.**
   `src/pipeline/forward_slate.py` builds tonight's rows from each team's recent
   appearances in the panel, which misses a player returning from a long

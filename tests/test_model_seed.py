@@ -214,3 +214,101 @@ def test_a_seeded_artifact_is_not_the_demo_one():
     assert meta["train_row_count"] > 50_000, meta["train_row_count"]
     assert meta["feature_cols"], "the sidecar carries no feature contract"
     assert meta["train_start_date"] < meta["train_end_date"]
+
+
+# --- the training window -------------------------------------------------
+#
+# A request to "narrow the training window to the recent seasons" was measured
+# and declined: on one common validation window the ensemble's calibrated
+# Brier degrades monotonically as the start date moves forward (0.24098 for the
+# full window, 0.24268 from 2024-10), and two seasons of history is the worst
+# configuration for every model. docs/training_window.md has the table.
+#
+# What the sweep did NOT refute is the coupling underneath: the 2/3-by-row
+# split ties how much history you train on to how much of it is withheld, so a
+# 2018 -> 2026 run fitted 142,713 rows and threw away 71,357. --train-end
+# separates them, and the retrained artifacts fit 200,678.
+
+
+def test_train_stats_takes_an_explicit_split_date():
+    import inspect
+
+    from scripts.nba_model_cli import train_stats
+
+    assert "train_end" in inspect.signature(train_stats).parameters
+
+
+def test_the_explicit_split_is_by_date_and_the_fallback_is_by_row_count():
+    """
+    Both halves. The fallback has to stay, because every scripted invocation
+    predates the option; the explicit path has to actually split on the date
+    rather than quietly still using the fraction.
+    """
+    import inspect
+
+    from scripts import nba_model_cli
+
+    source = inspect.getsource(nba_model_cli.train_stats)
+    assert 'work[work["GAME_DATE"] <= cutoff]' in source
+    assert 'work[work["GAME_DATE"] > cutoff]' in source
+    assert "len(work) * 2 // 3" in source, (
+        "the 2/3 fallback is gone, so an existing train-stats call without "
+        "--train-end now has no split at all"
+    )
+
+
+def test_a_split_date_outside_the_window_is_refused_rather_than_fitting_nothing():
+    """
+    `--train-end 2010-01-01` leaves an empty fit set and `--train-end 2030`
+    an empty holdout. Either one silently produces an artifact fitted on
+    nothing or calibrated on nothing, which is worse than a refusal.
+    """
+    import inspect
+
+    from scripts import nba_model_cli
+
+    source = inspect.getsource(nba_model_cli.train_stats)
+    assert "if train.empty or val.empty:" in source
+    assert "SystemExit(2)" in source
+
+
+def test_the_split_is_chronological_either_way():
+    """
+    `prepare_market_panel` ends in `sort_by_game_date`, so the positional
+    fallback is chronological rather than arbitrary — which is the only reason
+    an iloc split is not leakage. Pinned because a future reorder there would
+    silently turn the fallback into a random split.
+    """
+    import inspect
+
+    from src.models import compare
+
+    source = inspect.getsource(compare.prepare_market_panel)
+    assert "sort_by_game_date" in source
+
+
+@pytest.mark.skipif(
+    not (ROOT / "data/external/model_runs/comparison/xgboost_PTS.meta.json").exists(),
+    reason="no artifact trained in this checkout; data/** is gitignored",
+)
+def test_the_seeded_artifact_fits_past_the_two_thirds_point():
+    """
+    Runs only where an artifact has been trained. The 2/3 split on the full
+    archive window stops at 2023-12-13 with 142,713 rows; --train-end was
+    added so the fit reaches the present, and the seed was retrained with it.
+
+    Asserted as "more than the 2/3 split would have given" rather than against
+    a date, so it still means something as the panel grows.
+    """
+    import json
+
+    meta = json.loads(
+        (ROOT / "data/external/model_runs/comparison/xgboost_PTS.meta.json").read_text()
+    )
+    fit = meta["train_row_count"]
+    held = meta["validation_row_count"]
+    assert fit > 2 * held, (
+        f"the artifact fits {fit:,} rows and holds out {held:,} — that is the "
+        f"2/3-by-row split, so it was trained without --train-end and the fit "
+        f"stops years short of the panel's end"
+    )

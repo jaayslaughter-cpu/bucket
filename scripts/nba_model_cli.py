@@ -494,6 +494,13 @@ def train_stats(
         help="A prebuilt feature matrix (parquet) to train from, instead of "
              "the loader's own. Required where stats.nba.com is unreachable.",
     ),
+    train_end: str = typer.Option(
+        None, "--train-end",
+        help="Fit on rows up to and including this date; hold the rest of the "
+             "window out for calibration. Without it the window is split 2/3 "
+             "by ROW COUNT, which makes the holdout as long as a third of "
+             "however much history you passed.",
+    ),
     verbose: bool = False,
 ) -> None:
     """Fit XGBoost + CatBoost adapters for one market (artifacts under model_runs).
@@ -538,8 +545,49 @@ def train_stats(
     if is_demo:
         art = art / "demo"
     art.mkdir(parents=True, exist_ok=True)
-    mid = len(work) * 2 // 3
-    train, val = work.iloc[:mid], work.iloc[mid:]
+    # WHERE THE FIT STOPS AND THE HOLDOUT BEGINS.
+    #
+    # The 2/3-by-row-count split is the fallback, and it couples two unrelated
+    # things: how much HISTORY you train on, and how much of it is held out.
+    # A 2018-01-01 -> 2026-04-12 run fits only to 2023-12-13 and holds out
+    # 71,357 rows -- 2.4 seasons that never reach the model at all.
+    #
+    # MEASURED, because the obvious reading of that is wrong. Narrowing the
+    # window to recent seasons does NOT help: on one common validation window
+    # (2026-01-15 -> 2026-04-12, 13,248 scored rows) the ensemble's calibrated
+    # Brier degrades monotonically as the start date moves forward -- 0.24098
+    # for the full window, 0.24133 from 2022-10, 0.24191 from 2023-10, 0.24268
+    # from 2024-10. More history is better. The best configuration measured was
+    # the FULL window with the split late (fitting 200,678 rows), which is what
+    # --train-end makes reachable: keep the history AND reach the present.
+    #
+    # Numbers and the caveat that it is one window and one market:
+    # docs/training_window.md.
+    import pandas as pd
+
+    if train_end:
+        cutoff = pd.Timestamp(train_end)
+        train = work[work["GAME_DATE"] <= cutoff]
+        val = work[work["GAME_DATE"] > cutoff]
+        if train.empty or val.empty:
+            typer.echo(
+                f"--train-end {train_end} leaves {len(train)} fit row(s) and "
+                f"{len(val)} holdout row(s); one side is empty, so there is "
+                f"nothing to fit or nothing to calibrate on. The window is "
+                f"{work['GAME_DATE'].min().date()} to "
+                f"{work['GAME_DATE'].max().date()}.",
+                err=True,
+            )
+            raise SystemExit(2)
+    else:
+        mid = len(work) * 2 // 3
+        train, val = work.iloc[:mid], work.iloc[mid:]
+    typer.echo(
+        f"{market}: fitting {len(train):,} row(s) "
+        f"({train['GAME_DATE'].min().date()} -> {train['GAME_DATE'].max().date()}), "
+        f"holding out {len(val):,} "
+        f"({val['GAME_DATE'].min().date()} -> {val['GAME_DATE'].max().date()})"
+    )
     for name, model in comps.items():
         try:
             model.fit(train, val)

@@ -141,10 +141,17 @@ One command per launch market, run where the panel is:
 
 ```
 python -m scripts.nba_model_cli train-stats --market PTS \
-    --panel <feature-matrix>.parquet --start-date 2018-01-01 --end-date <today>
+    --panel <feature-matrix>.parquet \
+    --start-date 2018-01-01 --end-date <today> --train-end <today minus ~3 months>
 python -m scripts.nba_model_cli train-stats --market REB --panel ...  (same)
 python -m scripts.nba_model_cli train-stats --market AST --panel ...  (same)
 ```
+
+**Pass `--train-end`.** Without it the window is split 2/3 **by row count**,
+which ties how much history you train on to how much is withheld: a
+2018 → 2026 run fits 142,713 rows and holds out 71,357, so the fit stops in
+December 2023. With it the same window fits 200,678 and reaches the present.
+Keep a holdout — the components calibrate on it — but a few months is enough.
 
 Artifacts land under `artifacts_dir` from `config/model_comparison.yaml`
 (`data/external/model_runs/comparison`), which is where the scoring resolver
@@ -169,11 +176,12 @@ object storage, never by a commit.
   without the workbook resolves **27**, and the 11 missing ones (Elo, `MKT_*`,
   `DEF_*`) come from the workbook alone. Train and score with the same inputs,
   or the contract check rejects the artifact on every row.
-- `train-stats` splits the window **2/3 chronologically**, so
-  `--start-date 2018-01-01 --end-date 2026-04-12` fits only to **2023-12-13**
-  and validates on the remaining 2.4 seasons. A deliberate holdout, not a bug —
-  but not what you want for an artifact scoring tonight. Narrow the window, or
-  accept that the fit ignores the two most recent seasons.
+- Use `--train-end`, per above. And do **not** narrow `--start-date` to buy
+  recency: it was measured and it costs accuracy. On one common validation
+  window the ensemble's calibrated Brier degrades monotonically as the start
+  moves forward — 0.24098 for the full window, 0.24268 from 2024-10 — and two
+  seasons of history is the worst configuration for every model.
+  `docs/training_window.md`.
 
 ## 5. What runs, and when
 
