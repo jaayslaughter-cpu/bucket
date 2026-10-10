@@ -535,10 +535,34 @@ unseeded volume — so the "pipeline runs, writes nothing useful, does not look
 broken" state now fails a deploy gate instead of producing a week of empty
 boards. Mount at `/app/data`, seed, and run the probe before trusting a slate.
 
-**There is still no boot-time fetch.** No S3 client, no storage client, nothing
-in this repository downloads a model. An earlier version of this page offered
-"fetch from object storage at boot" as option 2; that code does not exist and
-listing it invited a first deploy that assumed the container would help itself.
+**There IS a boot-time fetch now** (2026-10-10), and this page said the
+opposite for months — correctly, at the time:
+
+> *Superseded:* There is still no boot-time fetch. No S3 client, no storage
+> client, nothing in this repository downloads a model.
+
+`src/models/artifact_store.py` pulls complete artifact families from Supabase
+Storage, and `scripts/start.sh` runs it before the probe. Configure
+`PROPIQ_ARTIFACT_STORE_URL` and `PROPIQ_ARTIFACT_STORE_KEY`, upload once from
+the machine that trained them:
+
+```
+python -m scripts.fetch_artifacts --push --from data/external/model_runs/comparison
+python -m scripts.fetch_artifacts                 # what the bucket holds
+python -m scripts.fetch_artifacts --pull          # what the boot does
+```
+
+**An unconfigured store is still a no-op, not a failure** — every deployment
+that seeds by hand was working, and failing their boot to add a feature they
+did not ask for would be the wrong trade. Mounting the volume remains a
+platform action no code here can take.
+
+**A family lands whole or not at all.** `xgb_adapter.load` sets
+`mean_model = None` when `.mean.json` is absent and only warns, so a booster
+installed without its mean head returns null projections beside live
+probabilities. Files stage beside the destination and move only once the family
+is complete and its sidecar parses, so a dropped connection leaves the volume
+exactly as it was.
 
 **2. ~~The image has never been built.~~ CLEARED 2026-10-10.** All 15 checks
 pass against the built image, the container boots and schedules, and the

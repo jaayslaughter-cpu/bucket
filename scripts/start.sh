@@ -50,6 +50,19 @@ case "${PROPIQ_MIGRATE_ON_BOOT:-true}" in
     ;;
 esac
 
+# BEFORE THE PROBE, so the probe reports what the volume has after the fetch
+# rather than what it had before one. Advisory like the probe: an unconfigured
+# store exits 0 saying so, and a store that cannot be reached leaves the volume
+# exactly as it was -- which is a deployment that seeds by hand, not a broken
+# one. The worker's own boot check then says whether anything is there.
+echo "--- artifact store (advisory; no-op when unconfigured)"
+if ! python -m scripts.fetch_artifacts --pull; then
+  echo "ARTIFACT FETCH REPORTED A PROBLEM — the lines above say which market."
+  echo "The volume is unchanged for those; they will ABSTAIN until an artifact"
+  echo "is there. Boot continues: settlement still runs, and a worker that will"
+  echo "not start cannot tell you any of this."
+fi
+
 echo "--- deployment healthcheck (advisory; the worker starts either way)"
 if ! python -m scripts.railway_healthcheck; then
   echo "HEALTHCHECK REPORTED FAILURE — the lines above say which check and why."
