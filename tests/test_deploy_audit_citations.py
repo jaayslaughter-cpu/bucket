@@ -37,6 +37,7 @@ REPO = Path(__file__).resolve().parents[1]
 AUDITS = (
     "docs/automation_audit_2026-10-09.md",
     "docs/configuration_audit_2026-10-09.md",
+    "docs/autonomy_audit_2026-10-10.md",
 )
 
 #: `path:12` or `path:12-34` inside backticks. The path must look like a real
@@ -102,8 +103,15 @@ def test_every_file_the_audits_name_is_in_the_tree():
     """
     import re
 
+    # A NAMED FILE has a directory, or is one of the known root files. A bare
+    # suffix discussed in prose -- `.meta.json`, `.mean.json` -- is neither,
+    # and flagging those sent this test looking for a file nobody claimed
+    # existed. The citation regex above already makes this distinction; this
+    # one did not.
     pat = re.compile(
-        r"`([A-Za-z0-9_./-]+\.(?:py|md|yaml|yml|toml|txt|sh|json|sql))`"
+        r"`((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+        r"\.(?:py|md|yaml|yml|toml|txt|sh|json|sql)"
+        r"|Dockerfile|Procfile|railway\.json|requirements\.txt|pyproject\.toml)`"
     )
     for audit in AUDITS:
         named = set(pat.findall((REPO / audit).read_text(encoding="utf-8")))
