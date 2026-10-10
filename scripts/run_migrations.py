@@ -47,10 +47,20 @@ def main(argv: list[str] | None = None) -> int:
     `migrate_db` with `--apply` prepended.
 
     Prepended rather than appended so an explicit flag of yours still parses,
-    and `--apply` is idempotent in argparse, so passing it twice is harmless.
+    and both flags are idempotent in argparse, so passing either twice is
+    harmless.
+
+    `--ensure-tables` IS NOT OPTIONAL HERE, and that was learned the hard way:
+    the SQL migrations ALTER tables that `Base.metadata.create_all` creates, so
+    on a brand-new database 002 fails with `relation "projections" does not
+    exist`, this returns 4, and `scripts/start.sh` -- which hard-fails the
+    container on a migration error -- means the worker never starts. A first
+    deploy is BY DEFINITION a brand-new database, so the container's front door
+    always ensures the tables. `create_all` is additive and idempotent, so on
+    every later boot it does nothing.
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    return _migrate_main(["--apply", *args])
+    return _migrate_main(["--apply", "--ensure-tables", *args])
 
 
 if __name__ == "__main__":

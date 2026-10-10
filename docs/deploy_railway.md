@@ -320,6 +320,34 @@ migration tool that writes by default is one typo away from the wrong
 `DATABASE_URL`; a container start command is the opposite case, where nobody
 is there to pass a flag.
 
+**`--ensure-tables` IS NOT OPTIONAL ON A FIRST DEPLOY**, and that was learned
+by doing one against a real Postgres on 2026-10-10. The SQL migrations `ALTER`
+tables that `Base.metadata.create_all` is what creates (`projections`,
+`player_game_logs`, `prop_line_snapshots`), and `ADD COLUMN IF NOT EXISTS` does
+not help when the *table* is absent — 002 fails with `relation "projections"
+does not exist`, the runner returns 4, and `scripts/start.sh` hard-fails the
+container. **The worker never starts.** `scripts/run_migrations` therefore
+always passes it; it is additive and idempotent, so later boots do nothing.
+
+Three more defects surfaced the same way, all of which had passing tests
+against SQLite:
+
+* a `%` in a migration **comment** made the file unapplicable —
+  `exec_driver_sql` hands the script to psycopg as a format string, so
+  `-- a win% that includes pushes` raised `incomplete placeholder: '%'`. The
+  runner had never applied a migration to Postgres;
+* 002 and 003 wrap themselves in `BEGIN; … COMMIT;`, which is right for `psql`
+  and ends the transaction this runner opened — so the "whole run is one
+  transaction" guarantee was false. The runner now strips whole-line
+  transaction control, leaving `$$` bodies alone;
+* every bulk upsert built one statement for every row, over Postgres'
+  **65,535 bind-parameter** limit. A season's workbook is 2,644 team-games ×
+  25 columns, and `upsert_player_game_logs` runs *daily* on a whole season.
+  All seven writers now share one `batched()`.
+
+Verified end to end: 7 migrations applied to an empty database, then 2,644
+workbook rows ingested and read back with no workbook on disk.
+
 **This list used to be written out here, and that was the defect.** It named
 002 through 005 and went stale the moment 006 was added, so the only way to
 learn whether a database had 007 was to query for the column it adds and

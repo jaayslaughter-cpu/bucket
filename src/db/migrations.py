@@ -238,6 +238,114 @@ def status(conn: Connection, directory: Path | None = None) -> dict[str, object]
     }
 
 
+#: Statement-level transaction control. The RUNNER owns the transaction -- the
+#: CLI wraps the whole run in ``engine.begin()`` so a mid-run failure leaves the
+#: database on the last fully applied migration -- so a file that commits on its
+#: own behalf silently breaks that guarantee.
+_TXN_CONTROL = re.compile(
+    r"^\s*(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK)\s*;\s*$",
+    re.IGNORECASE,
+)
+
+#: A ``$$``-quoted body. `DO $$ ... $$` blocks in these files contain SQL that
+#: must not be scanned for transaction control.
+_DOLLAR_QUOTE = re.compile(r"\$\$")
+
+
+def strip_transaction_control(sql: str) -> tuple[str, list[str]]:
+    """
+    Remove whole-line BEGIN/COMMIT from a migration body.
+
+    WHY THIS EXISTS, and it is not tidiness. `002_prop_results.sql` and
+    `003_capture_vs_ingest_time.sql` each wrap themselves in `BEGIN; ...
+    COMMIT;`, which is correct when the file is piped into `psql` and WRONG
+    here: the embedded COMMIT ends the transaction this runner opened, so a
+    failure in 004 would leave 002 and 003 applied and recorded with no way
+    back -- the exact failure the one-transaction contract exists to prevent.
+    Verified against a real Postgres: after such a COMMIT the connection's
+    transaction_status is IDLE.
+
+    STRIPPED RATHER THAN THE FILES EDITED, deliberately. The ledger records a
+    sha256 per file and refuses to continue when an applied file has changed;
+    editing 002 would make every database that applied it by hand report DRIFT
+    and need an override. So the bytes stay and the runner adapts.
+
+    Only FULL-LINE matches outside a ``$$`` body are touched, so a COMMIT
+    inside a function body or a string literal is left alone -- those are the
+    cases where guessing would be worse than doing nothing.
+    """
+    out: list[str] = []
+    stripped: list[str] = []
+    in_dollar = False
+    for line in sql.splitlines():
+        if _DOLLAR_QUOTE.search(line):
+            # A line may open and close one; an odd count flips the state.
+            if len(_DOLLAR_QUOTE.findall(line)) % 2 == 1:
+                in_dollar = not in_dollar
+            out.append(line)
+            continue
+        if not in_dollar and _TXN_CONTROL.match(line):
+            stripped.append(line.strip())
+            continue
+        out.append(line)
+    return "\n".join(out), stripped
+
+
+def execute_script(conn: Connection, sql: str) -> None:
+    """
+    Run a migration body as a script, with NO parameter interpolation.
+
+    THIS IS THE SECOND THING THAT ONLY A REAL POSTGRES SHOWS. The call here was
+    ``conn.exec_driver_sql(sql)``, chosen over ``text()`` because these files
+    contain ``$$`` bodies and ``:`` inside comments that SQLAlchemy's `text()`
+    would read as bind parameters. Correct as far as it went -- and
+    ``exec_driver_sql`` still hands the string to psycopg as a FORMAT STRING,
+    so a bare ``%`` anywhere in the file, including in a comment, raises
+    `incomplete placeholder: '%'` and the migration cannot be applied at all.
+
+    Two files have one: `002_prop_results.sql` ("a win% that includes pushes")
+    and `006_player_game_log_fouls.sql` ("99.6%"). Both are comments. The unit
+    tests ran against SQLite, whose driver has no %-placeholders, so this was
+    green everywhere and broken against the only database this project uses.
+
+    psycopg interpolates only when parameters are PASSED; omitting them
+    entirely skips it. SQLAlchemy sends an empty tuple, which still counts as
+    passed, so the statement goes to the DBAPI cursor directly. It is the same
+    connection SQLAlchemy has already begun a transaction on, so this stays
+    inside the caller's transaction -- which the one-transaction contract
+    requires.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    raw = conn.connection.driver_connection
+    cur = raw.cursor()
+    try:
+        # NOT `with raw.cursor()`: psycopg's cursor is a context manager and
+        # sqlite3's is not ("'sqlite3.Cursor' object does not support the
+        # context manager protocol"), and the migration tests run against
+        # SQLite. try/finally is the spelling both drivers accept.
+        try:
+            cur.execute(sql)
+        except Exception as orig:  # noqa: BLE001 — re-raised below, not swallowed
+            # RE-WRAPPED so this function's failure mode is unchanged. Going
+            # around SQLAlchemy to reach the DBAPI also goes around its
+            # exception wrapping, so a syntax error arrived as a raw
+            # `sqlite3.OperationalError` / `psycopg.ProgrammingError` instead
+            # of `sqlalchemy.exc.*` -- a silent API change for anything
+            # catching the latter, and the migration tests do.
+            # `DBAPIError.instance` is the same classmethod SQLAlchemy uses, so
+            # the subclass is the one it would have raised itself.
+            raise DBAPIError.instance(
+                statement=sql,
+                params=None,
+                orig=orig,
+                dbapi_base_err=conn.dialect.loaded_dbapi.Error,
+                dialect=conn.dialect,
+            ) from orig
+    finally:
+        cur.close()
+
+
 def apply_pending(
     conn: Connection,
     directory: Path | None = None,
@@ -292,10 +400,18 @@ def apply_pending(
     done: list[str] = []
     for f in pending:
         logger.info("Applying %s …", f.filename)
-        # exec_driver_sql, not text(): these files contain ``$$`` bodies and
-        # ``:`` inside comments, and SQLAlchemy's text() would read a colon as
-        # a bind parameter and fail on SQL that psql runs happily.
-        conn.exec_driver_sql(f.sql)
+        body, stripped = strip_transaction_control(f.sql)
+        if stripped:
+            # Said out loud, not swallowed: the file asked for its own
+            # transaction and this runner declined, because the CLI's
+            # engine.begin() is what makes a mid-run failure leave the database
+            # on the last fully applied migration.
+            logger.info(
+                "%s: ignoring its own transaction control (%s) — this run is "
+                "one transaction, owned by the caller.",
+                f.filename, ", ".join(stripped),
+            )
+        execute_script(conn, body)
         conn.execute(
             SchemaMigration.__table__.insert().values(
                 version=f.version,

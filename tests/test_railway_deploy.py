@@ -458,7 +458,11 @@ def test_run_migrations_applies_and_migrate_db_does_not(monkeypatch):
     seen: list[list[str]] = []
     monkeypatch.setattr(run_migrations, "_migrate_main", lambda argv: seen.append(argv) or 0)
     run_migrations.main(["--dry-run"])
-    assert seen == [["--apply", "--dry-run"]]
+    # --ensure-tables joined --apply on 2026-10-10: the SQL migrations ALTER
+    # tables that create_all makes, so without it a brand-new database fails
+    # at 002 and `scripts/start.sh` never starts the worker. A first deploy is
+    # by definition a brand-new database.
+    assert seen == [["--apply", "--ensure-tables", "--dry-run"]]
 
     parsed = migrate_db.main.__doc__  # the default lives in the argparse surface
     assert parsed is None or "apply" not in (parsed or "")

@@ -41,7 +41,11 @@ that trap demonstrated rather than documented.
 * the volume still has to be mounted and seeded by a person, which no code here
   can do;
 * `requirements.txt` and `pyproject.toml` remain two declarations whose caps a
-  test compares but whose contents can still diverge (O2).
+  test compares but whose contents can still diverge (O2);
+* and the suite still runs the migration runner against **SQLite**, which is
+  what hid F11's four defects. The properties are now asserted directly
+  (`tests/test_postgres_only_defects.py`) rather than through the driver, but a
+  Postgres service in CI is what would have caught them.
 
 ---
 
@@ -74,6 +78,7 @@ that trap demonstrated rather than documented.
 | **O7** | across ~40 `PROPIQ_*` variables | No central `pydantic-settings` model. **Recommended against.** The existing pattern is a bounded reader at each use site that logs and falls back; a settings model centralises validation and changes the failure mode to *refuse to start*, which for an unattended worker is strictly worse — a worker that will not boot cannot tell you why | low — decision |
 | **O8** | `railway.json` `numReplicas: 1` | A single point of failure: a container that dies at 08:55 PT misses the slate, since the one-hour grace only helps if it returns inside it. Cannot be raised — two schedulers double-dispatch, and there is no distributed lock. Accepted | medium — accepted |
 | ~~**O9**~~ | the whole of P1 | ~~**The image has never been built.**~~ **CLEARED 2026-10-10**: built, and all 15 `validate_docker` checks pass against it, including the two that demonstrate the volume-permission trap. The container boots through `scripts/start.sh` and schedules both jobs in Pacific. Caveat in `docs/deploy_railway.md` §2: the copy that was built carried two extra pip-trust instructions, because this session's egress re-terminates TLS | ~~high~~ **closed** |
+| **F11** | `src/db/migrations.py`, `src/db/repository.py`, `scripts/migrate_db.py` | **Nothing in this project had ever talked to Postgres.** Four defects, each with a passing test: a `%` in a migration comment made the file unapplicable (`exec_driver_sql` treats the script as a format string); 002 and 003 commit their own transactions, breaking the runner's one-transaction contract; the SQL migrations ALTER tables only `create_all` makes, so **no first deploy could boot**; and all seven bulk upserts exceeded Postgres' 65,535 bind-parameter limit — including the one the slate runs daily on a whole season | Script execution through the DBAPI cursor with parameters omitted (and the driver error re-wrapped as SQLAlchemy's, so the failure mode is unchanged); whole-line transaction control stripped with the `$$` bodies protected; `--ensure-tables`, always passed by the container's front door; and one shared `batched()` across all seven writers. Verified end to end against a real Postgres: 7 migrations applied to an empty database, 2,644 workbook rows in and back out |
 | **O10** | `Dockerfile` (the removed apt layer) | The `libgomp1` layer's justifying comment — "Without it the image builds and then fails at import" — was **wrong**: the xgboost wheel vendors its own `libgomp`, and both libraries import in a bare `python:3.11-slim`. It installed a second copy of a library nothing loaded, and was the only thing in the build needing `deb.debian.org`, so it failed the build on a host whose egress policy does not allow it | **fixed** — layer removed, and a `RUN python -c "import xgboost, catboost, sklearn"` layer now asserts at build time what the apt layer only assumed |
 
 ---

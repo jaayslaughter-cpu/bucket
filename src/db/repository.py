@@ -35,6 +35,62 @@ from src.db.session import session_scope
 logger = logging.getLogger(__name__)
 
 
+#: Postgres' hard limit on bind parameters in one statement. Not a tunable --
+#: the wire protocol encodes the count as an int16.
+PG_MAX_BIND_PARAMS = 65_535
+
+#: Headroom under that limit. A batch is sized from the widest row in it, and
+#: a row with a JSONB payload counts once, so 80% leaves room for the ledger
+#: columns a statement adds and for a model gaining a column later.
+_BATCH_SAFETY = 0.8
+
+
+def batched(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """
+    Split `rows` so no statement exceeds Postgres' bind-parameter limit.
+
+    THIS WAS A HARD BLOCKER AND NOTHING CAUGHT IT. Every bulk upsert here built
+    ONE `pg_insert(...).values(rows)` for every row it was given, and Postgres
+    refuses a statement with more than 65,535 bind parameters -- the count is
+    an int16 on the wire. So:
+
+      * `upsert_team_game_stats` on a season's BigDataBall workbook (~2,500
+        team-games x 25 columns) failed with "number of parameters must be
+        between 0 and 65535", which is where this was found on 2026-10-10;
+      * `upsert_player_game_logs` is worse and runs EVERY DAY: step [3b] pulls
+        a whole season from `leaguegamelog`, which is tens of thousands of
+        player-games x ~20 columns -- hundreds of thousands of parameters.
+
+    None of these can ever have worked against Postgres at real scale. The unit
+    tests pass a handful of rows, and SQLite's limit is a different number
+    reached a different way, so the suite was green and the only database this
+    project uses was unreachable.
+
+    ONE DEFINITION, not one per call site. Seven functions had the same shape
+    and would have grown seven batch sizes; the conflict clauses genuinely
+    differ between them, so those stay local and only the batching rule is
+    shared.
+
+    Batch size comes from the WIDEST row, not the first: `_records` produces
+    dicts from a DataFrame so they are uniform today, but a caller that builds
+    them by hand (`record_pending_prop_results`) can omit a key, and sizing off
+    a narrow first row would put a wide one over the limit.
+    """
+    if not rows:
+        return []
+    widest = max(len(r) for r in rows)
+    per_batch = max(1, int(PG_MAX_BIND_PARAMS * _BATCH_SAFETY) // max(1, widest))
+    if len(rows) <= per_batch:
+        return [rows]
+    out = [rows[i:i + per_batch] for i in range(0, len(rows), per_batch)]
+    logger.info(
+        "Splitting %d rows of %d columns into %d statements (<= %d rows each) "
+        "to stay under Postgres' %d bind-parameter limit.",
+        len(rows), widest, len(out), per_batch, PG_MAX_BIND_PARAMS,
+    )
+    return out
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     """DataFrame -> list of dicts with NaN converted to None (Postgres NULL).
 
@@ -50,18 +106,21 @@ def upsert_team_game_stats(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        stmt = pg_insert(TeamGameStat).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "team_abbr"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "points", "pace", "off_eff", "def_eff", "poss",
-                    "opponent_abbr", "is_home", "is_neutral_site",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: a season's workbook is ~2,500 team-games x 25 columns, over
+        # Postgres' 65,535 bind-parameter limit in one statement. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(TeamGameStat).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "team_abbr"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "points", "pace", "off_eff", "def_eff", "poss",
+                        "opponent_abbr", "is_home", "is_neutral_site",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d team-game stat rows", len(rows))
     return len(rows)
 
@@ -165,27 +224,32 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
 
     rows = _records(work)
     with session_scope() as session:
-        stmt = pg_insert(PlayerGameLog).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "nba_player_id"],
-            set_={
-                c: stmt.excluded[c]
-                # EVERY written column belongs here. `pf` did not, which
-                # made the docstring's "re-ingesting a season corrects rows"
-                # false for it alone: a season ingested before
-                # boxscores.COLUMN_MAP asked for PF kept pf NULL forever, and
-                # the only way to find out was to re-ingest and look. Found
-                # while adding starting_position by the same route, which
-                # would have inherited the same silence.
-                for c in (
-                    "player_name", "game_date", "season", "team_abbr",
-                    "opponent_abbr", "is_home", "is_neutral_site", "minutes",
-                    "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf",
-                    "starting_position", "source",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: step [3b] pulls a WHOLE SEASON from leaguegamelog --
+        # tens of thousands of player-games x ~20 columns, hundreds of
+        # thousands of bind parameters. This runs every day and could never
+        # have worked against Postgres at that size. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(PlayerGameLog).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "nba_player_id"],
+                set_={
+                    c: stmt.excluded[c]
+                    # EVERY written column belongs here. `pf` did not, which
+                    # made the docstring's "re-ingesting a season corrects rows"
+                    # false for it alone: a season ingested before
+                    # boxscores.COLUMN_MAP asked for PF kept pf NULL forever, and
+                    # the only way to find out was to re-ingest and look. Found
+                    # while adding starting_position by the same route, which
+                    # would have inherited the same silence.
+                    for c in (
+                        "player_name", "game_date", "season", "team_abbr",
+                        "opponent_abbr", "is_home", "is_neutral_site", "minutes",
+                        "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf",
+                        "starting_position", "source",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d player game-log rows", len(rows))
     return len(rows)
 
@@ -321,18 +385,21 @@ def upsert_market_lines(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        stmt = pg_insert(GameMarketLine).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "team_abbr", "source"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "opening_spread", "opening_total", "closing_spread",
-                    "closing_total", "moneyline", "status",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: one row per team-game from the same workbook as the
+        # team stats above. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(GameMarketLine).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "team_abbr", "source"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "opening_spread", "opening_total", "closing_spread",
+                        "closing_total", "moneyline", "status",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d market line rows", len(rows))
     return len(rows)
 
@@ -347,7 +414,9 @@ def insert_prop_snapshots(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        session.execute(pg_insert(PropLineSnapshot).values(rows))
+        # Batched: a full board of posted props across markets. See `batched`.
+        for batch in batched(rows):
+            session.execute(pg_insert(PropLineSnapshot).values(batch))
     logger.info("Inserted %d prop line snapshots", len(rows))
     return len(rows)
 
@@ -612,25 +681,28 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
         })
 
     with session_scope() as session:
-        stmt = pg_insert(Projection).values(rows)
-        # Conflict on the projection's natural identity so re-running a slate
-        # overwrites its own rows. Keying on run_id (a per-execution UUID)
-        # meant the target never matched and every re-run doubled the table.
-        # run_id is refreshed too, recording which run last wrote each row.
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "player_name", "market"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "run_id", "baseline_projection", "fatigue_multiplier",
-                    "fatigue_notes", "final_projection", "line", "prob_over",
-                    "prob_under", "prob_push",
-                    "model_version", "market_status", "market_status_reason",
-                    "ev_per_dollar", "notes",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: the slate's own output -- one row per (player, market)
+        # it scored. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(Projection).values(batch)
+            # Conflict on the projection's natural identity so re-running a slate
+            # overwrites its own rows. Keying on run_id (a per-execution UUID)
+            # meant the target never matched and every re-run doubled the table.
+            # run_id is refreshed too, recording which run last wrote each row.
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "player_name", "market"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "run_id", "baseline_projection", "fatigue_multiplier",
+                        "fatigue_notes", "final_projection", "line", "prob_over",
+                        "prob_under", "prob_push",
+                        "model_version", "market_status", "market_status_reason",
+                        "ev_per_dollar", "notes",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Persisted %d projections for run %s", len(rows), run_id)
     return len(rows)
 
@@ -674,12 +746,19 @@ PROP_RESULT_REFRESHABLE = (
 )
 
 
-def pending_prop_result_statement(rows: list[dict[str, Any]]):
+def pending_prop_result_statement(batch: list[dict[str, Any]]):
     """
     The upsert for PENDING prop_results, built but not executed.
 
     Separated from the execution so the conflict guard can be tested by
     compiling the SQL, which needs no database.
+
+    TAKES A BATCH, and the parameter is named for it. This deliberately returns
+    exactly ONE statement, so it is the one place in this module that must not
+    loop -- `record_pending_prop_results` batches around it. Naming the
+    parameter `rows` made it indistinguishable from the seven call sites that
+    DID need batching, which is how six of them could have been fixed and the
+    seventh missed.
 
     ON CONFLICT DO UPDATE ... WHERE prop_results.outcome_status = 'PENDING'.
     The WHERE is the load-bearing part: without it, re-running a slate after
@@ -687,7 +766,7 @@ def pending_prop_result_statement(rows: list[dict[str, Any]]):
     model's newer numbers, silently rewriting history in the one table whose
     job is to record what was predicted BEFORE the game.
     """
-    stmt = pg_insert(PropResult).values(rows)
+    stmt = pg_insert(PropResult).values(batch)
     return stmt.on_conflict_do_update(
         constraint="uq_prop_result",
         set_={c: stmt.excluded[c] for c in PROP_RESULT_REFRESHABLE},
@@ -709,7 +788,13 @@ def record_pending_prop_results(rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     with session_scope() as session:
-        session.execute(pending_prop_result_statement(rows))
+        # Batched here rather than in `pending_prop_result_statement`, which
+        # exists to be COMPILED by a test without a database and must keep
+        # returning exactly one statement for that. See `batched`: one row per
+        # recommended prop, so a wide slate crosses Postgres' bind-parameter
+        # limit the same way the projections do.
+        for batch in batched(rows):
+            session.execute(pending_prop_result_statement(batch))
     logger.info("Recorded %d pending prop result(s) for grading", len(rows))
     return len(rows)
 
@@ -776,16 +861,19 @@ def upsert_parlay_ledger(table: str, frame: pd.DataFrame) -> int:
     model = _PARLAY_MODELS[table]
     rows = [_parlay_payload(table, r) for r in _records(frame)]
     with session_scope() as session:
-        stmt = pg_insert(model).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=list(_PARLAY_KEYS[table]),
-            set_={
-                c: stmt.excluded[c]
-                for c in (*_PARLAY_PROMOTED[table], "record")
-                if c not in _PARLAY_KEYS[table]
-            },
-        )
-        session.execute(stmt)
+        # Batched: a ledger write is small today, and the limit is not a
+        # function of intent: one definition covers all of these. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(model).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=list(_PARLAY_KEYS[table]),
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (*_PARLAY_PROMOTED[table], "record")
+                    if c not in _PARLAY_KEYS[table]
+                },
+            )
+            session.execute(stmt)
     return len(rows)
 
 

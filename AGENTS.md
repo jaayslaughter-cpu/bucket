@@ -175,6 +175,16 @@ python -m scripts.validate_docker --preflight    # no daemon needed
 
 Kept here on purpose, so nobody reads an ambition as a fact.
 
+- **The suite proves less about Postgres than it looks.** Every unit test that
+  touches the database runs against **SQLite**, and on 2026-10-10 a first real
+  Postgres run found four defects that each had a passing test: a `%` in a
+  migration comment made the file unapplicable, two migrations commit their own
+  transactions, the SQL migrations ALTER tables only `create_all` makes (so no
+  first deploy could boot), and all seven bulk upserts exceeded the 65,535
+  bind-parameter limit — one of them daily. All four are fixed and their
+  properties are now asserted directly rather than through the driver
+  (`tests/test_postgres_only_defects.py`), but **there is still no Postgres in
+  CI**, which is what would have caught them.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

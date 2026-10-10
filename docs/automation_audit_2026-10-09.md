@@ -119,16 +119,40 @@ Scoring rules, so the number can be checked rather than believed:
 
 Ordered by what actually stops a deployment.
 
-### G1 — `--init-db` is not in the boot sequence *(small, real)*
+### G1 — ~~`--init-db` is not in the boot sequence *(small, real)*~~ — DONE, and it was never small
 
-`scripts/start.sh` applies the SQL migrations but does not create the
-ORM-defined tables. A brand-new database therefore needs one manual command
-that the rest of the boot already has the connection for. The reason it is not
-there yet: `create_all` is not transactional alongside the migration run, and
-making the boot do two kinds of schema change in two transactions is a worse
-failure mode than one documented manual step. **Proposed**, not done: a
-`--ensure-tables` step in `run_migrations` that runs `create_all` *before* the
-migration transaction, where it is idempotent and additive.
+This section called it "one manual command" and that was WRONG, established by
+running a first deploy against a real Postgres on 2026-10-10. Without
+`create_all` the SQL migrations ALTER tables that do not exist, so 002 fails
+with `relation "projections" does not exist`, `run_migrations` returns 4, and
+`scripts/start.sh` — which hard-fails the container on a migration error —
+**means the worker never starts**. Not a manual convenience: no first deploy
+could ever have booted.
+
+Done as proposed: `--ensure-tables` runs `create_all` in its own transaction
+*before* the migration transaction, and `scripts/run_migrations` (the
+container's front door) always passes it, because a first deploy is by
+definition a brand-new database. Idempotent on every later boot.
+
+Three more Postgres-only defects surfaced in the same session, each of which
+had a passing test:
+
+* **`%` in a migration comment** made the file unapplicable:
+  `exec_driver_sql` hands the script to psycopg as a format string, so
+  `-- a win% that includes pushes` raised `incomplete placeholder: '%'`. The
+  migration runner had never applied a migration to Postgres.
+* **002 and 003 wrap themselves in `BEGIN; … COMMIT;`**, which ends the
+  transaction the runner opened and breaks its one-transaction contract.
+* **Every bulk upsert exceeded Postgres' 65,535 bind-parameter limit.** A
+  season's workbook is 2,644 team-games × 25 columns; `upsert_player_game_logs`
+  runs daily on a whole season from `leaguegamelog` and is an order of
+  magnitude worse. Seven call sites, none of which could have worked at scale.
+
+The common cause is one thing and worth naming: **the unit tests run against
+SQLite**, whose driver has no %-placeholders, treats transaction statements
+differently, and hits its parameter limit at a different number. The suite was
+green and the only database this project uses was unreachable.
+`tests/test_postgres_only_defects.py`.
 
 ### G2 — ~~a missing workbook is now visible, not solved~~ — SOLVED 2026-10-10
 

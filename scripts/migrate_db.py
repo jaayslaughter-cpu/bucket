@@ -29,6 +29,7 @@ Usage:
     python -m scripts.migrate_db                     # status, changes nothing
     python -m scripts.migrate_db --apply --dry-run   # what WOULD be applied
     python -m scripts.migrate_db --apply             # apply, in one transaction
+    python -m scripts.migrate_db --apply --ensure-tables   # a brand-new database
 """
 
 from __future__ import annotations
@@ -82,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="With --apply: name what would be applied and execute "
                          "nothing.")
+    ap.add_argument("--ensure-tables", action="store_true",
+                    help="Create the ORM-defined tables first, if absent. "
+                         "REQUIRED ON A BRAND-NEW DATABASE: the SQL "
+                         "migrations ALTER tables that create_all makes, so "
+                         "002 fails with 'relation projections does not "
+                         "exist' without this. Additive and idempotent -- "
+                         "create_all touches nothing that exists.")
     ap.add_argument("--allow-drift", action="store_true",
                     help="With --apply: proceed although an applied migration's "
                          "file has changed. Records an override; it does not "
@@ -113,6 +121,28 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    if args.ensure_tables:
+        # BEFORE the migration transaction, and in its own. The SQL migrations
+        # ALTER tables that `Base.metadata.create_all` is what creates
+        # (projections, player_game_logs, prop_line_snapshots), so on a
+        # brand-new database 002 fails with `relation "projections" does not
+        # exist` and the whole run rolls back. Measured against a real
+        # Postgres on 2026-10-10; the unit tests build their own tables, so
+        # nothing caught it.
+        #
+        # Separate transaction so a migration failure does not roll the tables
+        # back out: they are additive, every migration's ADD COLUMN is
+        # IF NOT EXISTS, and a half-migrated schema with its tables present is
+        # a better place to debug from than an empty database.
+        try:
+            from src.db.session import init_db
+
+            init_db()
+            print("Ensured the ORM-defined tables exist.")
+        except Exception as exc:  # noqa: BLE001 — the driver's error is the answer
+            print(f"ERROR: could not create the ORM tables: {exc}", file=sys.stderr)
+            return 2
+
     try:
         # One transaction for the whole run: engine.begin() commits on clean
         # exit and rolls back on any exception, so a failure half way leaves
@@ -137,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("Nothing pending.")
             return 0
+        from src.db.session import init_db
+        init_db()
     except MigrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
