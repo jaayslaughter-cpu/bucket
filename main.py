@@ -282,6 +282,107 @@ def preflight(require_db: bool = True) -> dict[str, Any]:
 # [2] game market lines — GAME markets only, NOT prop EV
 # ---------------------------------------------------------------------------
 
+class MarketFramesUnavailable(RuntimeError):
+    """No workbook on disk AND nothing in the database to read instead."""
+
+
+def resolve_market_frames(
+    xlsx_path: Path,
+    *,
+    persist: bool = True,
+    slate_date: str | None = None,
+    lookback_days: int = 400,
+) -> dict[str, Any]:
+    """
+    The team-game and market-line frames, from the workbook OR the database.
+
+    THE BLOCKER THIS REMOVES. Step [2] called `ingest_market_lines` directly
+    and a missing path raised `FileNotFoundError`, which the orchestrator's
+    outer handler turned into a FAILED `pipeline_runs` row and exit 1 -- THE
+    WHOLE SLATE, not a degraded one. The image excludes `data/` and `*.xlsx`
+    deliberately, because a licensed third-party export does not belong in an
+    image layer, so a deployed container had no workbook and every scheduled
+    run died at 09:00 PT having looked healthy at boot. It was the largest
+    silent blocker in a fresh deploy and it was not the model.
+
+    THE DATA WAS NEVER MISSING; ONLY THE FILE WAS. Every run that does find a
+    workbook calls `upsert_team_game_stats` and `upsert_market_lines`, so the
+    contents are in Postgres -- which survives a redeploy, which is the whole
+    reason Postgres is there. `repository.load_team_game_stats` and
+    `load_game_market_lines` read them back under the SAME column names the
+    Elo, defence and market-context layers already accept, so the fallback
+    frame is interchangeable with the workbook's.
+
+    IT STILL REFUSES WHEN THERE IS GENUINELY NOTHING. With neither a workbook
+    nor a row, the Elo, `MKT_*` and `DEF_*` layers are omitted -- 11 of the 38
+    columns a seeded contract names -- and scoring abstains on every row. That
+    abstention does name the missing columns, so it is diagnosable; a refusal
+    at step [2] naming the workbook path AND the empty tables is still the
+    better message, because the cause is upstream of the columns. One of the
+    two frames being empty DEGRADES with a warning instead: the builder already
+    omits a layer whose input is absent, and an operator who trained without
+    the workbook has a 27-column contract that a partial frame satisfies.
+
+    Returns ``{"team_games", "market_lines", "source", "note"}``. ``source`` is
+    reported rather than inferred, because "the workbook was read" and "the
+    workbook was absent and the database answered" are very different runs and
+    only one of them is ingesting anything.
+    """
+    if xlsx_path.exists():
+        team_games, market_lines = ingest_market_lines(xlsx_path, persist=persist)
+        return {
+            "team_games": team_games,
+            "market_lines": market_lines,
+            "source": "workbook",
+            "note": f"BigDataBall workbook {xlsx_path}",
+        }
+
+    logger.warning(
+        "NO BIGDATABALL WORKBOOK at %s. Reading the team-game and market-line "
+        "frames back from Postgres instead -- the workbook's contents are "
+        "upserted there by every run that does find one, and the database "
+        "survives a redeploy while the container filesystem does not. Set "
+        "$%s to point at the licensed export to ingest a fresher one.",
+        xlsx_path, ENV_BIGDATABALL,
+    )
+
+    from src.db.repository import load_game_market_lines, load_team_game_stats
+
+    team_games = load_team_game_stats(slate_date=slate_date, lookback_days=lookback_days)
+    market_lines = load_game_market_lines(slate_date=slate_date, lookback_days=lookback_days)
+
+    if team_games.empty and market_lines.empty:
+        raise MarketFramesUnavailable(
+            f"No BigDataBall workbook at {xlsx_path} and NO ROWS in "
+            f"team_game_stats or game_market_lines within {lookback_days} days "
+            f"of the slate. Nothing has ever been ingested, so the Elo, MKT_* "
+            f"and DEF_* columns cannot be built -- 11 of the 38 a seeded "
+            f"artifact names -- and every row would abstain. Ingest the "
+            f"licensed export once (${ENV_BIGDATABALL}, or --bigdataball), "
+            f"which persists it; after that a container needs no workbook."
+        )
+
+    if team_games.empty or market_lines.empty:
+        logger.warning(
+            "PARTIAL MARKET DATA from the database: %d team-game row(s), %d "
+            "market-line row(s). The builder omits a layer whose input is "
+            "absent, so the matrix will be narrower than one built with the "
+            "workbook, and scoring abstains if the artifact's contract names a "
+            "column it no longer has -- naming that column when it does.",
+            len(team_games), len(market_lines),
+        )
+
+    return {
+        "team_games": team_games,
+        "market_lines": market_lines,
+        "source": "database",
+        "note": (
+            f"{len(team_games)} team-game and {len(market_lines)} market-line "
+            f"rows from Postgres; no workbook at {xlsx_path}"
+        ),
+    }
+
+
 def ingest_market_lines(
     xlsx_path: Path, persist: bool = True
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -458,6 +559,75 @@ def refresh_player_logs(slate_date: str, *, persist: bool = True) -> dict[str, A
         written, season, out["newest_game_date"],
         f", {held_back} row(s) after {slate_date} held back" if held_back else "",
     )
+    return out
+
+
+#: How far the newest team-game row may trail the slate before the run says so.
+#: Mirrors DEFAULT_MAX_PANEL_LAG_DAYS and is deliberately LOOSER: the player
+#: panel is refreshed by the slate itself every run, while the market frames
+#: come from a licensed workbook somebody uploads by hand. A week is a normal
+#: gap between uploads; a month means the Elo and DEF_* columns are describing
+#: a different part of the season than the rows being scored.
+ENV_MAX_MARKET_LAG = "PROPIQ_MAX_MARKET_LAG_DAYS"
+DEFAULT_MAX_MARKET_LAG_DAYS = 10
+
+
+def market_frames_freshness(
+    team_games: pd.DataFrame, slate_date: str, *, source: str
+) -> dict[str, Any]:
+    """
+    How far the newest team-game row trails the slate, and whether to say so.
+
+    WHY THE FALLBACK NEEDS THIS. Reading the frames back from Postgres removed
+    a hard failure and introduced a quiet one in its place: the database holds
+    whatever was last ingested, so a container running for weeks on one
+    workbook upload computes Elo and opponent-defence features from games that
+    stopped before the rows it is scoring. Nothing would have said so -- the
+    layers attach, the columns are present, the contract check passes, and the
+    numbers are simply out of date. That is exactly the shape this project
+    treats as worse than an error, so it is measured.
+
+    A workbook run is measured too, not just the fallback. A stale workbook on
+    disk is the same defect with a different cause, and only reading the frame
+    itself catches both.
+    """
+    if team_games is None or team_games.empty:
+        return {"status": "EMPTY", "lag_days": None, "newest_game_date": None,
+                "source": source}
+
+    dates = pd.to_datetime(team_games.get("game_date"), errors="coerce")
+    newest = dates.max() if dates is not None else None
+    if newest is None or pd.isna(newest):
+        return {"status": "UNDATED", "lag_days": None, "newest_game_date": None,
+                "source": source}
+
+    lag = int((pd.Timestamp(slate_date).normalize() - newest.normalize()).days)
+    limit = _int_env(ENV_MAX_MARKET_LAG, DEFAULT_MAX_MARKET_LAG_DAYS, low=0, high=400)
+    stale = lag > limit
+    out = {
+        "status": "STALE" if stale else "OK",
+        "newest_game_date": str(newest.date()),
+        "lag_days": lag,
+        "max_lag_days": limit,
+        "rows": int(len(team_games)),
+        "source": source,
+    }
+    if stale:
+        logger.warning(
+            "MARKET DATA IS STALE: the newest team-game row is %s, %d day(s) "
+            "before the %s slate, over the %d-day limit (source: %s). The Elo "
+            "and DEF_* columns are computed from games that stop there, so "
+            "they describe a different part of the season than the rows being "
+            "scored. Ingest a fresher BigDataBall export: $%s, or --bigdataball.",
+            out["newest_game_date"], lag, slate_date, limit, source,
+            ENV_BIGDATABALL,
+        )
+    else:
+        logger.info(
+            "Market data freshness: newest team-game row %s, %d day(s) before "
+            "the %s slate (source: %s).",
+            out["newest_game_date"], lag, slate_date, source,
+        )
     return out
 
 
@@ -1406,21 +1576,43 @@ def main(argv: list[str] | None = None) -> int:
         stage_summary["preflight"] = preflight(require_db=persist)
         guideline = load_master_guideline()
 
-        team_games_df, market_df = ingest_market_lines(
-            Path(args.bigdataball), persist=persist
+        # RESOLVED ONCE, HERE, and passed down. It used to be computed just
+        # before step [3b]; the market resolution and its freshness check both
+        # need it and are earlier, and a second `args.date or
+        # pacific_calendar_date()` would be two definitions of which day this
+        # run is -- the defect this repository keeps finding.
+        slate_pt = args.date or str(pacific_calendar_date())
+
+        frames = resolve_market_frames(
+            Path(args.bigdataball), persist=persist, slate_date=args.date,
         )
+        team_games_df = frames["team_games"]
+        market_df = frames["market_lines"]
         stage_summary["game_markets"] = {
             "rows": len(market_df),
-            "valid": int((market_df["status"] == "VALID").sum()),
+            # `status` is a workbook-frame column; the database loader selects
+            # the pregame columns only and filters status == VALID in the query,
+            # so every row it returns is already valid. Reading the column
+            # unconditionally raised KeyError on the fallback path.
+            "valid": (
+                int((market_df["status"] == "VALID").sum())
+                if "status" in market_df.columns else len(market_df)
+            ),
+            "team_game_rows": len(team_games_df),
+            "source": frames["source"],
             "note": "GAME spread/total/ML only — does not satisfy prop EV gate",
         }
+        # Measured from the frame itself, whichever source produced it: a
+        # stale workbook on disk and a database nobody has re-ingested into
+        # are the same defect, and only the frame shows both.
+        stage_summary["market_freshness"] = market_frames_freshness(
+            team_games_df, slate_pt, source=frames["source"],
+        )
 
         prop_df = ingest_prop_lines(guideline, persist=persist)
         stage_summary["prop_lines"] = {"rows": len(prop_df)}
 
         from src.db.repository import load_player_panel
-
-        slate_pt = args.date or str(pacific_calendar_date())
 
         # [3b] REFRESH THE PANEL'S SOURCE BEFORE READING IT. Until 2026-10-09
         # this step did not exist: load_player_panel below read whatever had

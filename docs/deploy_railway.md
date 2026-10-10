@@ -4,7 +4,7 @@ RESEARCH_ONLY. The deployed worker runs research jobs on a clock. It places no
 wager, contacts no operator's order API, and sizes no stake.
 
 Read `docs/railway_deployment_audit.md` first for what was wrong and what is
-still wrong. **Two blockers remain** and they are at the bottom of this page.
+still wrong. **One blocker remains** and it is at the bottom of this page.
 
 ---
 
@@ -72,28 +72,72 @@ deployment "fixed" in the direction of its own mistake.
 
 The repository root has a `Dockerfile`; point the service at it.
 
-**It has never been built.** The environment it was written in has a docker
-client but no daemon and a network policy that denies the package index, so
-`docker build` has not run against it once. Treat the layer ordering and the
-apt package list as reasoned, not verified.
-
-Build it where a daemon exists, with:
+**It was built on 2026-10-10** — the first time. This page said "it has never
+been built … treat the layer ordering and the apt package list as reasoned, not
+verified" for months, and the apt package list is precisely what turned out to
+be wrong. All 15 checks now pass:
 
 ```
-python -m scripts.validate_docker          # preflight, build, six smoke checks
-python -m scripts.validate_docker --preflight   # the daemon-free half
+python -m scripts.validate_docker                        # preflight, build, smoke
+python -m scripts.validate_docker --preflight            # the daemon-free half
+python -m scripts.validate_docker --skip-build --tag <t> # smoke an existing image
 ```
 
-The preflight half runs anywhere and passes today (8 checks: the CMD target
-exists, every `python -m` inside it resolves to a real module, no credential is
-defaulted in a layer, every installed extra is declared, the uid is the one
-this page tells you to chown to, and the ignore file is evaluated by matching
-rather than grepped). The build and the six
-in-image checks are what remain, and two of them exist to test **this page**:
-they mount a mode-0555 directory at `/app/data` and require
-`check_state_dir()` to report it unwritable, then mount a writable one and
-require it not to false-alarm. Until that runs, the trap below is documented
-and not demonstrated.
+**Phase A, 9 checks, no daemon**: the CMD target exists, every `python -m`
+inside it resolves to a real module, a `RUN` layer import-checks the ML extra,
+no credential is defaulted in a layer, every installed extra is declared, the
+uid is the one this page tells you to chown to, and the ignore file is
+evaluated by matching rather than grepped.
+
+**Phase C, 6 checks, inside the built image**: the ML and deploy extras import,
+the scheduler builds its job table, the process runs as uid 10001, there is no
+`.env` in the image — and **two that exist to test this page**: they mount a
+mode-0555 directory at `/app/data` and require `check_state_dir()` to report it
+unwritable, then mount a writable one and require it not to false-alarm. Both
+pass, so **the trap in §2b below is now demonstrated and not merely
+documented.**
+
+The container was then booted end to end: `scripts/start.sh` ran the
+migrations, ran the probe, and started the scheduler in `America/Los_Angeles`
+with both cron jobs and their misfire graces. Both failure policies were
+exercised for real — migrations with no `DATABASE_URL` exit 2 and the worker
+never starts; a probe FAILURE is logged and the worker starts anyway.
+
+**One caveat, stated precisely.** The session that built it routes HTTPS
+through a CA-re-terminating proxy, so pip inside a build container sees a
+self-signed chain for pypi.org. Baking that CA into the image would be wrong —
+Railway has no such proxy — so the build used a copy of the `Dockerfile` with
+exactly two extra instructions before the pip layer (`COPY` the CA, `ENV
+PIP_CERT`). Every other instruction is byte-identical to the committed file.
+The first build on a host with ordinary egress exercises the unmodified file.
+
+### The `libgomp1` apt layer is gone, and the comment justifying it was wrong
+
+It read: *"OpenMP, which xgboost and catboost link against. Without it the
+image builds and then fails at import."* Reasoned from the libraries' linkage,
+and false for these wheels. The first build settled it:
+
+```
+$ docker run --rm python:3.11-slim sh -c \
+    'pip install xgboost catboost; python -c "import xgboost, catboost"; \
+     find / -name "libgomp*"'
+xgboost 3.2.0 · catboost 1.2.10
+/usr/local/lib/python3.11/site-packages/xgboost.libs/libgomp-e985bcbb.so.1.0.0
+```
+
+The **wheel vendors its own libgomp**. The apt layer installed a second copy of
+a library nothing loaded, and it was the only thing in the build that needed
+the Debian package index — so on a host whose egress policy does not allow
+`deb.debian.org`, it failed the build at stage 2 of 8 for a dependency the
+image does not have.
+
+**The guarantee moved rather than disappearing.** Vendoring is a property of
+the wheel, not of this project: a future release could stop doing it, or a
+platform with no wheel could build from source and need system OpenMP. A
+`RUN python -c "import xgboost, catboost, sklearn"` layer now asserts at build
+time what the apt layer only assumed, and phase A check 7 asserts that layer is
+still there — so if a future wheel stops vendoring OpenMP the build goes red
+instead of the first unattended inference.
 
 **Point the service at the Dockerfile, not Nixpacks.** Nixpacks reads
 `requirements.txt` rather than `pyproject.toml`'s extras. `APScheduler` is now
@@ -182,6 +226,8 @@ these are the ones the worker reads.
 | `PROPIQ_BOARD_CSV` | Default `outputs/decision_board.csv`. |
 | `PROPIQ_BOARD_TRAIN_END` / `_VALIDATION_END` / `PROPIQ_BOARD_MARKETS` / `PROPIQ_MIN_EV` | Board build parameters, matching the `decision-board` CLI defaults. |
 | `PROPIQ_STATE_DIR` | Override where durable state resolves to, ahead of `RAILWAY_VOLUME_MOUNT_PATH`. Unset is right on Railway; set it on a host that mounts the volume somewhere the platform does not announce. |
+| `BIGDATABALL_XLSX` | The licensed team-stats export. **Needed once, not per deploy** — see §3b. |
+| `PROPIQ_MAX_MARKET_LAG_DAYS` | Default 10. How far the newest `team_game_stats` row may trail the slate before the run logs **MARKET DATA IS STALE**. Looser than the player panel's 3 because the slate refreshes the panel itself every run while the market frames come from a workbook somebody uploads. |
 | `PROPIQ_MIGRATE_ON_BOOT` | Default **on**. `scripts/start.sh` applies pending migrations before the worker starts and hard-fails the container if it cannot. Set false where a release step owns the schema. |
 | `PROPIQ_DB_POOL_RECYCLE` | Default 1800s. SQLAlchemy's own default is *never*, and this worker leaves a pooled connection idle for the eighteen hours between 09:00 and 03:30. |
 | `PROPIQ_DB_CONNECT_TIMEOUT` | Default 10s, passed to libpq. **Without it there is no bound**: a pooler that accepts the TCP connection and never completes the handshake blocks the caller forever, and the slate job has no timeout of its own — it would hang past every tip-off and be noticed as a worker that produced nothing, with no error anywhere. |
@@ -197,6 +243,58 @@ does not read is how an operator comes to believe a key is in use:
 | `SPORTSDATA_API_KEY` | **Appears nowhere in this repository.** No client, no reader, no default. The odds source is `PROPLINE_API_KEY`. |
 | `THE_ODDS_API_KEY` | Same, and worse: the Odds API (`ODDS_API_KEY`) is recorded as a **banned sportsbook source** in `docs/external_feature_harvest.md` and `docs/pickem_props.md`. Setting it would not wire anything up; listing it would advertise a source this project has decided against. |
 | `TZ=America/Los_Angeles` | The image sets `TZ=Etc/UTC` **on purpose** and that should not change. Storage is UTC throughout, and every slate cutoff is a Pacific *calendar day* that `scheduler_worker` gets by passing `America/Los_Angeles` to APScheduler explicitly — so the schedule does not depend on `TZ` at all. What `TZ` governs is the naive `datetime.now()` calls elsewhere, which should stay UTC and reproducible. Setting it to Pacific would make those calls shift twice a year while the stored timestamps did not, and the resulting off-by-an-hour rows would look like data, not like a setting. |
+
+## 3b. The BigDataBall workbook: once, not per deploy
+
+**This used to fail every scheduled run on a fresh container, and it was the
+largest blocker in a deploy — not the model.** `main.ingest_market_lines`
+reads the licensed export and was unguarded: a missing path raised
+`FileNotFoundError`, which the orchestrator turned into a FAILED
+`pipeline_runs` row and exit 1. The whole slate, not a degraded one. And
+`.dockerignore` excludes `data/` and `*.xlsx` **deliberately** — a licensed
+third-party export does not belong in an image layer — so the container never
+had one.
+
+**The data was never missing; only the file was.** Every run that finds a
+workbook calls `upsert_team_game_stats` and `upsert_market_lines`, so the
+contents are in Postgres, which is the thing that survives a redeploy.
+`main.resolve_market_frames` reads them back through
+`repository.load_team_game_stats` / `load_game_market_lines`, under the **same
+column names** the Elo, defence and market-context layers already accept — so
+the fallback frame is interchangeable with the workbook's.
+
+So the step is:
+
+```
+# ONCE, where the licensed export is, against the deployment's database:
+BIGDATABALL_XLSX=/path/to/2025-2026_NBA_Box_Score_Team-Stats.xlsx python main.py
+```
+
+After that a container needs no file. Three outcomes, and the probe reports
+which:
+
+| | What step [2] does |
+|---|---|
+| workbook on disk | reads it, upserts it — the fresher source |
+| no workbook, rows in the database | reads them back, logs `NO BIGDATABALL WORKBOOK` naming the fallback |
+| no workbook, no rows | **refuses**, naming both the path and the empty tables. 11 of the 38 columns a seeded contract names cannot be built, so every row would abstain — the cause is upstream of the columns, so step [2] says it rather than letting the scorer report missing column names |
+
+**The new thing to watch is staleness, not absence.** The database holds
+whatever was last ingested, so a container running for weeks on one upload
+computes Elo and `DEF_*` from games that stop before the rows it is scoring —
+the layers attach, the columns are present, the contract check passes, and the
+numbers are out of date. `main.market_frames_freshness` measures it from the
+frame itself and logs **MARKET DATA IS STALE** past
+`PROPIQ_MAX_MARKET_LAG_DAYS`. It measures a workbook run too: a stale file on
+disk is the same defect with a different cause.
+
+**Only pregame columns are ever read.** `game_market_lines` also stores
+`closing_spread`, `closing_total`, the halftime line and three line-movement
+columns. `load_game_market_lines` selects `market_context.PREGAME_SOURCE_COLS`
+and nothing else, and asserts no closing column came back —
+`attach_market_context` happens to project down to the pregame set, so a
+`SELECT *` would not leak today, and selecting them anyway would make that
+projection the only thing standing between a closing line and a feature matrix.
 
 ## 4. Database
 
@@ -395,10 +493,10 @@ empty board instead of saying so.
 
 ---
 
-## The remaining blockers
+## The remaining blocker
 
-Two, and both are now *visible* rather than silent — which is a different thing
-from being fixed.
+One, where there were two on 2026-10-09. It is *visible* rather than silent,
+which is a different thing from being fixed.
 
 **1. The volume still has to be mounted and seeded by a person.** Nothing in
 this repository can mount a volume or put a model on one. What changed on
@@ -414,16 +512,13 @@ in this repository downloads a model. An earlier version of this page offered
 "fetch from object storage at boot" as option 2; that code does not exist and
 listing it invited a first deploy that assumed the container would help itself.
 
-**2. The image has never been built.** `docker build` has not run against this
-Dockerfile once — the environment it was written in has a docker client, no
-daemon, and a network policy that denies the package index. The preflight half
-of `python -m scripts.validate_docker` passes (8 checks, including that the new
-`bash scripts/start.sh` entrypoint exists and that every `python -m` inside it
-resolves to a real module); the build and the six in-image checks are what
-remain, and two of those exist to test *this page* — they mount a mode-0555
-directory at `/app/data` and require `check_state_dir()` to report it
-unwritable. Until that runs, the `chown` trap above is documented and not
-demonstrated.
+**2. ~~The image has never been built.~~ CLEARED 2026-10-10.** All 15 checks
+pass against the built image, the container boots and schedules, and the
+`chown` trap above is now *demonstrated* rather than documented. §2 has the
+detail and the one caveat (the copy that was built carried two extra
+pip-trust instructions).
 
-Until both are cleared, treat a deployment as a wiring test rather than a
-shadow run.
+So the honest state: **one blocker remains, and it is the volume.** Mount it,
+ingest the workbook once (§3b), seed the artifacts (§4b), and run the probe.
+A deployment before that is a wiring test rather than a shadow run; after it,
+the nightly loop runs unattended.

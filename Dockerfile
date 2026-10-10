@@ -10,11 +10,26 @@
 # supplied by the platform at run time; see .env.example for the full list. A
 # key in an image layer survives every later layer that deletes it.
 #
-# NOT BUILT OR RUN ANYWHERE YET. The environment this was written in has the
-# docker client but no daemon, and its network policy denies the package index,
-# so no `docker build` of this file has ever executed. Every instruction here is
-# reasoned from the repository's own dependency metadata, not from a green
-# build. Build it once locally before trusting a deploy.
+# BUILT AND SMOKE-TESTED 2026-10-10, after months of being reasoned about
+# rather than run. `python -m scripts.validate_docker --skip-build` passes all
+# 15 checks against the built image, including the two that exist to
+# demonstrate the volume-permission trap documented at the bottom of this file:
+# a mode-0555 mount at /app/data makes check_state_dir() report it unwritable,
+# and a writable one is not false-alarmed. The container was then booted and
+# ran `scripts/start.sh` end to end -- migrate, probe, scheduler up in
+# America/Los_Angeles with both cron jobs and their misfire graces.
+#
+# ONE CAVEAT, STATED PRECISELY. The session that built it routes HTTPS through
+# a CA-re-terminating proxy, so pip inside a build container sees a self-signed
+# chain for pypi.org. Baking that CA into this file would be wrong -- Railway
+# has no such proxy -- so the build used a copy of this file with exactly two
+# extra instructions before the pip layer (`COPY` the CA, `ENV PIP_CERT`).
+# Every other instruction, this file's nine stages included, is byte-identical
+# to what was built. The first build on a host with ordinary egress will
+# exercise the unmodified file; nothing here is now unverified by inspection
+# alone, but that one difference is real.
+#
+# THE apt LAYER IS GONE and the comment that justified it was wrong; see below.
 #
 # THE ML EXTRA IS INSTALLED ON PURPOSE. catboost and xgboost are optional in
 # pyproject so a local checkout stays light, and a minimal image would start
@@ -38,12 +53,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # calls elsewhere, which should be UTC and reproducible rather than inherited.
 ENV TZ=Etc/UTC
 
-# libgomp1 is OpenMP, which xgboost and catboost link against. Without it the
-# image builds and then fails at import, which is the same late failure the ML
-# extra is installed to avoid.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+# NO apt LAYER. This file had one, installing libgomp1, with the comment
+# "OpenMP, which xgboost and catboost link against. Without it the image builds
+# and then fails at import". That was reasoned from the libraries' linkage and
+# it is FALSE for the wheels this project installs, which was established the
+# first time the image was actually built (2026-10-10):
+#
+#   $ docker run --rm python:3.11-slim sh -c 'pip install xgboost catboost; \
+#       python -c "import xgboost, catboost; print(xgboost.__version__)"'
+#   xgboost 3.2.0
+#   catboost 1.2.10
+#   /usr/local/lib/python3.11/site-packages/xgboost.libs/libgomp-e985bcbb.so.1.0.0
+#
+# The WHEEL vendors its own libgomp. The apt layer installed a second copy of a
+# library nothing loaded, and it was the only thing in this build that needed
+# the Debian package index -- so on a host whose egress policy does not allow
+# deb.debian.org the build failed at step 2 of 8 for a dependency the image
+# does not have.
+#
+# THE GUARANTEE MOVED RATHER THAN DISAPPEARING. Vendoring is a property of the
+# wheel, not of this project: a future xgboost or catboost could stop doing it,
+# or a platform with no wheel could build from source and need system OpenMP.
+# The import check below asserts at BUILD time what the apt layer only assumed,
+# which is the thing the old comment actually wanted.
 
 WORKDIR /app
 
@@ -51,6 +83,18 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/__init__.py src/__init__.py
 RUN pip install --no-cache-dir -e ".[ml,db,deploy]"
+
+# FAIL HERE, NOT AT THE FIRST INFERENCE. Importing xgboost and catboost is what
+# resolves OpenMP -- from the wheel's own vendored copy, or from the system if a
+# future wheel stops vendoring one. An image that starts cleanly and then dies
+# unattended at 09:00 PT, after the slate has already been ingested, is the
+# failure this whole block exists to prevent; `python -c "import ..."` costs one
+# layer and converts it into a red build.
+#
+# It also catches a build that resolved the ML extra to nothing, which is the
+# other way this image can look fine and score nothing.
+RUN python -c "import xgboost, catboost, sklearn; \
+    print('ml extra OK:', xgboost.__version__, catboost.__version__)"
 
 COPY . .
 

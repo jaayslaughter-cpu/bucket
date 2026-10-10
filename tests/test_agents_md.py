@@ -184,7 +184,13 @@ def test_it_states_what_is_not_true_rather_than_only_what_works():
     assert "What is still not true" in TEXT
     for claim in (
         "No model is profitable",
-        "never been built",
+        # "never been built" was pinned here until 2026-10-10, when the image
+        # WAS built and all 14 validate_docker checks passed — so the phrase
+        # had to go, and this guard firing is what it is for. The image entry
+        # still carries an open claim and that is what is pinned now: the base
+        # image tag floats, so a rebuild months later gets a different patch
+        # release of CPython and of every library the caps still permit.
+        "still floats",
         "do not survive a redeploy",
         "ProbabilitySource.MODEL",
     ):

@@ -251,24 +251,32 @@ def _check_model_artifacts(markets: list[str]) -> list[Check]:
     return out
 
 
-def _check_bigdataball_workbook() -> list[Check]:
+def _check_bigdataball_workbook(skip_db: bool) -> list[Check]:
     """
-    Is the licensed workbook where step [2] will look for it?
+    Can step [2] get the team-game and market-line frames at all?
 
-    THE BIGGEST SILENT BLOCKER IN A FRESH DEPLOY, and nothing reported it
-    before. `main.ingest_market_lines` is NOT guarded: a missing path raises
-    `FileNotFoundError`, the orchestrator's outer handler records a FAILED
-    `pipeline_runs` row and returns 1, and the slate produces nothing at all.
-    The image excludes it on purpose — `.dockerignore` drops `data/` and
-    `*.xlsx`, because a licensed third-party export does not belong in an image
-    layer — so a container that nobody uploaded it to fails EVERY scheduled run
-    at 09:00 PT, having looked healthy at boot.
+    THE ANSWER CHANGED ON 2026-10-10 and this check had to change with it.
+    `main.ingest_market_lines` was unguarded: a missing workbook raised
+    `FileNotFoundError` and failed the whole slate, so an absent file was a
+    FAILURE here, full stop. `main.resolve_market_frames` now falls back to
+    `team_game_stats` and `game_market_lines` in Postgres -- the workbook's own
+    contents, upserted by every run that does find one -- so an absent file is
+    no longer fatal, and reporting it as FAILURE would fail a deployment that
+    works. A probe that outlives the behaviour it probes is the defect this
+    repository keeps finding, in its most expensive form: it sends somebody to
+    fix something that is not broken.
 
-    Failing loudly there is the right behaviour, not a bug: the workbook
-    supplies the Elo, `MKT_*` and `DEF_*` columns, 11 of the 38 a trained
-    contract names, and a run that quietly built 27 would be rejected by the
-    contract check on every row instead — same empty board, worse diagnosis.
-    What was missing is the question being asked BEFORE the slate.
+    So, three outcomes rather than two:
+
+      workbook present                -> OK. A fresher ingest than the database.
+      absent, the database has rows   -> WARN, with the newest row's date,
+                                         because the fallback computes Elo and
+                                         DEF_* from whatever was last ingested
+                                         and nothing else would say how old
+                                         that is.
+      absent, the database is empty   -> FAIL. Nothing has ever been ingested;
+                                         `resolve_market_frames` refuses, and
+                                         it is right to.
     """
     from main import DEFAULT_BIGDATABALL_XLSX, ENV_BIGDATABALL
 
@@ -279,14 +287,71 @@ def _check_bigdataball_workbook() -> list[Check]:
             "bigdataball_workbook", OK, str(path),
             {"path": str(path), "configured": bool(configured)},
         )]
+
+    if skip_db:
+        return [Check(
+            "bigdataball_workbook", WARN,
+            f"{path} does not exist. Step [2] falls back to team_game_stats "
+            f"and game_market_lines in Postgres, which was not checked "
+            f"(--skip-db), so whether that fallback has anything to read is "
+            f"UNKNOWN. With neither, the slate refuses at step [2].",
+            {"path": str(path)},
+        )]
+
+    try:
+        from src.db.repository import load_game_market_lines, load_team_game_stats
+
+        team_games = load_team_game_stats()
+        market_lines = load_game_market_lines()
+    except Exception as exc:  # noqa: BLE001 — a missing database is the answer
+        return [Check(
+            "bigdataball_workbook", FAIL,
+            f"{path} does not exist and the database fallback could not be "
+            f"read ({exc}). Step [2] has no team-game or market-line frame, so "
+            f"the Elo, MKT_* and DEF_* columns cannot be built.",
+            {"path": str(path)},
+        )]
+
+    if team_games.empty and market_lines.empty:
+        return [Check(
+            "bigdataball_workbook", FAIL,
+            f"{path} does not exist AND there are no rows in team_game_stats "
+            f"or game_market_lines. Nothing has ever been ingested, so step [2] "
+            f"refuses: the Elo, MKT_* and DEF_* columns are 11 of the 38 a "
+            f"seeded artifact names. Ingest the licensed export ONCE with "
+            f"${ENV_BIGDATABALL} or --bigdataball -- it persists, and after "
+            f"that a container needs no workbook.",
+            {"path": str(path), "team_game_rows": 0, "market_line_rows": 0},
+        )]
+
+    newest = None
+    if not team_games.empty:
+        import pandas as pd
+
+        dates = pd.to_datetime(team_games["game_date"], errors="coerce")
+        if dates.notna().any():
+            newest = str(dates.max().date())
+
+    partial = team_games.empty or market_lines.empty
+    data = {
+        "path": str(path),
+        "team_game_rows": int(len(team_games)),
+        "market_line_rows": int(len(market_lines)),
+        "newest_team_game_date": newest,
+    }
     return [Check(
-        "bigdataball_workbook", FAIL,
-        f"{path} does not exist, and step [2] does not degrade: it raises "
-        f"FileNotFoundError and the WHOLE SLATE fails. The image excludes "
-        f"`data/` and `*.xlsx` on purpose, so upload the licensed export onto "
-        f"the volume and point ${ENV_BIGDATABALL} at it. Without it the Elo, "
-        f"MKT_* and DEF_* columns cannot be built at all.",
-        {"path": str(path)},
+        "bigdataball_workbook", WARN,
+        f"{path} does not exist; step [2] will read the database instead "
+        f"({len(team_games)} team-game, {len(market_lines)} market-line rows"
+        + (f", newest {newest}" if newest else "")
+        + ")."
+        + (" PARTIAL: one of the two frames is empty, so the matrix will be "
+           "narrower than a workbook run's and scoring abstains if the "
+           "artifact's contract names a column it no longer has."
+           if partial else
+           " Those features are computed from whatever was last ingested, so "
+           "upload a fresher export when that date falls behind the slate."),
+        data,
     )]
 
 
@@ -473,7 +538,7 @@ def run_checks(*, skip_db: bool = False) -> list[Check]:
     checks: list[Check] = []
     checks += _check_state_root()
     checks += _check_model_artifacts(markets)
-    checks += _check_bigdataball_workbook()
+    checks += _check_bigdataball_workbook(skip_db)
     checks += _check_database(skip_db)
     checks += _check_ledger(db_configured)
     checks += _check_calibration_report()

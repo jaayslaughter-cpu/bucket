@@ -48,8 +48,8 @@ CITATION = re.compile(
 
 #: The citations whose CONTENT is the finding. (path, line, substring).
 ANCHORS = [
-    ("Dockerfile", 24, "python:3.11-slim"),
-    ("Dockerfile", 39, "TZ=Etc/UTC"),
+    ("Dockerfile", 39, "python:3.11-slim"),
+    ("Dockerfile", 54, "TZ=Etc/UTC"),
     ("docs/external_feature_harvest.md", 90, "ODDS_API_KEY"),
     ("docs/pickem_props.md", 61, "ODDS_API_KEY"),
     ("src/models/xgb_adapter.py", 390, "_VERSIONS_KEY"),

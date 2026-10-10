@@ -280,6 +280,40 @@ def preflight(report: Report, root: Path = ROOT) -> None:
     else:
         report.ok("the application is not excluded")
 
+    # 7. the ML import is asserted at BUILD time.
+    #
+    # WHY THIS IS A CHECK NOW. The Dockerfile used to apt-install libgomp1,
+    # justified by "without it the image builds and then fails at import". The
+    # first real build (2026-10-10) disproved it -- the xgboost wheel vendors
+    # its own libgomp -- and that layer was removed, because it installed a
+    # library nothing loaded and was the only thing in the build needing the
+    # Debian package index. What replaced it is a `RUN python -c "import
+    # xgboost, catboost, sklearn"` layer, and THAT is now the only thing
+    # guaranteeing OpenMP resolves and the ML extra is present at build time
+    # rather than at the first unattended inference. A guarantee that rests on
+    # one line nobody checks is one edit from being gone, so it is checked.
+    #
+    # Matched on the RUN instruction, not anywhere in the file, so the comment
+    # explaining it cannot satisfy this.
+    joined_runs = " ".join(
+        re.sub(r"\\\s*\n\s*", " ", m.group(0))
+        for m in re.finditer(r"(?m)^RUN\s[^\n]*(?:\\\s*\n[^\n]*)*", body)
+    )
+    probe = re.search(r"python\s+-c\s+[\"']import\s+([A-Za-z0-9_,\s]+)", joined_runs)
+    imported = (
+        {n.strip() for n in probe.group(1).split(",") if n.strip()} if probe else set()
+    )
+    required = {"xgboost", "catboost"}
+    if not required <= imported:
+        report.bad(
+            "the ML extra is import-checked at build time",
+            f"no RUN layer imports {sorted(required - imported)}; a missing or "
+            f"unloadable ML extra would then surface at the first inference, "
+            f"unattended, after the slate had already been ingested",
+        )
+    else:
+        report.ok(f"the ML extra is import-checked at build time ({sorted(imported)})")
+
 
 # --- docker ------------------------------------------------------------------
 

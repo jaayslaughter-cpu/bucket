@@ -19,14 +19,34 @@ Two numbers, because one number hides the thing you want to know.
 | **The nightly loop** — what has to happen every day with nobody watching | 17 | 16 | **94%** |
 | **The whole system** — including setup, retraining and secret handling | 26 | 18 | **69%** |
 
-**The nightly loop is 94% and the missing 6% stops it dead.** That is the
-honest reading and it matters more than either percentage: the one unautomated
-stage in the daily loop is the BigDataBall workbook (§2, M1), and
-`main.ingest_market_lines` does not degrade when it is absent — it raises
-`FileNotFoundError` at step [2], the orchestrator records a FAILED
-`pipeline_runs` row and returns 1. So on a fresh container the coverage that
-matters is not 94%: it is **0% until a person uploads one file**, and before
-today nothing said so until 09:00 PT.
+**The nightly loop is 94%, and as of 2026-10-10 the missing 6% no longer stops
+it dead.** This section said the opposite yesterday and the correction is the
+point of re-reading it:
+
+> *Superseded (2026-10-09 reading):* the one unautomated stage in the daily
+> loop is the BigDataBall workbook, and `main.ingest_market_lines` does not
+> degrade when it is absent — it raises `FileNotFoundError` at step [2], the
+> orchestrator records a FAILED `pipeline_runs` row and returns 1. So on a
+> fresh container the coverage that matters is not 94%: it is **0% until a
+> person uploads one file.**
+
+That was true, and the fix was not to automate the upload. `main.resolve_
+market_frames` now falls back to `team_game_stats` and `game_market_lines` in
+Postgres — the workbook's own contents, which every run that finds one upserts,
+and which survive a redeploy. **The data was never missing; only the file was.**
+
+So the honest reading today: the workbook must be ingested **once, ever**, and
+after that a container needs no file and the nightly loop runs unattended at
+94%. It still refuses when there is genuinely nothing — neither a workbook nor
+a row — because then 11 of the 38 columns a seeded contract names cannot be
+built and every row would abstain.
+
+The cost of the fix is a new quiet failure, and it is measured rather than
+accepted: the database holds whatever was last ingested, so
+`main.market_frames_freshness` reports **MARKET DATA IS STALE** when the newest
+team-game row trails the slate by more than `PROPIQ_MAX_MARKET_LAG_DAYS`
+(default 10). A workbook run is measured too — a stale file on disk is the same
+defect with a different cause.
 
 Scoring rules, so the number can be checked rather than believed:
 
@@ -44,7 +64,7 @@ Scoring rules, so the number can be checked rather than believed:
 | # | Stage | Where | Automated |
 |---|---|---|---|
 | 1 | Player game logs refreshed | `main.refresh_player_logs`, step [3b] | ✅ since 2026-10-09 |
-| 2 | BigDataBall team stats + game markets | step [2] | ❌ **M1** — manual workbook |
+| 2 | BigDataBall team stats + game markets | step [2] | ✅ **from the database** since 2026-10-10 (**M1**: the workbook itself is ingested once, by hand) |
 | 3 | Prop lines (PropLine API) | step [3] | ✅ |
 | 4 | Forward slate from ESPN schedule | `attach_forward_slate` | ✅ |
 | 5 | Panel load + staleness check | step [4], `panel_freshness` | ✅ |
@@ -83,11 +103,11 @@ Scoring rules, so the number can be checked rather than believed:
 
 | ID | Dependency | Cadence | What happens without it | Can it be automated? |
 |---|---|---|---|---|
-| **M1** | **BigDataBall team-stats workbook** (`BIGDATABALL_XLSX`) | the export is per-season and refreshed through the season | **The whole slate fails at step [2].** Not a degraded board — `FileNotFoundError`, a FAILED `pipeline_runs` row, exit 1. The image excludes `data/` and `*.xlsx` deliberately, so a fresh container has none | **No, and it should not be.** It is a licensed third-party export; scraping it would breach the licence this project is careful about. What *was* missing is visibility, now fixed: `railway_healthcheck` reports a missing workbook as FAILURE before the slate runs |
+| **M1** | **BigDataBall team-stats workbook** (`BIGDATABALL_XLSX`) | **once, ever** — and again whenever you want fresher team stats | **Nothing, after the first ingest.** Step [2] reads `team_game_stats` and `game_market_lines` back from Postgres instead. Until 2026-10-10 a missing file was `FileNotFoundError` → FAILED `pipeline_runs` row → exit 1, the whole slate, and the image excludes `data/` and `*.xlsx` deliberately so a fresh container had none. With **neither** a workbook nor a row, step [2] still refuses — and says which | **The fetch: no, and it should not be.** It is a licensed third-party export; scraping it would breach the licence this project is careful about. **The dependency: yes, and now is.** `railway_healthcheck` reports a missing workbook as WARN with the newest row's date when the database can answer, and FAILURE only when it cannot |
 | **D1** | **A seeded model artifact** on the volume | once, then per retrain | Every row abstains. The slate runs, writes projections with no probabilities, dispatches an abstention and **exits 0** | Partly: `check_model_artifact()` reports it at boot and the probe now exits nonzero. The *putting it there* cannot be automated — there is no object-storage client in this repository |
 | **M2** | Model training | manual, periodic | The artifact ages. Nothing fails; the features drift away from the fit | Technically yes, and deliberately not: an unattended retrain that silently replaced the artifact producing today's probabilities is a worse failure than a stale one. §3 G3 |
 | **M3** | Volume mount + seeding | once per environment | §D1 | Mounting: no (platform action). Seeding: `scripts/seed_volume.py --from DIR --apply` |
-| **M4** | `python -m scripts.validate_docker` | once, before the first deploy | The image has still never been built. Everything about its layers is reasoned, not verified | Yes — in CI, with a daemon. Not available in the environment this was developed in |
+| **M4** | `python -m scripts.validate_docker` | once per Dockerfile change | **Done 2026-10-10**: built, 15/15 checks pass, container boots and schedules. One caveat in `docs/deploy_railway.md` §2 | Yes — in CI, with a daemon. Worth wiring now that it is known to pass |
 | **M5** | `python main.py --init-db` | once per database | The ORM tables do not exist; the SQL migrations alone do not create them | Yes, and it is the natural companion to the boot migration step. §3 G1 |
 | **M6** | `scripts/pull_starting_positions.py` | manual | `starting_position` stays NULL. Nothing reads it yet, so nothing breaks | Yes, once a feature consumes it |
 | **—** | Recording a stake | per wager | ROI cannot be computed | **Must stay manual.** PropIQ never places a wager and never writes a stake. Automating this would make the project something it has decided not to be |
@@ -110,16 +130,24 @@ failure mode than one documented manual step. **Proposed**, not done: a
 `--ensure-tables` step in `run_migrations` that runs `create_all` *before* the
 migration transaction, where it is idempotent and additive.
 
-### G2 — a missing workbook is now visible, not solved
+### G2 — ~~a missing workbook is now visible, not solved~~ — SOLVED 2026-10-10
 
-`railway_healthcheck` reports it as FAILURE before the slate, and
-`scripts/start.sh` runs the probe at boot. It is still a FAILURE at 09:00 PT if
-nobody acts between the two. The gap that remains is **nobody is told**: the
-probe writes to the deploy log, and this project's notification channel is
-Discord. **Proposed**: dispatch the probe's FAILURE lines to Discord at boot,
-reusing `src/notify/discord.py` (which already redacts the webhook). Not done
-in this change — a boot-time dispatch that fires on every redeploy loop is its
-own nuisance, and the gating deserves its own design.
+Was: "reports it as FAILURE before the slate … still a FAILURE at 09:00 PT if
+nobody acts between the two." The slate no longer fails on a missing workbook
+at all; see §1. What survives of this gap is narrower and still real:
+
+**Nobody is told when the probe does find something.** The probe writes to the
+deploy log and this project's notification channel is Discord, so a FAILURE at
+boot — an unseeded volume, an empty database, pending migrations — is seen only
+by whoever opens the platform's log pane. **Proposed, not done**: dispatch the
+probe's FAILURE lines to Discord at boot, reusing `src/notify/discord.py`
+(which already redacts the webhook). A boot-time dispatch that fires on every
+redeploy loop is its own nuisance, and the gating deserves its own design.
+
+**And a stale database is now a thing to watch.** `market_frames_freshness`
+logs it and records it in the run's audit row; nothing escalates it. That is
+the same shape as `PANEL IS STALE`, which is also only logged, so it is
+consistent rather than good.
 
 ### G3 — no automated retrain, on purpose
 
@@ -148,12 +176,19 @@ distributed lock to make two replicas safe is a large change to buy redundancy
 for a research job whose worst case is one missing board, and the platform's
 `restartPolicyType: ON_FAILURE` covers the common case.
 
-### G6 — the image has never been built
+### G6 — ~~the image has never been built~~ — CLEARED 2026-10-10
 
-Not an automation gap in the pipeline; an unverified assumption underneath all
-of it. Everything about the layers, the apt list and the install is reasoned
-from dependency metadata. Until `scripts/validate_docker` runs with a daemon,
-"it builds" is a claim.
+It builds, 15/15 `validate_docker` checks pass, and the container boots through
+`scripts/start.sh` and schedules both jobs in Pacific. The apt list was the
+part that turned out to be wrong: the `libgomp1` layer installed a library
+nothing loaded (the xgboost wheel vendors its own) and was the only thing in
+the build that needed the Debian package index. A build-time import assertion
+replaced it.
+
+**What is now the automation gap here**: nothing runs `validate_docker` on a
+Dockerfile change. It was unrunnable before, so there was nothing to wire; it
+passes now, so a CI job is worth having. **Proposed, not done** — it needs a
+daemon in CI and is outside this change.
 
 ---
 
@@ -164,8 +199,9 @@ Everything below the dashed line runs with no person present.
 ```
   MANUAL, ONCE PER ENVIRONMENT            MANUAL, PERIODIC
   ────────────────────────────            ────────────────
-  mount volume at /app/data               BigDataBall workbook  ──┐  (M1)
-  set DATABASE_URL, PROPLINE_API_KEY      train artifacts ────────┤  (M2)
+  mount volume at /app/data               BigDataBall workbook  ──┐  (M1:
+  set DATABASE_URL, PROPLINE_API_KEY        ONCE, then optional)  │
+                                          train artifacts ───────┤  (M2)
       DISCORD_WEBHOOK_URL                 seed_volume --apply ────┤  (M3)
   main.py --init-db                (G1)   validate_docker ────────┘  (M4)
   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
@@ -182,7 +218,9 @@ Everything below the dashed line runs with no person present.
    09:00 PT ────────┤ slate   (misfire grace 1h — a late slate is SKIPPED,
                     │          because projecting a tipped game is worse)
                     │   [1] preflight
-                    │   [2] BigDataBall ──── absent ⇒ WHOLE SLATE FAILS  (M1)
+                    │   [2] market frames ── workbook, else Postgres;
+                    │        neither ⇒ refuses and says so       (M1)
+                    │        stale ⇒ MARKET DATA IS STALE, runs on
                     │   [3] prop lines + forward slate
                     │  [3b] refresh player_game_logs
                     │   [4] panel + freshness (> 3 days ⇒ PANEL IS STALE)

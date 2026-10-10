@@ -352,6 +352,131 @@ def insert_prop_snapshots(df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def _window(slate_date: str | None, lookback_days: int) -> tuple[Any, Any]:
+    """``(lower, upper)`` for a date-bounded load. Shared by the loaders below.
+
+    Factored out when the team-stats and market-line loaders were added rather
+    than copied a third time: the UPPER BOUND IS A LEAKAGE GUARD -- a backfill
+    for an old slate must not see games played after it -- and three copies of
+    a leakage guard is three chances for one of them to drift.
+    """
+    from datetime import date as _date
+    from datetime import timedelta
+
+    if slate_date:
+        upper = _date.fromisoformat(slate_date)
+    else:
+        from src.utils.timezones import pacific_calendar_date
+
+        upper = pacific_calendar_date()
+    return upper - timedelta(days=lookback_days), upper
+
+
+#: What `load_team_game_stats` selects. The DB column names, UNCHANGED, because
+#: `team_strength._normalize_team_games` and `defense.REQUIRED_TEAM_COLS`
+#: already read these exact names -- so this frame is interchangeable with the
+#: one `bigdataball.load_bigdataball_workbook` returns, which is the point.
+TEAM_GAME_STAT_COLS: tuple[str, ...] = (
+    "nba_game_id", "game_date", "team_abbr", "opponent_abbr",
+    "is_home", "is_neutral_site", "points",
+    "fg", "fga", "fg3", "fg3a", "ft", "fta",
+    "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf",
+    "poss", "pace", "off_eff", "def_eff",
+)
+
+#: What `load_game_market_lines` selects: `market_context.PREGAME_SOURCE_COLS`
+#: and NOTHING ELSE. `game_market_lines` also stores closing_spread,
+#: closing_total, closing_odds_raw, halftime_raw and line_movement_1..3 -- every
+#: one of which is information from AFTER the game was priced. `attach_market_
+#: context` happens to project down to the pregame columns, so a `SELECT *`
+#: would not leak today; selecting them anyway would mean the leakage guard was
+#: one refactor away from being the only thing standing between a closing line
+#: and a feature matrix. So they are never read.
+MARKET_LINE_PREGAME_COLS: tuple[str, ...] = (
+    "nba_game_id", "game_date", "team_abbr", "opening_spread", "opening_total",
+)
+
+
+def load_team_game_stats(
+    slate_date: str | None = None, lookback_days: int = 400
+) -> pd.DataFrame:
+    """
+    The team-game frame, from the database rather than the workbook.
+
+    WHY THIS EXISTS. `main.ingest_market_lines` reads the licensed BigDataBall
+    workbook, and a missing path raised `FileNotFoundError` and FAILED THE
+    WHOLE SLATE. The image excludes `data/` and `*.xlsx` deliberately -- a
+    licensed third-party export does not belong in an image layer -- so a
+    deployed container had no workbook and every scheduled run died at step
+    [2], having looked healthy at boot.
+
+    But the workbook's contents are ALREADY IN POSTGRES: `ingest_market_lines`
+    calls `upsert_team_game_stats` on every run that does find one. The data
+    the feature build needs was never actually missing; only the file was. So
+    this reads it back, and the Elo and defence layers get the same column
+    names they already accept.
+
+    Returns an EMPTY frame when nothing matches, so the caller can tell
+    "no workbook AND no history" (a real refusal) from "no workbook" (not one).
+    """
+    lower, upper = _window(slate_date, lookback_days)
+    with session_scope() as session:
+        rows = session.execute(
+            select(TeamGameStat)
+            .where(TeamGameStat.game_date <= upper)
+            .where(TeamGameStat.game_date >= lower)
+            .order_by(TeamGameStat.game_date)
+        ).scalars().all()
+
+    logger.info(
+        "Team-game stats query window: %s to %s (%d day lookback) -> %d rows",
+        lower, upper, lookback_days, len(rows),
+    )
+    if not rows:
+        return pd.DataFrame(columns=list(TEAM_GAME_STAT_COLS))
+    return pd.DataFrame([
+        {col: getattr(r, col) for col in TEAM_GAME_STAT_COLS} for r in rows
+    ])
+
+
+def load_game_market_lines(
+    slate_date: str | None = None, lookback_days: int = 400
+) -> pd.DataFrame:
+    """
+    The market-line frame, pregame columns only, from the database.
+
+    The companion to `load_team_game_stats`; see its docstring for why either
+    exists. Selects `MARKET_LINE_PREGAME_COLS` and refuses to hand back a
+    closing column -- asserted here rather than trusted, because this is a
+    loader that feeds a feature matrix and the whole project turns on
+    `.shift(1)`-grade discipline about what a row could have known.
+    """
+    from src.features.market_context import assert_no_closing_lines
+
+    lower, upper = _window(slate_date, lookback_days)
+    with session_scope() as session:
+        rows = session.execute(
+            select(GameMarketLine)
+            .where(GameMarketLine.game_date <= upper)
+            .where(GameMarketLine.game_date >= lower)
+            .where(GameMarketLine.status == "VALID")
+            .order_by(GameMarketLine.game_date)
+        ).scalars().all()
+
+    logger.info(
+        "Game market lines query window: %s to %s (%d day lookback) -> %d VALID rows",
+        lower, upper, lookback_days, len(rows),
+    )
+    out = (
+        pd.DataFrame(columns=list(MARKET_LINE_PREGAME_COLS)) if not rows
+        else pd.DataFrame([
+            {col: getattr(r, col) for col in MARKET_LINE_PREGAME_COLS} for r in rows
+        ])
+    )
+    assert_no_closing_lines(out.columns)
+    return out
+
+
 def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -> pd.DataFrame:
     """
     Load the player game-log panel that feeds the feature builder.

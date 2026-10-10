@@ -299,25 +299,77 @@ def test_an_artifact_off_the_volume_is_flagged_even_though_it_loads(
     assert statuses["model_artifact_durable[PTS]"] == WARN
 
 
-def test_a_missing_bigdataball_workbook_is_a_failure(monkeypatch, tmp_path):
+def test_a_missing_workbook_is_a_failure_only_when_the_database_is_empty_too(
+    monkeypatch, tmp_path
+):
     """
-    THE BIGGEST SILENT BLOCKER IN A FRESH DEPLOY. `main.ingest_market_lines` is
-    not guarded: a missing path raises FileNotFoundError at step [2] and the
-    WHOLE SLATE fails with a FAILED `pipeline_runs` row. The image excludes
-    `data/` and `*.xlsx` on purpose, so a container nobody uploaded it to fails
-    every scheduled run at 09:00 PT having looked healthy at boot.
+    THIS TEST USED TO ASSERT THE OPPOSITE, and it was right to until
+    2026-10-10. `main.ingest_market_lines` was unguarded, so an absent workbook
+    failed the whole slate and an absent workbook was a FAILURE here.
+    `resolve_market_frames` now falls back to `team_game_stats` and
+    `game_market_lines` -- the workbook's own contents, which every run that
+    finds one upserts -- so an absent file is no longer fatal and reporting it
+    as FAILURE would fail a deployment that works. A probe that outlives the
+    behaviour it probes is this repository's recurring defect in its most
+    expensive form: it sends somebody to fix something that is not broken.
     """
+    import pandas as pd
+
+    import src.db.repository as repo
     from main import ENV_BIGDATABALL
-    from scripts.railway_healthcheck import FAIL, OK, run_checks
+    from scripts.railway_healthcheck import FAIL, OK, WARN, run_checks
+    from src.db.repository import MARKET_LINE_PREGAME_COLS, TEAM_GAME_STAT_COLS
 
     _volume(monkeypatch, tmp_path)
     monkeypatch.setenv(ENV_BIGDATABALL, str(tmp_path / "absent.xlsx"))
-    assert _statuses(run_checks(skip_db=True))["bigdataball_workbook"] == FAIL
 
+    # Nothing anywhere -> FAILURE: resolve_market_frames refuses, correctly.
+    monkeypatch.setattr(
+        repo, "load_team_game_stats",
+        lambda **k: pd.DataFrame(columns=list(TEAM_GAME_STAT_COLS)),
+    )
+    monkeypatch.setattr(
+        repo, "load_game_market_lines",
+        lambda **k: pd.DataFrame(columns=list(MARKET_LINE_PREGAME_COLS)),
+    )
+    assert _statuses(run_checks(skip_db=False))["bigdataball_workbook"] == FAIL
+
+    # The database has it -> WARN, naming how old it is. Not a failure.
+    monkeypatch.setattr(repo, "load_team_game_stats", lambda **k: pd.DataFrame([{
+        **{c: None for c in TEAM_GAME_STAT_COLS},
+        "nba_game_id": "0022600001", "game_date": pd.Timestamp("2026-01-10").date(),
+        "team_abbr": "LAL", "points": 110,
+    }]))
+    monkeypatch.setattr(repo, "load_game_market_lines", lambda **k: pd.DataFrame([{
+        "nba_game_id": "0022600001", "game_date": pd.Timestamp("2026-01-10").date(),
+        "team_abbr": "LAL", "opening_spread": -3.5, "opening_total": 224.5,
+    }], columns=list(MARKET_LINE_PREGAME_COLS)))
+    checks = {c.name: c for c in run_checks(skip_db=False)}
+    assert checks["bigdataball_workbook"].status == WARN
+    assert "2026-01-10" in checks["bigdataball_workbook"].detail, (
+        "the fallback's age is not reported, and nothing else would say it"
+    )
+
+    # A workbook on disk -> OK.
     present = tmp_path / "book.xlsx"
-    present.write_bytes(b"not really a workbook, only its presence is checked")
+    present.write_bytes(b"only its presence is checked here")
     monkeypatch.setenv(ENV_BIGDATABALL, str(present))
     assert _statuses(run_checks(skip_db=True))["bigdataball_workbook"] == OK
+
+
+def test_the_probe_cannot_claim_the_fallback_is_fine_without_looking(
+    monkeypatch, tmp_path
+):
+    """With --skip-db and no workbook, whether the fallback has anything to read
+    is UNKNOWN, and saying OK would be a guess."""
+    from main import ENV_BIGDATABALL
+    from scripts.railway_healthcheck import WARN, run_checks
+
+    _volume(monkeypatch, tmp_path)
+    monkeypatch.setenv(ENV_BIGDATABALL, str(tmp_path / "absent.xlsx"))
+    check = {c.name: c for c in run_checks(skip_db=True)}["bigdataball_workbook"]
+    assert check.status == WARN
+    assert "UNKNOWN" in check.detail
 
 
 def test_the_probe_and_the_orchestrator_read_one_workbook_path(monkeypatch):

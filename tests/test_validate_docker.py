@@ -34,6 +34,7 @@ ENV TZ=Etc/UTC
 WORKDIR /app
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir -e ".[ml,db,deploy]"
+RUN python -c "import xgboost, catboost, sklearn; print('ml extra OK')"
 COPY . .
 RUN useradd --create-home --uid 10001 propiq && chown -R propiq:propiq /app
 USER propiq
@@ -84,10 +85,61 @@ def failures(report: Report) -> list[str]:
 
 # --- the control: a sound tree passes, so the failures below mean something --
 
+#: The one line that now guarantees the ML extra resolved and OpenMP loads.
+IMPORT_CHECK_LINE = (
+    'RUN python -c "import xgboost, catboost, sklearn; print(\'ml extra OK\')"'
+)
+
+
+def test_a_dockerfile_with_no_build_time_import_check_fails(tmp_path):
+    """
+    THE GUARANTEE THAT REPLACED THE apt LAYER. The Dockerfile used to
+    apt-install libgomp1, justified by "without it the image builds and then
+    fails at import". The first real build (2026-10-10) disproved that -- the
+    xgboost wheel vendors its own libgomp -- and the layer was removed, because
+    it installed a library nothing loaded and was the only thing in the build
+    needing the Debian package index.
+
+    What took its place is that import layer, and it is now the ONLY thing
+    asserting at build time that the ML extra resolved and OpenMP loads. A
+    guarantee resting on one line nobody checks is one edit from being gone.
+    """
+    assert IMPORT_CHECK_LINE in GOOD_DOCKERFILE, "the fixture no longer has it"
+    root = tree(tmp_path, dockerfile=GOOD_DOCKERFILE.replace(
+        IMPORT_CHECK_LINE + "\n", ""))
+    assert "the ML extra is import-checked at build time" in failures(run(root))
+
+
+def test_a_comment_naming_the_import_does_not_satisfy_the_check(tmp_path):
+    """
+    The trap this repository has hit five times: a source assertion satisfied
+    by prose ABOUT the code. The check matches RUN instructions only, so the
+    comment explaining why the layer exists cannot stand in for the layer.
+    """
+    root = tree(tmp_path, dockerfile=GOOD_DOCKERFILE.replace(
+        IMPORT_CHECK_LINE, "# " + IMPORT_CHECK_LINE))
+    assert "the ML extra is import-checked at build time" in failures(run(root))
+
+
+def test_importing_only_one_of_the_two_ml_libraries_fails(tmp_path):
+    """Both are installed by the `ml` extra and both are scored with, so
+    checking one would leave the other to fail at the first inference."""
+    root = tree(tmp_path, dockerfile=GOOD_DOCKERFILE.replace(
+        "import xgboost, catboost, sklearn", "import xgboost"))
+    assert "the ML extra is import-checked at build time" in failures(run(root))
+
+
 def test_a_sound_tree_passes_every_check(tmp_path):
     report = run(tree(tmp_path))
     assert not report.failed, report.failed
-    assert len(report.passed) == 7
+    # EIGHT, not seven, since 2026-10-10: the build-time ML import check was
+    # added when the libgomp1 apt layer was removed. The count is pinned so a
+    # check that stops running cannot hide behind the ones that still do --
+    # the names are asserted too, so a change here says WHICH check moved
+    # rather than only that the arithmetic did.
+    assert len(report.passed) == 8, sorted(report.passed)
+    assert "the ML extra is import-checked at build time (['catboost', " \
+           "'sklearn', 'xgboost'])" in report.passed
 
 
 def test_this_repository_s_own_tree_passes(tmp_path):

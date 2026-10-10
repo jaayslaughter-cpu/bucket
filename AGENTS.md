@@ -184,9 +184,15 @@ Kept here on purpose, so nobody reads an ambition as a fact.
 - **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp
   two-way NBA player-prop benchmark feed, so nothing cross-checks the model's
   own number. `docs/go_live_readiness.md`.
-- **The Docker image has never been built.** `scripts/validate_docker.py`
-  preflight passes; the build and the six in-image checks need a machine with
-  a daemon.
+- **The Docker image is built and smoke-tested** (2026-10-10), where this said
+  for months that it never had been. All 15 `scripts/validate_docker.py` checks
+  pass against it, including the two that exist to demonstrate the
+  volume-permission trap, and the container boots through `scripts/start.sh`
+  and schedules both jobs in Pacific. Two things remain true: the base image
+  tag still floats, and the build used a copy of the `Dockerfile` with two
+  extra pip-trust instructions, because this session's egress re-terminates
+  TLS — every other instruction was byte-identical.
+  `docs/deploy_railway.md` §2.
 - **Model artifacts do not survive a redeploy.** They live under
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
   container abstains on every row without looking broken. That one is a
@@ -199,16 +205,21 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   nobody's code can mount a volume, and **there is no boot-time fetch** — no
   S3 client, no storage client, nothing that downloads a model.
   `docs/deploy_railway.md`.
-- **A missing BigDataBall workbook fails the whole slate.** `ingest_market_lines`
-  is not guarded: `FileNotFoundError` at step [2], a FAILED `pipeline_runs` row,
-  exit 1. The image excludes `data/` and `*.xlsx` deliberately — a licensed
-  export does not belong in an image layer — so a container nobody uploaded one
-  to fails every scheduled run. Failing loudly is correct (without the workbook
-  the Elo, `MKT_*` and `DEF_*` columns cannot be built at all, and a quietly
-  narrower matrix would be rejected by the contract check per row instead); what
-  was missing was anyone asking before 09:00 PT, which
-  `scripts/railway_healthcheck.py` now does.
-  `docs/automation_audit_2026-10-09.md` M1.
+- **The BigDataBall workbook is needed once, not per deploy — and a stale one
+  is now the thing to watch.** Fixed 2026-10-10. It *was* true that a missing
+  workbook failed the whole slate: `ingest_market_lines` was unguarded, so
+  `FileNotFoundError` at step [2] became a FAILED `pipeline_runs` row and exit
+  1, and the image excludes `data/` and `*.xlsx` deliberately, so a container
+  nobody uploaded one to failed every scheduled run.
+  `main.resolve_market_frames` now falls back to `team_game_stats` and
+  `game_market_lines` in Postgres — the workbook's own contents, upserted by
+  every run that finds one — because the data was never missing, only the file
+  was. With NEITHER it still refuses, naming both. The cost is a quiet failure
+  in place of a loud one: the database holds whatever was last ingested, so
+  `main.market_frames_freshness` logs MARKET DATA IS STALE past
+  `PROPIQ_MAX_MARKET_LAG_DAYS` (10), for a workbook run as well as a fallback.
+  Automating the *fetch* remains out of the question — it is a licensed export
+  and scraping it would breach the licence. `docs/deploy_railway.md` §3b.
 - **Nothing retrains on a schedule.** The artifact is a fixed snapshot and the
   panel moves daily. Deliberate: an unattended retrain replaces the artifact
   that produced the probabilities now in the database, mid-season, with nobody
