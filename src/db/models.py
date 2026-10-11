@@ -209,6 +209,31 @@ class PlayerGameLog(Base):
     stl: Mapped[int | None] = mapped_column(Integer)
     blk: Mapped[int | None] = mapped_column(Integer)
     tov: Mapped[int | None] = mapped_column(Integer)
+    # PERSONAL fouls, the player's own. TeamGameStat.pf above is a TEAM total
+    # written by src/ingestion/bigdataball: same name, different measurement,
+    # and conflating them would put five players' fouls on one player.
+    # Nullable with no default because a source that does not report fouls
+    # must leave the column unknown -- a zero would read as a clean game, and
+    # src/features/fouls.py builds a minutes-risk signal out of exactly this
+    # number. Both ingests now fetch it (boxscores.COLUMN_MAP and
+    # kaggle_nba.COLUMN_ALIASES); rows written before they did stay null,
+    # because what was never fetched cannot be recovered from what was stored.
+    pf: Mapped[int | None] = mapped_column(Integer)
+    # The position the player STARTED at: G, F or C, NULL for a bench
+    # appearance or a row whose source did not report one. It is NOT the
+    # player's listed position -- a different quantity, filled in for everyone
+    # who dressed rather than for the five who started, and writing it here
+    # would change what src/features/dvp.py's POS_BUCKET means for every row.
+    # src/ingestion/starting_positions.py refuses a payload whose filled count
+    # per team-game is not five, which is what keeps the two apart.
+    #
+    # Filled by a SEPARATE pass from the rest of this table: the league game
+    # log that supplies the counting stats carries no position, so the
+    # traditional box score is fetched per game and
+    # repository.update_starting_positions writes it onto rows that exist.
+    # VARCHAR(1) and a CHECK in migration 008 so a listed position like 'PG'
+    # cannot land here even if the normaliser were bypassed.
+    starting_position: Mapped[str | None] = mapped_column(String(1))
 
     source: Mapped[str] = mapped_column(String(32))
     raw_json: Mapped[dict | None] = mapped_column(JSONB)
@@ -304,7 +329,16 @@ class Projection(Base):
     prob_push: Mapped[float | None] = mapped_column(Float)
     model_version: Mapped[str | None] = mapped_column(String(64))
 
+    # PER ROW, from this row's own prop line. It used to be the slate-wide EV
+    # verdict written onto every row, so one priced prop out of three hundred
+    # labelled all three hundred READY_FOR_EVALUATION -- a claim about a
+    # different row, in the only form this column is ever read.
     market_status: Mapped[str] = mapped_column(String(32), default="DATA_NOT_AVAILABLE")
+    # WHY the status is what it is, because DATA_NOT_AVAILABLE has two causes
+    # that a reader must not confuse: NO LINE reached this row, or a line was
+    # posted and the gate refused it. "Nobody priced this player" and "a price
+    # was posted and could not be de-vigged" are different facts.
+    market_status_reason: Mapped[str | None] = mapped_column(Text)
     ev_per_dollar: Mapped[float | None] = mapped_column(Float)
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -465,4 +499,45 @@ class ParlayLegRow(Base):
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class SchemaMigration(Base):
+    """
+    Which `migrations/*.sql` file has been applied to THIS database.
+
+    WHY THIS EXISTS. Nothing recorded it. The SQL migrations are applied by
+    hand (`psql "$DATABASE_URL" -f migrations/00N_*.sql`), `docs/deploy_railway.md`
+    listed which ones to run, and that list went stale the moment 006 was
+    added — so the only way to know whether a database had 007 was to query
+    for the column it adds and infer. Two databases could disagree and look
+    identical.
+
+    IT IS DEFINED HERE, AS A MODEL, RATHER THAN AS HAND-WRITTEN DDL in the
+    runner. A ledger with two definitions — one in `create_all`, one in the
+    thing that reads it — is the same two-sides-of-one-contract failure this
+    project keeps finding, and SQLAlchemy emitting the DDL per dialect is also
+    what lets the runner be tested against SQLite while production stays
+    Postgres.
+
+    THERE IS NO `migrations/009_schema_migrations.sql`, deliberately. A ledger
+    that itself has to be applied by hand before anything can be recorded
+    reproduces the problem it was built to solve. `migrations.ensure_ledger`
+    creates it with `checkfirst=True`.
+
+    `checksum` is the sha256 of the file's bytes as applied. A file edited
+    after the fact is the one failure mode a version number cannot catch: the
+    database and the repository disagree while every version row looks
+    present and correct. `migrations.detect_drift` reports it and the runner
+    refuses to continue, because re-running an applied migration is not the
+    fix.
+    """
+
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    filename: Mapped[str] = mapped_column(String(128), nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
     )

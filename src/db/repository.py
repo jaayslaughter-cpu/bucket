@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
@@ -35,6 +35,62 @@ from src.db.session import session_scope
 logger = logging.getLogger(__name__)
 
 
+#: Postgres' hard limit on bind parameters in one statement. Not a tunable --
+#: the wire protocol encodes the count as an int16.
+PG_MAX_BIND_PARAMS = 65_535
+
+#: Headroom under that limit. A batch is sized from the widest row in it, and
+#: a row with a JSONB payload counts once, so 80% leaves room for the ledger
+#: columns a statement adds and for a model gaining a column later.
+_BATCH_SAFETY = 0.8
+
+
+def batched(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """
+    Split `rows` so no statement exceeds Postgres' bind-parameter limit.
+
+    THIS WAS A HARD BLOCKER AND NOTHING CAUGHT IT. Every bulk upsert here built
+    ONE `pg_insert(...).values(rows)` for every row it was given, and Postgres
+    refuses a statement with more than 65,535 bind parameters -- the count is
+    an int16 on the wire. So:
+
+      * `upsert_team_game_stats` on a season's BigDataBall workbook (~2,500
+        team-games x 25 columns) failed with "number of parameters must be
+        between 0 and 65535", which is where this was found on 2026-10-10;
+      * `upsert_player_game_logs` is worse and runs EVERY DAY: step [3b] pulls
+        a whole season from `leaguegamelog`, which is tens of thousands of
+        player-games x ~20 columns -- hundreds of thousands of parameters.
+
+    None of these can ever have worked against Postgres at real scale. The unit
+    tests pass a handful of rows, and SQLite's limit is a different number
+    reached a different way, so the suite was green and the only database this
+    project uses was unreachable.
+
+    ONE DEFINITION, not one per call site. Seven functions had the same shape
+    and would have grown seven batch sizes; the conflict clauses genuinely
+    differ between them, so those stay local and only the batching rule is
+    shared.
+
+    Batch size comes from the WIDEST row, not the first: `_records` produces
+    dicts from a DataFrame so they are uniform today, but a caller that builds
+    them by hand (`record_pending_prop_results`) can omit a key, and sizing off
+    a narrow first row would put a wide one over the limit.
+    """
+    if not rows:
+        return []
+    widest = max(len(r) for r in rows)
+    per_batch = max(1, int(PG_MAX_BIND_PARAMS * _BATCH_SAFETY) // max(1, widest))
+    if len(rows) <= per_batch:
+        return [rows]
+    out = [rows[i:i + per_batch] for i in range(0, len(rows), per_batch)]
+    logger.info(
+        "Splitting %d rows of %d columns into %d statements (<= %d rows each) "
+        "to stay under Postgres' %d bind-parameter limit.",
+        len(rows), widest, len(out), per_batch, PG_MAX_BIND_PARAMS,
+    )
+    return out
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     """DataFrame -> list of dicts with NaN converted to None (Postgres NULL).
 
@@ -50,20 +106,46 @@ def upsert_team_game_stats(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        stmt = pg_insert(TeamGameStat).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "team_abbr"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "points", "pace", "off_eff", "def_eff", "poss",
-                    "opponent_abbr", "is_home", "is_neutral_site",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: a season's workbook is ~2,500 team-games x 25 columns, over
+        # Postgres' 65,535 bind-parameter limit in one statement. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(TeamGameStat).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "team_abbr"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "points", "pace", "off_eff", "def_eff", "poss",
+                        "opponent_abbr", "is_home", "is_neutral_site",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d team-game stat rows", len(rows))
     return len(rows)
+
+
+def _normalised_start_positions(values: Any) -> pd.Series | None:
+    """``STARTING_POSITION`` as G/F/C/None, or None when the caller has none.
+
+    Returning None (rather than an all-null Series) when the column is absent
+    keeps `pd.DataFrame` from inventing a column name, and is what
+    `df.get("STARTING_POSITION")` already gives back for a panel built before
+    the archive ingest asked for it.
+
+    Normalising here and not just trusting the caller is the point: the
+    archive emits G/F/C, the live writer emits G/F/C, and anything else --
+    'PG', 'F-C', a stray empty string -- is a LISTED position or a bench row,
+    neither of which is a starting designation. migration 008's CHECK would
+    reject the first and silently accept the second.
+    """
+    if values is None:
+        return None
+    from src.features.dvp import normalise_bucket
+
+    return pd.Series(
+        [normalise_bucket(v) for v in values], index=values.index, dtype="object"
+    )
 
 
 def upsert_player_game_logs(df: pd.DataFrame) -> int:
@@ -108,6 +190,22 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         "stl": pd.to_numeric(df.get("STL"), errors="coerce"),
         "blk": pd.to_numeric(df.get("BLK"), errors="coerce"),
         "tov": pd.to_numeric(df.get("TOV"), errors="coerce"),
+        # Personal fouls. df.get returns None when the panel has no PF, and
+        # pd.to_numeric(None) gives an all-null column -- which is the right
+        # answer for a panel built before boxscores.COLUMN_MAP started asking
+        # the endpoint for PF: the row leaves pf unknown rather than claiming
+        # zero. See migrations/006_player_game_log_fouls.sql for why a zero
+        # default would be a fabrication rather than a convenience.
+        "pf": pd.to_numeric(df.get("PF"), errors="coerce"),
+        # The position the player STARTED at, when the caller has one. The
+        # league game log does not carry it, so on the live path this is
+        # normally absent here and filled later by
+        # update_starting_positions(); a panel rebuilt from the Kaggle
+        # archive DOES carry it, and then it rides along with the rest.
+        # Normalised rather than trusted: a listed position reaching this
+        # column would change what POS_BUCKET means downstream, and
+        # migration 008's CHECK only admits G, F and C.
+        "starting_position": _normalised_start_positions(df.get("STARTING_POSITION")),
         "source": "nba_stats_leaguegamelog",
     })
 
@@ -119,28 +217,125 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         raise ValueError("DATA_NOT_AVAILABLE: no player-log rows survived date parsing")
 
     # Integer columns in the model; a float like 30.0 would be rejected.
-    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov"):
+    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf"):
         work[col] = work[col].astype("Int64")
 
     work["is_neutral_site"] = _lookup_neutral_site(work)
 
     rows = _records(work)
     with session_scope() as session:
-        stmt = pg_insert(PlayerGameLog).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "nba_player_id"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "player_name", "game_date", "season", "team_abbr",
-                    "opponent_abbr", "is_home", "is_neutral_site", "minutes",
-                    "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "source",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: step [3b] pulls a WHOLE SEASON from leaguegamelog --
+        # tens of thousands of player-games x ~20 columns, hundreds of
+        # thousands of bind parameters. This runs every day and could never
+        # have worked against Postgres at that size. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(PlayerGameLog).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "nba_player_id"],
+                set_={
+                    c: stmt.excluded[c]
+                    # EVERY written column belongs here. `pf` did not, which
+                    # made the docstring's "re-ingesting a season corrects rows"
+                    # false for it alone: a season ingested before
+                    # boxscores.COLUMN_MAP asked for PF kept pf NULL forever, and
+                    # the only way to find out was to re-ingest and look. Found
+                    # while adding starting_position by the same route, which
+                    # would have inherited the same silence.
+                    for c in (
+                        "player_name", "game_date", "season", "team_abbr",
+                        "opponent_abbr", "is_home", "is_neutral_site", "minutes",
+                        "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf",
+                        "starting_position", "source",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d player game-log rows", len(rows))
     return len(rows)
+
+
+def update_starting_positions(frame: pd.DataFrame) -> dict[str, int]:
+    """
+    Write starting positions onto player-game rows that already exist.
+
+    THIS IS THE WRITER src/features/dvp.py WAS WAITING FOR. The league game
+    log that fills the rest of `player_game_logs` carries no position, so the
+    traditional box score is pulled separately
+    (src/ingestion/starting_positions.py) and joined on here by
+    (nba_game_id, nba_player_id).
+
+    IT UPDATES AND NEVER INSERTS, which is the whole design. A position with
+    no game log behind it would be a row with a bucket and no statistics --
+    enough to shift an opponent's allowed-to-bucket average while contributing
+    nothing to it. Those rows are COUNTED and reported as `unmatched` rather
+    than created or dropped silently, because a large unmatched count means
+    the ids disagree between two endpoints and that is worth seeing.
+
+    Returns {"matched", "updated", "unmatched", "cleared"}. `cleared` counts
+    rows the caller asked to set to NULL: permitted, because a corrected
+    payload that moves a player from starter to bench has to be able to say
+    so, and a writer that could only ever fill would make that uncorrectable.
+    """
+    required = {"GAME_ID", "PLAYER_ID", "STARTING_POSITION"}
+    if frame is None or frame.empty:
+        logger.warning(
+            "No starting positions to write — refusing to report a successful write"
+        )
+        return {"matched": 0, "updated": 0, "unmatched": 0, "cleared": 0}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"DATA_NOT_AVAILABLE: starting positions missing {sorted(missing)}"
+        )
+
+    work = pd.DataFrame({
+        "nba_game_id": frame["GAME_ID"].astype(str),
+        "nba_player_id": frame["PLAYER_ID"].astype(str),
+        "starting_position": _normalised_start_positions(frame["STARTING_POSITION"]),
+    }).drop_duplicates(subset=["nba_game_id", "nba_player_id"], keep="last")
+
+    wanted = {
+        (r["nba_game_id"], r["nba_player_id"]): r["starting_position"]
+        for r in _records(work)
+    }
+
+    matched = updated = cleared = 0
+    with session_scope() as session:
+        stmt = select(PlayerGameLog).where(
+            PlayerGameLog.nba_game_id.in_({g for g, _ in wanted})
+        )
+        for row in session.execute(stmt).scalars().all():
+            key = (row.nba_game_id, row.nba_player_id)
+            if key not in wanted:
+                continue
+            matched += 1
+            value = wanted[key]
+            if row.starting_position == value:
+                continue
+            if value is None:
+                cleared += 1
+            row.starting_position = value
+            updated += 1
+
+    unmatched = len(wanted) - matched
+    if unmatched:
+        logger.warning(
+            "starting positions: %d of %d (game, player) pairs had no "
+            "player_game_logs row and were NOT inserted — a bucket without a "
+            "box score would move an opponent's allowed average without "
+            "contributing to it",
+            unmatched, len(wanted),
+        )
+    logger.info(
+        "Starting positions: %d matched, %d updated, %d cleared, %d unmatched",
+        matched, updated, cleared, unmatched,
+    )
+    return {
+        "matched": matched,
+        "updated": updated,
+        "unmatched": unmatched,
+        "cleared": cleared,
+    }
 
 
 def _lookup_neutral_site(work: pd.DataFrame) -> pd.Series:
@@ -190,18 +385,21 @@ def upsert_market_lines(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        stmt = pg_insert(GameMarketLine).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "team_abbr", "source"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "opening_spread", "opening_total", "closing_spread",
-                    "closing_total", "moneyline", "status",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: one row per team-game from the same workbook as the
+        # team stats above. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(GameMarketLine).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "team_abbr", "source"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "opening_spread", "opening_total", "closing_spread",
+                        "closing_total", "moneyline", "status",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Upserted %d market line rows", len(rows))
     return len(rows)
 
@@ -216,9 +414,164 @@ def insert_prop_snapshots(df: pd.DataFrame) -> int:
         return 0
     rows = _records(df)
     with session_scope() as session:
-        session.execute(pg_insert(PropLineSnapshot).values(rows))
+        # Batched: a full board of posted props across markets. See `batched`.
+        for batch in batched(rows):
+            session.execute(pg_insert(PropLineSnapshot).values(batch))
     logger.info("Inserted %d prop line snapshots", len(rows))
     return len(rows)
+
+
+def _window(slate_date: str | None, lookback_days: int) -> tuple[Any, Any]:
+    """``(lower, upper)`` for a date-bounded load. Shared by the loaders below.
+
+    Factored out when the team-stats and market-line loaders were added rather
+    than copied a third time: the UPPER BOUND IS A LEAKAGE GUARD -- a backfill
+    for an old slate must not see games played after it -- and three copies of
+    a leakage guard is three chances for one of them to drift.
+    """
+    from datetime import date as _date
+    from datetime import timedelta
+
+    if slate_date:
+        upper = _date.fromisoformat(slate_date)
+    else:
+        from src.utils.timezones import pacific_calendar_date
+
+        upper = pacific_calendar_date()
+    return upper - timedelta(days=lookback_days), upper
+
+
+#: What `load_team_game_stats` selects. The DB column names, UNCHANGED, because
+#: `team_strength._normalize_team_games` and `defense.REQUIRED_TEAM_COLS`
+#: already read these exact names -- so this frame is interchangeable with the
+#: one `bigdataball.load_bigdataball_workbook` returns, which is the point.
+TEAM_GAME_STAT_COLS: tuple[str, ...] = (
+    "nba_game_id", "game_date", "team_abbr", "opponent_abbr",
+    "is_home", "is_neutral_site", "points",
+    "fg", "fga", "fg3", "fg3a", "ft", "fta",
+    "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf",
+    "poss", "pace", "off_eff", "def_eff",
+)
+
+#: What `load_game_market_lines` selects: `market_context.PREGAME_SOURCE_COLS`
+#: and NOTHING ELSE. `game_market_lines` also stores closing_spread,
+#: closing_total, closing_odds_raw, halftime_raw and line_movement_1..3 -- every
+#: one of which is information from AFTER the game was priced. `attach_market_
+#: context` happens to project down to the pregame columns, so a `SELECT *`
+#: would not leak today; selecting them anyway would mean the leakage guard was
+#: one refactor away from being the only thing standing between a closing line
+#: and a feature matrix. So they are never read.
+MARKET_LINE_PREGAME_COLS: tuple[str, ...] = (
+    "nba_game_id", "game_date", "team_abbr", "opening_spread", "opening_total",
+)
+
+
+def newest_team_game_date() -> str | None:
+    """
+    The newest ``game_date`` in ``team_game_stats``, as ``YYYY-MM-DD``, or None.
+
+    WHY A SCALAR AND NOT `load_team_game_stats().max()`. The callers that want
+    this -- the dispatch gate and the healthcheck -- want one date to compare an
+    artifact's `train_end_date` against. Loading a 400-day frame to take one
+    maximum is a table scan and a dataframe for a number the index already has,
+    and on a worker that runs it nightly it is a cost with nothing behind it.
+
+    NO WINDOW IS APPLIED HERE, unlike every other reader in this module. The
+    windows elsewhere are LEAKAGE GUARDS: they stop a feature from seeing past
+    the slate it predicts. This number is not a feature and never reaches a
+    model -- it answers "how far does our data run", which an upper bound would
+    be precisely the wrong way to ask.
+
+    None rather than a raise when the table is empty: a first deploy with no
+    ingest yet is not a broken one, and the caller treats an unknown date as an
+    axis it cannot measure rather than as a pass.
+    """
+    with session_scope() as session:
+        newest = session.execute(select(func.max(TeamGameStat.game_date))).scalar()
+    if newest is None:
+        logger.info("No team-game rows, so there is no newest game date.")
+        return None
+    return str(newest)[:10]
+
+
+def load_team_game_stats(
+    slate_date: str | None = None, lookback_days: int = 400
+) -> pd.DataFrame:
+    """
+    The team-game frame, from the database rather than the workbook.
+
+    WHY THIS EXISTS. `main.ingest_market_lines` reads the licensed BigDataBall
+    workbook, and a missing path raised `FileNotFoundError` and FAILED THE
+    WHOLE SLATE. The image excludes `data/` and `*.xlsx` deliberately -- a
+    licensed third-party export does not belong in an image layer -- so a
+    deployed container had no workbook and every scheduled run died at step
+    [2], having looked healthy at boot.
+
+    But the workbook's contents are ALREADY IN POSTGRES: `ingest_market_lines`
+    calls `upsert_team_game_stats` on every run that does find one. The data
+    the feature build needs was never actually missing; only the file was. So
+    this reads it back, and the Elo and defence layers get the same column
+    names they already accept.
+
+    Returns an EMPTY frame when nothing matches, so the caller can tell
+    "no workbook AND no history" (a real refusal) from "no workbook" (not one).
+    """
+    lower, upper = _window(slate_date, lookback_days)
+    with session_scope() as session:
+        rows = session.execute(
+            select(TeamGameStat)
+            .where(TeamGameStat.game_date <= upper)
+            .where(TeamGameStat.game_date >= lower)
+            .order_by(TeamGameStat.game_date)
+        ).scalars().all()
+
+    logger.info(
+        "Team-game stats query window: %s to %s (%d day lookback) -> %d rows",
+        lower, upper, lookback_days, len(rows),
+    )
+    if not rows:
+        return pd.DataFrame(columns=list(TEAM_GAME_STAT_COLS))
+    return pd.DataFrame([
+        {col: getattr(r, col) for col in TEAM_GAME_STAT_COLS} for r in rows
+    ])
+
+
+def load_game_market_lines(
+    slate_date: str | None = None, lookback_days: int = 400
+) -> pd.DataFrame:
+    """
+    The market-line frame, pregame columns only, from the database.
+
+    The companion to `load_team_game_stats`; see its docstring for why either
+    exists. Selects `MARKET_LINE_PREGAME_COLS` and refuses to hand back a
+    closing column -- asserted here rather than trusted, because this is a
+    loader that feeds a feature matrix and the whole project turns on
+    `.shift(1)`-grade discipline about what a row could have known.
+    """
+    from src.features.market_context import assert_no_closing_lines
+
+    lower, upper = _window(slate_date, lookback_days)
+    with session_scope() as session:
+        rows = session.execute(
+            select(GameMarketLine)
+            .where(GameMarketLine.game_date <= upper)
+            .where(GameMarketLine.game_date >= lower)
+            .where(GameMarketLine.status == "VALID")
+            .order_by(GameMarketLine.game_date)
+        ).scalars().all()
+
+    logger.info(
+        "Game market lines query window: %s to %s (%d day lookback) -> %d VALID rows",
+        lower, upper, lookback_days, len(rows),
+    )
+    out = (
+        pd.DataFrame(columns=list(MARKET_LINE_PREGAME_COLS)) if not rows
+        else pd.DataFrame([
+            {col: getattr(r, col) for col in MARKET_LINE_PREGAME_COLS} for r in rows
+        ])
+    )
+    assert_no_closing_lines(out.columns)
+    return out
 
 
 def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -> pd.DataFrame:
@@ -291,6 +644,20 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             "STL": r.stl,
             "BLK": r.blk,
             "TOV": r.tov,
+            # Personal fouls, so src/features/fouls.py reaches the LIVE path
+            # and not only a panel rebuilt from the archive. NULL on every row
+            # written before boxscores.COLUMN_MAP began requesting PF, which
+            # is what the layer's abstention is for: it can abstain on a null
+            # and cannot on a zero, which is why migration 006 writes neither
+            # a default nor a backfill.
+            "PF": r.pf,
+            # The starting position, so src/features/dvp.py reaches the LIVE
+            # path and not only a panel rebuilt from the archive. NULL on
+            # every row written before starting_positions.py ran, and NULL on
+            # every bench appearance after it -- the layer cannot tell those
+            # apart and does not need to, since both mean "no bucket from
+            # this game".
+            "STARTING_POSITION": r.starting_position,
         }
         for r in result
     ])
@@ -333,28 +700,37 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
             "prob_under": r.get("PROB_UNDER"),
             "prob_push": r.get("PROB_PUSH"),
             "market_status": r.get("MARKET_STATUS", "DATA_NOT_AVAILABLE"),
+            # The reason behind the status, kept beside it rather than folded
+            # into `notes`: notes already carries the under/push refusal, and
+            # two unrelated reasons in one free-text column cannot be read
+            # apart. See Projection.market_status_reason.
+            "market_status_reason": r.get("MARKET_STATUS_REASON"),
             "notes": r.get("NOTES"),
         })
 
     with session_scope() as session:
-        stmt = pg_insert(Projection).values(rows)
-        # Conflict on the projection's natural identity so re-running a slate
-        # overwrites its own rows. Keying on run_id (a per-execution UUID)
-        # meant the target never matched and every re-run doubled the table.
-        # run_id is refreshed too, recording which run last wrote each row.
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["nba_game_id", "player_name", "market"],
-            set_={
-                c: stmt.excluded[c]
-                for c in (
-                    "run_id", "baseline_projection", "fatigue_multiplier",
-                    "fatigue_notes", "final_projection", "line", "prob_over",
-                    "prob_under", "prob_push",
-                    "model_version", "market_status", "ev_per_dollar", "notes",
-                )
-            },
-        )
-        session.execute(stmt)
+        # Batched: the slate's own output -- one row per (player, market)
+        # it scored. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(Projection).values(batch)
+            # Conflict on the projection's natural identity so re-running a slate
+            # overwrites its own rows. Keying on run_id (a per-execution UUID)
+            # meant the target never matched and every re-run doubled the table.
+            # run_id is refreshed too, recording which run last wrote each row.
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "player_name", "market"],
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (
+                        "run_id", "baseline_projection", "fatigue_multiplier",
+                        "fatigue_notes", "final_projection", "line", "prob_over",
+                        "prob_under", "prob_push",
+                        "model_version", "market_status", "market_status_reason",
+                        "ev_per_dollar", "notes",
+                    )
+                },
+            )
+            session.execute(stmt)
     logger.info("Persisted %d projections for run %s", len(rows), run_id)
     return len(rows)
 
@@ -398,12 +774,19 @@ PROP_RESULT_REFRESHABLE = (
 )
 
 
-def pending_prop_result_statement(rows: list[dict[str, Any]]):
+def pending_prop_result_statement(batch: list[dict[str, Any]]):
     """
     The upsert for PENDING prop_results, built but not executed.
 
     Separated from the execution so the conflict guard can be tested by
     compiling the SQL, which needs no database.
+
+    TAKES A BATCH, and the parameter is named for it. This deliberately returns
+    exactly ONE statement, so it is the one place in this module that must not
+    loop -- `record_pending_prop_results` batches around it. Naming the
+    parameter `rows` made it indistinguishable from the seven call sites that
+    DID need batching, which is how six of them could have been fixed and the
+    seventh missed.
 
     ON CONFLICT DO UPDATE ... WHERE prop_results.outcome_status = 'PENDING'.
     The WHERE is the load-bearing part: without it, re-running a slate after
@@ -411,7 +794,7 @@ def pending_prop_result_statement(rows: list[dict[str, Any]]):
     model's newer numbers, silently rewriting history in the one table whose
     job is to record what was predicted BEFORE the game.
     """
-    stmt = pg_insert(PropResult).values(rows)
+    stmt = pg_insert(PropResult).values(batch)
     return stmt.on_conflict_do_update(
         constraint="uq_prop_result",
         set_={c: stmt.excluded[c] for c in PROP_RESULT_REFRESHABLE},
@@ -433,7 +816,13 @@ def record_pending_prop_results(rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     with session_scope() as session:
-        session.execute(pending_prop_result_statement(rows))
+        # Batched here rather than in `pending_prop_result_statement`, which
+        # exists to be COMPILED by a test without a database and must keep
+        # returning exactly one statement for that. See `batched`: one row per
+        # recommended prop, so a wide slate crosses Postgres' bind-parameter
+        # limit the same way the projections do.
+        for batch in batched(rows):
+            session.execute(pending_prop_result_statement(batch))
     logger.info("Recorded %d pending prop result(s) for grading", len(rows))
     return len(rows)
 
@@ -500,16 +889,19 @@ def upsert_parlay_ledger(table: str, frame: pd.DataFrame) -> int:
     model = _PARLAY_MODELS[table]
     rows = [_parlay_payload(table, r) for r in _records(frame)]
     with session_scope() as session:
-        stmt = pg_insert(model).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=list(_PARLAY_KEYS[table]),
-            set_={
-                c: stmt.excluded[c]
-                for c in (*_PARLAY_PROMOTED[table], "record")
-                if c not in _PARLAY_KEYS[table]
-            },
-        )
-        session.execute(stmt)
+        # Batched: a ledger write is small today, and the limit is not a
+        # function of intent: one definition covers all of these. See `batched`.
+        for batch in batched(rows):
+            stmt = pg_insert(model).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=list(_PARLAY_KEYS[table]),
+                set_={
+                    c: stmt.excluded[c]
+                    for c in (*_PARLAY_PROMOTED[table], "record")
+                    if c not in _PARLAY_KEYS[table]
+                },
+            )
+            session.execute(stmt)
     return len(rows)
 
 

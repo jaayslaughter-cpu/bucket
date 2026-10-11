@@ -19,7 +19,8 @@ the original named six docs and a module that do not exist here. See
 | Bet sizes are advisory metadata, never bound to an execution script | same; `recommended_units` is read-only output |
 | No EV, CLV or stake unless the market is real | `src/quant/contracts.py:187` — `context.status != "VALID"` returns a verdict with a reason and no number |
 | Pick'em multipliers are not valid two-way EV | `src/quant/dfs_payouts.py`, `src/quant/dfs_entry.py` — a payout multiple is a payout multiple; a one-sided benchmark is refused outright |
-| No card is published on an uncalibrated model | `src/quant/publication_gate.py:150` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
+| No card is published on an uncalibrated model | `src/quant/publication_gate.py:160` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
+| No board is published from a stale model artifact | `src/quant/publication_gate.py:378` `artifact_freshness_gate()`; `src/models/artifact_freshness.py:177` ages it on file age AND training recency, and an artifact whose age cannot be read withholds too |
 | No claim words | `tests/test_publication_gate.py:66` fails the build if `"guaranteed"`, `"profitable"`, `"lock"` or `"certain"` appears in the disclaimer |
 | Nothing fabricated — lines, odds, props, stats, injuries, endpoints, probabilities, history | explicit `DATA_NOT_AVAILABLE` statuses throughout; see §4 |
 | **NBA only. No NCAA, no other sport.** | `main.py:4`; `src/ingestion/propline.py:15` refuses every non-NBA league the provider offers |
@@ -42,7 +43,7 @@ the first question about any change, not the last.
 
 - Every grouped rolling feature is `.shift(1)` within player-season. No
   exceptions, including the ones that look harmless.
-- `src/features/builder.py:570` `assert_no_lookahead()` runs over whatever the
+- `src/features/builder.py:665` `assert_no_lookahead()` runs over whatever the
   layers produced and is not optional.
 - Season grouping comes from `src/features/season.py`. A layer that needs a
   season key and has none derives it **privately** and drops it before
@@ -58,7 +59,13 @@ A/B. A column correlating above ~0.97 with one the model already reads is a
 second copy of one number, and this repository has excluded whole feature
 families on that basis — see `src/models/labels.py` `_EXCLUDED_AS_REDUNDANT`
 and `docs/minutes_weighted.md` for a layer that is built, measurable, and
-deliberately not shipped.
+deliberately not shipped. `docs/fouls_and_dvp.md` records the opposite
+lesson: both of those layers were first judged impossible here because no
+panel on disk carried a foul count or a position, and both columns were in the
+source file all along. It also records what happens when the A/B comes back
+the other way — DvP improved REB's Brier on every one of four folds for four
+of five models — and that a measured win is still not a shipped feature while
+the column is null in production.
 
 ---
 
@@ -81,7 +88,7 @@ scripts/             CLI, A/B harnesses, audits, docker validation
 
 **Dependency direction is downward:** ingestion → features → models → quant →
 settlement/notify. One standing exception, and it is narrow:
-`src/features/builder.py:74` and `src/features/fatigue_load.py:284` each do a
+`src/features/builder.py:121` and `src/features/fatigue_load.py:284` each do a
 function-local `from src.models.compare import load_comparison_config` to read
 `config/model_comparison.yaml`. That is a config reader, not model code, and
 the import is lazy so it cannot create a cycle at import time. Do not widen it:
@@ -124,7 +131,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:97`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:241`
 `load_master_guideline()` returns `None` and the caller logs it. The
 `.example` beside it is a placeholder shape, not the real file.
 
@@ -169,6 +176,16 @@ python -m scripts.validate_docker --preflight    # no daemon needed
 
 Kept here on purpose, so nobody reads an ambition as a fact.
 
+- **The suite proves less about Postgres than it looks.** Every unit test that
+  touches the database runs against **SQLite**, and on 2026-10-10 a first real
+  Postgres run found four defects that each had a passing test: a `%` in a
+  migration comment made the file unapplicable, two migrations commit their own
+  transactions, the SQL migrations ALTER tables only `create_all` makes (so no
+  first deploy could boot), and all seven bulk upserts exceeded the 65,535
+  bind-parameter limit — one of them daily. All four are fixed and their
+  properties are now asserted directly rather than through the driver
+  (`tests/test_postgres_only_defects.py`), but **there is still no Postgres in
+  CI**, which is what would have caught them.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.
@@ -178,23 +195,102 @@ Kept here on purpose, so nobody reads an ambition as a fact.
 - **Every entry resolves to `ProbabilitySource.MODEL`.** There is no sharp
   two-way NBA player-prop benchmark feed, so nothing cross-checks the model's
   own number. `docs/go_live_readiness.md`.
-- **The Docker image has never been built.** `scripts/validate_docker.py`
-  preflight passes; the build and the six in-image checks need a machine with
-  a daemon.
+- **The Docker image is built and smoke-tested** (2026-10-10), where this said
+  for months that it never had been. All 15 `scripts/validate_docker.py` checks
+  pass against it, including the two that exist to demonstrate the
+  volume-permission trap, and the container boots through `scripts/start.sh`
+  and schedules both jobs in Pacific. The base image is pinned by digest as of
+  2026-10-11 — and by its MANIFEST LIST digest, verified with `docker manifest
+  inspect` to cover amd64 and arm64, so the pin does not break a developer on
+  Apple Silicon. **What remains true** is narrower: the committed `Dockerfile`
+  has not been built. Only a copy of it has, carrying two extra pip-trust
+  instructions, because the session that built it routes HTTPS through a
+  CA-re-terminating proxy — every other instruction was byte-identical.
+  `docs/deploy_railway.md` §2.
 - **Model artifacts do not survive a redeploy.** They live under
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh
   container abstains on every row without looking broken. That one is a
   platform step, not a code change. `docs/railway_deployment_audit.md` §4.
-- **Nothing produces rows for a slate that has not been played.**
-  `load_player_panel` reads completed box scores and `_filter_to_slate` keeps
-  only the slate date, so a 09:00 PT run finds nothing and exits 0.
-  `espn_schedule.load_slate` and `espn_availability.fetch_roster` both exist,
-  are tested, and are imported by no production module.
-  `docs/integration_audit.md` §1.1.
-- **A scheduled run cannot find a model even when one is trained.**
-  `score_prob_over` defaults to `models/xgb_prop_over.json`; `train-stats`
-  writes to `data/external/model_runs/comparison/`; `run_slate` passes no
-  `--model` and no variable overrides it. `docs/integration_audit.md` §2.1.
+  Since 2026-10-09 it is at least no longer *silent*:
+  `resolve_state_root()` in `src/utils/volume.py` reads
+  `RAILWAY_VOLUME_MOUNT_PATH` and reports how it chose,
+  `scripts/seed_volume.py` does the copying, and
+  `scripts/railway_healthcheck.py` exits NONZERO on an unseeded volume. Still
+  nobody's code can mount a volume, and **there is no boot-time fetch** — no
+  S3 client, no storage client, nothing that downloads a model.
+  `docs/deploy_railway.md`.
+- **The BigDataBall workbook is needed once, not per deploy — and a stale one
+  is now the thing to watch.** Fixed 2026-10-10. It *was* true that a missing
+  workbook failed the whole slate: `ingest_market_lines` was unguarded, so
+  `FileNotFoundError` at step [2] became a FAILED `pipeline_runs` row and exit
+  1, and the image excludes `data/` and `*.xlsx` deliberately, so a container
+  nobody uploaded one to failed every scheduled run.
+  `main.resolve_market_frames` now falls back to `team_game_stats` and
+  `game_market_lines` in Postgres — the workbook's own contents, upserted by
+  every run that finds one — because the data was never missing, only the file
+  was. With NEITHER it still refuses, naming both. The cost is a quiet failure
+  in place of a loud one: the database holds whatever was last ingested, so
+  `main.market_frames_freshness` logs MARKET DATA IS STALE past
+  `PROPIQ_MAX_MARKET_LAG_DAYS` (10), for a workbook run as well as a fallback.
+  Automating the *fetch* remains out of the question — it is a licensed export
+  and scraping it would breach the licence. `docs/deploy_railway.md` §3b.
+- **Nothing retrains on a schedule.** The artifact is a fixed snapshot and the
+  panel moves daily. Deliberate: an unattended retrain replaces the artifact
+  that produced the probabilities now in the database, mid-season, with nobody
+  looking at the validation numbers. `docs/automation_audit_2026-10-09.md` G3.
+- **A trained artifact is not a committed one.** PTS, REB and AST were fitted
+  on the archive panel on 2026-10-09 and verified end to end — the resolver
+  finds them, `check_model_artifact()` reports INFO rather than the demo
+  ERROR, and all three score a production-shaped frame with probabilities in
+  [0, 1]. But `data/**` is gitignored, so they live only where they were
+  trained: a fresh checkout and a fresh container both have none and abstain
+  on every row. Seeding is a volume or object-storage step, not a commit.
+  `docs/deploy_railway.md` §4b.
+- **More training history beats recency, measured.** Narrowing the window to
+  recent seasons was requested, measured and declined: the ensemble's
+  calibrated Brier degrades monotonically as the start date moves forward
+  (0.24098 full window → 0.24268 from 2024-10, one common validation window).
+  What was wrong was the 2/3-by-row split, which threw away a third of
+  whatever history it was given; `train-stats --train-end` separates the two
+  and the seed now fits 200,678 rows to 2026-01-13 rather than 142,713 to
+  2023-12-13. One window, one market, one fold — the direction is established
+  and the magnitudes are indicative. `docs/training_window.md`.
+- **A forward slate rests on who played recently, not on a roster.**
+  `src/pipeline/forward_slate.py` builds tonight's rows from each team's recent
+  appearances in the panel, which misses a player returning from a long
+  absence. `espn_availability.fetch_roster` would cover that and needs the
+  name crosswalk this repository does not have. `docs/integration_audit.md`
+  §1.1.
+- **No database has had the migration runner pointed at it.**
+  `src/db/migrations.py` and `scripts/migrate_db.py` apply `migrations/*.sql`
+  in version order and record each file with a checksum in
+  `schema_migrations`, and the ledger logic is tested against SQLite — but no
+  Postgres is reachable from this checkout, so the one thing still unverified
+  is whether Postgres accepts the hand-written DDL in files 002-008. Only
+  Postgres can answer that. `python -m scripts.migrate_db` reports before it
+  applies anything.
+- **The panel refreshes itself, but it has never fetched here.** The slate
+  pulls this season's player game logs and upserts them before reading the
+  panel (`main.refresh_player_logs`, step [3b]), and `main.panel_freshness`
+  measures how far the newest completed game trails the slate whatever the
+  refresh reported. Neither has run against a reachable nba.com from this
+  checkout, because the proxy denies it — the failure path is exercised, the
+  success path is tested only against injected payloads.
+- **No starting position has ever been pulled.** `player_game_logs` has the
+  column (migration 008), `src/ingestion/starting_positions.py` is the writer
+  and `scripts/pull_starting_positions.py` is the pass that runs it, but
+  stats.nba.com is denied at this environment's proxy, so the column is NULL
+  on every row today and `src/features/dvp.py` still abstains on a live panel.
+  Two things follow and neither is a code change: the pull has to run where
+  nba.com is reachable, and the one claim the fixtures cannot settle — that
+  `boxscoretraditionalv3.position` is a STARTING position and not a listed one
+  — is enforced as a refusal on the first real response rather than assumed.
+  `docs/fouls_and_dvp.md` section 5.
+- **DvP is measured on REB and wired for nothing.** The arm was run on an
+  archive panel, which is not the panel production builds from. Wiring it
+  needs the pull above to have happened and the arm re-run on a panel that
+  carries real positions. `src/models/labels.py`, `docs/fouls_and_dvp.md`
+  section 3a.
 - **Every board row carries today's date whatever game it describes.**
   `research_slate_from_predictions` drops the detail row's `game_date` and
   stamps its `slate_date` parameter instead. `docs/integration_audit.md` §2.2.

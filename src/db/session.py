@@ -87,6 +87,59 @@ def get_database_url() -> str:
     return _ensure_sslmode(url)
 
 
+#: Recycle a pooled connection after this many seconds. SQLAlchemy's default is
+#: -1, which is "never": the deployed worker runs a slate at 09:00 PT and a
+#: settlement at 03:30 PT, so a pooled connection sits idle for eighteen hours
+#: between them. ``pool_pre_ping`` already discards one the server has closed,
+#: at the cost of a round trip per checkout; recycling means the long-dead ones
+#: are not kept in the first place. Thirty minutes is comfortably inside
+#: Supabase's pooler idle timeout.
+POOL_RECYCLE_SECONDS = 1800
+
+#: How long to wait for a free slot in the pool before raising. SQLAlchemy's
+#: default is 30 and this restates it, because the value that matters is below.
+POOL_TIMEOUT_SECONDS = 30
+
+#: TCP/handshake timeout, passed to libpq. WITHOUT THIS THERE IS NO BOUND. A
+#: pooler host that accepts the connection and never completes the handshake —
+#: a region outage, a security group change — blocks the caller indefinitely,
+#: and the slate job has no timeout of its own: it would hang past every tip-off
+#: and be noticed as a worker that produced nothing, with no error anywhere.
+#: Ten seconds is long for a pooler in the same region and short enough that the
+#: failure is reported while the slate still has hours of runway.
+CONNECT_TIMEOUT_SECONDS = 10
+
+#: Shows up in ``pg_stat_activity`` and Supabase's dashboard, so a connection
+#: can be attributed to this worker rather than to "psycopg".
+APPLICATION_NAME = "propiq-worker"
+
+
+def _int_env(name: str, default: int, *, low: int, high: int) -> int:
+    """
+    A bounded integer env var, defaulting rather than raising.
+
+    Same contract as ``main._int_env`` and ``scheduler_worker._int_env``, and
+    deliberately a third small implementation rather than an import: this
+    module is the bottom of the dependency graph — the migration runner and
+    every repository import it — and reaching up to the orchestrator or the
+    worker to parse a number would make `src.db` depend on APScheduler.
+
+    BOUNDED, not merely positive. ``max_overflow=0`` is legitimate (no bursting
+    past ``pool_size``) so the floor cannot be 1, and a mistyped
+    ``pool_size=500`` against a Supabase pooler would exhaust the project's
+    connection allowance for every other client — which presents as unrelated
+    things failing, not as a bad value here.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if low <= value <= high else default
+
+
 def get_engine(echo: bool = False) -> Engine:
     global _engine
     if _engine is None:
@@ -94,8 +147,22 @@ def get_engine(echo: bool = False) -> Engine:
             get_database_url(),
             echo=echo,
             pool_pre_ping=True,   # survives Supabase pooler dropping idle connections
-            pool_size=5,
-            max_overflow=5,
+            pool_size=_int_env("PROPIQ_DB_POOL_SIZE", 5, low=1, high=50),
+            max_overflow=_int_env("PROPIQ_DB_MAX_OVERFLOW", 5, low=0, high=50),
+            pool_recycle=_int_env(
+                "PROPIQ_DB_POOL_RECYCLE", POOL_RECYCLE_SECONDS,
+                low=60, high=86_400,
+            ),
+            pool_timeout=_int_env(
+                "PROPIQ_DB_POOL_TIMEOUT", POOL_TIMEOUT_SECONDS, low=1, high=300,
+            ),
+            connect_args={
+                "connect_timeout": _int_env(
+                    "PROPIQ_DB_CONNECT_TIMEOUT", CONNECT_TIMEOUT_SECONDS,
+                    low=1, high=120,
+                ),
+                "application_name": APPLICATION_NAME,
+            },
         )
     return _engine
 

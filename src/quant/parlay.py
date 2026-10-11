@@ -206,6 +206,16 @@ def correlation_matrix(
     semi-definiteness by the caller — an inconsistent set of pairwise
     correlations describes no joint distribution at all, and silently
     "repairing" it would invent dependence nobody supplied.
+
+    THAT STANCE IS UNCHANGED, and it left a real gap: pairwise estimates fitted
+    on separate buckets are routinely jointly impossible (A +0.75 with both B
+    and C while B and C are -0.40 has a negative eigenvalue), so the ticket
+    could not be priced at all and the refusal asked a human to reconcile the
+    numbers by hand. ``quant.psd_repair.nearest_correlation`` is that
+    reconciliation, as an EXPLICIT step: a caller passing ``repair=True`` to
+    ``copula_joint_probability`` gets the projection, the distance it moved, and
+    a refusal when that distance is larger than a projection should paper over.
+    Nothing repairs by default.
     """
     size = len(leg_ids)
     matrix = np.eye(size, dtype=float)
@@ -223,7 +233,11 @@ def correlation_matrix(
 
 
 def _validated_cholesky(
-    correlation: np.ndarray | None, n_legs: int, n_sims: int
+    correlation: np.ndarray | None,
+    n_legs: int,
+    n_sims: int,
+    *,
+    repair: bool | float = False,
 ) -> np.ndarray:
     """
     Check a correlation matrix and return its Cholesky factor.
@@ -232,6 +246,13 @@ def _validated_cholesky(
     cannot drift apart on it. Every refusal below was measured, not assumed --
     see the comments inline. A second copy of this validator would be a second
     chance to get one of them wrong.
+
+    ``repair`` is OFF by default, so this function refuses an inconsistent
+    matrix exactly as it did before. ``True`` projects it to the nearest valid
+    correlation matrix and logs how far it moved; a float additionally shrinks
+    toward the identity by that weight first. Either way
+    ``psd_repair.nearest_correlation`` refuses when the projection would move an
+    entry further than a projection should.
     """
     if correlation is None:
         correlation = np.eye(n_legs, dtype=float)
@@ -292,13 +313,25 @@ def _validated_cholesky(
             "not a correlation."
         )
 
+    if repair is not False and n_legs > 1:
+        from src.quant.psd_repair import PsdRepairError, nearest_correlation
+
+        shrinkage = float(repair) if not isinstance(repair, bool) else 0.0
+        try:
+            repaired = nearest_correlation(correlation, shrinkage=shrinkage)
+        except PsdRepairError as exc:
+            raise ParlayError(f"Correlation matrix cannot be repaired: {exc}") from exc
+        correlation = repaired.matrix
+
     try:
         chol = np.linalg.cholesky(correlation)
     except np.linalg.LinAlgError as exc:
         raise ParlayError(
             "Correlation matrix is not positive semi-definite, so it describes "
             f"no joint distribution: {exc}. Check the pairwise values against "
-            "each other rather than adjusting one in isolation."
+            "each other rather than adjusting one in isolation, or pass "
+            "repair=True to project it onto the nearest valid matrix and be "
+            "told how far that moved it."
         ) from exc
 
     n = int(n_sims)
@@ -321,6 +354,7 @@ def copula_joint_probability(
     *,
     n_sims: int = DEFAULT_SIMULATIONS,
     seed: int = DEFAULT_SEED,
+    repair: bool | float = False,
 ) -> tuple[float, float]:
     """
     P(all legs win) under a Gaussian copula. Returns (probability, stderr).
@@ -336,7 +370,7 @@ def copula_joint_probability(
     for leg in legs:
         leg.validate()
     thresholds = norm.ppf([float(leg.model_prob) for leg in legs])
-    chol = _validated_cholesky(correlation, len(legs), n_sims)
+    chol = _validated_cholesky(correlation, len(legs), n_sims, repair=repair)
     n = int(n_sims)
 
     rng = np.random.default_rng(seed)
@@ -358,6 +392,7 @@ def hit_count_distribution(
     *,
     n_sims: int = DEFAULT_SIMULATIONS,
     seed: int = DEFAULT_SEED,
+    repair: bool | float = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     P(exactly k legs win) for k = 0..n, under the same Gaussian copula.
@@ -380,7 +415,7 @@ def hit_count_distribution(
     for leg in legs:
         leg.validate()
     thresholds = norm.ppf([float(leg.model_prob) for leg in legs])
-    chol = _validated_cholesky(correlation, len(legs), n_sims)
+    chol = _validated_cholesky(correlation, len(legs), n_sims, repair=repair)
     n = int(n_sims)
 
     rng = np.random.default_rng(seed)

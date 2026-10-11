@@ -31,11 +31,13 @@ FOUR VALUES, NOT TWO:
   UNKNOWN      ESPN has a row it could not bucket. Not the same as healthy.
   UNVERIFIED   the feed did not answer. Not the same as healthy either.
 
-MATCHING IS EXACT ON A NORMALISED NAME, NEVER FUZZY. This repository has a
-dedicated fuzzy crosswalk (``ingestion/id_crosswalk.py``); a second naive one
-here could withhold the wrong player, and withholding the wrong player is worse
-than withholding nobody. ESPN athlete ids would be better, but a projections
-frame carries NBA ids, so a name is what the two sides share.
+MATCHING IS EXACT ON A NORMALISED NAME, NEVER FUZZY — and the normaliser is
+now ``ingestion.id_crosswalk.normalise_player_name``, shared so both sides
+reduce to the same form. It is deterministic, not a score: that module measured
+that no fuzzy cutoff separates ``Jokic``/``Jokić`` (81.8-91.7) from
+``Jalen``/``Jaylen`` Williams (96.6), and withholding the wrong player is worse
+than withholding nobody. ESPN athlete ids would be better still, but a
+projections frame carries NBA ids, so a name is what the two sides share.
 
 DOUBTFUL IS TREATED AS UNAVAILABLE, inherited from
 ``espn_availability.UNAVAILABLE``. Doubtful players mostly do not play, and the
@@ -105,8 +107,25 @@ class ScratchFilterResult:
 
 
 def _normalise(name: Any) -> str:
-    """Lowercase, collapse whitespace. Deliberately not a fuzzy match."""
-    return " ".join(str(name or "").strip().lower().split())
+    """
+    The crosswalk's canonical form, shared so both sides agree.
+
+    THIS USED TO BE LOWERCASE AND WHITESPACE ONLY, and that was a silent safety
+    failure rather than a cosmetic gap. ESPN publishes ``Nikola Jokić`` and the
+    NBA panel carries ``Nikola Jokic``; those do not compare equal, so a player
+    ESPN reported OUT was labelled AVAILABLE and the filter withheld nobody —
+    demonstrated before the fix, and pinned by
+    ``tests/test_name_crosswalk.py``.
+
+    ``id_crosswalk.normalise_player_name`` strips diacritics, dots and
+    apostrophes and spaces out hyphens. It is still EXACT and still not fuzzy,
+    which is what the note at the top of this module requires: no score
+    threshold can separate ``Jokic``/``Jokić`` from ``Jalen``/``Jaylen``, and
+    that module carries the measurement.
+    """
+    from src.ingestion.id_crosswalk import normalise_player_name
+
+    return normalise_player_name(name)
 
 
 def apply_scratch_filter(

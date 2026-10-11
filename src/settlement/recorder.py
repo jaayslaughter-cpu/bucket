@@ -125,14 +125,23 @@ def _int_or_none(value: Any) -> int | None:
     return int(number) if number is not None else None
 
 
-def _line_lookup(prop_lines: pd.DataFrame | None) -> dict[tuple[str, str], dict[str, Any]]:
+def _line_lookup(
+    prop_lines: pd.DataFrame | None,
+    projections: pd.DataFrame | None = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
     """
     Exact (player_name, market) -> the posted line's own fields.
 
-    EXACT MATCH ONLY, mirroring ``main._attach_prop_lines``. This repository has
-    a dedicated fuzzy crosswalk (``ingestion/id_crosswalk.py``); a second, naive
-    one here could join one player's price onto another's prediction, which in a
-    settlement ledger is not a near miss but a wrong record.
+    STILL AN EXACT MATCH, mirroring ``main._attach_prop_lines`` — but the
+    board's names are first rewritten to the panel's canonical form by
+    ``ingestion.id_crosswalk``, which is deterministic rather than fuzzy. A
+    score high enough to catch ``Jokic``/``Jokić`` also catches
+    ``Jalen``/``Jaylen`` Williams, and in a settlement ledger that is a wrong
+    record rather than a near miss, so a name resolving to two players is
+    refused instead.
+
+    ``projections`` supplies the canonical side. Omitted, the names are used as
+    they arrive, which is the behaviour this function had before.
     """
     if prop_lines is None or getattr(prop_lines, "empty", True):
         return {}
@@ -144,6 +153,12 @@ def _line_lookup(prop_lines: pd.DataFrame | None) -> dict[tuple[str, str], dict[
             missing,
         )
         return {}
+
+    if projections is not None and not getattr(projections, "empty", True):
+        from src.ingestion.id_crosswalk import apply_name_map, resolve_board_names
+
+        name_map, _report = resolve_board_names(prop_lines, projections)
+        prop_lines = apply_name_map(prop_lines, name_map)
 
     frame = prop_lines.dropna(subset=list(LINE_JOIN_KEYS))
     # keep="last" matches _attach_prop_lines: the most recent capture wins.
@@ -175,7 +190,7 @@ def pending_prop_result_rows(
     if projections is None or projections.empty:
         return report
 
-    lookup = _line_lookup(prop_lines)
+    lookup = _line_lookup(prop_lines, projections)
 
     for _, row in projections.iterrows():
         player = _text(row.get("PLAYER_NAME"))

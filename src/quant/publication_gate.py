@@ -99,6 +99,11 @@ class PublicationVerdict:
     n_scored: int | None = None
     evidence_as_of: str | None = None
     evidence_age_days: float | None = None
+    # The FITTED ARTIFACT's own age, which is a different claim from the
+    # calibration evidence's age above: evidence can be days old and describe a
+    # model that is months old. `artifact_freshness_gate` fills these.
+    artifact_as_of: str | None = None
+    artifact_age_days: float | None = None
     checks: tuple[str, ...] = field(default_factory=tuple)
     disclaimer: str = PUBLICATION_DISCLAIMER
 
@@ -118,6 +123,11 @@ class PublicationVerdict:
             "EVIDENCE_AGE_DAYS": (
                 round(self.evidence_age_days, 2)
                 if self.evidence_age_days is not None else None
+            ),
+            "ARTIFACT_AS_OF": self.artifact_as_of,
+            "ARTIFACT_AGE_DAYS": (
+                round(self.artifact_age_days, 2)
+                if self.artifact_age_days is not None else None
             ),
             "CHECKS_PASSED": list(self.checks),
             "DISCLAIMER": self.disclaimer,
@@ -354,3 +364,154 @@ def calibration_gate(
         evidence_as_of=stamp_iso, evidence_age_days=age_days,
         checks=tuple(checks),
     )
+
+
+# --------------------------------------------------------------- artifact age
+
+#: Statuses `models.artifact_freshness` reports. Spelled out here rather than
+#: imported so this module keeps taking a plain mapping and does not acquire a
+#: dependency on `src.models` — the same reason `calibration_gate` takes a
+#: report mapping instead of importing `settlement.calibration`.
+FRESHNESS_OK = "OK"
+
+
+def artifact_freshness_gate(
+    freshness: Mapping[str, Any] | None,
+    *,
+    probability_source: ProbabilitySource = ProbabilitySource.MODEL,
+) -> PublicationVerdict:
+    """
+    Decide whether a figure may be published GIVEN THE AGE OF THE MODEL BEHIND IT.
+
+    ``freshness`` is a ``models.artifact_freshness.artifact_freshness``-shaped
+    mapping — ``status``, ``artifact_age_days``, ``saved_at_utc``,
+    ``training_lag_days`` and ``reasons``.
+
+    WHY THIS IS A SECOND GATE AND NOT A CHECK INSIDE THE FIRST. The calibration
+    gate asks whether the model has been shown to be right lately; this one asks
+    whether the artifact being scored with is the one that was shown that. Both
+    can pass while the other fails, and the pair that matters is the dangerous
+    one: a recent calibration report describing a months-old artifact reads as
+    full evidence and is evidence about a model nobody is running any more.
+
+    THE MARKET-GROUNDED CARVE-OUT IS THE SAME ONE, FOR THE SAME REASON. A
+    probability de-vigged from a sharp two-way price does not rest on our model,
+    so our model's age is not a fact about it. Gating it here would withhold a
+    figure on the strength of something it never used.
+
+    ``None`` is a refusal, not a pass. "We could not establish this artifact's
+    age" and "this artifact is current" are what a silent pass would merge.
+    """
+    source = ProbabilitySource(probability_source)
+
+    if source not in MODEL_DEPENDENT_SOURCES:
+        return PublicationVerdict(
+            status=PUBLISH_ALLOWED,
+            probability_source=source,
+            reason=(
+                "Probabilities came from a de-vigged two-way sharp benchmark, so "
+                "no fitted artifact of ours stands behind them and its age is not "
+                "a fact about them."
+            ),
+            checks=("source_is_market_grounded",),
+        )
+
+    if not freshness:
+        return PublicationVerdict(
+            status=PUBLISH_WITHHELD,
+            probability_source=source,
+            reason=(
+                "No artifact age was supplied. A model-sourced probability whose "
+                "model could be of any age is not publishable — an unknown age is "
+                "not a young one."
+            ),
+        )
+
+    status = str(freshness.get("status") or "")
+    age_days = freshness.get("artifact_age_days")
+    try:
+        age_days = float(age_days) if age_days is not None else None
+    except (TypeError, ValueError):
+        age_days = None
+    saved_at = freshness.get("saved_at_utc")
+    saved_at = str(saved_at) if saved_at else None
+    reasons = tuple(str(r) for r in (freshness.get("reasons") or ()))
+
+    if status != FRESHNESS_OK:
+        return PublicationVerdict(
+            status=PUBLISH_WITHHELD,
+            probability_source=source,
+            reason=(
+                f"The fitted artifact is {status or 'of unknown freshness'}. "
+                + (" ".join(reasons) if reasons else "No reason was recorded.")
+            ),
+            artifact_as_of=saved_at,
+            artifact_age_days=age_days,
+            checks=tuple(str(c) for c in (freshness.get("checks") or ())),
+        )
+
+    # An OK status with NO axis actually measured is not an OK artifact. The
+    # freshness dict reports which axes ran precisely so this cannot be read as
+    # a pass; reading `status` alone would turn "nothing was checked" into
+    # "everything passed".
+    checks = tuple(str(c) for c in (freshness.get("checks") or ()))
+    if not checks:
+        return PublicationVerdict(
+            status=PUBLISH_WITHHELD,
+            probability_source=source,
+            reason=(
+                "The artifact reported no staleness failure, but no freshness "
+                "check actually ran on it — so nothing was established. "
+                + (" ".join(reasons) if reasons else "")
+            ).strip(),
+            artifact_as_of=saved_at,
+            artifact_age_days=age_days,
+        )
+
+    lag = freshness.get("training_lag_days")
+    return PublicationVerdict(
+        status=PUBLISH_ALLOWED,
+        probability_source=source,
+        reason=(
+            f"The artifact was saved {age_days:.1f} day(s) ago"
+            if age_days is not None
+            else "The artifact's age was established"
+        )
+        + (
+            f" and trained through games {lag} day(s) behind the newest we hold"
+            if lag is not None
+            else " (training recency not measured)"
+        )
+        + ". Being current is not a claim that it is right.",
+        artifact_as_of=saved_at,
+        artifact_age_days=age_days,
+        checks=checks,
+    )
+
+
+def first_refusal(*verdicts: PublicationVerdict | None) -> PublicationVerdict:
+    """
+    The first withheld verdict, or the last allowed one.
+
+    WHY A COMBINER RATHER THAN MORE ARGUMENTS ON ONE GATE. Each gate reads a
+    different kind of evidence and each names its own refusal, and a dispatch
+    path has exactly one slot to put a verdict in. Folding them into one
+    function would make every caller pass evidence it may not hold; folding them
+    with `and` would lose the reason, which is the part a reader in a Discord
+    channel needs — "withheld" with no figure and no cause is indistinguishable
+    from a broken pipeline.
+
+    Raises on an empty call rather than inventing permission: there is no
+    sensible default verdict, and returning an allowed one would publish on the
+    strength of having been asked nothing.
+    """
+    present = [v for v in verdicts if v is not None]
+    if not present:
+        raise ValueError(
+            "DATA_NOT_AVAILABLE: first_refusal needs at least one verdict. "
+            "An empty call has no answer, and 'allowed' is not a safe guess."
+        )
+    for verdict in present:
+        if not verdict.allowed:
+            return verdict
+    return present[-1]

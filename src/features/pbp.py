@@ -15,11 +15,23 @@ games and never his current one. ``attach_pbp_rolling_features`` does the
 shifting; ``summarise_player_games`` deliberately returns same-game values
 and is not safe to join directly.
 
-COVERAGE IS A REAL LIMIT. The logs supplied cover 2025-26 only. A feature
-that exists in the validation window and nowhere earlier is not a feature,
-it is the shape of a leak, and compare_models_on_panel now refuses one.
-Anything built here can only be trained and evaluated inside the seasons the
-logs actually cover.
+COVERAGE IS A REAL LIMIT, AND THIS PARAGRAPH USED TO STATE IT WRONGLY. It
+said "The logs supplied cover 2025-26 only". More parts were supplied since,
+and counted on the real panel on 2026-10-05, PBP_RIM_RATE_L10 is populated for
+2021-22 through 2025-26 and absent before: 126,624 of 214,381 rows, 59.1%.
+The principle stands either way -- a feature that exists in the validation
+window and nowhere earlier is not a feature, it is the shape of a leak, and
+compare_models_on_panel refuses one -- but the span is five seasons, not one.
+
+AND FOR SHOT MIX SPECIFICALLY, src/features/shot_zones.py NOW COVERS MORE.
+That layer reads the NBA's own shotchartdetail export, reaches 97.8% of the
+panel, and agrees with the columns here at |r| 0.92-0.998 where both exist. It
+does NOT replace this module: PBP_ASSISTED_RATE needs the event log's second
+player, PBP_GARBAGE_SHOT_SHARE needs the running score and clock, and
+PBP_GAME_PACE needs possessions -- a shot table has none of the three. Those
+three are this module's alone. The shot-mix columns are the ones with a wider
+alternative, and which family a model should read is a feature_ab measurement
+rather than a decision taken here.
 
 THE LOG IS COMPLETE, AND THAT WAS CHECKED. Against the box score on the
 1,220 games it shares with the panel:

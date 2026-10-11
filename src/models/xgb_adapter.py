@@ -382,6 +382,15 @@ class XGBoostAdapter:
             **self._meta_extra,
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
         }
+        # WHICH LIBRARIES PRODUCED THIS. The volume survives a redeploy and the
+        # image does not, so a `docker build` months later can pair a fresh
+        # major version of XGBoost with this booster. Nothing recorded that, so
+        # the pairing was undetectable: it either loaded with possibly-changed
+        # behaviour or raised something opaque from the C++ layer.
+        from src.models.runtime_versions import META_KEY as _VERSIONS_KEY
+        from src.models.runtime_versions import collect as _collect_versions
+
+        meta[_VERSIONS_KEY] = _collect_versions()
         model_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         logger.info("Saved XGBoost artifact to %s", model_path)
 
@@ -398,6 +407,16 @@ class XGBoostAdapter:
                 "train and save before scoring; will not substitute another model."
             )
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        # Majors only, and it warns rather than refusing: a warning beside a
+        # working booster is useful, refusing to score tonight's slate over a
+        # version string is not. An artifact saved before this block existed
+        # has no `runtime_versions` key and is reported as nothing, not as a
+        # mismatch.
+        from src.models.runtime_versions import META_KEY as _VERSIONS_KEY
+        from src.models.runtime_versions import warn_on_mismatch
+
+        warn_on_mismatch(meta.get(_VERSIONS_KEY), str(model_path))
         self.feature_cols = list(meta["feature_cols"])
         self.target_market = meta.get("target_market", self.target_market)
         self.model_version = meta.get("model_version", self.model_version)

@@ -299,3 +299,147 @@ def test_an_explicit_argument_beats_the_environment(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_LEDGER_BACKEND, "postgres")
     store = open_parlay_log(tmp_path, ledger="csv")
     assert isinstance(store.backend, CsvLedgerBackend)
+
+
+# --- the boot check -------------------------------------------------------
+#
+# The Dockerfile already sets PROPIQ_PARLAY_LEDGER=postgres (line 73, with a
+# comment saying why), so the IMAGE never relied on the csv default. What was
+# missing was a RUNTIME check: a deploy that does not build from that
+# Dockerfile — a buildpack, a plain `python scheduler_worker.py` on a VM, or
+# the variable overridden in a platform dashboard — gets the CSV ledger on an
+# ephemeral filesystem and loses every ticket at the next redeploy, leaving no
+# trace at all, because the CSV writes succeed.
+
+
+def _check(monkeypatch, ledger: str | None, database: bool) -> dict:
+    import scheduler_worker as worker
+    import src.db.session as session
+
+    if ledger is None:
+        monkeypatch.delenv("PROPIQ_PARLAY_LEDGER", raising=False)
+    else:
+        monkeypatch.setenv("PROPIQ_PARLAY_LEDGER", ledger)
+    if database:
+        monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/x")
+    else:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        for var in ("PGHOST", "PGUSER", "PGPASSWORD", "PGDATABASE", "PGPORT"):
+            monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(session, "_engine", None, raising=False)
+    return worker.check_parlay_ledger()
+
+
+def test_postgres_with_a_database_is_the_deployed_shape(monkeypatch, caplog):
+    with caplog.at_level("INFO"):
+        out = _check(monkeypatch, "postgres", database=True)
+    assert out["status"] == "OK" and out["ledger"] == "postgres"
+    assert "survive a redeploy" in caplog.text
+
+
+def test_csv_with_a_database_configured_is_an_error_not_a_warning(monkeypatch, caplog):
+    """
+    THE CASE THIS CHECK EXISTS FOR. A configured database means this is almost
+    certainly a deployment, and a deployment on the CSV ledger loses its
+    tickets at the next redeploy. At WARNING it would be read as acceptable.
+    """
+    with caplog.at_level("WARNING"):
+        out = _check(monkeypatch, "csv", database=True)
+    assert out["status"] == "EPHEMERAL"
+    assert any(r.levelname == "ERROR" for r in caplog.records), (
+        "reported below ERROR, which reads as acceptable"
+    )
+    # The message has to name the consequence and the remedy, not just the state.
+    assert "ephemeral" in caplog.text.lower()
+    assert "PROPIQ_PARLAY_LEDGER=postgres" in caplog.text
+
+
+def test_an_unset_variable_is_treated_exactly_as_csv(monkeypatch):
+    """Unset is the csv default, which is the configuration most likely to
+    reach a container by accident."""
+    assert _check(monkeypatch, None, database=True)["status"] == "EPHEMERAL"
+
+
+def test_postgres_without_a_database_is_reported_before_the_first_ticket(
+    monkeypatch, caplog
+):
+    with caplog.at_level("WARNING"):
+        out = _check(monkeypatch, "postgres", database=False)
+    assert out["status"] == "UNUSABLE"
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    assert "first parlay write will fail" in caplog.text
+
+
+def test_csv_with_no_database_is_a_local_run_and_not_an_error(monkeypatch, caplog):
+    """
+    A guard that shouted at every local run would be switched off. csv with no
+    Postgres is legitimately local; naming the consequence is all that is owed.
+    """
+    with caplog.at_level("INFO"):
+        out = _check(monkeypatch, "csv", database=False)
+    assert out["status"] == "LOCAL"
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert "will not survive" in caplog.text
+
+
+def test_a_typo_is_reported_rather_than_silently_becoming_csv(monkeypatch, caplog):
+    with caplog.at_level("WARNING"):
+        out = _check(monkeypatch, "postgress", database=True)
+    assert out["ledger"] is None and "error" in out
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_the_check_never_takes_the_boot_down(monkeypatch):
+    """
+    Same policy as check_model_artifact: a worker that refuses to start cannot
+    report anything, and settlement is still useful with a broken ledger
+    setting.
+    """
+    import scheduler_worker as worker
+    import src.quant.parlay_log as parlay_log
+
+    monkeypatch.setattr(
+        parlay_log, "resolve_ledger_choice",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    out = worker.check_parlay_ledger()
+    assert out["ledger"] is None and "boom" in out["error"]
+
+
+def test_it_reports_the_backend_open_parlay_log_would_actually_open(monkeypatch):
+    """
+    THE BOOT CHECK AND THE STORE MUST NOT DISAGREE. Two separate readings of
+    one env var is a defect this project has found twice; both now go through
+    `resolve_ledger_choice`.
+    """
+    from src.quant.parlay_log import open_parlay_log, resolve_ledger_choice
+
+    for value, expected in (("csv", CsvLedgerBackend), ("postgres", PostgresLedgerBackend)):
+        monkeypatch.setenv("PROPIQ_PARLAY_LEDGER", value)
+        assert resolve_ledger_choice() == value
+        assert isinstance(open_parlay_log("data/external/parlay_log").backend, expected)
+
+
+def test_the_worker_runs_the_check_at_boot():
+    """A check nothing calls is the state the Dockerfile comment was already in."""
+    import inspect
+
+    import scheduler_worker as worker
+
+    source = inspect.getsource(worker)
+    main_fn = source[source.index("\ndef main("):]
+    assert "check_parlay_ledger()" in main_fn, (
+        "the ledger check exists but boot never calls it"
+    )
+
+
+def test_the_dockerfile_still_sets_the_durable_backend():
+    """
+    The image's own answer, pinned. If this line is dropped the boot check
+    above turns ERROR on the deployed shape — but a test that says so by name
+    fails faster and explains itself.
+    """
+    from pathlib import Path
+
+    dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text()
+    assert "ENV PROPIQ_PARLAY_LEDGER=postgres" in dockerfile

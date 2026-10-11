@@ -139,6 +139,30 @@ def synthetic_panel(n_players: int = 4, n_games: int = 24) -> pd.DataFrame:
                 "TOV": float(rng.integers(0, 5)),
                 "FGA": float(rng.integers(8, 24)),
                 "FTA": float(rng.integers(0, 9)),
+                # Personal fouls, so the fouls layer runs in this check too.
+                # load_player_panel returns PF, and
+                # test_the_synthetic_panel_carries_what_the_repository_returns
+                # requires this fixture to carry everything it returns -- that
+                # guard is what caught the column being added without it.
+                "PF": float(rng.integers(0, 6)),
+                # The starting position. This comment used to read "there is
+                # deliberately no STARTING_POSITION: the live panel has none",
+                # and that was true until migration 008 and
+                # src/ingestion/starting_positions.py gave the live path a
+                # writer. load_player_panel returns it now, so the same guard
+                # that caught PF caught this one too -- which is the second
+                # time that assertion has earned its place.
+                #
+                # One position per player, stable across his games, because
+                # dvp.assign_position_buckets takes the expanding MODAL of a
+                # player's PRIOR starts and a fixture that reassigned him
+                # nightly would exercise the tie-breaking rather than the
+                # layer. This fixture has one player per team-game, so it
+                # cannot and does not stand in for the five-starters
+                # semantics gate in starting_positions.py -- that gate is
+                # tested against payload fixtures in
+                # tests/test_starting_positions.py.
+                "STARTING_POSITION": ["G", "F", "C", "G"][p % 4],
             })
     return pd.DataFrame(rows)
 
@@ -201,15 +225,30 @@ def section_1(report: Report) -> pd.DataFrame | None:
     g = guard(report, "every registered feature layer actually adds columns")
 
     def _layers() -> None:
+        # IN SEQUENCE, CUMULATIVELY, WHICH IS HOW build_feature_matrix RUNS
+        # THEM. This loop used to hand each layer the RAW panel in isolation,
+        # which cannot evaluate a layer whose inputs another layer produces:
+        # halflife.pra_rollups reads PTS_HL, which halflife.shrink creates one
+        # position earlier, so in isolation it correctly added nothing and was
+        # reported inert.
+        #
+        # It had been passing for the wrong reason. That layer also re-derived
+        # the raw PRA label, which WAS a new column on the bare fixture, so the
+        # check saw an addition and said nothing -- and the addition it saw was
+        # a duplicate write that has since been removed as a defect in its own
+        # right. A check satisfied by the thing it should have flagged is worse
+        # than one that fails.
+        working = panel.copy()
         inert = []
         for label, attach in _ADDITIVE_FEATURE_LAYERS:
-            before = set(panel.columns)
+            before = set(working.columns)
             try:
-                out = attach(panel.copy())
+                out = attach(working.copy())
             except Exception as exc:  # noqa: BLE001
                 inert.append(f"{label} (raised {type(exc).__name__})")
                 continue
             added = set(out.columns) - before
+            working = out
             if not added:
                 inert.append(f"{label} (added nothing)")
                 continue
@@ -313,22 +352,26 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
     g = guard(report, "the path scoring reads and the path training writes agree")
 
     def _paths() -> None:
-        from main import MODEL_ARTIFACT_DEFAULT
-        scoring = ROOT / MODEL_ARTIFACT_DEFAULT
-        trained = sorted(art_dir.glob("xgboost_*.json")) if art_dir.exists() else []
-        if scoring.exists():
+        from main import ENV_MODEL, resolve_model_artifact
+        path, how = resolve_model_artifact()
+        if path is not None:
             report.ok("the path scoring reads and the path training writes agree",
-                      f"{MODEL_ARTIFACT_DEFAULT} exists")
+                      f"resolved {path} by {how}")
             return
-        report.bad(
-            "the path scoring reads and the path training writes agree",
-            f"score_prob_over defaults to {MODEL_ARTIFACT_DEFAULT} (absent); "
-            f"train-stats writes to {art_dir.relative_to(ROOT) if art_dir.exists() else art_dir}"
-            f" ({len(trained)} xgboost_*.json there). main.py needs --model to "
-            "bridge them, and scheduler_worker.run_slate calls main.main([]) with "
-            "no arguments — so a scheduled run scores nothing even when a model "
-            "has been trained.",
-        )
+        trained = sorted(art_dir.glob("xgboost_*.json")) if art_dir.exists() else []
+        if trained:
+            report.bad(
+                "the path scoring reads and the path training writes agree",
+                f"{len(trained)} xgboost_*.json in {art_dir} and the resolver "
+                f"found none of them: {how}",
+            )
+        else:
+            report.skip(
+                "the path scoring reads and the path training writes agree",
+                f"no artifact has been trained yet. The RESOLUTION is wired "
+                f"(--model, then ${ENV_MODEL}, then {art_dir}); there is simply "
+                "nothing to resolve in this checkout.",
+            )
     g(_paths)
 
     # the train/serve contract check, exercised against a real sidecar if present
@@ -389,13 +432,29 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
         if features is None:
             report.skip("scored probabilities are in [0, 1] or null", "no feature frame")
             return
-        from main import MODEL_ARTIFACT_DEFAULT, score_prob_over
-        scored = score_prob_over(features, pd.DataFrame(), ROOT / MODEL_ARTIFACT_DEFAULT)
+        # THROUGH THE RESOLVER, not through MODEL_ARTIFACT_DEFAULT. This used to
+        # score against the legacy default path -- a directory that does not
+        # exist -- so the check abstained on EVERY run no matter what was
+        # trained or what $PROPIQ_MODEL pointed at, and then reported "no model
+        # artifact" as the reason. A check that cannot pass is worse than no
+        # check: it reads as "this was tested". It also blamed the wrong thing,
+        # because the call below passes an EMPTY prop_lines frame and P(Over)
+        # needs lines as well as a model.
+        from main import resolve_model_artifact, score_prob_over
+        artifact, how = resolve_model_artifact()
+        if artifact is None:
+            report.skip("scored probabilities are in [0, 1] or null",
+                        f"nothing to score with: {how}")
+            return
+        scored = score_prob_over(features, pd.DataFrame(), artifact)
         vals = pd.to_numeric(pd.Series(scored), errors="coerce").dropna()
         if vals.empty:
-            report.skip("scored probabilities are in [0, 1] or null",
-                        "no model artifact, so every row abstained — which is the "
-                        "documented behaviour, not a range violation")
+            report.skip(
+                "scored probabilities are in [0, 1] or null",
+                f"resolved {artifact} via {how}, and every row still abstained — "
+                "this call passes no prop lines, and P(Over) needs a line as "
+                "well as a model. Not a range violation.",
+            )
             return
         bad = vals[(vals < 0) | (vals > 1)]
         if len(bad):
@@ -428,13 +487,41 @@ def section_2(report: Report, features: pd.DataFrame | None) -> None:
                        f"PROB_OVER written for {claimed}, but the artifact's "
                        "target_market is PTS")
         else:
+            # AND THE OTHER HALF, which this check used to report as a
+            # permanent WARN: that one artifact meant one market per RUN, so
+            # the remaining markets could never carry a probability and the
+            # recorder skipped them. assemble_projections now takes a
+            # market -> Series MAPPING, and score_prob_over_by_market fills it
+            # by resolving xgboost_{MARKET}.json per market. So the question is
+            # no longer "does one model overclaim" alone -- it is also "can
+            # several models each claim their own".
             others = sorted(set(proj["MARKET"]) - {"PTS"})
-            report.warn(
-                "a one-market model does not claim the other markets",
-                f"correct: PROB_OVER only for PTS. But score_prob_over takes ONE "
-                f"model_path, so {others} can never carry a probability in a single "
-                "run, and the recorder skips a row with no probability.",
+            multi = {}
+            for market in ("PTS", *others[:2]):
+                series = pd.Series(0.55, index=features.index)
+                series.attrs["target_market"] = market
+                multi[market] = series
+            many = assemble_projections(
+                features, multi, {"status": "DATA_NOT_AVAILABLE", "by_key": {}},
+                stats=DEFAULT_STATS,
             )
+            claimed_many = sorted(
+                many.loc[many["PROB_OVER"].notna(), "MARKET"].unique()
+            )
+            if claimed_many != sorted(multi):
+                report.bad(
+                    "a one-market model does not claim the other markets",
+                    f"a {len(multi)}-market mapping produced probabilities for "
+                    f"{claimed_many}; each market must carry its own and only "
+                    "its own",
+                )
+            else:
+                report.ok(
+                    "a one-market model does not claim the other markets",
+                    f"one Series -> only PTS; a mapping of {len(multi)} markets "
+                    f"-> {claimed_many}, each from its own artifact. Markets "
+                    f"with no artifact stay null rather than borrowing one.",
+                )
     g(_one_market)
 
 
@@ -852,15 +939,17 @@ def section_5(report: Report) -> None:
 
     def _argv() -> None:
         src = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
-        if "main.main(argv or [])" in src and "--model" not in src:
-            report.warn(
-                "the scheduled slate passes the arguments it needs",
-                "run_slate calls main.main(argv or []) with no --model, and no "
-                "environment variable overrides the model path, so a scheduled "
-                "run always reads main.MODEL_ARTIFACT_DEFAULT. See section 2.",
-            )
+        from main import ENV_MODEL
+
+        if "main.main(argv or [])" not in src:
+            report.warn("the scheduled slate passes the arguments it needs",
+                        "run_slate no longer delegates to main.main — check by hand")
         else:
-            report.ok("the scheduled slate passes the arguments it needs")
+            report.ok(
+                "the scheduled slate passes the arguments it needs",
+                f"it calls main.main([]) in-process, so ${ENV_MODEL} reaches "
+                "resolve_model_artifact with no argv plumbing",
+            )
     g(_argv)
 
     g = guard(report, "a withheld board sends the gate's reason, not the rows")
@@ -1021,23 +1110,30 @@ def section_6(report: Report) -> None:
         has_roster = "def fetch_roster" in (
             ROOT / "src/ingestion/espn_availability.py"
         ).read_text(encoding="utf-8")
-        wired = "espn_schedule" in main_src or "espn_schedule" in worker_src
-        if has_schedule and has_roster and not wired:
+        wired = "attach_forward_slate" in main_src or "attach_forward_slate" in worker_src
+        if not (ROOT / "src/pipeline/forward_slate.py").exists():
             report.bad(
-                "a schedule and a roster source exist for a forward slate",
-                "load_player_panel reads PlayerGameLog — COMPLETED games only — and "
-                "_filter_to_slate keeps rows whose GAME_DATE equals the slate, so a "
-                "09:00 PT run finds zero rows for games that have not been played "
-                "and returns success_no_data. espn_schedule.load_slate (games + "
-                "tipoffs) and espn_availability.fetch_roster (players per team) both "
-                "exist and are tested; neither is imported by main.py or "
-                "scheduler_worker.py.",
+                "a slate that has not been played can produce rows",
+                "src/pipeline/forward_slate.py is gone; load_player_panel reads "
+                "COMPLETED box scores only, so a 09:00 PT run has no rows",
             )
-        elif wired:
-            report.ok("a schedule and a roster source exist for a forward slate")
+        elif not wired:
+            report.bad(
+                "a slate that has not been played can produce rows",
+                "forward_slate.py exists and nothing calls it — the same shape "
+                "the gap was in when espn_schedule was CLI-only",
+            )
         else:
-            report.skip("a schedule and a roster source exist for a forward slate",
-                        f"schedule={has_schedule} roster={has_roster}")
+            report.ok(
+                "a slate that has not been played can produce rows",
+                f"forward_slate wired into main.py; schedule={has_schedule}, "
+                f"roster helper present={has_roster}. fetch_roster is still "
+                "uncalled, and the reason has changed: the ESPN-name crosswalk "
+                "it needed now EXISTS (src/ingestion/id_crosswalk.py), so "
+                "wiring it is a decision rather than a blocker. The lineup "
+                "comes from the panel instead, which needs no name match at "
+                "all.",
+            )
     g(_forward)
 
 

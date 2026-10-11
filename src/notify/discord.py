@@ -316,6 +316,33 @@ def build_decision_board_embed(
             f"· {len(candidates) - len(considered)} abstained"
         )
 
+    # THE DATES THE ROWS ACTUALLY DESCRIBE. A board is built from a scored
+    # VALIDATION WINDOW, so its rows can be about any day that window covers --
+    # and the title carries slate_date, which reads as "tonight". Until this
+    # check existed a card titled with today's date could be entirely February
+    # backtest rows with nothing saying so. This is the loudest place that can
+    # be said, so it is said first, before any row.
+    off_slate = sorted({
+        str(seen) for seen in (
+            getattr(c, "game_date", None) for c in considered
+        ) if seen and str(seen) != str(slate_date)
+    })
+    undated = sum(1 for c in considered if not getattr(c, "game_date", None))
+    if off_slate:
+        lines.insert(0, (
+            f"⚠️ **NOT TONIGHT'S SLATE.** {len(off_slate)} other game date(s) "
+            f"appear below ({', '.join(off_slate[:4])}"
+            f"{', …' if len(off_slate) > 4 else ''}). These are BACKTEST rows "
+            f"scored from a past validation window, not projections for "
+            f"{slate_date or 'the slate date'}."
+        ))
+    if undated:
+        lines.insert(0, (
+            f"⚠️ **{undated} row(s) carry no game date**, so which game they "
+            f"describe cannot be shown. The heading date is when this board "
+            f"was built, not when the games are played."
+        ))
+
     fields: list[dict[str, Any]] = []
     for c in considered[:max_rows]:
         basis = getattr(c, "decision_basis", "unavailable")
@@ -336,6 +363,14 @@ def build_decision_board_embed(
                 f"`{basis}` — model {_prob(getattr(c, 'model_prob', None))}. "
                 "No priced market, so no EV and no market check on this one."
             )
+        # Per row, and only when it is not the slate date: repeating today's
+        # date on every row would be noise, while an off-slate date on one row
+        # is the thing a reader has to see.
+        row_date = getattr(c, "game_date", None)
+        if row_date and str(row_date) != str(slate_date):
+            value += f"\n⚠️ game date **{row_date}**, not {slate_date}."
+        elif not row_date:
+            value += "\n⚠️ no game date on this row."
         fields.append({"name": name, "value": value, "inline": False})
 
     embed = {
@@ -668,6 +703,103 @@ def build_win_loss_embed(
         "fields": fields,
         "footer": {"text": RESEARCH_FOOTER[:MAX_FOOTER]},
     })
+
+
+def build_prelock_correction_embed(
+    *,
+    game: str,
+    tipoff_display: str | None,
+    withheld: Sequence[Any] = (),
+    unknown: Sequence[Any] = (),
+    verified: bool = True,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """
+    One embed for a pre-lock availability re-check on a single game.
+
+    WHAT THIS EXISTS TO SAY. The board is built hours before tip. By 30-45
+    minutes out ESPN's injury report has settled, and a recommendation on a
+    player who will not dress is not a weak recommendation -- it is a row that
+    should not exist. This is the correction, and it is the only surface in
+    this project that RETRACTS something already published.
+
+    A RETRACTION IS NOT AN ABSTENTION, which is why this is not
+    ``build_abstention_embed`` with a composed string. An abstention says "we
+    have nothing for you". This says "we gave you something and it is now
+    wrong", names the players, and must survive being skim-read, so the
+    players are fields rather than prose.
+
+    AN UNUSABLE FEED IS NOT A CLEAN SLATE, the rule the whole scratch filter
+    turns on (``src/pipeline/scratches.py``). When ``verified`` is False this
+    says the check could not be made -- it does not say everyone is playing,
+    and it does not stay silent, because silence reads as "nothing changed".
+
+    NOTHING HERE IS A BET INSTRUCTION. It withdraws research, which is the one
+    direction this project is allowed to move a reader in without a price.
+    """
+    lines: list[str] = []
+    fields: list[dict[str, Any]] = []
+
+    if not verified:
+        colour = COLOR_ABSTAIN
+        title = f"⚠️ Pre-lock check FAILED — {game}"
+        lines.append(
+            "**The availability check could not be made**, so nothing below is "
+            "confirmed and nothing is cleared either. An unusable injury feed "
+            "is not a healthy slate: treat every recommendation on this game as "
+            "UNVERIFIED rather than as checked."
+        )
+        if reason:
+            lines.append(f"Reason: {reason}")
+    elif withheld:
+        colour = COLOR_ABSTAIN
+        title = f"🚫 WITHDRAWN before lock — {game}"
+        lines.append(
+            f"**{len(withheld)} recommendation(s) are withdrawn.** ESPN now "
+            "lists these players OUT or DOUBTFUL, after the board was built. A "
+            "recommendation on a player who will not dress is a row that should "
+            "not exist."
+        )
+    else:
+        colour = COLOR_CONSIDER
+        title = f"✅ Pre-lock check clear — {game}"
+        lines.append(
+            "No recommended player on this game is listed OUT or DOUBTFUL. "
+            "This confirms the availability check ran; it is not a claim about "
+            "whether the recommendations are good."
+        )
+
+    if tipoff_display:
+        lines.append(f"Tip-off {tipoff_display}.")
+
+    for row in withheld:
+        name = getattr(row, "player_name", None) or getattr(row, "player_id", "?")
+        detail = getattr(row, "availability_detail", None)
+        fields.append({
+            "name": f"🚫 {name} — {getattr(row, 'target_market', '?')} "
+                    f"{str(getattr(row, 'side', '') or '').upper()} "
+                    f"{getattr(row, 'line', '—')}",
+            "value": f"WITHDRAWN: {detail or 'listed OUT or DOUBTFUL'}",
+            "inline": False,
+        })
+    for row in unknown:
+        name = getattr(row, "player_name", None) or getattr(row, "player_id", "?")
+        fields.append({
+            "name": f"❓ {name} — {getattr(row, 'target_market', '?')}",
+            "value": (
+                "ESPN has a row for this player that could not be bucketed, so "
+                "availability is UNKNOWN — which is not the same as healthy."
+            ),
+            "inline": False,
+        })
+
+    return {
+        "title": title,
+        "description": "\n".join(lines),
+        "color": colour,
+        "fields": fields[:MAX_FIELDS_PER_EMBED],
+        "footer": {"text": RESEARCH_FOOTER},
+    }
 
 
 def build_abstention_embed(reason: str, *, title: str = "No ticket") -> dict[str, Any]:

@@ -68,10 +68,43 @@ class Layer:
         self.note = note
 
     def arms(
-        self, panel: pd.DataFrame, cfg: dict[str, Any]
+        self,
+        panel: pd.DataFrame,
+        cfg: dict[str, Any],
+        *,
+        allow_partial: bool = False,
     ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-        """Return (control, treatment, columns_under_test)."""
+        """Return (control, treatment, columns_under_test).
+
+        A PANEL THAT PREDATES A COLUMN THIS LAYER NOW DECLARES IS A REFUSAL,
+        and that is the whole point of ``allow_partial``. The subtractive
+        branch below triggers on ANY declared column being present, so a panel
+        built before ``DVP_PRA_*`` existed measured the twelve older DvP
+        columns and said "Layer 'dvp' under test: [...]" with a list that
+        looked complete. `--markets PRA` happened to be caught downstream by
+        "no market reads any dvp column"; `--markets REB` would have run for
+        an hour and produced a confident measurement OF THE OLD LAYER. The
+        panel is a build artifact and the column list is code, so they drift
+        the moment a layer gains a column.
+
+        Partial presence is sometimes legitimate: ``build_opponent_allowed``
+        emits only the stats the panel carries, so a panel without BLK really
+        has no ``DVP_BLK_*``. That is what the override is for -- passed
+        deliberately, named in the output, rather than guessed at here.
+        """
         present = [c for c in self.columns if c in panel.columns]
+        missing = [c for c in self.columns if c not in panel.columns]
+        if present and missing and not allow_partial:
+            raise RuntimeError(
+                f"this panel carries {len(present)} of the {len(self.columns)} "
+                f"columns this layer declares and is missing {missing}. The "
+                f"arm would be subtractive over the {len(present)} it has and "
+                f"would report a measurement of a DIFFERENT column set than "
+                f"the one in the code — most likely the panel was built before "
+                f"those columns existed, so rebuild it. If the absence is "
+                f"real (a panel genuinely without the source stat), pass "
+                f"--allow-partial-layer to measure what is there."
+            )
         if present:
             # Subtractive: the panel has them, so the control is the panel
             # without them. Used for layers that are attached during the
@@ -140,6 +173,75 @@ LAYERS: dict[str, Layer] = {
             "whether game pace earns a place beside DEF_PACE_L10, which is the "
             "only other pace column any market reads (r = 0.04 between them; "
             "PACE_ROLL correlates 0.82 but no model reads it)."
+        ),
+    ),
+    "shot_zones": Layer(
+        (
+            "SZ_DIST_AVG_L5", "SZ_DIST_AVG_L10",
+            "SZ_RIM_RATE_L5", "SZ_RIM_RATE_L10",
+            "SZ_PAINT_RATE_L5", "SZ_PAINT_RATE_L10",
+            "SZ_MID_RATE_L5", "SZ_MID_RATE_L10",
+            "SZ_THREE_RATE_L5", "SZ_THREE_RATE_L10",
+            "SZ_CORNER3_RATE_L5", "SZ_CORNER3_RATE_L10",
+            "SZ_DUNK_LAYUP_RATE_L5", "SZ_DUNK_LAYUP_RATE_L10",
+            "SZ_SELF_CREATED_RATE_L5", "SZ_SELF_CREATED_RATE_L10",
+            "SZ_MADE_PCT_L5", "SZ_MADE_PCT_L10",
+        ),
+        note=(
+            "Shot location and type from the NBA's own shotchartdetail "
+            "export, 97.8% of the panel against the PBP_* shot-mix family's "
+            "59.1%. Where both exist they agree at |r| 0.92-0.998, so this "
+            "arm is really asking WHICH family to keep, not whether shot mix "
+            "helps -- running it against --layer pbp is the comparison that "
+            "matters. PAINT, CORNER3, SELF_CREATED and MADE_PCT have no PBP "
+            "counterpart at all. No market reads these, so use "
+            "--wire-under-test."
+        ),
+    ),
+    "matchup": Layer(
+        ("MU_PTS_PER_MIN_L10", "MU_PTS_PER_MIN_INDEX_L10"),
+        note=(
+            "Opponent defence weighted by the minutes its defenders actually "
+            "spend on assignment, from the NBA's own matchup tracking -- no "
+            "position proxy and no team total. Only the PTS_PER_MIN pair is "
+            "under test: the FG% pair it also computes correlates 0.96 with "
+            "DEF_FG_PCT_ALLOWED_L10 and is excluded, measured. The question "
+            "is whether per-assigned-minute points beat DEF_RATING_L10 "
+            "(|r| 0.77 between them). No market reads these, so use "
+            "--wire-under-test."
+        ),
+    ),
+    "fouls": Layer(
+        ("PF_L5", "PF_L10", "PF_SEASON", "PF_PER_MIN_L10", "PF_TROUBLE_RATE_L10"),
+        note=(
+            "The player's own prior foul history. Six fouls ends a night, so "
+            "this asks whether foul propensity carries minutes risk the "
+            "minutes columns do not already describe. Needs a panel built "
+            "after PF was mapped -- from the archive's foulsPersonal or the "
+            "league game log's PF, both of which were carried and neither of "
+            "which was requested until now. No market reads these columns, "
+            "so run it with --wire-under-test."
+        ),
+    ),
+    "dvp": Layer(
+        (
+            "DVP_PTS_ALLOWED_L10", "DVP_REB_ALLOWED_L10", "DVP_AST_ALLOWED_L10",
+            "DVP_FG3M_ALLOWED_L10", "DVP_STL_ALLOWED_L10", "DVP_BLK_ALLOWED_L10",
+            "DVP_PRA_ALLOWED_L10",
+            "DVP_PTS_INDEX_L10", "DVP_REB_INDEX_L10", "DVP_AST_INDEX_L10",
+            "DVP_FG3M_INDEX_L10", "DVP_STL_INDEX_L10", "DVP_BLK_INDEX_L10",
+            "DVP_PRA_INDEX_L10",
+        ),
+        note=(
+            "Opponent defence split by the position it is defending -- the "
+            "first column in this panel that varies by who the player is as "
+            "well as by whom he faces. The question it settles is whether it "
+            "adds anything to DEF_RATING_L10, which hands every player in a "
+            "game the same number. Covers the 87.2% of rows with an as-of "
+            "position bucket; no market reads these columns, so run it with "
+            "--wire-under-test. REB was measured and improved Brier on 4 of 4 "
+            "folds (docs/fouls_and_dvp.md section 3a); PRA, whose DVP_PRA_* "
+            "pair is new, has not been run."
         ),
     ),
     # The four layers that ran on every build while no market read a column
@@ -257,6 +359,91 @@ _STAT_PREFIXES = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA")
 # labels._DEFENSE_BY_MARKET and must not be handed to a market it is not for.
 _UNIVERSAL_DEFENSE_COLS = frozenset({"DEF_RATING_L10", "DEF_PACE_L10"})
 
+# The three stats PRA is the sum of. Still used for the DEF_* family, which
+# has no combined column, so a PRA arm sees the rebound and assist defence
+# rates. Mirrors labels._DEFENSE_BY_MARKET["PRA"].
+_PRA_COMPONENTS = frozenset({"PTS", "REB", "AST"})
+
+
+def column_for_market(column: str, market: str) -> bool:
+    """
+    Should ``--wire-under-test`` offer this column to ``market``'s arm?
+
+    PER MARKET, not every column to every market. A first version appended all
+    of them to all of them, so a PTS run was handed AST_HL and REB_HL_SHRINK
+    -- which is not the question being asked, and is not what labels.py does
+    either: every dict there is keyed by market. A column carrying another
+    market's stat prefix is skipped; MIN_*, MINUTES_*, TS_PCT_*,
+    USAGE_PROXY_* and the rest are market-neutral and go to all.
+
+    MODULE LEVEL, and this is the function the run itself calls. It used to be
+    a closure inside _run, which meant the only thing a test could reach was
+    the helper it delegates to -- so deleting the delegation went unnoticed.
+    Both the rule and the wiring are now covered by
+    tests/test_dvp.py::test_each_market_is_offered_only_its_own_matchup_columns.
+    """
+    from src.models.labels import _DEFENSE_BY_MARKET
+
+    market = market.upper()
+    # A DEF_* column is not market-neutral just because it carries no stat
+    # prefix: labels._DEFENSE_BY_MARKET assigns each one to the markets it
+    # bears on, and DEF_REB_ALLOWED_PER100_L10 belongs to REB and PRA, not to
+    # PTS. Treating the whole family as neutral meant `--layer defense
+    # --wire-under-test --markets PTS` fed a points model the rebound and
+    # assist defence columns -- not the question being asked, and the same
+    # defect as the stat-prefix one below.
+    if column.startswith("DEF_"):
+        if column in _UNIVERSAL_DEFENSE_COLS:
+            return True
+        return column in set(_DEFENSE_BY_MARKET.get(market, ()))
+    # DVP_* carries its stat in the MIDDLE, not at the front, so the prefix
+    # loop below does not see it: DVP_REB_ALLOWED_L10 starts with neither
+    # "REB_" nor "OPP_REB_". Without this branch every market received all
+    # twelve, and `--layer dvp --markets PTS` fed a points model the rebound,
+    # assist and block matchup columns -- the identical defect the DEF_ branch
+    # above exists to fix, reproduced in a launched run before being caught.
+    if column.startswith("DVP_"):
+        return _dvp_for_market(column, market)
+    for stat in _STAT_PREFIXES:
+        if stat == market:
+            continue
+        if column.startswith(f"{stat}_") or column.startswith(f"OPP_{stat}_"):
+            return False
+    return True
+
+
+def _dvp_for_market(column: str, market: str) -> bool:
+    """
+    Does this DVP_* column belong in ``market``'s arm?
+
+    MODULE LEVEL ON PURPOSE, so the routing rule has a test
+    (tests/test_dvp.py::test_each_market_is_offered_only_its_own_matchup_columns)
+    rather than living only inside the closure that uses it. The rule it
+    encodes is not obvious from the column names: DVP_* carries its stat in
+    the MIDDLE, so DVP_REB_ALLOWED_L10 starts with neither "REB_" nor
+    "OPP_REB_" and the stat-prefix filter in _run does not see it at all.
+
+    PRA USED TO BE A SPECIAL CASE HERE and is not any more. It returned the
+    three COMPONENT matchups (PTS, REB, AST) because the layer had no combined
+    column; dvp.DVP_COMBOS now emits DVP_PRA_*, so PRA routes by the same
+    equality as every other market. Offering both would hand the model one
+    number twice on the ALLOWED side, where DVP_PRA_ALLOWED_L10 is the sum of
+    the three component columns by construction — a perfect dependency, well
+    past the ~0.97 at which labels._EXCLUDED_AS_REDUNDANT excludes a whole
+    feature family.
+
+    This CHANGES what `--layer dvp --markets PRA` measures, and invalidates
+    nothing: only the REB arm has ever been run (docs/fouls_and_dvp.md section
+    3a), and it reads DVP_REB_* either way. Whether the three component INDEX
+    columns carry something DVP_PRA_INDEX_L10 does not — they are ratios and
+    do not add, so the combo cannot reconstruct which stat a defence concedes
+    — is a separate arm nobody has run.
+    """
+    if not column.startswith("DVP_"):
+        return True
+    stat = column[len("DVP_"):].split("_", 1)[0]
+    return stat == market.upper()
+
 
 METRICS = (
     ("brier_score", "Brier raw"),
@@ -357,6 +544,12 @@ def _run(
                          "FOR THIS RUN ONLY, so a column that is not yet wired "
                          "can be measured before it is shipped. Without this, a "
                          "layer no market reads cannot be compared at all.")
+    ap.add_argument("--allow-partial-layer", action="store_true",
+                    help="Measure a layer whose panel carries only SOME of the "
+                         "columns it declares. Refused by default: the usual "
+                         "cause is a panel built before a column was added, "
+                         "and the arm would report a confident measurement of "
+                         "the older column set.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -385,7 +578,9 @@ def _run(
         print("DEMO PANEL — synthetic players. These numbers test wiring, not accuracy.\n")
 
     try:
-        control, treatment, under_test = layer.arms(panel, cfg)
+        control, treatment, under_test = layer.arms(
+            panel, cfg, allow_partial=args.allow_partial_layer
+        )
     except Exception as exc:  # noqa: BLE001 — a missing input is the answer, not a crash
         print(f"ERROR: cannot build the '{args.layer}' arms: {exc}", file=sys.stderr)
         return 2
@@ -401,7 +596,7 @@ def _run(
     # produced a table of exact zeros -- a correct answer to a question
     # nobody meant to ask. Say so instead of printing it.
     import src.models.compare as compare_module
-    from src.models.labels import _DEFENSE_BY_MARKET, default_feature_cols
+    from src.models.labels import default_feature_cols
 
     if args.wire_under_test:
         # compare.py binds default_feature_cols at import, so the patch has to
@@ -411,35 +606,10 @@ def _run(
         # as a subtractive arm does.
         _base = compare_module.default_feature_cols
 
-        # PER MARKET, not every column to every market. A first version appended
-        # all of them to all of them, so a PTS run was handed AST_HL and
-        # REB_HL_SHRINK -- which is not the question being asked, and is not what
-        # labels.py does either: every dict there is keyed by market. A column
-        # carrying another market's stat prefix is skipped; MIN_*, MINUTES_*,
-        # TS_PCT_*, USAGE_PROXY_* and the rest are market-neutral and go to all.
-        def _for_market(column: str, market: str) -> bool:
-            # A DEF_* column is not market-neutral just because it carries no
-            # stat prefix: labels._DEFENSE_BY_MARKET assigns each one to the
-            # markets it bears on, and DEF_REB_ALLOWED_PER100_L10 belongs to REB
-            # and PRA, not to PTS. Treating the whole family as neutral meant
-            # `--layer defense --wire-under-test --markets PTS` fed a points
-            # model the rebound and assist defence columns -- not the question
-            # being asked, and the same defect as the stat-prefix one below.
-            if column.startswith("DEF_"):
-                if column in _UNIVERSAL_DEFENSE_COLS:
-                    return True
-                return column in set(_DEFENSE_BY_MARKET.get(market, ()))
-            for stat in _STAT_PREFIXES:
-                if stat == market:
-                    continue
-                if column.startswith(f"{stat}_") or column.startswith(f"OPP_{stat}_"):
-                    return False
-            return True
-
         def _widened(market, _base=_base, _extra=tuple(under_test)):
             cols = list(_base(market))
             for c in _extra:
-                if c not in cols and _for_market(c, market.upper()):
+                if c not in cols and column_for_market(c, market.upper()):
                     cols.append(c)
             return cols
 
@@ -449,9 +619,10 @@ def _run(
             _patched.append((compare_module, _base))
         compare_module.default_feature_cols = _widened  # type: ignore[assignment]
         print(f"--wire-under-test: up to {len(under_test)} column(s) added to "
-              f"each market's feature list for this run only, skipping any that "
-              f"carry another market's stat prefix. Nothing is written to "
-              f"src/models/labels.py.")
+              f"each market's feature list for this run only, routed per "
+              f"market by column_for_market -- a column carrying another "
+              f"market's stat, in its prefix or inside a DEF_/DVP_ name, is "
+              f"skipped. Nothing is written to src/models/labels.py.")
 
     resolver = (
         compare_module.default_feature_cols if args.wire_under_test

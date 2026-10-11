@@ -43,6 +43,13 @@ PANEL_COLS = (
     "TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "IS_HOME",
     "MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV",
     "FGM", "FGA", "FTM", "FTA", "OREB", "DREB",
+    # Personal fouls and the starting-five designation. Both OPTIONAL, like
+    # the shooting-volume block above: an export without them simply means
+    # the layers that read them abstain. PF feeds src/features/fouls.py;
+    # STARTING_POSITION is the only position source in this project and feeds
+    # src/features/dvp.py, which is why a column the models never read is
+    # nonetheless carried through the panel contract.
+    "PF", "STARTING_POSITION",
 )
 
 # Candidate source spellings per target column, lowercased and stripped of
@@ -111,6 +118,15 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "FTA": ("freethrowsattempted", "fta"),
     "OREB": ("reboundsoffensive", "oreb", "orb", "offensiverebounds"),
     "DREB": ("reboundsdefensive", "dreb", "drb", "defensiverebounds"),
+    # Personal fouls -- the PLAYER's, not the team's. src/ingestion/bigdataball
+    # also writes a column called "pf", onto TeamGameStat, and that one is a
+    # team total; the two are different measurements sharing a name.
+    "PF": ("foulspersonal", "personalfouls", "pf", "numfouls"),
+    # The starting-five designation: G, F or C, populated for starters only.
+    # It is a POSITION STRING, so "PF" appearing as a value here means power
+    # forward and has nothing to do with the PF column above -- see the note
+    # in src/features/dvp.py. Not coerced to numeric for that reason.
+    "STARTING_POSITION": ("startingposition", "startposition", "position", "pos"),
 }
 
 # A frame carrying any of these is not an NBA player panel.
@@ -482,7 +498,7 @@ def normalize_player_box_scores(
         raise KaggleNbaError("DATA_NOT_AVAILABLE: no rows survived date parsing")
 
     for numeric in ("MIN", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV",
-                    "FGM", "FGA", "FTM", "FTA", "OREB", "DREB"):
+                    "FGM", "FGA", "FTM", "FTA", "OREB", "DREB", "PF"):
         if numeric in out.columns:
             out[numeric] = pd.to_numeric(out[numeric], errors="coerce")
 

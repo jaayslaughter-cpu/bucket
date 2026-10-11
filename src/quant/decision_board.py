@@ -338,6 +338,11 @@ class BettingDecisionCandidate(BaseModel):
 
     rank: int = 0
     slate_date: str
+    # Carried from ResearchSlateRow.game_date -- see the long note there. This
+    # is the date of the GAME; slate_date is when the board was built. Both
+    # reach the CSV and the Discord embed, because a reader who sees only one
+    # of them cannot tell a projection from a backtest row.
+    game_date: str | None = None
     event_id: str
     player_id: str
     player_name: str | None = None
@@ -380,8 +385,6 @@ class BettingDecisionCandidate(BaseModel):
     timezone_display: str = DISPLAY_TZ_NAME
     disclaimer: str = BOARD_DISCLAIMER
     warnings: list[str] = Field(default_factory=list)
-
-
 def _side_ev(row: ResearchSlateRow, side: str) -> float | None:
     return row.book_ev_over if side == "over" else row.book_ev_under
 
@@ -528,6 +531,7 @@ def expand_row_to_candidates(
         out.append(
             BettingDecisionCandidate(
                 slate_date=row.slate_date,
+                game_date=row.game_date,
                 event_id=row.event_id,
                 player_id=row.player_id,
                 player_name=row.player_name,

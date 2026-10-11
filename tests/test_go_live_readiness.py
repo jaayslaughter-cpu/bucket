@@ -60,6 +60,31 @@ def _git_available() -> bool:
         return False
 
 
+def _full_history_available() -> bool:
+    """
+    Git AND the history, which are two preconditions, not one.
+
+    FOUND IN CI, 2026-10-11. These attribution checks need `git log
+    --diff-filter=A` to reach the commit that actually added a file. On a
+    SHALLOW clone it cannot: only the checked-out commit is present, so every
+    path looks as though that one commit created it and every older sha fails
+    to resolve at all. `actions/checkout@v4` is shallow by default, so the six
+    failures the run produced read as "the page is wrong about six things"
+    when the page was right and the clone was thin. The run had never passed
+    these -- the workflow fires on `pull_request`, so the first PR for a branch
+    is the first time they are reached in CI.
+
+    Guarding on `_git_available` alone was the defect: a tool being installed
+    is not the same as the data being there. The workflow now fetches full
+    history (`test_the_workflow_fetches_the_history_these_checks_need` pins
+    that), and this stays as the honest precondition so a thin clone skips
+    with a reason rather than accusing the document.
+    """
+    if not _git_available():
+        return False
+    return _git("rev-parse", "--is-shallow-repository") != "true"
+
+
 def _claimed_attributions() -> list[tuple[str, str]]:
     """
     PARSE THE PAGE, do not keep a second copy of it.
@@ -85,7 +110,10 @@ def test_the_page_makes_checkable_attribution_claims():
     )
 
 
-@pytest.mark.skipif(not _git_available(), reason="no git in this environment")
+@pytest.mark.skipif(
+    not _full_history_available(),
+    reason="shallow clone: git log cannot reach the commit that added a file",
+)
 @pytest.mark.parametrize("sha,path", _claimed_attributions())
 def test_each_cited_commit_really_added_what_the_page_credits_it_with(sha, path):
     assert (ROOT / path).exists(), f"the page credits a commit with adding {path}, which is gone"
@@ -96,11 +124,51 @@ def test_each_cited_commit_really_added_what_the_page_credits_it_with(sha, path)
     )
 
 
-@pytest.mark.skipif(not _git_available(), reason="no git in this environment")
+@pytest.mark.skipif(
+    not _full_history_available(),
+    reason="shallow clone: older commits are not present to resolve",
+)
 def test_every_hash_on_the_page_resolves():
     for sha in set(re.findall(r"`([0-9a-f]{7})`", TEXT)):
         assert _git("cat-file", "-t", sha) == "commit", (
             f"the page cites {sha}, which is not a commit in this repository"
+        )
+
+
+def test_the_workflow_fetches_the_history_these_checks_need():
+    """
+    THE OTHER HALF OF THE SKIP ABOVE, and the reason it is not a silent pass.
+
+    A precondition that skips is a guard that stops guarding, so the thing that
+    makes the skip unnecessary is pinned here: CI must check out full history.
+    `actions/checkout@v4` defaults to `fetch-depth: 1`, which is why the
+    attribution checks had never once run in CI -- they skipped or failed
+    depending only on whether anyone noticed.
+
+    Asserted against the workflow's parsed YAML rather than a substring, so a
+    `fetch-depth: 0` sitting in a comment or under a different step does not
+    satisfy it.
+    """
+    yaml = pytest.importorskip("yaml")
+
+    workflow = ROOT / ".github" / "workflows" / "tests.yml"
+    assert workflow.is_file(), "the test workflow is gone"
+    config = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+
+    checkouts = [
+        step
+        for job in (config.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+        if str(step.get("uses") or "").startswith("actions/checkout")
+    ]
+    assert checkouts, "no checkout step found, so this guard proves nothing"
+    for step in checkouts:
+        depth = (step.get("with") or {}).get("fetch-depth")
+        assert str(depth) == "0", (
+            f"{step.get('uses')} uses fetch-depth={depth!r}. The commit "
+            "attribution checks need the whole history to find which commit "
+            "added a file; at depth 1 they skip, and the page goes unguarded "
+            "in the only place it is checked automatically."
         )
 
 
@@ -137,11 +205,40 @@ def test_13_the_feature_contract_is_checked_at_serve_time():
     assert "verify_feature_contract" in (ROOT / "main.py").read_text(encoding="utf-8")
 
 
-def test_43_the_pooling_claims_are_still_true():
+def test_43_the_pooling_claims_are_still_true(monkeypatch):
+    """
+    THE EFFECTIVE POOL, not the source literals.
+
+    This read `"pool_size=5" in body` until 2026-10-09, when the values became
+    env-overridable (`pool_size=_int_env("PROPIQ_DB_POOL_SIZE", 5, ...)`) and
+    the literal disappeared while the default did not. The test failed on a
+    change that strengthened what it was guarding — and, being a substring
+    check, it would equally have passed on a COMMENT saying `pool_size=5`,
+    which is the trap this repository has hit five times. So it now reads the
+    kwargs that reach `create_engine`.
+    """
+    import src.db.session as session
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        session, "create_engine",
+        lambda url, **kw: captured.update(kw, url=url) or object(),
+    )
+    monkeypatch.setattr(session, "_engine", None)
+    monkeypatch.delenv("PROPIQ_DB_POOL_SIZE", raising=False)
+    monkeypatch.delenv("PROPIQ_DB_MAX_OVERFLOW", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com:6543/postgres")
+    session.get_engine()
+    session._engine = None
+
+    assert captured["pool_pre_ping"] is True
+    assert captured["pool_size"] == 5
+    assert captured["max_overflow"] == 5
+    # sslmode is appended by the URL builder, not passed as a kwarg.
+    assert "sslmode=require" in captured["url"]
+
     body = (ROOT / "src" / "db" / "session.py").read_text(encoding="utf-8")
-    for claim in ("pool_pre_ping=True", "pool_size=5", "max_overflow=5",
-                  "expire_on_commit=False", "sslmode=require"):
-        assert claim in body, f"the page calls 4.3 PASS but {claim} is gone"
+    assert "expire_on_commit=False" in body
 
 
 def test_the_two_corrections_are_kept_rather_than_quietly_dropped():
@@ -179,8 +276,14 @@ def test_the_results_card_exists_and_the_page_says_how_it_is_sent():
     body = (ROOT / "src" / "notify" / "discord.py").read_text(encoding="utf-8")
     builders = re.findall(r"^def (build_\w+_embed)", body, re.M)
     assert "build_win_loss_embed" in builders, "the page claims a fifth builder"
-    assert len(builders) == 5, (
-        f"the page says five builders; there are {len(builders)}: {builders}"
+    # SIX NOW. build_prelock_correction_embed is the sixth, added with the
+    # tip-anchored pre-lock check: it is the only surface here that RETRACTS
+    # something already published, which an abstention embed cannot express.
+    # The count is asserted rather than left open because a builder nobody
+    # sends is how four of these sat unreachable before.
+    assert "build_prelock_correction_embed" in builders
+    assert len(builders) == 6, (
+        f"the page says six builders; there are {len(builders)}: {builders}"
     )
     worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
     settle = worker[worker.index("def run_settlement"):]
@@ -209,34 +312,99 @@ def test_o8_nothing_populates_the_tipoff_column():
     )
 
 
-def test_o9_the_schedule_and_roster_sources_are_still_unwired():
-    assert (ROOT / "src" / "ingestion" / "espn_schedule.py").is_file()
-    assert "def fetch_roster" in (
-        ROOT / "src" / "ingestion" / "espn_availability.py"
-    ).read_text(encoding="utf-8")
-    for entry in ("main.py", "scheduler_worker.py"):
-        body = (ROOT / entry).read_text(encoding="utf-8")
-        assert "espn_schedule" not in body, (
-            f"O9 is fixed — {entry} imports espn_schedule. Update "
-            "docs/go_live_readiness.md and docs/integration_audit.md."
-        )
-
-
-def test_o2_the_model_path_mismatch_is_still_there():
+def test_the_forward_slate_is_wired_into_the_run():
     """
-    The worker passes no --model and nothing overrides the path, so a scheduled
-    run reads main.MODEL_ARTIFACT_DEFAULT whatever was trained.
+    Was the first open item on this page. The panel is completed box scores, so
+    without this a 09:00 PT run has no rows for tonight.
     """
-    worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
-    assert "--model" not in worker, (
-        "O2 is fixed — the worker now passes --model. Update the page."
+    assert (ROOT / "src" / "pipeline" / "forward_slate.py").is_file()
+    body = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "attach_forward_slate" in body, (
+        "the page says the forward slate is wired, and main.py does not use it"
     )
-    assert "PROPIQ_MODEL" not in worker, (
-        "O2 is fixed — an env override exists now. Update the page."
+    assert "PROPIQ_FORWARD_SLATE" in body
+
+
+def test_fetch_roster_is_still_uncalled_and_the_page_says_why():
+    """
+    The page claims this is now DELIBERATE: a roster fetch needs the ESPN-name
+    crosswalk that does not exist. If something starts calling it, the page's
+    reasoning needs revisiting rather than silently going stale.
+    """
+    # A CALL or an IMPORT, not the word: forward_slate.py names it in prose to
+    # explain why it does NOT use it, and an earlier version of this check
+    # counted that explanation as a caller.
+    callers = []
+    for path in list((ROOT / "src").rglob("*.py")) + [ROOT / "main.py"]:
+        if "__pycache__" in str(path) or path.name == "espn_availability.py":
+            continue
+        body = path.read_text(encoding="utf-8")
+        if re.search(r"fetch_roster\s*\(|import[^\n]*\bfetch_roster\b", body):
+            callers.append(path.relative_to(ROOT).as_posix())
+    assert not callers, (
+        f"{callers} now calls fetch_roster — update the crosswalk reasoning in "
+        "docs/go_live_readiness.md"
+    )
+    assert "fetch_roster" in TEXT
+
+
+def test_the_model_resolver_reaches_the_scheduled_worker():
+    """
+    Was the second open item. The worker calls main.main([]) with no arguments,
+    so the environment is the only channel — which is why the fix is a resolver
+    reading PROPIQ_MODEL rather than argv plumbing.
+    """
+    import main
+
+    assert hasattr(main, "resolve_model_artifact")
+    assert main.ENV_MODEL == "PROPIQ_MODEL"
+    assert "PROPIQ_MODEL" in TEXT
+    path, reason = main.resolve_model_artifact()
+    assert path is not None or "PROPIQ_MODEL" in reason, (
+        "with nothing resolvable, the reason must name the paths it tried"
     )
 
 
-def test_the_open_list_is_numbered_without_gaps():
-    found = sorted(int(n) for n in set(re.findall(r"\*\*O(\d+)\*\*", TEXT)))
-    assert found == list(range(1, len(found) + 1)), f"O-numbers have gaps: {found}"
-    assert len(found) >= 10
+def test_every_o_number_is_unique_and_resolves_to_exactly_one_row():
+    """
+    UNIQUE AND RESOLVABLE. Contiguity is deliberately NOT required, and this
+    test has now been wrong in both directions, which is why this is spelled
+    out at length rather than left as an assertion.
+
+    FIRST it asserted ``range(1, len+1)``, forcing a renumbering every time the
+    lowest-numbered item closed. That is the opposite of what cross-references
+    need: an O-number is cited from test docstrings, commit messages and other
+    docs, and renumbering silently repoints every one of them at a different
+    item. It had already happened -- ``tests/test_forward_slate.py`` opens
+    "O1 - rows for a slate that has not been played" and
+    ``tests/test_under_and_push.py`` opens "O8 - the under and the push", while
+    this page's current O8 is self-referential evaluation, so a bare O-number
+    in a docstring older than 2026-10-05 may not mean what it means here.
+
+    THEN it asserted contiguity from wherever the list started, which was no
+    better: closing O5 while O4 and O6 remain open leaves a gap, and that gap
+    is CORRECT. O5 is closed, not missing. Requiring contiguity would force
+    exactly the renumbering the previous paragraph is about.
+
+    So what is checked is the invariant that actually holds under stable
+    numbering: every number appears EXACTLY ONCE as a table row, and nothing
+    cited in the prose is missing from the tables. A duplicate or a dangling
+    citation is a real error; a gap is a closed item.
+    """
+    import collections
+
+    rows = re.findall(r"^\| \*\*O(\d+)\*\* \|", TEXT, re.M)
+    assert rows, "no O-numbered table rows at all"
+
+    duplicated = [n for n, c in collections.Counter(rows).items() if c > 1]
+    assert not duplicated, (
+        f"O-number(s) {duplicated} appear in more than one table row, so a "
+        "citation to them is ambiguous"
+    )
+
+    cited = {int(n) for n in re.findall(r"\*\*O(\d+)\*\*", TEXT)}
+    tabled = {int(n) for n in rows}
+    assert cited <= tabled, (
+        f"O-number(s) {sorted(cited - tabled)} are cited in the prose but have "
+        "no table row"
+    )

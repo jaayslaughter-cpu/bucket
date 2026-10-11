@@ -161,6 +161,81 @@ def default_feature_cols(market: str) -> list[str]:
 # shipped, so `--layer minutes_weighted --wire-under-test` can settle it.
 # Full write-up with the per-column table: docs/minutes_weighted.md.
 #
+# TWO MORE LAYERS ARE IN THE SAME STATE, for the opposite reason: not measured
+# redundant. src/features/fouls.py (the player's prior foul history) and
+# src/features/dvp.py (opponent defence split by the position it is defending)
+# are built on every panel that carries PF and STARTING_POSITION, and no
+# market below reads a column from either. Measured the same way as the table
+# above, every one of their columns is well clear of the redundancy band --
+# the worst is PF_SEASON at 0.631 against MIN_SEASON, and a count accumulated
+# over playing time should correlate with playing time; DVP_*_INDEX_L10 tops
+# out at 0.389, against the team-level DEF_* column covering the same stat,
+# where DEF_RATING_INDEX_L10 sits at 0.999 against DEF_RATING_L10. So they are
+# not copies of anything listed here. The halflife and usage_volume results
+# below are the reason correlation alone does not settle it: redundancy was
+# PREDICTED from |r| and then tested, and the test is what the exclusion rests
+# on. Write-up: docs/fouls_and_dvp.md.
+#
+# FOULS is still unmeasured; `--layer fouls --wire-under-test` is the arm.
+#
+# DVP HAS NOW BEEN MEASURED, for REB, and it HELPS. 4 chronological folds from
+# 2025-01-15 stepping 14 days, 3-season slice (2022-23..2024-25), 76,585 rows,
+# ~17,988 distinct validation rows, REB reading the two columns carrying its
+# own stat (DVP_REB_ALLOWED_L10, DVP_REB_INDEX_L10):
+#
+#   ensemble    Brier raw  -0.00070 (sd 0.00034)  4/4 folds better
+#   line_aware  Brier raw  -0.00065 (sd 0.00034)  4/4
+#   line_aware  Brier cal  -0.00054 (sd 0.00022)  4/4
+#   catboost    Brier cal  -0.00099 (sd 0.00077)  4/4
+#   xgboost     Brier cal  -0.00061 (sd 0.00052)  4/4
+#
+# Better on every fold for four of the five models, at 1.3-2.5x the fold
+# spread -- the opposite sign and the opposite consistency to the halflife and
+# usage_volume tables below. Calibrated ECE did NOT improve (line_aware
+# +0.00125, better in only 1 of 4 folds), though every ECE delta is smaller
+# than its own fold spread, so that is a thing to watch and not a finding.
+#
+# PRA WAS THEN RUN IDENTICALLY AND DOES NOT HELP. Its DVP_PRA_* pair is a
+# combination market (dvp.DVP_COMBOS), 4 folds, same slice, ~18,179 distinct
+# validation rows:
+#
+#   line_aware  Brier raw  +0.00048 (sd 0.00017)  0/4 folds better
+#   line_aware  Brier cal  +0.00044 (sd 0.00011)  0/4
+#   catboost    Brier cal  +0.00039 (sd 0.00030)  0/4
+#   ensemble    Brier raw  +0.00006 (sd 0.00012)  1/4
+#   xgboost     Brier raw  +0.00004 (sd 0.00021)  1/4
+#
+# line_aware is worse on every fold at 2.8-4x the fold spread; the rest are
+# nil. Raw ECE improved (xgboost -0.00195 at 4/4, ensemble -0.00253 at 3/3),
+# which is the SAME pattern the halflife and usage_volume note below records
+# and the same reading applies: without a Murphy decomposition the honest
+# statement is the measurement, and Brier is the metric these calls are made
+# on. The measured geometry predicted a weak effect -- PRA's between-bucket
+# spread is 1.11 against REB's 2.17, because centre-heavy rebounds and
+# guard-heavy assists cancel in the sum -- and the arm came back adverse
+# rather than merely weak. Not wired. Write-up: docs/fouls_and_dvp.md
+# section 3b.
+#
+# IT IS STILL NOT WIRED, AND THE REASON IS NOT THE EVIDENCE. The reason used
+# to be that STARTING_POSITION had no writer on the live path. It has one now
+# -- src/ingestion/starting_positions.py, migration 008 and
+# scripts/pull_starting_positions.py -- and what remains is narrower and still
+# blocking:
+#
+#   1. THE PULL HAS NEVER BEEN RUN. stats.nba.com is denied at this
+#      environment's proxy, so player_game_logs.starting_position is NULL on
+#      every row today and attach_dvp_features still abstains on a live panel.
+#   2. THE MEASUREMENT ABOVE WAS MADE ON AN ARCHIVE PANEL, which is not the
+#      panel production builds from.
+#
+# Wiring these columns now would train trees to split on a column that arrives
+# empty in production -- the teammate_cascade.py failure mode this project has
+# documented once already. The order is: run the pull where nba.com is
+# reachable, rebuild the live panel, confirm non-null coverage there, re-run
+# this arm on a panel that carries real positions, and only then change the
+# tuples below. Numbers, the collinearity table, the slice's cost and the
+# writer: docs/fouls_and_dvp.md sections 3a and 5.
+#
 # OPP_{M}_ALLOWED_L10 is per GAME where the listed DEF_* columns are per 100
 # POSSESSIONS. Per-game allowed confounds defensive quality with tempo, which
 # is the exact confound DEF_PACE_L10 was published separately to avoid, so the

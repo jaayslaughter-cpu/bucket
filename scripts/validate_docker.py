@@ -125,6 +125,36 @@ def _is_ignored(path: str, rules: list[tuple[str, bool]]) -> bool:
     return ignored
 
 
+def _check_shell_entrypoint(root: Path, script: Path, report: "Report") -> None:
+    """
+    Every `python -m <module>` and `python <file>.py` the start script runs.
+
+    WHY THIS IS WORTH A CHECK. A start script is the one file in the image that
+    nothing imports and no test calls, so a renamed module inside it is found
+    by booting the container — in front of the platform's deploy log, after the
+    build has already succeeded. Resolving the names against the tree is cheap
+    and catches exactly that.
+    """
+    body = script.read_text(encoding="utf-8")
+    missing: list[str] = []
+
+    for module in re.findall(r"python\s+-m\s+([A-Za-z0-9_.]+)", body):
+        as_path = root / (module.replace(".", "/") + ".py")
+        as_pkg = root / module.replace(".", "/") / "__init__.py"
+        if not as_path.is_file() and not as_pkg.is_file():
+            missing.append(f"-m {module}")
+
+    for name in re.findall(r"python\s+([A-Za-z0-9_./-]+\.py)", body):
+        if not (root / name).is_file():
+            missing.append(name)
+
+    if missing:
+        report.bad(f"{script.name} runs only things that exist",
+                   f"not in the tree: {missing}")
+    else:
+        report.ok(f"{script.name} runs only things that exist")
+
+
 def preflight(report: Report, root: Path = ROOT) -> None:
     """``root`` is a parameter so the checks can be exercised against a
     synthetic tree; see tests/test_validate_docker.py."""
@@ -143,13 +173,26 @@ def preflight(report: Report, root: Path = ROOT) -> None:
         report.bad("CMD is present", "no CMD instruction")
     else:
         parts = [p.strip().strip('"') for p in cmd.group(1).split(",")]
-        target = next((p for p in parts if p.endswith(".py")), None)
+        # A SHELL ENTRYPOINT IS LEGITIMATE and used to fail this check. The CMD
+        # is `bash scripts/start.sh`, which migrates, probes and then execs the
+        # worker; requiring a .py here would have reported "names no .py
+        # entrypoint" for the correct image. So the target is any file the CMD
+        # names that is in the tree, and a .sh target is followed: a start
+        # script referring to a module that does not exist is exactly the
+        # failure this check is for, and it is invisible until the container
+        # boots.
+        target = next(
+            (p for p in parts if p.endswith((".py", ".sh"))), None
+        )
         if target is None:
-            report.bad("CMD names a script", f"CMD {parts} names no .py entrypoint")
+            report.bad("CMD names a script",
+                       f"CMD {parts} names no .py or .sh entrypoint")
         elif not (root / target).is_file():
             report.bad("CMD target exists", f"CMD runs {target}, which is not in the tree")
         else:
             report.ok(f"CMD target exists ({target})")
+            if target.endswith(".sh"):
+                _check_shell_entrypoint(root, root / target, report)
 
     # 2. no secret baked in. Scanned on the JOINED body, because an ENV with
     #    line continuations puts its later assignments on lines that do not
@@ -236,6 +279,40 @@ def preflight(report: Report, root: Path = ROOT) -> None:
         report.bad("the application is not excluded", f"excluded by .dockerignore: {dropped}")
     else:
         report.ok("the application is not excluded")
+
+    # 7. the ML import is asserted at BUILD time.
+    #
+    # WHY THIS IS A CHECK NOW. The Dockerfile used to apt-install libgomp1,
+    # justified by "without it the image builds and then fails at import". The
+    # first real build (2026-10-10) disproved it -- the xgboost wheel vendors
+    # its own libgomp -- and that layer was removed, because it installed a
+    # library nothing loaded and was the only thing in the build needing the
+    # Debian package index. What replaced it is a `RUN python -c "import
+    # xgboost, catboost, sklearn"` layer, and THAT is now the only thing
+    # guaranteeing OpenMP resolves and the ML extra is present at build time
+    # rather than at the first unattended inference. A guarantee that rests on
+    # one line nobody checks is one edit from being gone, so it is checked.
+    #
+    # Matched on the RUN instruction, not anywhere in the file, so the comment
+    # explaining it cannot satisfy this.
+    joined_runs = " ".join(
+        re.sub(r"\\\s*\n\s*", " ", m.group(0))
+        for m in re.finditer(r"(?m)^RUN\s[^\n]*(?:\\\s*\n[^\n]*)*", body)
+    )
+    probe = re.search(r"python\s+-c\s+[\"']import\s+([A-Za-z0-9_,\s]+)", joined_runs)
+    imported = (
+        {n.strip() for n in probe.group(1).split(",") if n.strip()} if probe else set()
+    )
+    required = {"xgboost", "catboost"}
+    if not required <= imported:
+        report.bad(
+            "the ML extra is import-checked at build time",
+            f"no RUN layer imports {sorted(required - imported)}; a missing or "
+            f"unloadable ML extra would then surface at the first inference, "
+            f"unattended, after the slate had already been ingested",
+        )
+    else:
+        report.ok(f"the ML extra is import-checked at build time ({sorted(imported)})")
 
 
 # --- docker ------------------------------------------------------------------

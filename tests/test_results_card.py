@@ -40,15 +40,28 @@ def _field(embed, name: str) -> str:
 
 # --- it exists and reports the record --------------------------------------
 
-def test_the_builder_exists_and_is_the_fifth():
-    """O9's whole content: four builders, none of them a results card."""
+def test_the_builder_exists_and_the_set_of_builders_is_known():
+    """
+    The gap this closed was four builders, none of them a results card. The
+    count is asserted rather than left open because a builder nobody sends is
+    how four of these sat unreachable before — so adding one has to be a
+    deliberate act that updates this list.
+
+    SIX NOW, and this test caught the sixth being added. It was
+    ``build_prelock_correction_embed``, added with the tip-anchored pre-lock
+    check, and the count was updated in
+    ``tests/test_go_live_readiness.py`` and NOT here — two places assert the
+    same fact and only one was found by the targeted test runs at commit time.
+    The full suite is what caught it.
+    """
     import re
     from pathlib import Path
 
     body = (Path(__file__).parent.parent / "src" / "notify" / "discord.py").read_text()
     builders = set(re.findall(r"^def (build_\w+_embed)", body, re.M))
-    assert "build_win_loss_embed" in builders
-    assert len(builders) == 5, sorted(builders)
+    assert "build_win_loss_embed" in builders, "the results card builder"
+    assert "build_prelock_correction_embed" in builders, "the pre-lock retraction"
+    assert len(builders) == 6, sorted(builders)
 
 
 def test_the_record_is_reported_as_w_l_p():

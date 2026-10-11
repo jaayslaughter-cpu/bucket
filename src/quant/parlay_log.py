@@ -831,11 +831,39 @@ def open_parlay_log(
     on a typo would look like it worked and lose the ledger at the next
     restart, which is the failure this exists to prevent.
     """
-    choice = (ledger or os.environ.get(ENV_LEDGER_BACKEND) or "csv").strip().lower()
+    choice = resolve_ledger_choice(ledger)
     if choice == "csv":
         return ParlayLogStore(root)
-    if choice == "postgres":
-        return ParlayLogStore(backend=PostgresLedgerBackend())
+    return ParlayLogStore(backend=PostgresLedgerBackend())
+
+
+#: The two backends. "csv" is local and ephemeral; "postgres" survives a
+#: redeploy. The Dockerfile sets PROPIQ_PARLAY_LEDGER=postgres, so the image
+#: never relies on this default.
+LEDGER_CHOICES: tuple[str, ...] = ("csv", "postgres")
+DEFAULT_LEDGER_CHOICE = "csv"
+
+
+def resolve_ledger_choice(ledger: str | None = None) -> str:
+    """
+    Which backend this environment has chosen: "csv" or "postgres".
+
+    SPLIT OUT SO THE BOOT CHECK AND THE STORE CANNOT DISAGREE. The worker
+    reports the ledger in use at boot (``scheduler_worker.check_parlay_ledger``)
+    and ``open_parlay_log`` opens it; those reading the env var separately
+    would be two implementations of one decision, which is a defect this
+    project has now found twice -- see ``builder.attach_pra_from_components``.
+
+    A typo RAISES rather than defaulting. Falling back to csv on
+    ``PROPIQ_PARLAY_LEGER=postgres`` would look like it worked and lose every
+    ticket at the next restart, which is exactly the failure the postgres
+    backend exists to prevent.
+    """
+    choice = (
+        ledger or os.environ.get(ENV_LEDGER_BACKEND) or DEFAULT_LEDGER_CHOICE
+    ).strip().lower()
+    if choice in LEDGER_CHOICES:
+        return choice
     raise ParlayLogError(
         f"{ENV_LEDGER_BACKEND}={choice!r} is not a ledger backend. Use 'csv' or "
         "'postgres'; defaulting to csv on a typo would look like it worked and "

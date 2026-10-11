@@ -37,7 +37,7 @@ pregame-only features
 | `src/utils/` | Timezone helpers |
 | `scripts/nba_model_cli.py` | CLI entry point |
 | `config/` | `model_comparison.yaml` — seeds, weights, hyperparameters |
-| `migrations/` | SQL migrations |
+| `migrations/` | SQL migrations, applied and recorded by `python -m scripts.migrate_db` |
 | `outputs/` | Downloadable CSV/Parquet deliverables only |
 | `tests/` | pytest suite |
 

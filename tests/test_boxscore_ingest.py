@@ -90,3 +90,32 @@ def test_parsed_frame_matches_the_feature_builder_contract():
     feats = build_feature_matrix(frame)
     assert "PTS_L2" in feats.columns
     assert "fatigue_multiplier" in feats.columns
+
+
+def test_personal_fouls_come_through_the_live_parser():
+    """
+    PF is in HEADERS above, between TOV and PTS, because it is in the real
+    LeagueGameLog payload. COLUMN_MAP had never asked for it, so the LIVE
+    panel carried no foul count while the Kaggle archive did, and a docstring
+    asserted the endpoint simply did not report fouls. The header list in this
+    file is what disproved that. src/features/fouls.py reads this column.
+    """
+    from src.ingestion.boxscores import COLUMN_MAP
+
+    assert "PF" in COLUMN_MAP
+    assert "PF" in HEADERS
+    frame = parse_league_game_log(_payload([_row(22500001, "GSW @ LAL")]), season="2025-26")
+    assert "PF" in frame.columns
+    assert frame["PF"].notna().all()
+
+    # And it is COERCED, which is the half the fixture's own int value cannot
+    # test: JSON hands numbers back as strings often enough that every other
+    # stat in this payload goes through pd.to_numeric, and a string column
+    # would reach the rolling mean as an object and silently produce nothing.
+    import pandas as pd
+
+    row = _row(22500002, "GSW @ LAL")
+    row[HEADERS.index("PF")] = "3"
+    as_text = parse_league_game_log(_payload([row]), season="2025-26")
+    assert pd.api.types.is_numeric_dtype(as_text["PF"])
+    assert as_text["PF"].iloc[0] == 3.0
