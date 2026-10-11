@@ -31,7 +31,19 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      # fetch-depth: 0 -- THE WHOLE HISTORY, not the default single commit.
+      # `tests/test_go_live_readiness.py` checks that each commit the readiness
+      # page credits with adding a file really did add it, which needs
+      # `git log --diff-filter=A` to reach that commit. On a depth-1 clone it
+      # cannot: every path looks as though the one checked-out commit created
+      # it, and the older shas do not resolve at all. On 2026-10-11 that
+      # produced six failures reading "the page is wrong about six things"
+      # when the page was right and the clone was thin -- and because this
+      # workflow fires on `pull_request`, the first PR for a branch is the
+      # first time those checks are reached at all.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # 3.11 matches the version the suite is developed against; pyproject
       # sets ruff's target-version to py311 for the same reason.

@@ -60,6 +60,31 @@ def _git_available() -> bool:
         return False
 
 
+def _full_history_available() -> bool:
+    """
+    Git AND the history, which are two preconditions, not one.
+
+    FOUND IN CI, 2026-10-11. These attribution checks need `git log
+    --diff-filter=A` to reach the commit that actually added a file. On a
+    SHALLOW clone it cannot: only the checked-out commit is present, so every
+    path looks as though that one commit created it and every older sha fails
+    to resolve at all. `actions/checkout@v4` is shallow by default, so the six
+    failures the run produced read as "the page is wrong about six things"
+    when the page was right and the clone was thin. The run had never passed
+    these -- the workflow fires on `pull_request`, so the first PR for a branch
+    is the first time they are reached in CI.
+
+    Guarding on `_git_available` alone was the defect: a tool being installed
+    is not the same as the data being there. The workflow now fetches full
+    history (`test_the_workflow_fetches_the_history_these_checks_need` pins
+    that), and this stays as the honest precondition so a thin clone skips
+    with a reason rather than accusing the document.
+    """
+    if not _git_available():
+        return False
+    return _git("rev-parse", "--is-shallow-repository") != "true"
+
+
 def _claimed_attributions() -> list[tuple[str, str]]:
     """
     PARSE THE PAGE, do not keep a second copy of it.
@@ -85,7 +110,10 @@ def test_the_page_makes_checkable_attribution_claims():
     )
 
 
-@pytest.mark.skipif(not _git_available(), reason="no git in this environment")
+@pytest.mark.skipif(
+    not _full_history_available(),
+    reason="shallow clone: git log cannot reach the commit that added a file",
+)
 @pytest.mark.parametrize("sha,path", _claimed_attributions())
 def test_each_cited_commit_really_added_what_the_page_credits_it_with(sha, path):
     assert (ROOT / path).exists(), f"the page credits a commit with adding {path}, which is gone"
@@ -96,11 +124,51 @@ def test_each_cited_commit_really_added_what_the_page_credits_it_with(sha, path)
     )
 
 
-@pytest.mark.skipif(not _git_available(), reason="no git in this environment")
+@pytest.mark.skipif(
+    not _full_history_available(),
+    reason="shallow clone: older commits are not present to resolve",
+)
 def test_every_hash_on_the_page_resolves():
     for sha in set(re.findall(r"`([0-9a-f]{7})`", TEXT)):
         assert _git("cat-file", "-t", sha) == "commit", (
             f"the page cites {sha}, which is not a commit in this repository"
+        )
+
+
+def test_the_workflow_fetches_the_history_these_checks_need():
+    """
+    THE OTHER HALF OF THE SKIP ABOVE, and the reason it is not a silent pass.
+
+    A precondition that skips is a guard that stops guarding, so the thing that
+    makes the skip unnecessary is pinned here: CI must check out full history.
+    `actions/checkout@v4` defaults to `fetch-depth: 1`, which is why the
+    attribution checks had never once run in CI -- they skipped or failed
+    depending only on whether anyone noticed.
+
+    Asserted against the workflow's parsed YAML rather than a substring, so a
+    `fetch-depth: 0` sitting in a comment or under a different step does not
+    satisfy it.
+    """
+    yaml = pytest.importorskip("yaml")
+
+    workflow = ROOT / ".github" / "workflows" / "tests.yml"
+    assert workflow.is_file(), "the test workflow is gone"
+    config = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+
+    checkouts = [
+        step
+        for job in (config.get("jobs") or {}).values()
+        for step in (job.get("steps") or [])
+        if str(step.get("uses") or "").startswith("actions/checkout")
+    ]
+    assert checkouts, "no checkout step found, so this guard proves nothing"
+    for step in checkouts:
+        depth = (step.get("with") or {}).get("fetch-depth")
+        assert str(depth) == "0", (
+            f"{step.get('uses')} uses fetch-depth={depth!r}. The commit "
+            "attribution checks need the whole history to find which commit "
+            "added a file; at depth 1 they skip, and the page goes unguarded "
+            "in the only place it is checked automatically."
         )
 
 
