@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -169,20 +170,50 @@ def test_the_artifacts_dir_agrees_with_the_resolver_the_slate_uses(monkeypatch):
 # scripts/railway_healthcheck.py — strict where the worker is forgiving
 # ---------------------------------------------------------------------------
 
-def _seed(artifacts_dir: Path, market: str, *, rows: int, sidecar: bool = True) -> Path:
+def _seed(
+    artifacts_dir: Path,
+    market: str,
+    *,
+    rows: int,
+    sidecar: bool = True,
+    saved_days_ago: float | None = 2.0,
+) -> Path:
+    """
+    A seeded artifact family, with the keys TRAINING ACTUALLY WRITES.
+
+    `saved_at_utc` was added on 2026-10-11 with the artifact-freshness check.
+    It is not optional dressing: a sidecar without it reads as UNDATED, which
+    the freshness check FAILS and the dispatch gate withholds on, so a fixture
+    that omitted it stood for a volume no real training run produces. See
+    `tests/test_artifact_freshness.py` for the key's provenance — it is the one
+    training persists, and `registered_at_utc` is not.
+
+    `saved_days_ago=None` omits it, for the tests that want the UNDATED case.
+    """
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     artifact = artifacts_dir / f"xgboost_{market}.json"
     artifact.write_text("{}", encoding="utf-8")
     (artifacts_dir / f"xgboost_{market}.mean.json").write_text("{}", encoding="utf-8")
     if sidecar:
+        meta: dict = {"train_row_count": rows, "feature_cols": ["x"]}
+        if saved_days_ago is not None:
+            stamp = datetime.now(timezone.utc) - timedelta(days=saved_days_ago)
+            meta["saved_at_utc"] = stamp.isoformat()
         (artifacts_dir / f"xgboost_{market}.meta.json").write_text(
-            json.dumps({"train_row_count": rows, "feature_cols": ["x"]}),
-            encoding="utf-8",
+            json.dumps(meta), encoding="utf-8",
         )
     return artifact
 
 
-def _volume(monkeypatch, tmp_path, *, rows=200_000, sidecar=True, markets=("PTS",)):
+def _volume(
+    monkeypatch,
+    tmp_path,
+    *,
+    rows=200_000,
+    sidecar=True,
+    markets=("PTS",),
+    saved_days_ago: float | None = 2.0,
+):
     """A state root that looks like a seeded volume, and the checks run on it."""
     from src.utils.volume import ENV_STATE_DIR, artifact_dir_on
 
@@ -199,13 +230,42 @@ def _volume(monkeypatch, tmp_path, *, rows=200_000, sidecar=True, markets=("PTS"
     # artifacts, which is what they assert.
     monkeypatch.setenv("PROPLINE_API_KEY", "fixture-value-not-a-real-key")
     for market in markets:
-        artifact = _seed(artifact_dir_on(root), market, rows=rows, sidecar=sidecar)
+        artifact = _seed(
+            artifact_dir_on(root),
+            market,
+            rows=rows,
+            sidecar=sidecar,
+            saved_days_ago=saved_days_ago,
+        )
     monkeypatch.setenv("PROPIQ_MODEL", str(artifact))
     return root
 
 
 def _statuses(checks) -> dict[str, str]:
     return {c.name: c.status for c in checks}
+
+
+def test_a_volume_seeded_with_an_undated_artifact_is_a_failure(monkeypatch, tmp_path):
+    """
+    The other side of `_seed`'s `saved_at_utc`, so that key is not just dressing.
+
+    `scripts/seed_volume.py` copies artifact families onto the volume by hand,
+    which is exactly how a sidecar from an older training run — or a hand-built
+    one — gets there. Without a readable `saved_at_utc` the deployment cannot
+    establish its model's age, and an unknown age is not a young one: the probe
+    FAILS rather than passing an artifact it knows nothing about.
+    """
+    from scripts.railway_healthcheck import FAIL, run_checks
+
+    _volume(monkeypatch, tmp_path, saved_days_ago=None)
+    monkeypatch.setenv("PROPIQ_PARLAY_LEDGER", "postgres")
+    checks = run_checks(skip_db=True)
+    failed = {c.name: c.detail for c in checks if c.status == FAIL}
+    assert "artifact_freshness[PTS]" in failed
+    assert "saved_at_utc" in failed["artifact_freshness[PTS]"]
+    # And NOT reported as an unusable artifact: it resolves, it has its
+    # sidecar, it was fit on real rows. Two faults with two different fixes.
+    assert "model_artifact[PTS]" not in failed
 
 
 def test_a_correctly_seeded_volume_is_not_reported_as_a_failure(monkeypatch, tmp_path):

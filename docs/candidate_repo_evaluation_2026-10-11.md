@@ -145,8 +145,8 @@ stated reason is the failure that prompted it — a snapshot stamped "generated
 today" while serving models trained three weeks earlier, where "nothing on the
 page said so."
 
-We have no equivalent. That is **A2** below, and it is the most valuable thing
-in all 25 repositories.
+We had no equivalent. That is **A2** below, it was the most valuable thing in
+all 25 repositories, and it is now built.
 
 ## 2. Deliverable — Model Extraction Checklist
 
@@ -211,7 +211,7 @@ re-derive it.
 Two items. The set is weaker than PropIQ on this pillar almost everywhere, and
 most of what looks like autonomy is a laptop — but these two are real.
 
-### A2 — Refuse to publish on a stale model artifact *(highest-value item on this page)*
+### A2 — Refuse to publish on a stale model artifact — **IMPLEMENTED 2026-10-11**
 
 - **Source.** `Kevocado/NBA_Predictor @ src/nba_predictor/public_snapshot.py:1-20`:
   compare the model's `trained_at` against now at publish time and **raise**
@@ -219,27 +219,46 @@ most of what looks like autonomy is a laptop — but these two are real.
   refusal raises rather than warns, because the alternative is a staleness
   banner the reader has to notice — "and the whole point is that they would
   not."
-- **The gap in our tree, verified.** `src/models/artifact_registry.py:52`
-  writes `registered_at_utc` into every sidecar, and **nothing in the tree ever
-  reads it back to judge age**: there is no `trained_at`, `model_age` or
-  `MAX_MODEL_AGE` anywhere. `scripts/railway_healthcheck.py:152` checks that
-  artifacts *exist* and parse, not how old they are. We do bound **data**
-  freshness (`main.resolve_market_frames` / `market_frames_freshness`, default
-  10 days) — but not **model** freshness.
+- **The gap in our tree, verified.** `scripts/railway_healthcheck.py:152`
+  checked that artifacts *exist*, parse, and were not fit on demo-sized data —
+  never how old they are. There was no `model_age` or `MAX_MODEL_AGE` anywhere.
+  We bound **data** freshness (`main.market_frames_freshness`, default 10 days)
+  but not **model** freshness.
+- **The key is `saved_at_utc`, which took inspecting the artifacts to establish.**
+  I first wrote that `src/models/artifact_registry.py:52` put
+  `registered_at_utc` in every sidecar. It does not: that module builds a
+  separate append-only `model_registry.jsonl`, **nothing writes to it**, and
+  `main.py:182` says in as many words that it is
+  deliberately not read because "resolving through a dead module is how
+  `oddspapi` stayed in the source precedence for months". What training actually
+  persists is `saved_at_utc`, present in 8 of the 9 sidecars under
+  `data/external/model_runs` — and `tests/test_artifact_freshness.py` now
+  asserts that coupling, so a training change that drops the key fails a test
+  instead of silently withholding every board.
 - **Why it matters here specifically.** We are a nightly Discord worker with no
   human in the loop. If a retrain silently stops, the board keeps going out,
   stamped with tonight's date, on an artifact that could be months old, and
   nothing anywhere says so. This is the autonomous-operation failure mode that
   looks most like success.
-- **Shape of the fix.** A named `MAX_MODEL_ARTIFACT_AGE_DAYS`, read from
-  `registered_at_utc` (the key we actually write — not an invented
-  `trained_at`), checked in two places: as a FAILURE in
-  `scripts/railway_healthcheck.py`, and as a refusal on the publication path
-  alongside `src/quant/publication_gate.py:150`. The constant is ours to
-  decide, pinned by a test, so loosening it fails a test rather than quietly
-  reversing a conclusion.
+- **Built with TWO axes, where the source has one.** File age alone certifies
+  the pipeline it should catch: a retrain that keeps running against the same
+  stale frame rewrites `saved_at_utc` nightly forever while the model learns
+  nothing. So training recency is measured too, from `train_end_date` — and
+  **against the newest game we hold, not against today**
+  (`src/db/repository.py:469` is the one reader in that module with no upper
+  window, because a window there would hide exactly the lag it looks for).
+  Against today, every artifact would go stale each July and the alarm would
+  fire for four months, which is how a staleness alarm gets muted.
+- **Where it lives.** Measurement in `src/models/artifact_freshness.py:177`
+  (`OK` / `STALE` / `UNDATED` / `MISSING`, reporting *which* axes ran so
+  "not measured" cannot be read as "fine"); the refusal in
+  `src/quant/publication_gate.py:378` as a second verdict beside
+  `calibration_gate`, combined by `first_refusal` so the reason that fired is
+  the reason shown; wired into the nightly dispatch at
+  `scheduler_worker.py:1176` and into the deploy probe as a FAILURE at
+  `scripts/railway_healthcheck.py:254`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
-  reasoning, cited — not their code.
+  reasoning, cited — not their code. Every line is ours.
 
 ### A1 — Cross-process advisory lock on the write path *(real gap, small fix)*
 
@@ -249,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap in our tree.** `scheduler_worker.py:1605-1608` sets
+- **The gap in our tree.** `scheduler_worker.py:1697-1700` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
@@ -360,7 +379,10 @@ Ordered by damage if ignored.
 - No candidate's model was *run*, and no claim here compares measured
   performance — only method and contract. M1 is explicitly gated on a
   measurement we have not taken.
-- A1 and A2 are **not implemented**. They are scoped findings, and A2's "the
-  gap is real" half is verified against our tree; the fix is not written.
+- **A2 is implemented** (see its entry above), with eight mutations each
+  failing a named test. **A1 and M1 are not** — they are scoped findings.
+- A2 refuses to publish; it does not refuse to *score*. A stale artifact still
+  produces a board CSV, which is deliberate: the file is the record an operator
+  inspects to see what was withheld and why.
 - No candidate code was copied into this repository. The clones are in the
   session scratchpad and are not part of the tree.

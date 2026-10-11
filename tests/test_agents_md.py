@@ -25,7 +25,7 @@ TEXT = AGENTS.read_text(encoding="utf-8")
 CITATIONS = [
     ("src/quant/advisory_sizing.py", 114, '"AUTO_PLACED": False'),
     ("src/quant/contracts.py", 187, 'context.status != "VALID"'),
-    ("src/quant/publication_gate.py", 150, "def calibration_gate"),
+    ("src/quant/publication_gate.py", 160, "def calibration_gate"),
     ("src/features/builder.py", 665, "def assert_no_lookahead"),
     ("src/features/builder.py", 121, "from src.models.compare import load_comparison_config"),
     ("src/features/fatigue_load.py", 284, "from src.models.compare import load_comparison_config"),
@@ -35,6 +35,8 @@ CITATIONS = [
     ("src/ingestion/propline.py", 15, "refused here"),
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/utils/timezones.py", 12, 'STORAGE_TZ_NAME = "UTC"'),
+    ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate"),
+    ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
 ]
 
 
@@ -73,6 +75,35 @@ def test_every_cited_line_number_appears_in_the_file(path, line, _needle):
     in this table would otherwise go on passing."""
     assert _cited_in_prose(path, line), (
         f"{path}:{line} is in the citation table but no longer in AGENTS.md"
+    )
+
+
+def test_no_citation_in_the_prose_escapes_the_table():
+    """
+    THE HOLE THE TABLE ABOVE LEFT. Both directions were already guarded —
+    a tabled citation must resolve, and a tabled citation must still be in the
+    prose — but nothing stopped a NEW line citation being added to AGENTS.md
+    without a table entry, and an untabled citation is exactly one that goes
+    stale silently. Found on 2026-10-11 by adding a row and noticing that
+    nothing checked it.
+
+    A range (`file.py:11-12`) is covered when either endpoint is tabled: the
+    table's job is to pin the finding, not every line of it.
+    """
+    tabled = {(path, line) for path, line, _ in CITATIONS}
+    pattern = re.compile(
+        r"((?:src|tests|scripts|docs|config|migrations)/[\w./-]+\.py"
+        r"|main\.py|scheduler_worker\.py):(\d+)(?:-(\d+))?"
+    )
+    untabled = []
+    for m in pattern.finditer(TEXT):
+        path, lo, hi = m.group(1), int(m.group(2)), m.group(3)
+        endpoints = {lo} | ({int(hi)} if hi else set())
+        if not any((path, line) in tabled for line in endpoints):
+            untabled.append(m.group(0))
+    assert not untabled, (
+        f"these citations are in AGENTS.md but not in CITATIONS, so nothing "
+        f"keeps them pointing at what they claim: {sorted(set(untabled))}"
     )
 
 

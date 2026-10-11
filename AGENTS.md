@@ -19,7 +19,8 @@ the original named six docs and a module that do not exist here. See
 | Bet sizes are advisory metadata, never bound to an execution script | same; `recommended_units` is read-only output |
 | No EV, CLV or stake unless the market is real | `src/quant/contracts.py:187` — `context.status != "VALID"` returns a verdict with a reason and no number |
 | Pick'em multipliers are not valid two-way EV | `src/quant/dfs_payouts.py`, `src/quant/dfs_entry.py` — a payout multiple is a payout multiple; a one-sided benchmark is refused outright |
-| No card is published on an uncalibrated model | `src/quant/publication_gate.py:150` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
+| No card is published on an uncalibrated model | `src/quant/publication_gate.py:160` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
+| No board is published from a stale model artifact | `src/quant/publication_gate.py:378` `artifact_freshness_gate()`; `src/models/artifact_freshness.py:177` ages it on file age AND training recency, and an artifact whose age cannot be read withholds too |
 | No claim words | `tests/test_publication_gate.py:66` fails the build if `"guaranteed"`, `"profitable"`, `"lock"` or `"certain"` appears in the disclaimer |
 | Nothing fabricated — lines, odds, props, stats, injuries, endpoints, probabilities, history | explicit `DATA_NOT_AVAILABLE` statuses throughout; see §4 |
 | **NBA only. No NCAA, no other sport.** | `main.py:4`; `src/ingestion/propline.py:15` refuses every non-NBA league the provider offers |

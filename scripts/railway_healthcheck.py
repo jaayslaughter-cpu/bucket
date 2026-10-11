@@ -251,6 +251,113 @@ def _check_model_artifacts(markets: list[str]) -> list[Check]:
     return out
 
 
+def _check_artifact_freshness(markets: list[str], skip_db: bool) -> list[Check]:
+    """
+    One check per market: HOW OLD is the artifact we would score with.
+
+    SEPARATE FROM `_check_model_artifacts` ON PURPOSE. That one answers whether
+    an artifact is usable — present, sidecar beside it, not the synthetic demo.
+    This one answers whether it is CURRENT, which is a different question with a
+    different remedy: the first is fixed by seeding or training an artifact, the
+    second only by retraining. Folding them into one check would report one
+    status for two faults and name one of the two fixes.
+
+    A FAILURE, not a warning. On a deploy with a stale artifact every number on
+    the nightly board is computed from a model that stopped learning months ago,
+    the slate exits 0 and nothing looks broken — the failure mode this probe
+    exists for. `publication_gate.artifact_freshness_gate` withholds the board
+    at dispatch time for the same reason; this says so at deploy time, before a
+    channel sees anything.
+
+    Training recency needs the database, so under `--skip-db` only the
+    artifact's own file age is judged, and the detail says which axes ran rather
+    than implying both did.
+    """
+    from main import resolve_model_artifact
+    from src.models.artifact_freshness import (
+        MISSING,
+        STALE,
+        UNDATED,
+        artifact_freshness_for,
+    )
+    from src.models.artifact_freshness import OK as FRESH_OK
+
+    newest: str | None = None
+    if not skip_db:
+        try:
+            from src.db.repository import newest_team_game_date
+
+            newest = newest_team_game_date()
+        except Exception as exc:  # noqa: BLE001 — absence is the signal
+            print(f"note: could not read the newest game date ({exc}); "
+                  "training recency not measured", file=sys.stderr)
+
+    out: list[Check] = []
+    for market in markets:
+        name = f"artifact_freshness[{market}]"
+        try:
+            path, how = resolve_model_artifact(market=market)
+        except Exception as exc:  # noqa: BLE001 — the resolver's error is the answer
+            out.append(Check(name, FAIL, f"the resolver raised: {exc}"))
+            continue
+
+        if path is None or not Path(path).exists():
+            # `_check_model_artifacts` already FAILS this and names the fix, so
+            # repeating it as a second failure would double-count one fault.
+            out.append(Check(
+                name, WARN,
+                f"no artifact resolved ({how}), so there is no age to judge — "
+                "see the model_artifact check above for the actual fault.",
+            ))
+            continue
+
+        fresh = artifact_freshness_for(
+            path, newest_game_date=newest, market=market
+        )
+        data = {
+            "path": str(path),
+            "saved_at_utc": fresh["saved_at_utc"],
+            "artifact_age_days": fresh["artifact_age_days"],
+            "max_artifact_age_days": fresh["max_artifact_age_days"],
+            "train_end_date": fresh["train_end_date"],
+            "training_lag_days": fresh["training_lag_days"],
+            "max_training_lag_days": fresh["max_training_lag_days"],
+            "newest_game_date": fresh["newest_game_date"],
+            "checks_run": list(fresh["checks"]),
+        }
+        if fresh["status"] in (STALE, UNDATED, MISSING):
+            out.append(Check(
+                name, FAIL, " ".join(fresh["reasons"]) or fresh["status"], data,
+            ))
+            continue
+        if not fresh["checks"]:
+            # An OK status with nothing measured is not an OK artifact, and the
+            # dispatch gate withholds on exactly this. Say so here too.
+            out.append(Check(
+                name, FAIL,
+                "no freshness check could run on this artifact, so nothing "
+                "about its age was established.", data,
+            ))
+            continue
+
+        age = fresh["artifact_age_days"]
+        lag = fresh["training_lag_days"]
+        detail = (
+            f"saved {age} d ago (limit {fresh['max_artifact_age_days']})"
+            if age is not None else "age established"
+        )
+        detail += (
+            f", trained through {fresh['train_end_date']}, {lag} d behind our "
+            f"newest game (limit {fresh['max_training_lag_days']})"
+            if lag is not None
+            else f", trained through {fresh['train_end_date']} "
+                 "(recency not measured — no database)"
+        )
+        assert fresh["status"] == FRESH_OK
+        out.append(Check(name, OK, detail, data))
+    return out
+
+
 def _check_bigdataball_workbook(skip_db: bool) -> list[Check]:
     """
     Can step [2] get the team-game and market-line frames at all?
@@ -585,6 +692,7 @@ def run_checks(*, skip_db: bool = False) -> list[Check]:
     checks: list[Check] = []
     checks += _check_state_root()
     checks += _check_model_artifacts(markets)
+    checks += _check_artifact_freshness(markets, skip_db)
     checks += _check_bigdataball_workbook(skip_db)
     checks += _check_database(skip_db)
     checks += _check_ledger(db_configured)

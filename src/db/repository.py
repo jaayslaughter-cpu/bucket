@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
@@ -464,6 +464,34 @@ TEAM_GAME_STAT_COLS: tuple[str, ...] = (
 MARKET_LINE_PREGAME_COLS: tuple[str, ...] = (
     "nba_game_id", "game_date", "team_abbr", "opening_spread", "opening_total",
 )
+
+
+def newest_team_game_date() -> str | None:
+    """
+    The newest ``game_date`` in ``team_game_stats``, as ``YYYY-MM-DD``, or None.
+
+    WHY A SCALAR AND NOT `load_team_game_stats().max()`. The callers that want
+    this -- the dispatch gate and the healthcheck -- want one date to compare an
+    artifact's `train_end_date` against. Loading a 400-day frame to take one
+    maximum is a table scan and a dataframe for a number the index already has,
+    and on a worker that runs it nightly it is a cost with nothing behind it.
+
+    NO WINDOW IS APPLIED HERE, unlike every other reader in this module. The
+    windows elsewhere are LEAKAGE GUARDS: they stop a feature from seeing past
+    the slate it predicts. This number is not a feature and never reaches a
+    model -- it answers "how far does our data run", which an upper bound would
+    be precisely the wrong way to ask.
+
+    None rather than a raise when the table is empty: a first deploy with no
+    ingest yet is not a broken one, and the caller treats an unknown date as an
+    axis it cannot measure rather than as a pass.
+    """
+    with session_scope() as session:
+        newest = session.execute(select(func.max(TeamGameStat.game_date))).scalar()
+    if newest is None:
+        logger.info("No team-game rows, so there is no newest game date.")
+        return None
+    return str(newest)[:10]
 
 
 def load_team_game_stats(

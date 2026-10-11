@@ -55,7 +55,13 @@ import signal
 import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # the annotation only; importing it at runtime would make
+    # this module pull in the quant layer at import time, which every deferred
+    # import in this file exists to avoid.
+    from src.quant.publication_gate import PublicationVerdict
+
 
 logger = logging.getLogger("propiq.scheduler")
 
@@ -378,6 +384,85 @@ def notify_boot_problems(
             f"one thing that cannot be recomputed after the game.",
         ))
     return out
+
+
+def newest_game_date_or_none() -> str | None:
+    """
+    The newest game date we hold, or None when it cannot be read.
+
+    FAIL-SOFT ON PURPOSE. This feeds the training-recency half of the artifact
+    freshness check, and a database hiccup must not be able to withhold a board
+    that is otherwise fine. When this returns None that axis is simply NOT
+    MEASURED -- `artifact_freshness` omits it from `checks` and says so -- while
+    the artifact's own file age is still judged. Guessing a date here, or
+    falling back to today, would turn an unreadable database into either a
+    false pass or an alarm every offseason.
+    """
+    try:
+        from src.db.repository import newest_team_game_date
+
+        return newest_team_game_date()
+    except Exception as exc:  # noqa: BLE001 — absence is the signal, not an error
+        logger.warning(
+            "Could not read the newest game date (%s), so training recency was "
+            "not measured against it. The artifact's own age still was.", exc,
+        )
+        return None
+
+
+def artifact_freshness_verdict(
+    markets: list[str] | None = None,
+) -> PublicationVerdict | None:
+    """
+    One publication verdict for the age of the artifacts behind tonight's board.
+
+    STRICTEST ACROSS MARKETS, not per row. The board CSV is already written by
+    the time dispatch runs and carries no per-row artifact identity, so there is
+    no honest way to withhold one market's rows and publish another's from here.
+    Withholding the board and naming the stale market is the direction that
+    cannot mislead: the abstention embed still goes out, carrying which market
+    is stale and by how much, so the operator learns the cause tonight rather
+    than from an eventual look at the dates.
+
+    A MARKET WHOSE ARTIFACT DOES NOT RESOLVE IS WITHHELD, not skipped. Nothing
+    scored those rows from a model, so a model-sourced board has no business
+    publishing numbers for them, and "no artifact" is exactly the unknown age
+    this gate refuses to read as a young one.
+    """
+    from pathlib import Path
+
+    from main import resolve_model_artifact
+    from src.models.artifact_freshness import artifact_freshness, artifact_freshness_for
+    from src.quant.dfs_payouts import ProbabilitySource
+    from src.quant.publication_gate import artifact_freshness_gate, first_refusal
+
+    names = [str(m).upper() for m in (markets if markets is not None else board_markets())]
+    if not names:
+        return None
+
+    newest = newest_game_date_or_none()
+    verdicts = []
+    for market in names:
+        try:
+            path, how = resolve_model_artifact(market=market)
+        except Exception as exc:  # noqa: BLE001 — the resolver's failure is the answer
+            logger.warning("Could not resolve the %s artifact (%s).", market, exc)
+            path, how = None, str(exc)
+        if path is None or not Path(path).exists():
+            logger.warning(
+                "No %s artifact resolved (%s), so its age is unknown.", market, how,
+            )
+            freshness = artifact_freshness(None, market=market)
+        else:
+            freshness = artifact_freshness_for(
+                path, newest_game_date=newest, market=market
+            )
+        verdicts.append(
+            artifact_freshness_gate(
+                freshness, probability_source=ProbabilitySource.MODEL
+            )
+        )
+    return first_refusal(*verdicts)
 
 
 def board_markets() -> list[str]:
@@ -1071,7 +1156,7 @@ def run_dispatch() -> dict[str, Any]:
             send_embeds,
         )
         from src.quant.dfs_payouts import ProbabilitySource
-        from src.quant.publication_gate import calibration_gate
+        from src.quant.publication_gate import calibration_gate, first_refusal
 
         report = None
         if report_path.exists():
@@ -1082,6 +1167,13 @@ def run_dispatch() -> dict[str, Any]:
                 # would treat None as "none supplied". Say which it was.
                 logger.warning("Calibration report %s is not JSON: %s", report_path, exc)
         verdict = calibration_gate(report, probability_source=ProbabilitySource.MODEL)
+        # THE SECOND GATE: the artifact's own age. A fresh calibration report
+        # describing a months-old artifact passes the gate above and is evidence
+        # about a model nobody is running any more -- see
+        # publication_gate.artifact_freshness_gate. first_refusal keeps whichever
+        # reason actually fired, because "withheld" with no cause reads in a
+        # channel as a broken pipeline rather than as a stale model.
+        verdict = first_refusal(verdict, artifact_freshness_verdict())
 
         if not board_csv.exists():
             if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
