@@ -31,6 +31,8 @@ from typing import Any
 
 import requests
 
+from src.utils.ids import normalise_one_game_id
+
 logger = logging.getLogger(__name__)
 
 CDN_BOXSCORE_URL = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
@@ -72,7 +74,7 @@ class GameNotFinalError(BoxScoreError):
 
 def normalize_game_id(game_id: str | int) -> str:
     """NBA game ids are zero-padded 10-char strings."""
-    return str(game_id).strip().zfill(10)
+    return normalise_one_game_id(game_id) or ""
 
 
 def fetch_boxscore(game_id: str | int, session: requests.Session | None = None) -> dict[str, Any]:

@@ -29,6 +29,8 @@ from typing import Any
 
 import pandas as pd
 
+from src.utils.ids import normalise_game_id
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SHEET = "NBA-2025-26-TEAM"
@@ -174,7 +176,7 @@ def load_bigdataball_workbook(
 
     # Re-pad in case the source ever delivers unpadded ids: NBA game ids
     # are 10 chars. zfill is a no-op on already-correct values.
-    df["_game_id"] = df[c_gameid].astype(str).str.strip().str.zfill(10)
+    df["_game_id"] = normalise_game_id(df[c_gameid])
     df["_game_date"] = df[c_date].map(_parse_bdb_date)
     df["_team_abbr"] = df[c_team].astype(str).str.strip().map(lambda t: team_map.get(t, t))
     # Venue is R/H/N — NEUTRAL SITE IS REAL: the 2025-26 workbook has 12
