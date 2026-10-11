@@ -152,6 +152,84 @@ def test_a_failing_slate_does_not_take_the_worker_down(monkeypatch):
     assert worker.run_slate([]) == 1
 
 
+def test_a_preflight_exit_is_caught_alerted_and_returned(monkeypatch):
+    """
+    FOUND IN PRODUCTION, 2026-10-11. `main.preflight` ends a run it cannot do
+    with `raise SystemExit(1)` (main.py:264) — and `SystemExit` derives from
+    BaseException, so the `except Exception` above it never saw it. On Railway
+    the 09:00 PT slate hit an unset DATABASE_URL and produced a raw APScheduler
+    traceback with NO Discord alert, while an ordinary exception on the very
+    same line alerted correctly. The one failure a misconfigured deploy is
+    guaranteed to hit was the one failure that told nobody.
+
+    `main.main` is a CLI entry point called in-process here, so its SystemExit
+    is "the CLI would have exited with this code" — a return value for this
+    caller, not a request that the worker exit.
+    """
+    import main
+
+    alerts = []
+    monkeypatch.setattr(
+        worker, "notify_failure",
+        lambda stage, detail, **kw: alerts.append((stage, detail)) or {},
+    )
+
+    def preflight_refuses(argv=None):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(main, "main", preflight_refuses)
+
+    assert worker.run_slate([]) == 1
+    assert [stage for stage, _ in alerts] == ["slate"]
+    assert "exit" in alerts[0][1].lower()
+
+
+def test_an_argparse_exit_is_also_caught(monkeypatch):
+    """argparse exits 2 on bad argv. Same boundary, same reasoning."""
+    import main
+
+    monkeypatch.setattr(worker, "notify_failure", lambda *a, **k: {})
+    monkeypatch.setattr(
+        main, "main", lambda argv=None: (_ for _ in ()).throw(SystemExit(2))
+    )
+    assert worker.run_slate([]) == 2
+
+
+def test_a_zero_system_exit_is_not_reported_as_a_failure(monkeypatch):
+    """
+    `SystemExit(None)` and `SystemExit(0)` are a CLI succeeding, which must not
+    alert — or the fix above turns every clean run into an incident.
+    """
+    import main
+
+    alerts = []
+    monkeypatch.setattr(
+        worker, "notify_failure", lambda *a, **k: alerts.append(a) or {},
+    )
+    monkeypatch.setattr(worker, "run_board", lambda: {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: {})
+    monkeypatch.setattr(
+        main, "main", lambda argv=None: (_ for _ in ()).throw(SystemExit(None))
+    )
+    assert worker.run_slate([]) == 0
+    assert alerts == []
+
+
+def test_a_keyboard_interrupt_still_propagates(monkeypatch):
+    """
+    The fix catches SystemExit, NOT BaseException. A Ctrl-C or a SIGINT during
+    a slate is a shutdown request, and swallowing it would make the worker
+    unkillable mid-run — a worse defect than the one being fixed.
+    """
+    import main
+
+    monkeypatch.setattr(
+        main, "main", lambda argv=None: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        worker.run_slate([])
+
+
 def test_a_failing_settlement_reports_rather_than_raising(monkeypatch):
     import src.settlement.runner as runner
 

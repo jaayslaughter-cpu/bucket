@@ -331,10 +331,53 @@ def notify_failure(stage: str, detail: str, *, dedupe: bool = True) -> dict[str,
         return {"status": "FAILED", "stage": stage, "error": scrub_alert(exc)}
 
 
+def check_database() -> dict[str, Any]:
+    """
+    Does the database answer? Asked at BOOT, not at 09:00.
+
+    FOUND IN PRODUCTION, 2026-10-11. The container booted at 03:22 PT reporting
+    nothing wrong, with `DATABASE_URL` unset. Settlement raised at 03:30, the
+    slate refused at 09:00, and the first signal arrived more than five hours
+    after a boot that already had every fact needed to say so.
+
+    The three checks beside this one ask about the volume, the artifact and the
+    ledger. None asked whether the database answers. The ledger check came
+    closest and still only catches it sideways -- it reports that "the first
+    parlay write will fail", which names a consequence, and only when the
+    ledger is explicitly set to postgres. With the ledger left at its csv
+    default and no database configured, the worker boots entirely quietly and
+    every job fails for a day.
+
+    NEVER RAISES. A probe that raises at boot takes the worker down before the
+    scheduler starts, which is strictly worse than the silence it replaces.
+    `session.healthcheck` already returns `(ok, message)` rather than raising;
+    the try here is for an import or driver failure underneath it.
+    """
+    try:
+        from src.db.session import healthcheck
+
+        ok, message = healthcheck()
+    except Exception as exc:  # noqa: BLE001 — a boot probe may not kill the worker
+        logger.error("Database boot check could not run: %s", exc)
+        return {"ok": False, "message": f"the database check itself failed: {exc}"}
+
+    out = {"ok": bool(ok), "message": str(message)}
+    if ok:
+        logger.info("Database reachable at boot.")
+    else:
+        logger.error(
+            "DATABASE UNREACHABLE AT BOOT: %s Every database step will fail "
+            "until this is fixed -- settlement at 03:30 PT and the slate at "
+            "09:00 PT both need it.", message,
+        )
+    return out
+
+
 def notify_boot_problems(
     state: Mapping[str, Any],
     artifact: Mapping[str, Any],
     ledger: Mapping[str, Any],
+    database: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """
     Alert on whatever the three boot checks found, reading their return values.
@@ -349,6 +392,22 @@ def notify_boot_problems(
     same unseeded-volume alert on every boot.
     """
     out: list[dict[str, Any]] = []
+    # FIRST, because it is the cause of which the other three are symptoms: an
+    # unreachable database makes the ledger unusable and every job fail, and an
+    # operator reading one alert should get the one that names the fix.
+    #
+    # `database` is a REQUIRED argument rather than one defaulting to None. A
+    # default would make "nobody passed the database result" indistinguishable
+    # from "the database is fine", which is the shape of silent pass this file
+    # keeps finding.
+    if database.get("ok") is False:
+        out.append(notify_failure(
+            "boot:database",
+            f"The database did not answer at boot: {database.get('message')} "
+            f"Nothing that persists will work -- settlement at 03:30 PT and "
+            f"the 09:00 PT slate both refuse without it, and the slate's "
+            f"preflight exits rather than scoring anything.",
+        ))
     if state.get("writable") is False:
         out.append(notify_failure(
             "boot:state-dir",
@@ -795,11 +854,47 @@ def run_slate(argv: list[str] | None = None) -> int:
     scheduled path and the manual one cannot drift. An exception is caught and
     logged: a failed slate must not take the scheduler down, or one bad day
     ends every subsequent day too.
+
+    SYSTEMEXIT IS CAUGHT SEPARATELY, AND THAT IS NOT A DETAIL. `main.preflight`
+    ends a run it cannot perform with ``raise SystemExit(1)`` (`main.py:264`),
+    and argparse exits 2 on bad argv -- both `BaseException`, so `except
+    Exception` never saw either. On Railway on 2026-10-11 the 09:00 PT slate
+    met an unset `DATABASE_URL`, preflight refused, and the result was a raw
+    APScheduler traceback and NO Discord alert -- while an ordinary exception
+    on this same line would have alerted. The single most likely failure of a
+    misconfigured deploy was the single failure that told nobody.
+
+    `main.main` is a CLI ENTRY POINT being called in-process, so its SystemExit
+    means "the CLI would have exited with this code". For this caller that is a
+    return value, not a request that the worker exit. `KeyboardInterrupt` is
+    deliberately NOT caught: that one IS a shutdown request, and swallowing it
+    would make the worker unkillable mid-slate -- a worse defect than this one.
     """
     import main
 
     try:
         code = main.main(argv or [])
+    except SystemExit as exc:
+        # `SystemExit(None)` and `SystemExit(0)` are a CLI that SUCCEEDED and
+        # must not alert, or the fix turns every clean run into an incident.
+        code = 0 if exc.code is None else exc.code
+        if isinstance(code, int) and code == 0:
+            logger.info("Slate run exited cleanly (SystemExit 0).")
+        else:
+            logger.error(
+                "Slate run exited with SystemExit %r; the scheduler stays up. "
+                "This is how main.preflight refuses a run it cannot do -- an "
+                "unset DATABASE_URL is the usual cause.", exc.code,
+            )
+            notify_failure(
+                "slate",
+                f"The 09:00 PT slate exited early with code {exc.code!r}. "
+                f"main.preflight refuses a run it cannot perform -- the usual "
+                f"cause is an unset DATABASE_URL, which makes every database "
+                f"step raise. Nothing was scored, no board was built and no "
+                f"card was sent.",
+            )
+            return 1 if not isinstance(code, int) else code
     except Exception as exc:  # noqa: BLE001 — a job may not kill the worker
         logger.exception("Slate run raised; the scheduler stays up.")
         notify_failure("slate", f"The 09:00 PT slate raised: {exc}")
@@ -1762,12 +1857,15 @@ def main() -> int:
     # put on it. See check_model_artifact for why inference is too late.
     artifact_state = check_model_artifact()
     ledger_state = check_parlay_ledger()
+    # Asked at boot for the reason in check_database: on 2026-10-11 this was
+    # the actual fault and the boot said nothing about it.
+    database_state = check_database()
     # ROUTED OUT, not just logged. In Railway's log view every line is already
     # red -- Python logging writes to stderr and Railway classifies stderr as
     # error severity -- so a real boot failure is indistinguishable from an
     # INFO line by eye. Deduped per stage per Pacific day so a redeploy loop
     # does not post the same alert on every boot.
-    notify_boot_problems(state_state, artifact_state, ledger_state)
+    notify_boot_problems(state_state, artifact_state, ledger_state, database_state)
 
     scheduler = build_scheduler()
     # Published so the daily planner can add one-shot jobs to the scheduler

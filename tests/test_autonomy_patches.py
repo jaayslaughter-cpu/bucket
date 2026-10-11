@@ -421,6 +421,7 @@ def test_boot_problems_are_read_from_the_checks_return_values(alerting):
         {"path": "/app/data", "writable": False, "error": "EACCES"},
         {"resolved": False, "reason": "no artifact found"},
         {"status": "UNUSABLE", "ledger": "postgres"},
+        {"ok": True, "message": "Database reachable."},
     )
     assert len(out) == 3
     stages = {a["stage"] for a in out}
@@ -433,6 +434,7 @@ def test_a_healthy_boot_alerts_nothing(alerting):
         {"path": "/app/data", "writable": True},
         {"resolved": True, "exists": True, "path": "/app/data/x.json"},
         {"status": "OK", "ledger": "postgres"},
+        {"ok": True, "message": "Database reachable."},
     )
     assert out == []
     assert alerting == []
@@ -449,6 +451,7 @@ def test_the_demo_artifact_is_reported_using_the_key_that_is_actually_set(alerti
         {"resolved": True, "exists": True, "implausible_train_rows": True,
          "train_row_count": 968},
         {"status": "OK"},
+        {"ok": True, "message": "Database reachable."},
     )
     assert [a["stage"] for a in out] == ["boot:model-artifact-demo"]
     assert "968" in json.dumps(alerting[0]["embeds"][0])
@@ -459,13 +462,87 @@ def test_a_local_csv_ledger_is_not_alerted(alerting):
     assert worker.notify_boot_problems(
         {"writable": True}, {"resolved": True, "exists": True},
         {"status": "LOCAL", "ledger": "csv"},
+        {"ok": True, "message": "Database reachable."},
     ) == []
     assert alerting == []
 
 
+def test_an_unreachable_database_is_alerted_at_boot(alerting):
+    """
+    FOUND IN PRODUCTION, 2026-10-11. The Railway container booted at 03:22 PT
+    reporting nothing wrong. `DATABASE_URL` was unset, so settlement failed at
+    03:30 and the slate refused at 09:00 -- the first signal came more than
+    five hours after a boot that had every fact it needed to say so.
+
+    The three existing checks ask about the volume, the artifact and the
+    ledger. None asks whether the database answers, and on this deployment the
+    ledger check only caught it indirectly: it reports "the first parlay write
+    will fail", which names a consequence rather than the cause.
+    """
+    out = worker.notify_boot_problems(
+        {"writable": True},
+        {"resolved": True, "exists": True},
+        {"status": "OK", "ledger": "postgres"},
+        {"ok": False, "message": "No database connection configured."},
+    )
+    assert [a["stage"] for a in out] == ["boot:database"]
+    assert "No database connection configured" in json.dumps(alerting[0]["embeds"][0])
+
+
+def test_a_reachable_database_alerts_nothing(alerting):
+    assert worker.notify_boot_problems(
+        {"writable": True}, {"resolved": True, "exists": True},
+        {"status": "OK"}, {"ok": True, "message": "Database reachable."},
+    ) == []
+    assert alerting == []
+
+
+def test_the_boot_database_check_never_raises(monkeypatch):
+    """
+    A probe that raises at boot takes the worker down before the scheduler
+    starts, which is strictly worse than the silence it replaces.
+    """
+    import src.db.session as session
+
+    def explode():
+        raise RuntimeError("driver exploded on import")
+
+    monkeypatch.setattr(session, "healthcheck", explode)
+    out = worker.check_database()
+    assert out["ok"] is False
+    assert "driver exploded" in out["message"]
+
+
+def test_the_boot_database_alert_carries_no_credential(alerting):
+    """
+    SQLAlchemy and psycopg both put the connection URL -- password included --
+    into their error messages, and this check hands that message straight to an
+    outbound channel. `scrub_alert` is what stands between the two.
+    """
+    leak = (
+        "Database connection failed: could not connect to "
+        "postgresql://propiq:sup3rs3cret@db.example.com:5432/propiq"
+    )
+    worker.notify_boot_problems(
+        {"writable": True}, {"resolved": True, "exists": True},
+        {"status": "OK"}, {"ok": False, "message": leak},
+    )
+    body = json.dumps(alerting[0]["embeds"][0])
+    assert "sup3rs3cret" not in body
+    assert "propiq:***@db.example.com" in body
+
+
 def test_main_routes_the_boot_checks_into_the_alerter():
-    """AST-walked: the three checks' return values must reach
-    `notify_boot_problems`, not be discarded."""
+    """
+    AST-walked: every boot check must RUN in `main` and its return value must
+    reach `notify_boot_problems`, not be discarded.
+
+    THIS TEST USED TO COUNT ARGUMENTS AND NOTHING ELSE, and a mutation that
+    replaced the database result with the literal `{"ok": True}` passed it --
+    the arity was right and the check had been unwired. Counting arguments
+    cannot tell a routed result from a hardcoded pass, so each argument is now
+    required to be a NAME, and each check is required to be called.
+    """
     tree = ast.parse((REPO / "scheduler_worker.py").read_text(encoding="utf-8"))
     main_fn = next(
         n for n in ast.walk(tree)
@@ -477,7 +554,39 @@ def test_main_routes_the_boot_checks_into_the_alerter():
         and n.func.id == "notify_boot_problems"
     ]
     assert len(calls) == 1
-    assert len(calls[0].args) == 3, "all three check results must be passed"
+    args = calls[0].args
+    assert len(args) == 4, "all four check results must be passed"
+
+    literals = [ast.dump(a) for a in args if not isinstance(a, ast.Name)]
+    assert not literals, (
+        "a boot check result was passed as a literal rather than as the "
+        f"variable the check returned, so the check is not wired: {literals}"
+    )
+
+    called = {
+        n.func.id for n in ast.walk(main_fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    for check in ("check_state_dir", "check_model_artifact",
+                  "check_parlay_ledger", "check_database"):
+        assert check in called, f"main does not call {check}"
+
+    # And the names passed must be the ones those checks were assigned to, or
+    # four correctly-shaped variables could still be the wrong four.
+    assigned = {
+        target.id: node.value.func.id
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    routed = [assigned.get(a.id) for a in args]
+    assert routed == [
+        "check_state_dir", "check_model_artifact",
+        "check_parlay_ledger", "check_database",
+    ], f"the arguments do not come from the four checks, in order: {routed}"
 
 
 # ---------------------------------------------------------------------------
