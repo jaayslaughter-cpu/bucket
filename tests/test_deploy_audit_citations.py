@@ -38,6 +38,7 @@ AUDITS = (
     "docs/automation_audit_2026-10-09.md",
     "docs/configuration_audit_2026-10-09.md",
     "docs/autonomy_audit_2026-10-10.md",
+    "docs/candidate_repo_evaluation_2026-10-11.md",
 )
 
 #: `path:12` or `path:12-34` inside backticks. The path must look like a real
@@ -55,7 +56,33 @@ ANCHORS = [
     ("docs/pickem_props.md", 61, "ODDS_API_KEY"),
     ("src/models/xgb_adapter.py", 390, "_VERSIONS_KEY"),
     ("src/models/xgb_adapter.py", 417, "warn_on_mismatch"),
+    # The 2026-10-11 candidate evaluation concluded "do not port, we already
+    # have this" and rests entirely on these twelve lines being where it says
+    # they are. If a refactor moves one, the verdict loses its evidence while
+    # still reading as though it had some -- which is the exact failure mode
+    # this file exists to catch.
+    ("src/quant/devig_methods.py", 99, "_bisect"),
+    ("src/quant/devig_methods.py", 136, "_shin_probabilities"),
+    ("src/models/residuals.py", 79, "variance_for"),
+    ("src/quant/psd_repair.py", 105, "nearest_correlation"),
+    ("src/models/prob_calibration.py", 34, "IsotonicRegression"),
+    ("src/quant/dfs_payouts.py", 513, "independent_hit_count_distribution"),
+    ("src/models/oof.py", 125, "chronological_fold_indices"),
+    ("src/features/schedule.py", 69, "haversine_miles"),
+    ("src/features/fatigue_logic.py", 22, "altitude"),
+    ("src/quant/line_diff.py", 103, "_over_given_no_push"),
+    ("scheduler_worker.py", 1605, "job_defaults"),
+    ("scheduler_worker.py", 1606, "max_instances"),
 ]
+
+#: A citation into a CANDIDATE repository, which is not in this tree:
+#: `owner/repo @ path:line`. The space-at-space makes it unmatchable by
+#: CITATION above, so these are exempt from the line check -- deliberately,
+#: since no test here can keep a foreign clone's line numbers fresh.
+EXTERNAL_CITATION = re.compile(
+    r"`([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) @ "
+    r"([A-Za-z0-9_./-]+\.(?:py|md|toml|txt|sql|yaml|yml)):(\d+)(?:-(\d+))?`"
+)
 
 
 def _citations() -> list[tuple[str, str, int, int]]:
@@ -80,9 +107,7 @@ def test_every_cited_line_exists(audit: str, path: str, lo: int, hi: int):
     target = REPO / path
     assert target.is_file(), f"{audit} cites {path}, which is not in the tree"
     count = len(target.read_text(encoding="utf-8").splitlines())
-    assert 1 <= lo <= hi <= count, (
-        f"{audit} cites {path}:{lo}-{hi} and the file has {count} lines"
-    )
+    assert 1 <= lo <= hi <= count, f"{audit} cites {path}:{lo}-{hi} and the file has {count} lines"
 
 
 @pytest.mark.parametrize("path,line,needle", ANCHORS)
@@ -120,6 +145,29 @@ def test_every_file_the_audits_name_is_in_the_tree():
         assert not missing, f"{audit} names paths that do not exist: {missing}"
 
 
+def test_the_external_citation_form_is_only_used_for_foreign_files():
+    """
+    The `owner/repo @ path:line` form is an EXEMPTION from the line check, so
+    it is also a hole: writing `src/quant/x.py` as `propiq/propiq @ src/quant/x.py:9`
+    would smuggle one of our own files past every assertion above. The exemption
+    is therefore allowed only for a path that genuinely is not in this tree.
+    """
+    found = []
+    for audit in AUDITS:
+        body = (REPO / audit).read_text(encoding="utf-8")
+        for m in EXTERNAL_CITATION.finditer(body):
+            found.append((audit, m.group(1), m.group(2)))
+
+    assert len(found) >= 5, (
+        f"only {len(found)} external citations parsed, so this test proves almost nothing: {found}"
+    )
+    in_tree = [(audit, repo, path) for audit, repo, path in found if (REPO / path).exists()]
+    assert not in_tree, (
+        "these citations use the foreign-repository form for a path that IS in "
+        f"this tree, which exempts it from the line check for no reason: {in_tree}"
+    )
+
+
 def test_the_audits_do_not_claim_a_banned_source_is_required():
     """
     A standing constraint, asserted on the deliverables that are most likely to
@@ -136,5 +184,6 @@ def test_the_audits_do_not_claim_a_banned_source_is_required():
                     if banned in para:
                         assert re.search(
                             r"not added|not here|banned|appears nowhere|Verdict",
-                            para, re.I,
+                            para,
+                            re.I,
                         ), f"{audit} mentions {banned} without refusing it: {para}"
