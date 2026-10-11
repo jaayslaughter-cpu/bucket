@@ -36,7 +36,30 @@
 # cleanly and then fail at the first inference — late, unattended, and after the
 # slate had already been ingested. Failing at build time is the better trade.
 
-FROM python:3.11-slim
+# PINNED BY DIGEST, 2026-10-11. A floating tag meant a rebuild months later
+# got a different patch release of CPython and of every apt package in the
+# layer, which is the one thing the dependency caps in pyproject.toml do not
+# cover. `docs/configuration_audit_2026-10-09.md` O1 left this open because
+# "pinning to a digest I cannot resolve or verify here would be a guess written
+# as a fact"; it is resolved and verified now:
+#
+#   $ docker image inspect python:3.11-slim --format '{{index .RepoDigests 0}}'
+#   python@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+#
+# AND IT IS THE MANIFEST LIST, not a platform-specific manifest — checked with
+# `docker manifest inspect`, which reports an OCI image index covering amd64,
+# arm64, 386, arm, ppc64le, riscv64 and s390x. So this pin builds on Apple
+# Silicon and on Railway's amd64 builders alike. Pinning a per-architecture
+# digest would have broken every developer on a Mac, silently, at `docker
+# build`.
+#
+# This is the same image the 2026-10-10 build used, so it is the digest of an
+# image that passed all 15 validate_docker checks rather than whatever the
+# registry serves today.
+#
+# To move it: pull the new tag, read the digest with the command above, confirm
+# `docker manifest inspect` still reports an index, and rebuild.
+FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
 
 # - PYTHONDONTWRITEBYTECODE: the filesystem is ephemeral; .pyc files are waste.
 # - PYTHONUNBUFFERED: without it, logs sit in a buffer and a crash loses the

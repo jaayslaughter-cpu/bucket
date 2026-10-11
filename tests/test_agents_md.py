@@ -184,13 +184,15 @@ def test_it_states_what_is_not_true_rather_than_only_what_works():
     assert "What is still not true" in TEXT
     for claim in (
         "No model is profitable",
+        # THIS SLOT HAS NOW TURNED OVER TWICE, which is the guard working.
         # "never been built" was pinned here until 2026-10-10, when the image
-        # WAS built and all 14 validate_docker checks passed — so the phrase
-        # had to go, and this guard firing is what it is for. The image entry
-        # still carries an open claim and that is what is pinned now: the base
-        # image tag floats, so a rebuild months later gets a different patch
-        # release of CPython and of every library the caps still permit.
-        "still floats",
+        # WAS built and every validate_docker check passed. "still floats"
+        # replaced it and lasted a day: the base image was pinned by digest on
+        # 2026-10-11. What is still open about the image is narrower and is
+        # what is pinned now — the COMMITTED Dockerfile has not itself been
+        # built, only a copy carrying two pip-trust instructions, because the
+        # session that built it routes HTTPS through a CA-re-terminating proxy.
+        "has not been built",
         "do not survive a redeploy",
         "ProbabilitySource.MODEL",
     ):

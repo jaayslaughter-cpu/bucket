@@ -198,10 +198,13 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   for months that it never had been. All 15 `scripts/validate_docker.py` checks
   pass against it, including the two that exist to demonstrate the
   volume-permission trap, and the container boots through `scripts/start.sh`
-  and schedules both jobs in Pacific. Two things remain true: the base image
-  tag still floats, and the build used a copy of the `Dockerfile` with two
-  extra pip-trust instructions, because this session's egress re-terminates
-  TLS — every other instruction was byte-identical.
+  and schedules both jobs in Pacific. The base image is pinned by digest as of
+  2026-10-11 — and by its MANIFEST LIST digest, verified with `docker manifest
+  inspect` to cover amd64 and arm64, so the pin does not break a developer on
+  Apple Silicon. **What remains true** is narrower: the committed `Dockerfile`
+  has not been built. Only a copy of it has, carrying two extra pip-trust
+  instructions, because the session that built it routes HTTPS through a
+  CA-re-terminating proxy — every other instruction was byte-identical.
   `docs/deploy_railway.md` §2.
 - **Model artifacts do not survive a redeploy.** They live under
   `data/external/model_runs/`, on an ephemeral filesystem, and a fresh

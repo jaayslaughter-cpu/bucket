@@ -34,8 +34,13 @@ that trap demonstrated rather than documented.
 
 **What still withholds the last 1.3**, and none of it is a guess:
 
-* the base image tag still floats (O1) — pin it from the first build on a host
-  with ordinary egress;
+* ~~the base image tag still floats (O1)~~ — **CLOSED 2026-10-11.** Pinned to
+  `python:3.11-slim@sha256:e88e9763…`, the digest of the image that passed
+  every check on 2026-10-10, and verified to be the OCI **image index** rather
+  than a per-architecture manifest: `docker manifest inspect` reports amd64,
+  arm64, 386, arm, ppc64le, riscv64 and s390x, so the pin builds on Apple
+  Silicon as well as Railway's builders. A per-arch digest would have broken
+  every developer on a Mac, silently, at `docker build`;
 * the committed `Dockerfile` itself has not been built, only a copy with two
   extra pip-trust instructions (`docs/deploy_railway.md` §2);
 * the volume still has to be mounted and seeded by a person, which no code here
@@ -69,7 +74,7 @@ that trap demonstrated rather than documented.
 
 | ID | Where | Finding | Severity |
 |---|---|---|---|
-| **O1** | `Dockerfile:39` | `FROM python:3.11-slim` is a floating tag. A rebuild six months from now gets a different patch release of CPython and of every apt package in the layer. **Not fixed deliberately**: pinning to a digest I cannot resolve or verify here would be a guess written as a fact, and the image has never been built once, so the first build should establish the digest. Pin it at that point | medium |
+| ~~**O1**~~ | `Dockerfile` `FROM` line | `FROM python:3.11-slim` was a floating tag: a rebuild six months on gets a different patch release of CPython and of every apt package in the layer — the one exposure the dependency caps do not cover. The reason given for leaving it open was that "pinning to a digest I cannot resolve or verify here would be a guess written as a fact" | **CLOSED 2026-10-11**, because the digest can now be resolved AND verified: it is the digest of the image that passed all 15 checks, and `docker manifest inspect` confirms it is the OCI image index (amd64, arm64 and five more) rather than a per-architecture manifest — the distinction that decides whether the pin breaks a Mac. Rebuilt against the pin before committing |
 | **O2** | `Dockerfile:85-87` vs `requirements.txt` | Two dependency declarations for one commit. The caps now agree and a test enforces that, but the *contents* can still diverge — a package added to one and not the other. A single source would need either Nixpacks support for extras or dropping `requirements.txt`, and the latter removes the belt-and-braces for a Nixpacks build | low |
 | **O3** | `.dockerignore` | `tests/` and `docs/` are not excluded, so they ship in the image. Harmless and mildly useful (the deploy doc is readable inside the container); listed so it is a decision | low |
 | **O4** | `Dockerfile` | No `HEALTHCHECK` instruction. **Deliberate**: Railway does not consume Docker's healthcheck for a worker, and a probe running every 30s would hit the database and the filesystem for nothing. `scripts/railway_healthcheck.py` is run once at boot and on demand instead | none — decision |
@@ -91,7 +96,7 @@ applied**, written out so the decision is reversible by someone who disagrees.
 ### R1 — pin the base image, after the first successful build (O1)
 
 ```dockerfile
-# Replaces Dockerfile:39. Resolve the digest from the build that proves the
+# Replaces the Dockerfile's FROM line. Resolve the digest from the build that proves the
 # image works, not from a guess:
 #   docker image inspect python:3.11-slim --format '{{index .RepoDigests 0}}'
 FROM python:3.11-slim@sha256:<digest from that build>
@@ -166,7 +171,7 @@ migration that cannot be applied — already exits nonzero, in
 
 | Asked | Verdict |
 |---|---|
-| `TZ=America/Los_Angeles` | **Not applied.** `Dockerfile:54` keeps `TZ=Etc/UTC`. Storage is UTC throughout and the schedule does not depend on `TZ` — `scheduler_worker` passes `America/Los_Angeles` to APScheduler explicitly. What `TZ` governs is the naive `datetime.now()` calls, which should stay UTC and reproducible; setting it to Pacific would make those shift twice a year while stored timestamps did not, and the resulting off-by-an-hour rows would look like data rather than a setting |
+| `TZ=America/Los_Angeles` | **Not applied.** `Dockerfile:77` keeps `TZ=Etc/UTC`. Storage is UTC throughout and the schedule does not depend on `TZ` — `scheduler_worker` passes `America/Los_Angeles` to APScheduler explicitly. What `TZ` governs is the naive `datetime.now()` calls, which should stay UTC and reproducible; setting it to Pacific would make those shift twice a year while stored timestamps did not, and the resulting off-by-an-hour rows would look like data rather than a setting |
 | `SPORTSDATA_API_KEY`, `THE_ODDS_API_KEY` | **Not added.** Neither appears anywhere in this repository, and the Odds API (`ODDS_API_KEY`) is recorded as a banned sportsbook source in `docs/external_feature_harvest.md:90` and `docs/pickem_props.md:61`. Documenting a variable the code does not read is how an operator comes to believe a key is wired up |
 | a multi-stage Dockerfile | **Not applied, and it buys nothing here.** A multi-stage build pays off when a build stage installs a toolchain the runtime does not need. This image installs **no toolchain**: `python:3.11-slim` plus `libgomp1`, and every dependency arrives as a wheel. There is no `build-essential`, no `libpq-dev` (hence `psycopg[binary]`), nothing to leave behind. A builder stage would add a layer, a copy and a second place for the dependency list to drift, and would shrink nothing |
 | `/app/data/models/` | **Not created.** Artifacts go to `config/model_comparison.yaml`'s `artifacts_dir` (`data/external/model_runs/comparison`), which under a volume at `/app/data` is already on the volume. Writing them to a second location would leave `main.resolve_model_artifact` finding nothing while the files sat there |
