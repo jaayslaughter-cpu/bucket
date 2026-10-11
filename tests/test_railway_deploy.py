@@ -191,6 +191,13 @@ def _volume(monkeypatch, tmp_path, *, rows=200_000, sidecar=True, markets=("PTS"
     monkeypatch.setenv(ENV_STATE_DIR, str(root))
     monkeypatch.delenv("PROPIQ_MODEL", raising=False)
     monkeypatch.setenv("PROPIQ_BOARD_MARKETS", ",".join(markets))
+    # A CONFIGURED deployment, which is what this fixture stands for. The
+    # odds-source check was added on 2026-10-11 and a seeded volume with no
+    # PROPLINE_API_KEY is correctly a FAILURE -- it can resolve a model and
+    # still produce an empty board, because there are no posted lines to price
+    # against. Setting it here keeps these tests about the volume and the
+    # artifacts, which is what they assert.
+    monkeypatch.setenv("PROPLINE_API_KEY", "fixture-value-not-a-real-key")
     for market in markets:
         artifact = _seed(artifact_dir_on(root), market, rows=rows, sidecar=sidecar)
     monkeypatch.setenv("PROPIQ_MODEL", str(artifact))

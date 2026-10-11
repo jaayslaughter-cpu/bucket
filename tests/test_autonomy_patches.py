@@ -478,3 +478,172 @@ def test_main_routes_the_boot_checks_into_the_alerter():
     ]
     assert len(calls) == 1
     assert len(calls[0].args) == 3, "all three check results must be passed"
+
+
+# ---------------------------------------------------------------------------
+# the odds source, and why its absence is a FAILURE rather than a warning
+# ---------------------------------------------------------------------------
+
+def test_a_missing_odds_key_does_not_crash_the_slate_which_is_the_problem(
+    monkeypatch,
+):
+    """
+    VERIFIED, AND THE FIRST GUESS WAS WRONG. The expectation was that a missing
+    `PROPLINE_API_KEY` raised and failed the slate loudly. It does not:
+    `pull_nba_prop_lines` catches `PropLineAuthError` and returns a
+    DATA_NOT_AVAILABLE snapshot, step [3] logs one WARNING and skips it, and
+    the run continues with no posted lines -- so every row abstains for want of
+    a market, the board is empty, and the run exits 0.
+
+    The quieter behaviour is the worse one, and because it is a warning rather
+    than an error `notify_failure` does not alert on it either. This test pins
+    the behaviour so the probe check below is known to be guarding something
+    real.
+    """
+    import main
+
+    monkeypatch.delenv("PROPLINE_API_KEY", raising=False)
+    frame = main.ingest_prop_lines(None, persist=False)
+    assert len(frame) == 0, "step [3] no longer degrades; re-check the probe's reason"
+
+
+def test_the_probe_fails_when_the_odds_key_is_absent(monkeypatch, tmp_path):
+    from scripts.railway_healthcheck import FAIL, OK, run_checks
+    from src.utils.volume import ENV_STATE_DIR
+
+    root = tmp_path / "volume"
+    root.mkdir()
+    monkeypatch.setenv(ENV_STATE_DIR, str(root))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    monkeypatch.setenv("PROPIQ_MODEL", str(root / "absent.json"))
+
+    monkeypatch.delenv("PROPLINE_API_KEY", raising=False)
+    statuses = {c.name: c.status for c in run_checks(skip_db=True)}
+    assert statuses["odds_source"] == FAIL
+
+    monkeypatch.setenv("PROPLINE_API_KEY", "a-value")
+    statuses = {c.name: c.status for c in run_checks(skip_db=True)}
+    assert statuses["odds_source"] == OK
+
+
+def test_the_probe_never_prints_the_odds_key(monkeypatch, tmp_path, capsys):
+    from scripts.railway_healthcheck import main as probe_main
+    from src.utils.volume import ENV_STATE_DIR
+
+    monkeypatch.setenv(ENV_STATE_DIR, str(tmp_path))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    monkeypatch.setenv("PROPLINE_API_KEY", "UNMISTAKABLE-ODDS-KEY-VALUE")
+    probe_main(["--skip-db"])
+    out = capsys.readouterr()
+    assert "UNMISTAKABLE-ODDS-KEY-VALUE" not in out.out + out.err
+
+
+def test_the_probe_makes_no_live_api_call(monkeypatch, tmp_path):
+    """
+    A probe that called the API on every boot would spend quota on a redeploy
+    loop. Asserted by making any request through the client's session fail
+    loudly: the check must not touch it.
+    """
+    import requests
+
+    from scripts.railway_healthcheck import run_checks
+    from src.utils.volume import ENV_STATE_DIR
+
+    monkeypatch.setenv(ENV_STATE_DIR, str(tmp_path))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    monkeypatch.setenv("PROPLINE_API_KEY", "a-value")
+
+    def _boom(*a, **k):
+        raise AssertionError("the probe made a network call")
+
+    monkeypatch.setattr(requests.Session, "request", _boom)
+    monkeypatch.setattr(requests.Session, "get", _boom)
+    run_checks(skip_db=True)
+
+
+# ---------------------------------------------------------------------------
+# P4 — the one daily-path client that had neither exponential backoff nor 429
+# ---------------------------------------------------------------------------
+
+def test_the_boxscore_fetcher_backs_off_exponentially(monkeypatch):
+    """
+    2s, 4s, 8s -- not 2s, 4s, 6s.
+
+    RETRY_ATTEMPTS IS RAISED TO 4 HERE, and that is the point of the test
+    rather than an incidental detail. At the shipped setting of 3 the loop
+    sleeps twice, and `2 * attempt` and `2 ** attempt` are IDENTICAL for
+    attempts 1 and 2 -- so the first version of this test passed against the
+    linear backoff it was written to catch. The two only diverge at the third
+    sleep. Stated plainly: the exponential change is a no-op at the shipped
+    setting and matters only if the attempt budget ever rises, which is
+    exactly why it is pinned here instead of assumed.
+    """
+    import requests
+
+    from src.settlement import boxscore_fetcher as bf
+
+    waits: list[float] = []
+    monkeypatch.setattr(bf.time, "sleep", lambda s: waits.append(s))
+    monkeypatch.setattr(bf, "RETRY_ATTEMPTS", 4)
+
+    class _Session:
+        def get(self, *a, **k):
+            raise requests.exceptions.ConnectionError("down")
+
+    with pytest.raises(bf.BoxScoreError):
+        bf.fetch_boxscore("0022600001", session=_Session())
+
+    assert waits == [2.0, 4.0, 8.0], "linear backoff would give [2, 4, 6]"
+
+
+def test_a_429_is_retried_and_honours_retry_after(monkeypatch):
+    from src.settlement import boxscore_fetcher as bf
+
+    waits: list[float] = []
+    monkeypatch.setattr(bf.time, "sleep", lambda s: waits.append(s))
+    calls: list[int] = []
+
+    class _Resp:
+        def __init__(self, status, headers=None, payload=None):
+            self.status_code = status
+            self.headers = headers or {}
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def get(self, *a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                return _Resp(429, {"Retry-After": "7"})
+            return _Resp(200, payload={"game": "final"})
+
+    assert bf.fetch_boxscore("0022600001", session=_Session()) == {"game": "final"}
+    assert waits == [7.0], "Retry-After was not honoured"
+    assert len(calls) == 2
+
+
+def test_a_429_without_retry_after_falls_back_to_the_backoff(monkeypatch):
+    from src.settlement import boxscore_fetcher as bf
+
+    waits: list[float] = []
+    monkeypatch.setattr(bf.time, "sleep", lambda s: waits.append(s))
+
+    class _Resp:
+        status_code = 429
+        headers: dict = {}
+
+        def raise_for_status(self):
+            pass
+
+    class _Session:
+        def get(self, *a, **k):
+            return _Resp()
+
+    with pytest.raises(bf.BoxScoreError, match="rate-limited"):
+        bf.fetch_boxscore("0022600001", session=_Session())
+    assert waits == [bf.RETRY_BACKOFF ** 1, bf.RETRY_BACKOFF ** 2]

@@ -501,6 +501,53 @@ def _check_calibration_report() -> list[Check]:
     return out
 
 
+def _check_odds_source() -> list[Check]:
+    """
+    Is the odds source keyed? PRESENCE ONLY -- no API call is made.
+
+    WHY THIS IS A FAILURE AND NOT A WARNING. Without a key the slate does NOT
+    crash, which is the problem: `pull_nba_prop_lines` catches the auth error
+    and returns a DATA_NOT_AVAILABLE snapshot, step [3] logs one WARNING and
+    skips, and the run continues. With no posted lines every row abstains for
+    want of a market, so the pipeline ingests, builds features, writes
+    projections with no probability, dispatches an abstention and exits 0.
+    The whole board is empty and the only trace is one warning in the middle
+    of a run -- and because it is a warning rather than an error,
+    `scheduler_worker.notify_failure` does not alert on it either.
+
+    Verified rather than assumed, 2026-10-11: calling `ingest_prop_lines` with
+    the variable unset returns a frame of 0 rows. The first guess was that it
+    raised and failed the slate; it does not, and the quieter behaviour is the
+    worse one.
+
+    NO LIVE REQUEST. A probe that called the API on every boot would spend
+    quota on a redeploy loop, and the client already tracks quota headroom from
+    the response headers of real calls (`_check_quota_headroom`). Presence is
+    what a boot can check for free; whether the key is VALID is answered by the
+    first slate, which is why this check says so.
+    """
+    from src.ingestion.propline import API_BASE_URL, ENV_API_KEY
+
+    configured = bool((os.environ.get(ENV_API_KEY) or "").strip())
+    if configured:
+        return [Check(
+            "odds_source", OK,
+            f"${ENV_API_KEY} is set (value not shown); the client calls "
+            f"{API_BASE_URL} with an X-API-Key header. Whether the key is "
+            f"valid and in quota is answered by the first slate, not here.",
+            {"configured": True, "base_url": API_BASE_URL},
+        )]
+    return [Check(
+        "odds_source", FAIL,
+        f"${ENV_API_KEY} is NOT set. The slate will not crash -- it logs one "
+        f"warning, skips the source and continues -- so EVERY ROW ABSTAINS for "
+        f"want of a market and the board is empty while the run exits 0. "
+        f"Without posted lines there is no two-way price, so no EV, no CLV and "
+        f"no advisory size either.",
+        {"configured": False, "base_url": API_BASE_URL},
+    )]
+
+
 def _check_dispatch() -> list[Check]:
     """
     Whether a Discord webhook is configured — NEVER what it is.
@@ -542,6 +589,7 @@ def run_checks(*, skip_db: bool = False) -> list[Check]:
     checks += _check_database(skip_db)
     checks += _check_ledger(db_configured)
     checks += _check_calibration_report()
+    checks += _check_odds_source()
     checks += _check_dispatch()
     return checks
 

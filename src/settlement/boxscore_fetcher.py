@@ -50,7 +50,16 @@ HEADERS = {
 GAME_STATUS_FINAL = 3
 REQUEST_TIMEOUT = 15
 RETRY_ATTEMPTS = 3
+#: EXPONENTIAL, as the base of `RETRY_BACKOFF ** attempt`. This was multiplied
+#: by the attempt number instead -- 2s, 4s, 6s -- which `docs/autonomy_audit_
+#: 2026-10-10.md` P4 recorded as the one client on a daily path with neither
+#: exponential backoff nor a 429 branch, while `ingestion/espn_client` and
+#: `ingestion/propline` had both.
 RETRY_BACKOFF = 2.0
+#: The one 4xx that IS transient: the request is fine, there have just been too
+#: many of them. Falling through to `raise_for_status` abandoned a night's
+#: grading over rate limiting.
+TOO_MANY_REQUESTS = 429
 
 
 class BoxScoreError(RuntimeError):
@@ -86,6 +95,28 @@ def fetch_boxscore(game_id: str | int, session: requests.Session | None = None) 
                     f"404 for game {gid} — game id does not exist or the box "
                     f"score is not yet posted."
                 )
+            if resp.status_code == TOO_MANY_REQUESTS:
+                # Honour the server's own number when it gives one; guessing a
+                # backoff against a rate limiter is how access gets revoked.
+                # `espn_client` and `propline` both already do this.
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else RETRY_BACKOFF ** attempt
+                except (TypeError, ValueError):
+                    wait = RETRY_BACKOFF ** attempt
+                if attempt < RETRY_ATTEMPTS:
+                    logger.warning(
+                        "boxscore: 429 for %s, attempt %d/%d; waiting %.1fs%s",
+                        gid, attempt, RETRY_ATTEMPTS, wait,
+                        " (Retry-After)" if retry_after else "",
+                    )
+                    time.sleep(wait)
+                    continue
+                raise BoxScoreError(
+                    f"NBA CDN rate-limited {gid} on all {RETRY_ATTEMPTS} "
+                    f"attempts. Settlement has a six-hour misfire grace, so "
+                    f"this game is graded on the next run rather than lost."
+                )
             resp.raise_for_status()
             return resp.json()
         except BoxScoreError:
@@ -93,7 +124,9 @@ def fetch_boxscore(game_id: str | int, session: requests.Session | None = None) 
         except requests.exceptions.RequestException as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF * attempt)
+                # ** not *: 2s, 4s, 8s. Linear backoff against a rate limiter
+                # that is still saturated just retries into the same wall.
+                time.sleep(RETRY_BACKOFF ** attempt)
 
     raise BoxScoreError(f"Failed to fetch box score for {gid} after {RETRY_ATTEMPTS} attempts") from last_exc
 
