@@ -81,7 +81,7 @@ ANCHORS = [
     ("scheduler_worker.py", 1271, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 254, "def _check_artifact_freshness("),
     ("src/db/repository.py", 469, "def newest_team_game_date"),
-    ("main.py", 182, "Deliberately NOT read"),
+    ("main.py", 183, "Deliberately NOT read"),
 ]
 
 #: A citation into a CANDIDATE repository, which is not in this tree:

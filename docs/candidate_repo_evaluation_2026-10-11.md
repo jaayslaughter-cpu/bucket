@@ -228,7 +228,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   I first wrote that `src/models/artifact_registry.py:52` put
   `registered_at_utc` in every sidecar. It does not: that module builds a
   separate append-only `model_registry.jsonl`, **nothing writes to it**, and
-  `main.py:182` says in as many words that it is
+  `main.py:183` says in as many words that it is
   deliberately not read because "resolving through a dead module is how
   `oddspapi` stayed in the source precedence for months". What training actually
   persists is `saved_at_utc`, present in 8 of the 9 sidecars under
