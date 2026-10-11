@@ -347,3 +347,147 @@ def recommended_units_for_entry(
         probabilities, multiples,
         kelly_fraction=kelly_fraction, max_cap_units=max_cap_units,
     )
+
+
+def advisory_size_for_candidate(
+    candidate: object,
+    *,
+    kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+    max_cap_units: float = DEFAULT_MAX_CAP_UNITS,
+) -> AdvisorySize:
+    """
+    Size one ``decision_board.BettingDecisionCandidate``, or refuse with a reason.
+
+    WHY THIS EXISTS. The sizer was reachable from exactly one place --
+    ``scripts/nba_model_cli.py``, behind a ``--advisory-sizing`` flag on a
+    hand-run command -- so the nightly board carried no recommended size at
+    all. Neither ``pipeline.slate_board`` nor ``scheduler_worker`` referenced
+    sizing. A board row that passes the publication gate and carries no size
+    makes the operator do arithmetic this project already does better.
+    `docs/autonomy_audit_2026-10-10.md` §3.2.
+
+    ADVISORY, AND THAT IS THE WHOLE CONTRACT. The returned number is read-only
+    metadata: ``as_dict`` carries ``AUTO_PLACED: False``, nothing in this
+    project places or sizes a wager, and no execution path consumes this.
+
+    DUCK-TYPED on purpose, like ``recommended_units_for_entry`` above: taking
+    the candidate by ``getattr`` keeps this module free of a
+    ``decision_board`` import, which would be a cycle.
+
+    IT REFUSES ON FOUR CONDITIONS, each of which would otherwise produce a
+    confident number from an input that does not support one:
+
+      1. not RECOMMENDED -- the board already declined to recommend it, and
+         sizing a row it withheld would contradict the gate that withheld it;
+      2. no VALID book -- ``f* = (bp - q)/b`` needs a price, and the house rule
+         is that nothing is ranked or priced without valid odds. A model
+         probability alone sizes nothing;
+      3. no usable model probability;
+      4. PUSH MASS WITHOUT THE TWO SIDES TO REMOVE IT -- see below, which is
+         the part that is easy to get wrong.
+
+    THE PUSH. Binary Kelly is a two-outcome formula: ``q`` is P(lose). On a
+    whole-number line a push is a third outcome and the stake is RETURNED, so
+    ``q = 1 - p`` counts returned money as lost and understates the size. The
+    correct reduction is the one this project already applies when comparing a
+    model against a two-way price (``line_diff._over_given_no_push``): a
+    two-way American price de-vigs to a TWO-outcome fair probability because a
+    push is voided rather than priced, so the model's probability must be taken
+    CONDITIONAL ON NO PUSH --
+    ``model_prob / (model_p_over + model_p_under)``.
+
+    When the line can push and the two sides are not both available, there is
+    nothing to normalise with and it refuses rather than sizing on a
+    probability that means something different from the price.
+    """
+    def _get(name: str) -> object:
+        return getattr(candidate, name, None)
+
+    def _refuse(reason: str) -> AdvisorySize:
+        return AdvisorySize(
+            0.0, 0.0, float(kelly_fraction), False, "none", reason,
+        )
+
+    status = _get("decision_status")
+    if status != "RECOMMENDED":
+        return _refuse(
+            f"not sized: the board's decision_status is {status!r}, not "
+            f"RECOMMENDED, so sizing it would contradict the gate that "
+            f"withheld it"
+        )
+
+    book_status = _get("book_status")
+    american = _get("american_odds")
+    if book_status != "VALID" or american is None:
+        return _refuse(
+            f"not sized: book_status is {book_status!r} and american_odds is "
+            f"{american!r}. Fractional Kelly needs a price; a model "
+            f"probability on its own sizes nothing, and this project does not "
+            f"rank or price without valid odds"
+        )
+
+    model_prob = _get("model_prob")
+    try:
+        p_raw = float(model_prob)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _refuse(f"not sized: model_prob is {model_prob!r}")
+    if not (math.isfinite(p_raw) and 0.0 < p_raw < 1.0):
+        return _refuse(
+            f"not sized: model_prob {p_raw!r} is not a probability in (0, 1)"
+        )
+
+    # --- the push reduction ------------------------------------------------
+    p_push = _get("model_p_push")
+    pushable = bool(_get("line_can_push")) and bool(p_push)
+    p_fair = p_raw
+    method_note = ""
+    if pushable:
+        over, under = _get("model_p_over"), _get("model_p_under")
+        try:
+            decided = float(over) + float(under)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            decided = 0.0
+        if not (math.isfinite(decided) and decided > 0.0):
+            return _refuse(
+                f"not sized: the line can push (p_push={p_push!r}) and "
+                f"model_p_over/model_p_under are {over!r}/{under!r}, so there "
+                f"is nothing to condition on. A two-way price is a TWO-outcome "
+                f"fair probability -- sizing against a three-outcome one "
+                f"compares different quantities"
+            )
+        p_fair = p_raw / decided
+        if not (math.isfinite(p_fair) and 0.0 < p_fair < 1.0):
+            return _refuse(
+                f"not sized: P(side | no push) came out {p_fair!r} from "
+                f"model_prob={p_raw!r} and decided mass {decided!r}"
+            )
+        method_note = (
+            f" P(side) taken conditional on no push: {p_raw:.4f} / "
+            f"{decided:.4f} = {p_fair:.4f}, because a two-way price voids a "
+            f"push rather than pricing it."
+        )
+
+    try:
+        from src.quant.odds_math import american_to_decimal
+
+        decimal_odds = american_to_decimal(int(american))  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 — a bad price is a refusal, not a crash
+        return _refuse(f"not sized: american_odds {american!r} is not a price ({exc})")
+
+    sized = recommended_units_binary(
+        p_fair, decimal_odds,
+        kelly_fraction=kelly_fraction, max_cap_units=max_cap_units,
+    )
+    if method_note and sized.reason:
+        return AdvisorySize(
+            sized.recommended_units, sized.full_kelly_fraction,
+            sized.kelly_fraction_applied, sized.capped, sized.method,
+            sized.reason + method_note,
+        )
+    if method_note:
+        return AdvisorySize(
+            sized.recommended_units, sized.full_kelly_fraction,
+            sized.kelly_fraction_applied, sized.capped, sized.method,
+            method_note.strip(),
+        )
+    return sized

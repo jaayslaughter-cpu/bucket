@@ -385,8 +385,6 @@ class BettingDecisionCandidate(BaseModel):
     timezone_display: str = DISPLAY_TZ_NAME
     disclaimer: str = BOARD_DISCLAIMER
     warnings: list[str] = Field(default_factory=list)
-
-
 def _side_ev(row: ResearchSlateRow, side: str) -> float | None:
     return row.book_ev_over if side == "over" else row.book_ev_under
 

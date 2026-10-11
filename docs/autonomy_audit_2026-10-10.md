@@ -15,6 +15,14 @@ corrected rather than answered.
 
 > ### **SEMI-AUTONOMOUS — one-time setup, then hands-free**
 >
+> **Updated 2026-10-11: P1 and P2 are done.** The two technical omissions this
+> audit called "the whole gap" are closed — the nightly board now carries an
+> advisory size, and failures reach Discord. What remains is setup that no code
+> can perform (mount a volume, provide secrets, ingest the licensed workbook
+> once) plus the boundaries that must stay manual. The verdict is unchanged
+> because those are what make it semi- rather than fully-autonomous; the
+> *recurring* loop needed no human before and still does not.
+>
 > The nightly loop needs no human. **Four one-time setup actions** stand
 > between a fresh Railway service and that loop, three of which no code can
 > take. After them, the system runs unattended and degrades loudly rather than
@@ -133,8 +141,31 @@ arise from an unguarded `log` of a non-positive number because the guard
 precedes it. Multi-leg Pick'em flows through `dfs_payouts` /
 `leg_correlation`, whose per-market loop is also guarded.
 
-**❌ 3.2 Advisory sizing is NOT on the automated path.** This is the clearest
-technical omission in the audit.
+**✅ 3.2 Advisory sizing is on the automated path — DONE 2026-10-11 (P1).**
+`scheduler_worker.attach_board_sizing` sizes every board row after the board is
+built and writes `RECOMMENDED_UNITS`, `SIZING_METHOD`,
+`KELLY_FRACTION_APPLIED`, `SIZING_CAPPED`, `SIZING_NOTE` and
+`AUTO_PLACED: False` into the board CSV — which `run_dispatch` reads, so a size
+reaches Discord.
+
+**IT LIVES IN THE WORKER, NOT THE RANKING LAYER, AND TWO EXISTING GUARDS
+DECIDED THAT.** Written first inside `src/quant/decision_board.py`, it tripped
+`test_no_module_under_src_imports_this_one` ("a size is held by a caller that
+already computed it, never fetched by a module that sends or places anything")
+and `test_layer_cannot_reach_a_book_or_size_a_stake` (no `kelly` identifier in
+that module). Both were right and the design is better for it: the ranking
+layer keeps no concept of stake, and `scheduler_worker` — not under `src/`, and
+it sends nothing — holds the size.
+
+**The push reduction is the part that was easy to get wrong.** Binary Kelly is
+two-outcome and `q` is P(lose); on a whole-number line a push is a third
+outcome and the stake is *returned*, so `q = 1 - p` counts returned money as
+lost. A two-way American price de-vigs to a two-outcome fair probability
+because a push is voided rather than priced, so the model probability is taken
+conditional on no push — the same reduction `line_diff._over_given_no_push`
+applies. With push mass and no two sides to condition on, it refuses.
+
+*What this section said before:*
 
 `src/quant/advisory_sizing.recommended_units_for_entry` — fractional Kelly,
 hard-capped, tested — is imported in exactly **one** place:
@@ -179,10 +210,29 @@ artifact yields a null column and the loop proceeds to the next. The new
 artifact fetch has the same shape per market. `load_cached_absences` catches
 per *file* so one bad parquet does not lose the rest.
 
-**❌ 5.2 Webhook & alert dispatch — HALF met, and this is the most important
-finding in the audit.**
+**✅ 5.2 Webhook & alert dispatch — DONE 2026-10-11 (P2).**
+`scheduler_worker.notify_failure` logs *and* dispatches, and
+`notify_boot_problems` reads what the three boot checks returned, so an
+unwritable volume, a missing artifact, the demo artifact and an unusable ledger
+all post. The slate, board and settlement failure paths call it too.
 
-Successes dispatch. Failures do not.
+Four things about it that are the actual engineering:
+
+* **The body is scrubbed.** An alert body is an exception string, and psycopg
+  and SQLAlchemy both put the connection URL — password included — in their
+  messages. Without `scrub_alert` this would have published `DATABASE_URL` to a
+  chat channel the first time the database refused a connection: worse than the
+  silence it set out to fix.
+* **Deduped per stage per Pacific day**, or a redeploy loop posts the same
+  unseeded-volume alert on every boot.
+* **The dedupe fails OPEN.** Its store is on the mounted volume, and "the
+  volume is not writable" is one of the failures it reports — a dedupe that
+  suppressed on its own failure would silence exactly the alert it could not
+  record.
+* **It never recurses.** `run_dispatch` does not call it, asserted by a test:
+  alerting about a broken webhook through that webhook is a loop with no exit.
+
+*What this section said before:*
 
 | Event | Discord? |
 |---|---|

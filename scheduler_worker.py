@@ -50,8 +50,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -155,6 +157,227 @@ def cap_thread_counts() -> int | None:
         os.environ.setdefault(variable, str(cap))
     logger.info("Thread pools capped at %d per process", cap)
     return cap
+
+
+#: Dispatch failures to Discord. Defaults to ON when a webhook is configured,
+#: the same rule ENV_DISPATCH follows: a worker with no webhook should not
+#: spend a boot trying to post.
+ENV_ALERT_FAILURES = "PROPIQ_ALERT_FAILURES"
+#: At-most-once per stage per Pacific day. Off, every boot of a redeploy loop
+#: posts the same unseeded-volume alert again.
+ENV_ALERT_DEDUPE = "PROPIQ_ALERT_DEDUPE"
+#: Where the "already alerted today" marks live, under the durable state root.
+ALERT_STATE_FILENAME = "alerts_sent.json"
+
+#: Patterns scrubbed from an alert before it leaves the process. An alert body
+#: is an EXCEPTION STRING going to an outbound channel, and the exceptions this
+#: worker raises are database ones: SQLAlchemy puts the connection URL in its
+#: message, and that URL carries the password. `notify.discord` already redacts
+#: its own webhook from everything it logs; this is the same argument applied
+#: to the other credential in the process.
+_ALERT_SCRUBBERS: tuple[tuple[str, str], ...] = (
+    # postgresql://user:password@host/db  ->  postgresql://user:***@host/db
+    (r"(?i)\b([a-z0-9+]+://[^\s:/@]+):[^\s@/]+@", r"\1:***@"),
+    # Any remaining key=value that names a secret.
+    (r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|WEBHOOK|CREDENTIAL)"
+     r"[A-Z0-9_]*)\s*=\s*\S+",
+     r"\1=***"),
+)
+
+
+def scrub_alert(text: Any) -> str:
+    """
+    Remove credentials from a string about to be sent off the machine.
+
+    THE ALERT BODY IS AN EXCEPTION STRING. `psycopg` and SQLAlchemy both put
+    the connection URL into their error messages, and the URL carries the
+    password -- so routing failures to Discord without this would publish
+    `DATABASE_URL` to a chat channel the first time the database refused a
+    connection. That is a worse outcome than the silence P2 set out to fix.
+
+    Webhook redaction is delegated to `notify.discord.redact_webhook`, which
+    already owns that pattern; duplicating it here would be a second copy of
+    one rule.
+    """
+    out = str(text)
+    for pattern, replacement in _ALERT_SCRUBBERS:
+        out = re.sub(pattern, replacement, out)
+    try:
+        from src.notify.discord import redact_webhook
+
+        out = redact_webhook(out)
+    except Exception:  # noqa: BLE001 — scrubbing must not fail the alert
+        pass
+    return out
+
+
+def _alert_state_path() -> Any:
+    from src.utils.volume import resolve_state_root
+
+    return resolve_state_root()[0] / ALERT_STATE_FILENAME
+
+
+def _alert_already_sent_today(stage: str) -> bool:
+    """
+    Has this stage already alerted on today's Pacific date?
+
+    FAILS OPEN -- an unreadable or missing store returns False, meaning SEND.
+    The store lives on the mounted volume, and "the volume is not writable" is
+    one of the failures this is meant to report: a dedupe that suppressed on
+    its own failure would silence exactly the alert it could not record.
+    A duplicate alert is a nuisance; a missing one is the problem P2 exists for.
+    """
+    if not _flag(ENV_ALERT_DEDUPE, True):
+        return False
+    try:
+        import json
+
+        from src.utils.timezones import pacific_calendar_date
+
+        path = _alert_state_path()
+        if not path.exists():
+            return False
+        marks = json.loads(path.read_text(encoding="utf-8"))
+        return str(marks.get(stage) or "") == str(pacific_calendar_date())
+    except Exception as exc:  # noqa: BLE001 — fail open, and say so
+        logger.debug("Alert dedupe store unreadable (%s); sending anyway.", exc)
+        return False
+
+
+def _mark_alert_sent(stage: str) -> None:
+    """Best effort. A mark that cannot be written costs a duplicate, not a miss."""
+    try:
+        import json
+
+        from src.utils.timezones import pacific_calendar_date
+
+        path = _alert_state_path()
+        marks: dict[str, str] = {}
+        if path.exists():
+            try:
+                marks = json.loads(path.read_text(encoding="utf-8")) or {}
+            except Exception:  # noqa: BLE001 — a corrupt store is replaced
+                marks = {}
+        marks[stage] = str(pacific_calendar_date())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(marks, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — never fail a run over bookkeeping
+        logger.debug("Could not record the alert mark for %s (%s).", stage, exc)
+
+
+def notify_failure(stage: str, detail: str, *, dedupe: bool = True) -> dict[str, Any]:
+    """
+    Log a failure AND dispatch it to Discord. Never raises.
+
+    WHY THIS EXISTS. Successes dispatched -- the board, the withdrawal card,
+    the results card -- and failures did not. A boot ERROR, a FAILED slate, a
+    FAILED settlement and a probe FAILURE were log-only, and in Railway's log
+    view every line is already red (Python logging writes to stderr, which
+    Railway classifies as error severity), so a real failure is
+    indistinguishable from an INFO line by eye. The board would go empty for
+    days with nobody told. `docs/autonomy_audit_2026-10-10.md` §5.2.
+
+    IT NEVER RAISES AND IT NEVER RECURSES. A dispatch that fails must not turn
+    one failure into two, so everything here is swallowed and reported in the
+    return value -- and nothing in `run_dispatch`'s own failure path calls
+    this, because alerting about a broken webhook through that webhook is a
+    loop with no exit.
+
+    THE BODY IS SCRUBBED. See `scrub_alert`: an exception string from this
+    worker routinely contains the database URL, password included.
+    """
+    safe = scrub_alert(detail)
+    logger.error("ALERT [%s] %s", stage, safe)
+
+    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
+    if not _flag(ENV_ALERT_FAILURES, webhook_configured):
+        return {"status": "SKIPPED", "reason": "alerting off", "stage": stage}
+
+    if dedupe and _alert_already_sent_today(stage):
+        return {"status": "DEDUPED", "stage": stage}
+
+    try:
+        from src.notify.discord import DiscordConfig, send_embeds
+
+        embed = {
+            "title": f"PropIQ: {stage} FAILED",
+            # Discord rejects an over-long embed; the first 1,500 characters of
+            # an exception carry the cause, and the log has the rest.
+            "description": safe[:1500],
+            "color": 0xB00020,
+            "footer": {
+                "text": (
+                    "RESEARCH_ONLY — this is a pipeline alert, not a bet "
+                    "instruction. Nothing here places or sizes a wager."
+                )
+            },
+        }
+        result = send_embeds([embed], config=DiscordConfig(dry_run=False))
+        status = getattr(result, "status", "UNKNOWN")
+        if status == "SENT":
+            _mark_alert_sent(stage)
+        return {"status": status, "stage": stage}
+    except Exception as exc:  # noqa: BLE001 — one failure must not become two
+        logger.warning(
+            "Could not dispatch the %s alert (%s). It is in the log above; "
+            "that is all that is lost.", stage, scrub_alert(exc),
+        )
+        return {"status": "FAILED", "stage": stage, "error": scrub_alert(exc)}
+
+
+def notify_boot_problems(
+    state: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Alert on whatever the three boot checks found, reading their return values.
+
+    THE CHECKS STAY PURE. They already return structured dicts and their own
+    policy is warn-and-carry-on; threading a dispatch callback through them
+    would couple three probes to an outbound channel for no gain. This reads
+    what they returned instead, which is also what makes it testable without
+    a webhook.
+
+    Deduped per stage per Pacific day, so a redeploy loop does not post the
+    same unseeded-volume alert on every boot.
+    """
+    out: list[dict[str, Any]] = []
+    if state.get("writable") is False:
+        out.append(notify_failure(
+            "boot:state-dir",
+            f"State directory {state.get('path')} is NOT writable: "
+            f"{state.get('error')}. A mounted volume is commonly root-owned "
+            f"while this process runs as uid 10001. The calibration evidence "
+            f"and the model artifacts live there, so the publication gate will "
+            f"withhold every card.",
+        ))
+    if not artifact.get("resolved") or artifact.get("exists") is False:
+        out.append(notify_failure(
+            "boot:model-artifact",
+            f"No usable scoring artifact: {artifact.get('reason') or artifact.get('error') or artifact}. "
+            f"EVERY ROW WILL ABSTAIN -- the slate still ingests, builds "
+            f"features, writes projections with no probability and exits 0, so "
+            f"nothing else will look wrong.",
+        ))
+    # `implausible_train_rows`, which is the key check_model_artifact actually
+    # sets. The first version of this read `demo_suspected`, a key nothing
+    # writes, so the branch was dead code that would have reported a healthy
+    # deploy and stayed silent on the demo artifact.
+    elif artifact.get("implausible_train_rows"):
+        out.append(notify_failure(
+            "boot:model-artifact-demo",
+            f"The resolved artifact looks like the synthetic demo one: "
+            f"{artifact}. Scoring a live slate with it is worse than abstaining.",
+        ))
+    if ledger.get("status") in {"UNUSABLE", "EPHEMERAL"}:
+        out.append(notify_failure(
+            "boot:parlay-ledger",
+            f"Parlay ledger is {ledger.get('status')}: {ledger}. The ledger "
+            f"holds each ticket's at-bet-time probability and EV, which is the "
+            f"one thing that cannot be recomputed after the game.",
+        ))
+    return out
 
 
 def board_markets() -> list[str]:
@@ -492,8 +715,9 @@ def run_slate(argv: list[str] | None = None) -> int:
 
     try:
         code = main.main(argv or [])
-    except Exception:  # noqa: BLE001 — a scheduled job may not kill the worker
+    except Exception as exc:  # noqa: BLE001 — a job may not kill the worker
         logger.exception("Slate run raised; the scheduler stays up.")
+        notify_failure("slate", f"The 09:00 PT slate raised: {exc}")
         return 1
     logger.info("Slate run finished with code %s", code)
 
@@ -645,6 +869,15 @@ def run_board() -> dict[str, Any]:
             min_ev=min_ev,
         )
         logger.info("Board: %s", result.as_dict())
+        # ADVISORY SIZING, attached by this caller rather than by the ranking
+        # layer -- see attach_board_sizing for the two guards that require it.
+        # getattr, not result.board: the attribute access itself must not be
+        # able to fail the board. run_board's own except would turn an
+        # AttributeError here into {"status": "FAILED"} for a board that was
+        # built and written -- the same misattribution the prelock note below
+        # warns about, and it is how the first version of this broke two
+        # existing tests whose stub result carries no board.
+        sizing = attach_board_sizing(getattr(result, "board", None), board_csv)
         # Arm tonight's tip-anchored re-checks now that a board exists for them
         # to correct. Before the board there is nothing to withdraw.
         #
@@ -667,10 +900,123 @@ def run_board() -> dict[str, Any]:
         # above -- can see WHICH days were scored, not just how many rows came
         # back. A board of 40 rows is the same shape whether it describes
         # tonight or a fortnight in 2025.
-        return {"status": "OK", **result.as_dict(), "window": window}
+        return {"status": "OK", **result.as_dict(), "window": window,
+                "sizing": sizing}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Board build raised; the scheduler stays up.")
+        notify_failure("board", f"The board build raised: {exc}")
         return {"status": "FAILED", "error": str(exc), "out": board_csv}
+
+
+def attach_board_sizing(board: Any, csv_path: str) -> dict[str, Any]:
+    """
+    Add an advisory size to each board row, and write it into the board CSV.
+
+    WHY THIS LIVES HERE AND NOT IN src/. Two existing guards say so, and both
+    fired when this was first written inside `src/quant/decision_board.py`:
+
+      * `tests/test_advisory_sizing.py::test_no_module_under_src_imports_this_one`
+        -- "Nothing under src/ may import it at all. A size is held by a caller
+        that already computed it, never fetched by a module that sends or
+        places anything."
+      * `tests/test_decision_board.py::test_layer_cannot_reach_a_book_or_size_a_stake`
+        -- no identifier in that module may contain "kelly".
+
+    So `decision_board` stays a pure ranking layer with no sizing concept, and
+    the size is attached by this caller, which is not under `src/` and sends
+    nothing. The guards were right and the design is better for it: the
+    ranking layer cannot develop an opinion about stake.
+
+    WHAT IT CLOSES. `advisory_sizing` was reachable from exactly one place --
+    `scripts/nba_model_cli.py`, behind a flag on a hand-run command -- so the
+    nightly board carried no recommended size at all.
+    `docs/autonomy_audit_2026-10-10.md` §3.2.
+
+    ADVISORY, AND THAT IS THE WHOLE CONTRACT. `AUTO_PLACED` is written as False
+    on every row, nothing in this project places or sizes a wager, and no
+    execution path reads these columns. A row the board withheld gets no size.
+
+    POSITIONAL JOIN, asserted. `build_slate_board` wrote the CSV from this same
+    ordered list via `board_to_dataframe`, so row i of the frame is candidate i
+    -- and a length mismatch means that stopped being true, which would attach
+    one row's size to another's price. It refuses rather than guessing.
+
+    NEVER RAISES. The board is the durable output and it is already written; a
+    sizing failure must not turn a good board into a failed one.
+    """
+    out: dict[str, Any] = {"sized": 0, "declined": 0, "status": "OK"}
+    try:
+        import pandas as pd
+
+        from src.quant.advisory_sizing import advisory_size_for_candidate
+
+        rows = list(board or [])
+        if not rows:
+            # Also the path for a caller whose result carries no board at all,
+            # which is why the caller passes it with getattr: nothing about
+            # sizing may decide whether the board succeeded.
+            return {"status": "SKIPPED", "reason": "no board rows", "sized": 0}
+
+        sizes = []
+        for c in rows:
+            try:
+                sized = advisory_size_for_candidate(c)
+            except Exception as exc:  # noqa: BLE001 — one row must not lose the rest
+                logger.warning("Advisory sizing raised for a row (%s).", exc)
+                sizes.append(None)
+                continue
+            sizes.append(sized)
+
+        frame = pd.read_csv(csv_path)
+        if len(frame) != len(rows):
+            logger.error(
+                "Board CSV has %d row(s) and the board has %d; NOT attaching "
+                "sizes, because the positional join this relies on is no "
+                "longer true and would pair one row's size with another's "
+                "price.", len(frame), len(rows),
+            )
+            return {"status": "FAILED", "reason": "row count mismatch",
+                    "csv_rows": len(frame), "board_rows": len(rows)}
+
+        # A declined row gets None, never 0.0: zero would read as "sized, and
+        # the answer is nothing" rather than "not sized, and here is why".
+        frame["RECOMMENDED_UNITS"] = [
+            None if s is None or s.method == "none" else float(s.recommended_units)
+            for s in sizes
+        ]
+        frame["SIZING_METHOD"] = [
+            None if s is None or s.method == "none" else s.method for s in sizes
+        ]
+        frame["KELLY_FRACTION_APPLIED"] = [
+            None if s is None or s.method == "none"
+            else float(s.kelly_fraction_applied) for s in sizes
+        ]
+        frame["SIZING_CAPPED"] = [
+            None if s is None or s.method == "none" else bool(s.capped) for s in sizes
+        ]
+        frame["SIZING_NOTE"] = [None if s is None else s.reason for s in sizes]
+        # Written on every row, not just sized ones: the claim is about the
+        # whole pipeline, not about this number.
+        frame["AUTO_PLACED"] = False
+        frame.to_csv(csv_path, index=False)
+
+        out["sized"] = int(sum(
+            1 for s in sizes if s is not None and s.method != "none"
+        ))
+        out["declined"] = len(sizes) - out["sized"]
+        logger.info(
+            "Advisory sizing: %d row(s) sized, %d declined (no valid price, a "
+            "withheld row, or push mass with no two sides to condition on). "
+            "ADVISORY ONLY -- nothing here places or sizes a wager.",
+            out["sized"], out["declined"],
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001 — must not fail an written board
+        logger.exception(
+            "Could not attach advisory sizing (%s). The board above STANDS and "
+            "was written; what is lost is the recommended size column.", exc,
+        )
+        return {"status": "FAILED", "error": str(exc)}
 
 
 def run_dispatch() -> dict[str, Any]:
@@ -1122,6 +1468,7 @@ def run_settlement() -> dict[str, Any]:
         logger.info("Settlement: %s", out)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Settlement raised; the scheduler stays up.")
+        notify_failure("settlement", f"The 03:30 PT settlement raised: {exc}")
         out = {"status": "FAILED", "error": str(exc)}
 
     out["calibration"] = rebuild_calibration_report()
@@ -1317,12 +1664,18 @@ def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
     )
     cap_thread_counts()
-    check_state_dir()
+    state_state = check_state_dir()
     # Asked at boot, beside the state directory, because a redeploy breaks the
     # same two things: the volume's permissions and whether anything was ever
     # put on it. See check_model_artifact for why inference is too late.
-    check_model_artifact()
-    check_parlay_ledger()
+    artifact_state = check_model_artifact()
+    ledger_state = check_parlay_ledger()
+    # ROUTED OUT, not just logged. In Railway's log view every line is already
+    # red -- Python logging writes to stderr and Railway classifies stderr as
+    # error severity -- so a real boot failure is indistinguishable from an
+    # INFO line by eye. Deduped per stage per Pacific day so a redeploy loop
+    # does not post the same alert on every boot.
+    notify_boot_problems(state_state, artifact_state, ledger_state)
 
     scheduler = build_scheduler()
     # Published so the daily planner can add one-shot jobs to the scheduler
