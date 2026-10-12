@@ -129,3 +129,126 @@ def test_the_probe_and_the_healthcheck_read_the_same_resolver():
 
     hc = pathlib.Path("scripts/railway_healthcheck.py").read_text(encoding="utf-8")
     assert "resolve_state_root" in hc
+
+
+# --- cubic's two findings on PR #8, both valid -----------------------------
+
+
+def test_every_failing_directory_is_reported_not_just_the_first(monkeypatch, tmp_path):
+    """
+    cubic, PR #8: the loop collected every failure into `failures` and then read
+    only `failures[0]`. `failures[1:]` was dead data, so when BOTH directories
+    were unwritable the second vanished from the log and from the return value —
+    an operator would chown the first, redeploy, and meet the same alert again
+    naming the other one.
+
+    Simulated by making the probe itself fail, because this container runs as
+    root and cannot be denied by mode bits.
+    """
+    import src.utils.volume as volume
+
+    root = tmp_path / "vol"
+    report = tmp_path / "elsewhere"
+    root.mkdir()
+    report.mkdir()
+    monkeypatch.setattr(volume, "resolve_state_root", lambda: (root, "test"))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(report / "cal.json"))
+
+    real_write = type(tmp_path).write_text
+
+    def deny(self, *a, **k):
+        if self.name == ".propiq_write_probe":
+            raise PermissionError(f"denied: {self.parent}")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(type(tmp_path), "write_text", deny)
+
+    out = worker.check_state_dir()
+    assert out["writable"] is False
+    failed = out.get("failures")
+    assert failed is not None, "the return value drops every failure after the first"
+    assert len(failed) == 2, f"only {len(failed)} failure(s) reported, expected both"
+    assert {f["path"] for f in failed} == {str(root), str(report)}
+
+
+def test_the_message_names_what_actually_lives_in_the_broken_directory(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    cubic, PR #8: the message was written for the single-target check and
+    asserted "The calibration report and the model artifacts live here" plus the
+    root-owned-volume hypothesis for BOTH cases. When the calibration report's
+    own directory is the one that failed, the artifacts live elsewhere and a
+    mounted volume is usually not the cause — the text named the wrong contents
+    for one of the two cases this very change introduced.
+
+    Documentation outliving its facts, which is the defect this repository
+    guards against in two separate test files. I changed the semantics and left
+    the message describing the old ones.
+    """
+    import logging
+
+    import src.utils.volume as volume
+
+    root = tmp_path / "vol"
+    report = tmp_path / "elsewhere"
+    root.mkdir()
+    report.mkdir()
+    monkeypatch.setattr(volume, "resolve_state_root", lambda: (root, "test"))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(report / "cal.json"))
+
+    real_write = type(tmp_path).write_text
+
+    def deny_report_only(self, *a, **k):
+        if self.name == ".propiq_write_probe" and self.parent == report:
+            raise PermissionError("denied")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(type(tmp_path), "write_text", deny_report_only)
+
+    with caplog.at_level(logging.ERROR):
+        out = worker.check_state_dir()
+    assert out["writable"] is False
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "calibration report" in text.lower()
+    assert "mounted volume" not in text.lower(), (
+        "the mounted-volume hypothesis is named for a calibration-report "
+        "failure, where it is usually not the cause"
+    )
+
+
+def test_the_alert_names_every_unwritable_directory(caplog):
+    """
+    The consequence of cubic's first finding, carried through to the thing an
+    operator actually reads. The probe reporting both failures is no use if the
+    Discord alert still names one: they chown it, redeploy, and meet the same
+    alert — which reads as "the fix did not work", not "there was a second one".
+    """
+    import logging
+
+    with caplog.at_level(logging.ERROR):
+        out = worker.notify_boot_problems(
+            {
+                "path": "/app/data",
+                "writable": False,
+                "error": "EACCES",
+                "failures": [
+                    {"path": "/app/data", "error": "EACCES"},
+                    {"path": "/elsewhere", "error": "EROFS"},
+                ],
+            },
+            {"resolved": True, "exists": True},
+            {"status": "OK"},
+            {"ok": True, "message": "Database reachable."},
+        )
+    assert "boot:state-dir" in [a["stage"] for a in out]
+    # The dispatch result carries no body -- the alert TEXT is what an operator
+    # sees, in the log line and in the Discord message built from it.
+    body = " ".join(
+        r.getMessage() for r in caplog.records if "boot:state-dir" in r.getMessage()
+    )
+    assert "/app/data" in body
+    assert "/elsewhere" in body, (
+        "the second unwritable directory is missing from the alert an operator "
+        "reads, so they will fix one and see the same message again"
+    )

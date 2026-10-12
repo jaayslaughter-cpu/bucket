@@ -409,13 +409,22 @@ def notify_boot_problems(
             f"preflight exits rather than scoring anything.",
         ))
     if state.get("writable") is False:
+        # EVERY unwritable directory, not just the first. An alert that names
+        # one of two gets one of them chowned and then fires again, which reads
+        # as "the fix did not work" rather than "there was a second one".
+        broken = state.get("failures") or [
+            {"path": state.get("path"), "error": state.get("error")}
+        ]
+        named = "; ".join(
+            f"{f.get('path')} ({f.get('error')})" for f in broken
+        )
         out.append(notify_failure(
             "boot:state-dir",
-            f"State directory {state.get('path')} is NOT writable: "
-            f"{state.get('error')}. A mounted volume is commonly root-owned "
-            f"while this process runs as uid 10001. The calibration evidence "
-            f"and the model artifacts live there, so the publication gate will "
-            f"withhold every card.",
+            f"State director{'y' if len(broken) == 1 else 'ies'} NOT writable: "
+            f"{named}. A mounted volume is commonly root-owned while this "
+            f"process runs as uid 10001. The calibration evidence and the model "
+            f"artifacts live there, so the publication gate will withhold every "
+            f"card.",
         ))
     if not artifact.get("resolved") or artifact.get("exists") is False:
         out.append(notify_failure(
@@ -591,56 +600,88 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     #
     # An explicit `path` still wins outright: that is how a caller aims this at
     # one directory it cares about.
+
+    # EACH TARGET CARRIES WHAT LIVES IN IT, because the two directories break
+    # different things and have different causes. cubic, PR #8: the single
+    # message this check logged was written when there was one target, and it
+    # asserted both "the calibration report and the model artifacts live here"
+    # and the root-owned-volume hypothesis for whichever directory failed --
+    # true of the state root, wrong for a calibration report configured outside
+    # it, where no volume is involved and the artifacts are not affected. The
+    # same defect this repository has two test files guarding against: text
+    # outliving the facts it describes.
+    uid = os.getuid() if hasattr(os, "getuid") else "?"
+    state_root_cause = (
+        "The model artifacts and, by default, the calibration report live here, "
+        "so score_prob_over will find no model and the publication gate will "
+        "withhold every card. If this is a mounted volume it is most likely "
+        f"owned by root while this process runs as uid {uid} -- chown it to that "
+        "uid, or run the service as root."
+    )
+    report_cause = (
+        "Settlement writes the calibration report here at 03:30 PT and the "
+        "09:00 PT slate reads it, so the gate will withhold every model-sourced "
+        "card; market-grounded figures are unaffected, and the model artifacts "
+        "live elsewhere. This directory is configured outside the state root, so "
+        "it is most likely owned by root or another uid while this process runs "
+        f"as uid {uid} -- chown it to that uid, or configure the report under the "
+        "state root."
+    )
+
     if path is not None:
-        targets = [Path(path).parent]
+        targets = [(Path(path).parent, "CALIBRATION REPORT DIRECTORY", report_cause)]
     else:
         root = resolve_state_root()[0]
-        targets = [root]
+        targets = [(root, "STATE ROOT", state_root_cause)]
         report_dir = Path(
             os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
         ).parent
         # Compare resolved paths: "outputs" and "/app/outputs" are the same
         # directory and probing it twice would log a duplicate.
         if report_dir.resolve() != root.resolve():
-            targets.append(report_dir)
+            targets.append((report_dir, "CALIBRATION REPORT DIRECTORY", report_cause))
 
     failures: list[dict[str, str]] = []
-    for candidate in targets:
+    for candidate, label, cause in targets:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
             tmp = candidate / ".propiq_write_probe"
             tmp.write_text("ok", encoding="utf-8")
             tmp.unlink()
         except OSError as exc:
-            failures.append({"path": str(candidate), "error": str(exc)})
+            failures.append(
+                {"path": str(candidate), "error": str(exc), "what": label, "cause": cause}
+            )
 
     if failures:
-        first = failures[0]
-        logger.error(
-            "STATE DIRECTORY %s IS NOT WRITABLE (%s). The calibration report and "
-            "the model artifacts live here, so the publication gate will withhold "
-            "every card and score_prob_over will find no model. If this is a "
-            "mounted volume, it is most likely owned by root while this process "
-            "runs as uid %s -- chown it to that uid, or run the service as root. "
-            "The slate still runs and still writes to Postgres.",
-            first["path"], first["error"],
-            os.getuid() if hasattr(os, "getuid") else "?",
-        )
+        # EVERY failure, one line each. cubic, PR #8: this read failures[0] and
+        # dropped the rest, so with both directories broken an operator would
+        # chown the one named, redeploy, and meet the same alert naming the
+        # other. ``path``/``error`` stay on the dict for the callers that read
+        # them -- scripts/validate_docker.py and the healthcheck -- and
+        # ``failures`` is what carries the whole list.
+        for failure in failures:
+            logger.error(
+                "%s %s IS NOT WRITABLE (%s). %s The slate still runs and still "
+                "writes to Postgres.",
+                failure["what"], failure["path"], failure["error"], failure["cause"],
+            )
         return {
-            "path": first["path"],
+            "path": failures[0]["path"],
             "writable": False,
-            "error": first["error"],
-            "checked": [str(t) for t in targets],
+            "error": failures[0]["error"],
+            "failures": failures,
+            "checked": [str(t) for t, _, _ in targets],
         }
     logger.info(
         "State director%s writable: %s.",
         "y is" if len(targets) == 1 else "ies are",
-        ", ".join(str(t) for t in targets),
+        ", ".join(str(t) for t, _, _ in targets),
     )
     return {
-        "path": str(targets[0]),
+        "path": str(targets[0][0]),
         "writable": True,
-        "checked": [str(t) for t in targets],
+        "checked": [str(t) for t, _, _ in targets],
     }
 
 
