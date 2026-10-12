@@ -409,13 +409,44 @@ def notify_boot_problems(
             f"preflight exits rather than scoring anything.",
         ))
     if state.get("writable") is False:
+        # EVERY unwritable directory, EACH WITH ITS OWN CAUSE. Two findings,
+        # both cubic's, both on PR #8:
+        #
+        #   1. this named only `state["path"]`, so one of two broken
+        #      directories got chowned and the next boot produced the same
+        #      alert naming the other -- which reads as "the fix did not work",
+        #      not "there was a second one";
+        #   2. the fix for (1) listed every path under ONE generic cause,
+        #      asserting the mounted-volume hypothesis and "the model artifacts
+        #      live there" for a calibration report configured outside the state
+        #      root -- contradicting `check_state_dir`'s own log line about that
+        #      same directory, which says the artifacts live elsewhere.
+        #
+        # `check_state_dir` already worked out what lives in each directory;
+        # this reads that rather than keeping a second copy of the reasoning
+        # that can drift from it. A ``state`` dict with no ``failures`` -- a
+        # caller predating the key, or a hand-built one -- gets the generic
+        # text, which says only what is true of either directory.
+        broken = state.get("failures") or [
+            {
+                "path": state.get("path"),
+                "error": state.get("error"),
+                "what": "State directory",
+                "cause": (
+                    "Durable state lives there. A mounted volume is commonly "
+                    "root-owned while this process runs as uid 10001."
+                ),
+            }
+        ]
         out.append(notify_failure(
             "boot:state-dir",
-            f"State directory {state.get('path')} is NOT writable: "
-            f"{state.get('error')}. A mounted volume is commonly root-owned "
-            f"while this process runs as uid 10001. The calibration evidence "
-            f"and the model artifacts live there, so the publication gate will "
-            f"withhold every card.",
+            " ".join(
+                (
+                    f"{f.get('what') or 'State directory'} {f.get('path')} is "
+                    f"NOT writable: {f.get('error')}. {f.get('cause') or ''}"
+                ).strip()
+                for f in broken
+            ),
         ))
     if not artifact.get("resolved") or artifact.get("exists") is False:
         out.append(notify_failure(
@@ -568,27 +599,112 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     """
     from pathlib import Path
 
-    target = Path(
-        path or os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
-    ).parent
-    probe = target / ".propiq_write_probe"
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-    except OSError as exc:
-        logger.error(
-            "STATE DIRECTORY %s IS NOT WRITABLE (%s). The calibration report and "
-            "the model artifacts live here, so the publication gate will withhold "
-            "every card and score_prob_over will find no model. If this is a "
-            "mounted volume, it is most likely owned by root while this process "
-            "runs as uid %s — chown it to that uid, or run the service as root. "
-            "The slate still runs and still writes to Postgres.",
-            target, exc, os.getuid() if hasattr(os, "getuid") else "?",
-        )
-        return {"path": str(target), "writable": False, "error": str(exc)}
-    logger.info("State directory %s is writable.", target)
-    return {"path": str(target), "writable": True}
+    from src.utils.volume import resolve_state_root
+
+    # BOTH DIRECTORIES THAT MATTER, because they can differ and each breaks
+    # something different when it is not writable.
+    #
+    # THE STATE ROOT was the production defect, found 2026-10-12: a volume was
+    # attached at /var/lib/postgresql/data and root-owned,
+    # `railway_healthcheck` FAILED on it correctly, and this check -- the one
+    # whose whole purpose is catching a root-owned mounted volume -- probed
+    # /app/data instead, because that is where the calibration report pointed,
+    # and reported "writable". A FALSE ALL-CLEAR, so `notify_boot_problems`
+    # alerted nobody about the fault that silently breaks the artifact store.
+    # Two readers of one fact, the fifth time in this repository; the resolver
+    # in `utils.volume` is the one reader.
+    #
+    # THE CALIBRATION REPORT'S DIRECTORY stays covered too. Settlement writes
+    # it at 03:30 PT and the slate reads it at 09:00 PT, and an operator can
+    # point $PROPIQ_CALIBRATION_REPORT outside the state root -- probing only
+    # the root would have dropped a check that already existed, which is not a
+    # fix, it is a trade.
+    #
+    # An explicit `path` still wins outright: that is how a caller aims this at
+    # one directory it cares about.
+
+    # EACH TARGET CARRIES WHAT LIVES IN IT, because the two directories break
+    # different things and have different causes. cubic, PR #8: the single
+    # message this check logged was written when there was one target, and it
+    # asserted both "the calibration report and the model artifacts live here"
+    # and the root-owned-volume hypothesis for whichever directory failed --
+    # true of the state root, wrong for a calibration report configured outside
+    # it, where no volume is involved and the artifacts are not affected. The
+    # same defect this repository has two test files guarding against: text
+    # outliving the facts it describes.
+    uid = os.getuid() if hasattr(os, "getuid") else "?"
+    state_root_cause = (
+        "The model artifacts and, by default, the calibration report live here, "
+        "so score_prob_over will find no model and the publication gate will "
+        "withhold every card. If this is a mounted volume it is most likely "
+        f"owned by root while this process runs as uid {uid} -- chown it to that "
+        "uid, or run the service as root."
+    )
+    report_cause = (
+        "Settlement writes the calibration report here at 03:30 PT and the "
+        "09:00 PT slate reads it, so the gate will withhold every model-sourced "
+        "card; market-grounded figures are unaffected, and the model artifacts "
+        "live elsewhere. This directory is configured outside the state root, so "
+        "it is most likely owned by root or another uid while this process runs "
+        f"as uid {uid} -- chown it to that uid, or configure the report under the "
+        "state root."
+    )
+
+    if path is not None:
+        targets = [(Path(path).parent, "CALIBRATION REPORT DIRECTORY", report_cause)]
+    else:
+        root = resolve_state_root()[0]
+        targets = [(root, "STATE ROOT", state_root_cause)]
+        report_dir = Path(
+            os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
+        ).parent
+        # Compare resolved paths: "outputs" and "/app/outputs" are the same
+        # directory and probing it twice would log a duplicate.
+        if report_dir.resolve() != root.resolve():
+            targets.append((report_dir, "CALIBRATION REPORT DIRECTORY", report_cause))
+
+    failures: list[dict[str, str]] = []
+    for candidate, label, cause in targets:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            tmp = candidate / ".propiq_write_probe"
+            tmp.write_text("ok", encoding="utf-8")
+            tmp.unlink()
+        except OSError as exc:
+            failures.append(
+                {"path": str(candidate), "error": str(exc), "what": label, "cause": cause}
+            )
+
+    if failures:
+        # EVERY failure, one line each. cubic, PR #8: this read failures[0] and
+        # dropped the rest, so with both directories broken an operator would
+        # chown the one named, redeploy, and meet the same alert naming the
+        # other. ``path``/``error`` stay on the dict for the callers that read
+        # them -- scripts/validate_docker.py and the healthcheck -- and
+        # ``failures`` is what carries the whole list.
+        for failure in failures:
+            logger.error(
+                "%s %s IS NOT WRITABLE (%s). %s The slate still runs and still "
+                "writes to Postgres.",
+                failure["what"], failure["path"], failure["error"], failure["cause"],
+            )
+        return {
+            "path": failures[0]["path"],
+            "writable": False,
+            "error": failures[0]["error"],
+            "failures": failures,
+            "checked": [str(t) for t, _, _ in targets],
+        }
+    logger.info(
+        "State director%s writable: %s.",
+        "y is" if len(targets) == 1 else "ies are",
+        ", ".join(str(t) for t, _, _ in targets),
+    )
+    return {
+        "path": str(targets[0][0]),
+        "writable": True,
+        "checked": [str(t) for t, _, _ in targets],
+    }
 
 
 #: Below this many training rows an artifact is almost certainly the synthetic
