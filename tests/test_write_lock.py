@@ -130,31 +130,91 @@ def test_an_unlockable_location_proceeds_rather_than_stopping_the_slate(
 # --- and it has to actually be wired in -----------------------------------
 
 
-def test_main_takes_the_lock_around_the_run():
+def test_both_entry_points_take_the_lock():
     """
-    AST-walked. main.main is the funnel both the scheduled job and a manual
-    `railway run python main.py` pass through — it holds every upsert — so the
-    lock belongs there and nowhere else, which is also what keeps the nesting
-    single-level.
+    AST-walked, at BOTH of `main.main`'s callers.
+
+    THE FIRST VERSION OF THIS TEST ASSERTED THE WRONG DESIGN. It required the
+    lock inside `main.main`, so the implementation extracted that function's
+    body to indent it under a `with` -- and broke four AST tests across three
+    files that walk `main`'s body for the steps it must wire, in order. Those
+    tests were right: `main` holding the pipeline is a contract the suite
+    depends on. The lock belongs at the two call sites instead, which is also
+    wider cover, since `run_slate`'s board write and dispatch fall inside its
+    scope where wrapping `main` alone left them out.
+
+    Both sites are asserted because one of them is the hole: locking only the
+    scheduled path leaves `railway run python main.py` free to interleave, and
+    locking only the manual path leaves the 09:00 job free to do the same.
     """
+    import ast
+
+    def takes_lock(tree: ast.AST) -> bool:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            for item in node.items:
+                call = item.context_expr
+                if isinstance(call, ast.Call):
+                    f = call.func
+                    if (isinstance(f, ast.Name) and f.id == "write_lock") or (
+                        getattr(f, "attr", "") == "write_lock"
+                    ):
+                        return True
+        return False
+
+    # the MANUAL path: main.py's __main__ block
+    main_tree = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+    main_guard = [
+        n for n in main_tree.body
+        if isinstance(n, ast.If)
+        and ast.dump(n.test).find("__main__") != -1
+    ]
+    assert main_guard, "main.py has no __main__ block to lock"
+    assert takes_lock(main_guard[0]), (
+        "main.py's __main__ block does not take the write lock, so a manual "
+        "`railway run python main.py` can interleave with the scheduled slate"
+    )
+
+    # the SCHEDULED path: scheduler_worker.run_slate
+    worker_tree = ast.parse(Path("scheduler_worker.py").read_text(encoding="utf-8"))
+    run_slate = next(
+        n for n in ast.walk(worker_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "run_slate"
+    )
+    assert takes_lock(run_slate), (
+        "run_slate does not take the write lock, so the 09:00 PT job can "
+        "interleave with a manual run"
+    )
+
+
+def test_main_itself_still_holds_the_pipeline_body():
+    """
+    THE REGRESSION GUARD for the mistake above, stated as the contract it broke.
+
+    Four tests in test_player_log_refresh, test_market_frames_fallback and
+    test_per_market_and_per_row_status walk `main`'s body for the calls it must
+    make. If a future change moves that body into a helper again, they all fail
+    with "main() does not call: [...]" and the cause is not obvious from any
+    one of them. This says it once, here, next to the change that caused it.
+    """
+    import ast
+
     tree = ast.parse(Path("main.py").read_text(encoding="utf-8"))
     fn = next(
         n for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "main"
     )
-    withs = [
-        item
-        for node in ast.walk(fn)
-        if isinstance(node, ast.With)
-        for item in node.items
-    ]
-    names = []
-    for item in withs:
-        call = item.context_expr
-        if isinstance(call, ast.Call):
-            f = call.func
-            names.append(f.id if isinstance(f, ast.Name) else getattr(f, "attr", ""))
-    assert "write_lock" in names, (
-        "main.main does not take the write lock, so a manual run and the "
-        "scheduled slate can still interleave their writes"
+    called = {
+        n.func.id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    expected = {"preflight", "load_master_guideline", "resolve_market_frames"}
+    missing = expected - called
+    assert not missing, (
+        f"main() no longer calls {sorted(missing)} directly. If its body was "
+        "moved into a helper to wrap it in something, four other AST tests are "
+        "about to fail too -- take the wrapper at main's CALL SITES instead "
+        "(main.py's __main__ block and scheduler_worker.run_slate)."
     )

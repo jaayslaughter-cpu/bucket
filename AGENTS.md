@@ -131,7 +131,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:242`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:241`
 `load_master_guideline()` returns `None` and the caller logs it. The
 `.example` beside it is a placeholder shape, not the real file.
 

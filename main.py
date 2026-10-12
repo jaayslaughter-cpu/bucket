@@ -71,7 +71,6 @@ from src.models.labels import (
     mask_probabilities_at_unsupported_lines,
 )
 from src.utils.timezones import DISPLAY_TZ_NAME, now_pacific, pacific_calendar_date
-from src.utils.write_lock import write_lock
 
 load_dotenv()
 
@@ -1573,39 +1572,6 @@ def main(argv: list[str] | None = None) -> int:
     persist = not args.no_db
     stage_summary: dict[str, Any] = {}
 
-    # ONE SLATE AT A TIME, ACROSS PROCESSES (A1). `scheduler_worker` already
-    # schedules with max_instances=1, which is a property of one process; this
-    # is the guard against a manual `railway run python main.py` interleaving
-    # its upserts with the 09:00 PT job's. The lock lives HERE, at the funnel
-    # both paths pass through, rather than in the worker: `run_slate` delegates
-    # to this function, so one level is all there is and the reentrancy in
-    # `utils.write_lock` covers the nesting if that ever changes.
-    #
-    # DECLINING IS NOT A FAILURE, so this returns 0: the other process is doing
-    # the work, and a nonzero exit would make the platform report a broken run
-    # and, on the scheduled path, suppress a board that is about to be written
-    # correctly by the run that holds the lock.
-    with write_lock() as acquired:
-        if not acquired:
-            logger.warning(
-                "Another process is already running a slate, so this one is "
-                "SKIPPED. Nothing was ingested, scored or written. This is a "
-                "deliberate decline, not a failure."
-            )
-            return 0
-        return _run_pipeline(args, run_id, persist, stage_summary)
-
-
-def _run_pipeline(
-    args: Any, run_id: str, persist: bool, stage_summary: dict[str, Any]
-) -> int:
-    """
-    The pipeline itself, extracted so `main` holds the lock around it.
-
-    SPLIT RATHER THAN INDENTED: wrapping the whole body in a `with` would have
-    re-indented several hundred lines and buried the change in whitespace,
-    which is the kind of diff that hides a real edit inside it.
-    """
     try:
         stage_summary["preflight"] = preflight(require_db=persist)
         guideline = load_master_guideline()
@@ -1834,4 +1800,27 @@ def _run_pipeline(
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ONE SLATE AT A TIME, ACROSS PROCESSES (A1) -- taken HERE, at the manual
+    # entry point, and in `scheduler_worker.run_slate` for the scheduled one.
+    # Those are the only two callers of `main`, so between them the lock covers
+    # both paths.
+    #
+    # NOT INSIDE main() ITSELF, which was the first attempt and was wrong: four
+    # AST tests across three files walk main()'s body for the steps it must
+    # wire, in order, and extracting that body to indent it under a `with`
+    # moved every one of those calls out of the function they assert on. The
+    # tests were right and the refactor was the mistake. Putting the lock at
+    # the two call sites also covers MORE than the first version did --
+    # `run_slate`'s board write and dispatch sit inside its scope, where
+    # wrapping main() alone left them out.
+    from src.utils.write_lock import write_lock
+
+    with write_lock() as _acquired:
+        if not _acquired:
+            logger.warning(
+                "Another process is already running a slate, so this one is "
+                "SKIPPED. Nothing was ingested, scored or written. This is a "
+                "deliberate decline, not a failure."
+            )
+            sys.exit(0)
+        sys.exit(main())

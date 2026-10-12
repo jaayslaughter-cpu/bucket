@@ -848,12 +848,49 @@ def check_model_artifact() -> dict[str, Any]:
 
 
 def run_slate(argv: list[str] | None = None) -> int:
-    """One slate run: ingest, build features, score, gate, persist, record.
+    """
+    One slate run, under the cross-process write lock.
 
-    Delegates to ``main.main`` rather than reimplementing the sequence, so the
-    scheduled path and the manual one cannot drift. An exception is caught and
-    logged: a failed slate must not take the scheduler down, or one bad day
-    ends every subsequent day too.
+    THE LOCK IS HERE, NOT INSIDE ``main.main``, and the first attempt at A1 had
+    it the other way round. Four AST tests across three files walk ``main``'s
+    body for the steps it must wire and the order it wires them in; extracting
+    that body so it could be indented under a ``with`` moved every one of those
+    calls out of the function they assert on. The tests were right and the
+    refactor was the mistake. Taking it at the two CALL SITES instead -- here
+    and in ``main.py``'s ``__main__`` block, which are ``main``'s only two
+    callers -- leaves that body alone and covers MORE than wrapping ``main``
+    did: the board write and the dispatch below sit inside this scope, and a
+    half-written board is as bad as a half-written upsert.
+
+    ``utils.write_lock`` is reentrant, so nesting stays safe if a third caller
+    ever appears.
+    """
+    from src.utils.write_lock import write_lock
+
+    # ONE SLATE AT A TIME, ACROSS PROCESSES (A1). max_instances=1 above is a
+    # property of THIS process; this is the guard against a manual
+    # `railway run python main.py` interleaving its writes with ours. The scope
+    # deliberately covers the board write and the dispatch below too, not just
+    # the scoring: a half-written board is as bad as a half-written upsert.
+    with write_lock() as acquired:
+        if not acquired:
+            logger.warning(
+                "Another process holds the slate write lock, so the 09:00 PT "
+                "run is SKIPPED. Nothing was scored, no board was built and no "
+                "card was sent. A deliberate decline, not a failure."
+            )
+            return 0
+        return _run_slate_locked(argv)
+
+
+def _run_slate_locked(argv: list[str] | None = None) -> int:
+    """
+    The slate sequence, with the write lock already held by ``run_slate``.
+
+    Delegates to ``main.main`` rather than reimplementing it, so the scheduled
+    path and the manual one cannot drift. An exception is caught and logged: a
+    failed slate must not take the scheduler down, or one bad day ends every
+    subsequent day too.
 
     SYSTEMEXIT IS CAUGHT SEPARATELY, AND THAT IS NOT A DETAIL. `main.preflight`
     ends a run it cannot perform with ``raise SystemExit(1)`` (`main.py:264`),
