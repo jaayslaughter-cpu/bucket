@@ -568,27 +568,80 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     """
     from pathlib import Path
 
-    target = Path(
-        path or os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
-    ).parent
-    probe = target / ".propiq_write_probe"
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-    except OSError as exc:
+    from src.utils.volume import resolve_state_root
+
+    # BOTH DIRECTORIES THAT MATTER, because they can differ and each breaks
+    # something different when it is not writable.
+    #
+    # THE STATE ROOT was the production defect, found 2026-10-12: a volume was
+    # attached at /var/lib/postgresql/data and root-owned,
+    # `railway_healthcheck` FAILED on it correctly, and this check -- the one
+    # whose whole purpose is catching a root-owned mounted volume -- probed
+    # /app/data instead, because that is where the calibration report pointed,
+    # and reported "writable". A FALSE ALL-CLEAR, so `notify_boot_problems`
+    # alerted nobody about the fault that silently breaks the artifact store.
+    # Two readers of one fact, the fifth time in this repository; the resolver
+    # in `utils.volume` is the one reader.
+    #
+    # THE CALIBRATION REPORT'S DIRECTORY stays covered too. Settlement writes
+    # it at 03:30 PT and the slate reads it at 09:00 PT, and an operator can
+    # point $PROPIQ_CALIBRATION_REPORT outside the state root -- probing only
+    # the root would have dropped a check that already existed, which is not a
+    # fix, it is a trade.
+    #
+    # An explicit `path` still wins outright: that is how a caller aims this at
+    # one directory it cares about.
+    if path is not None:
+        targets = [Path(path).parent]
+    else:
+        root = resolve_state_root()[0]
+        targets = [root]
+        report_dir = Path(
+            os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
+        ).parent
+        # Compare resolved paths: "outputs" and "/app/outputs" are the same
+        # directory and probing it twice would log a duplicate.
+        if report_dir.resolve() != root.resolve():
+            targets.append(report_dir)
+
+    failures: list[dict[str, str]] = []
+    for candidate in targets:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            tmp = candidate / ".propiq_write_probe"
+            tmp.write_text("ok", encoding="utf-8")
+            tmp.unlink()
+        except OSError as exc:
+            failures.append({"path": str(candidate), "error": str(exc)})
+
+    if failures:
+        first = failures[0]
         logger.error(
             "STATE DIRECTORY %s IS NOT WRITABLE (%s). The calibration report and "
             "the model artifacts live here, so the publication gate will withhold "
             "every card and score_prob_over will find no model. If this is a "
             "mounted volume, it is most likely owned by root while this process "
-            "runs as uid %s — chown it to that uid, or run the service as root. "
+            "runs as uid %s -- chown it to that uid, or run the service as root. "
             "The slate still runs and still writes to Postgres.",
-            target, exc, os.getuid() if hasattr(os, "getuid") else "?",
+            first["path"], first["error"],
+            os.getuid() if hasattr(os, "getuid") else "?",
         )
-        return {"path": str(target), "writable": False, "error": str(exc)}
-    logger.info("State directory %s is writable.", target)
-    return {"path": str(target), "writable": True}
+        return {
+            "path": first["path"],
+            "writable": False,
+            "error": first["error"],
+            "checked": [str(t) for t in targets],
+        }
+    logger.info(
+        "State director%s writable: %s.",
+        "y is" if len(targets) == 1 else "ies are",
+        ", ".join(str(t) for t in targets),
+    )
+    return {
+        "path": str(targets[0]),
+        "writable": True,
+        "checked": [str(t) for t in targets],
+    }
 
 
 #: Below this many training rows an artifact is almost certainly the synthetic
