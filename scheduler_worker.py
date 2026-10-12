@@ -409,22 +409,44 @@ def notify_boot_problems(
             f"preflight exits rather than scoring anything.",
         ))
     if state.get("writable") is False:
-        # EVERY unwritable directory, not just the first. An alert that names
-        # one of two gets one of them chowned and then fires again, which reads
-        # as "the fix did not work" rather than "there was a second one".
+        # EVERY unwritable directory, EACH WITH ITS OWN CAUSE. Two findings,
+        # both cubic's, both on PR #8:
+        #
+        #   1. this named only `state["path"]`, so one of two broken
+        #      directories got chowned and the next boot produced the same
+        #      alert naming the other -- which reads as "the fix did not work",
+        #      not "there was a second one";
+        #   2. the fix for (1) listed every path under ONE generic cause,
+        #      asserting the mounted-volume hypothesis and "the model artifacts
+        #      live there" for a calibration report configured outside the state
+        #      root -- contradicting `check_state_dir`'s own log line about that
+        #      same directory, which says the artifacts live elsewhere.
+        #
+        # `check_state_dir` already worked out what lives in each directory;
+        # this reads that rather than keeping a second copy of the reasoning
+        # that can drift from it. A ``state`` dict with no ``failures`` -- a
+        # caller predating the key, or a hand-built one -- gets the generic
+        # text, which says only what is true of either directory.
         broken = state.get("failures") or [
-            {"path": state.get("path"), "error": state.get("error")}
+            {
+                "path": state.get("path"),
+                "error": state.get("error"),
+                "what": "State directory",
+                "cause": (
+                    "Durable state lives there. A mounted volume is commonly "
+                    "root-owned while this process runs as uid 10001."
+                ),
+            }
         ]
-        named = "; ".join(
-            f"{f.get('path')} ({f.get('error')})" for f in broken
-        )
         out.append(notify_failure(
             "boot:state-dir",
-            f"State director{'y' if len(broken) == 1 else 'ies'} NOT writable: "
-            f"{named}. A mounted volume is commonly root-owned while this "
-            f"process runs as uid 10001. The calibration evidence and the model "
-            f"artifacts live there, so the publication gate will withhold every "
-            f"card.",
+            " ".join(
+                (
+                    f"{f.get('what') or 'State directory'} {f.get('path')} is "
+                    f"NOT writable: {f.get('error')}. {f.get('cause') or ''}"
+                ).strip()
+                for f in broken
+            ),
         ))
     if not artifact.get("resolved") or artifact.get("exists") is False:
         out.append(notify_failure(

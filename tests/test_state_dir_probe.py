@@ -252,3 +252,49 @@ def test_the_alert_names_every_unwritable_directory(caplog):
         "the second unwritable directory is missing from the alert an operator "
         "reads, so they will fix one and see the same message again"
     )
+
+
+def test_the_alert_carries_each_directory_s_own_cause(caplog):
+    """
+    cubic, second round on PR #8, and right: the fix for finding 2 gave the LOG
+    a per-directory cause and left the Discord ALERT asserting the state-root
+    one for whichever directory failed. The two then contradict each other about
+    the same failure — the log saying the artifacts live elsewhere and no volume
+    is involved, the alert saying a mounted volume is commonly root-owned and
+    the artifacts live there. Message outliving its facts, one layer up from
+    where this PR fixed it.
+
+    `check_state_dir` already puts a `cause` on every failure. The alert has to
+    read it rather than keep a second copy of the reasoning.
+    """
+    import logging
+
+    with caplog.at_level(logging.ERROR):
+        worker.notify_boot_problems(
+            {
+                "path": "/elsewhere",
+                "writable": False,
+                "error": "EACCES",
+                "failures": [
+                    {
+                        "path": "/elsewhere",
+                        "error": "EACCES",
+                        "what": "CALIBRATION REPORT DIRECTORY",
+                        "cause": "Settlement writes the calibration report here.",
+                    }
+                ],
+            },
+            {"resolved": True, "exists": True},
+            {"status": "OK"},
+            {"ok": True, "message": "Database reachable."},
+        )
+    text = " ".join(
+        r.getMessage() for r in caplog.records if "boot:state-dir" in r.getMessage()
+    )
+    assert "Settlement writes the calibration report here." in text, (
+        "the alert ignores the cause the probe worked out and substitutes its own"
+    )
+    assert "mounted volume" not in text.lower(), (
+        "the alert asserts the state-root cause for a calibration-report "
+        "failure, contradicting the log line about the same directory"
+    )
