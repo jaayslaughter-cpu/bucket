@@ -284,7 +284,7 @@ def test_only_pre_tip_games_are_projected():
     finally:
         sched.load_slate = original
     assert set(forward_only(out.panel)["GAME_ID"]) == {"401700001"}
-    assert "1 pre-tip game(s) of 2" in " ".join(out.notes)
+    assert "1 projectable game(s) of 1 pre-tip, 2 on the schedule" in " ".join(out.notes)
 
 
 # --- the slate run uses it -------------------------------------------------

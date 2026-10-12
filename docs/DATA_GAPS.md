@@ -294,6 +294,25 @@ match"). Partial coverage logs the matched percentage instead. The
 `GAME_ID`-width defect those two warnings exposed is fixed — every join now
 routes through `src/utils/ids.py` — but the warnings remain the signal to read.
 
+## 4c. Fixture types the live slate cannot judge
+
+Added 2026-10-12, after the deployed worker armed its full pipeline on five
+PRESEASON games — one of them `LON @ POR`, against a team with no NBA mapping
+at all. `src/ingestion/espn_schedule.py` now reads ESPN's season type and
+`SlateResult.projectable` is the one reader for "may this fixture be
+projected". What that filter still cannot do:
+
+| Case | What happens today | Why it is left here rather than fixed |
+|---|---|---|
+| **A season type ESPN does not report** | Projected anyway, with an ERROR log line and a note on the result | The field has never been seen from this environment: outbound CONNECT to `site.api.espn.com` is denied, so the parser reads four plausible locations and the NAME as well as the number. Excluding an unreported type would mean one renamed key turns every slate into an empty board that reads as a quiet night. The first live slate is the real test — if the log says *every* game carries no season type, the shape has changed. |
+| **The postseason** | Projected, with a note | The training pack filters to `IS_REGULAR_SEASON` too, so a playoff game is also off-distribution. Excluding it would blank every April board, which is a larger decision than the preseason filter and was not the one asked for. |
+| **All-Star, the play-in, the in-season tournament** | Projected if ESPN types them as anything other than preseason | Nobody here can verify which numbers ESPN uses for them, which is why the filter is an EXCLUDE-list of preseason rather than an INCLUDE-list of {regular, postseason}: a dark board on a real game night is worse than a noisy one on All-Star Saturday. |
+
+**How to tell this apart from a real failure.** An empty board from this filter
+says so: the result carries `NO PROJECTABLE GAMES: all N pre-tip game(s) were
+excluded`, and `load_slate` logs one line per excluded game with its reason. A
+board that is empty with none of those lines is a different fault.
+
 ## 5. What unblocks the most, fastest
 
 1. **Player game logs.** Run `nba-model ingest-logs` (or

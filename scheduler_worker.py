@@ -1539,7 +1539,24 @@ def schedule_prelock_jobs(
 
     from datetime import timedelta
 
-    games = list(getattr(slate, "pregame_only", None) or [])
+    # PROJECTABLE, not merely pre-tip. Found in production 2026-10-12: this
+    # armed a tip-off job for every one of five PRESEASON games, one of them
+    # against ``LON``, a code with no NBA mapping at all. ``projectable`` is
+    # the one reader for "may this fixture be projected" -- a preseason test
+    # here and another in the slate pipeline would be the two-readers defect
+    # this repository has fixed five times.
+    #
+    # FAILS OPEN, LOUDLY, for a slate object that predates the property: an
+    # arming that silently stops happening is worse than one that warns, and
+    # the same policy as ``utils.write_lock``.
+    games = list(getattr(slate, "projectable", None) or [])
+    if not hasattr(slate, "projectable"):
+        logger.warning(
+            "This slate object has no .projectable, so the preseason filter "
+            "cannot have run on it; falling back to pre-tip games. A preseason "
+            "fixture may be armed."
+        )
+        games = list(getattr(slate, "pregame_only", None) or [])
     armed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
