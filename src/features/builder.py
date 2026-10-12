@@ -315,6 +315,22 @@ def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
         )
         return df
 
+    # ALREADY BUILT? The merge below adds PACE_ROLL and PACE_MULTIPLIER. If the
+    # frame already carries them, pandas suffixes both copies to _x/_y and the
+    # unsuffixed read a few lines down raises a bare KeyError naming the
+    # column -- which describes a missing feature, not the actual mistake of
+    # running the builder twice over its own output. Found by audit on
+    # 2026-10-11, where it cost a wrong diagnosis before the right one.
+    collisions = sorted({"PACE_ROLL", "PACE_MULTIPLIER"} & set(df.columns))
+    if collisions:
+        raise FeatureFrameError(
+            f"This frame already has {collisions}, so it has already been through "
+            "the feature builder. Pass the RAW player panel (as "
+            "`db.repository.load_player_panel` returns it), not a built one: "
+            "re-running the builder over its own output collides on every "
+            "column it adds."
+        )
+
     work = df.copy()
     season_col = "SEASON" if "SEASON" in work.columns else None
     group = ["SEASON", "TEAM_ABBREVIATION", "GAME_ID"] if season_col else [
@@ -384,6 +400,10 @@ def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
         "and stay null).", known, len(out),
     )
     return out
+
+
+class FeatureFrameError(ValueError):
+    """Raised when the frame handed to a feature layer is not what it expects."""
 
 
 class LookaheadError(AssertionError):

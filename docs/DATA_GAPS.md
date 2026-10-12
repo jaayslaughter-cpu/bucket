@@ -276,6 +276,24 @@ player lines.
   admissible, and within-season form must come from the shift-1 rollers in
   `builder.py`.
 
+## 4b. Coverage that is thin BY CONSTRUCTION, not by defect
+
+Recorded because a 12% non-null rate reads as breakage to anyone who has not
+checked which seasons the source covers, and an audit on 2026-10-11 spent real
+time on it before measuring the denominator.
+
+| Columns | Coverage | Why |
+|---|---|---|
+| `MKT_*` (`src/features/market_context.py`) | ~12% of panel rows | The BigDataBall workbook on disk covers ONE season (1,322 games, 2025-26). The player panel spans 2018-2026 — eight. 1/8 is 12.5%, so ~12% is the arithmetic, not a join failure. A second workbook season raises it; nothing in the code can. |
+| `IS_NEUTRAL_SITE` on cached panels | absent | Both `player_game_logs` and `team_game_stats` carry it, and `load_player_panel` returns it, so the PRODUCTION panel has it. The `data/external/training_pack/panel*.parquet` caches predate it, and `fatigue_logic` warns that neutral-site games are taxed as altitude trips when it is missing. Regenerating the caches fixes it; they are gitignored local files. |
+
+**How to tell this apart from a real failure.** A genuine join failure is
+*total* and says so: `market_context` logs "nothing matched" at 0%, and
+`team_strength` logs the row count twice ("305614 of 305614 ... had no Elo
+match"). Partial coverage logs the matched percentage instead. The
+`GAME_ID`-width defect those two warnings exposed is fixed — every join now
+routes through `src/utils/ids.py` — but the warnings remain the signal to read.
+
 ## 5. What unblocks the most, fastest
 
 1. **Player game logs.** Run `nba-model ingest-logs` (or

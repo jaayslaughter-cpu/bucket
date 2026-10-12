@@ -35,6 +35,8 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
+from src.utils.ids import normalise_game_id
+
 logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "market_context"
@@ -120,7 +122,7 @@ def build_market_context(market_lines: pd.DataFrame) -> pd.DataFrame:
         "game_date": "GAME_DATE",
         "team_abbr": "TEAM_ABBREVIATION",
     })
-    out["GAME_ID"] = out["GAME_ID"].astype(str).str.strip()
+    out["GAME_ID"] = normalise_game_id(out["GAME_ID"])
     out["GAME_DATE"] = pd.to_datetime(out["GAME_DATE"], errors="coerce")
     out["TEAM_ABBREVIATION"] = out["TEAM_ABBREVIATION"].astype(str).str.strip().str.upper()
 
@@ -183,7 +185,11 @@ def attach_market_context(
 
     context = build_market_context(market_lines)
     out = panel.copy()
-    out["GAME_ID"] = out["GAME_ID"].astype(str).str.strip()
+    # BOTH SIDES, through the one reader. These two frames reach this function
+    # from different ingests, and on 2026-10-11 they disagreed on id width --
+    # the workbook ten-wide, a cached panel eight -- which matched 0 of 1322
+    # games and left every MKT_* column NaN while the run exited 0.
+    out["GAME_ID"] = normalise_game_id(out["GAME_ID"])
     out["TEAM_ABBREVIATION"] = out["TEAM_ABBREVIATION"].astype(str).str.strip().str.upper()
 
     merged = out.merge(

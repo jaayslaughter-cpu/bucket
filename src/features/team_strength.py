@@ -32,6 +32,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from src.utils.ids import normalise_game_id
+
 logger = logging.getLogger(__name__)
 
 BASE_RATING = 1500.0
@@ -258,8 +260,10 @@ def attach_elo_features(panel: pd.DataFrame, elo_frame: pd.DataFrame) -> pd.Data
     )
 
     out = panel.copy()
-    out["GAME_ID"] = out["GAME_ID"].astype(str)
-    lookup["GAME_ID"] = lookup["GAME_ID"].astype(str)
+    # Both sides, through the one reader -- see utils.ids. This join reported
+    # "305614 of 305614 panel rows had no Elo match" on an id-width mismatch.
+    out["GAME_ID"] = normalise_game_id(out["GAME_ID"])
+    lookup["GAME_ID"] = normalise_game_id(lookup["GAME_ID"])
     out = out.merge(lookup, on=["GAME_ID", "TEAM_ABBREVIATION"], how="left")
 
     unmatched = int(out["TEAM_ELO_PRE"].isna().sum())

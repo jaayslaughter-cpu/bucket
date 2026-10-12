@@ -34,6 +34,8 @@ from typing import Any
 import pandas as pd
 import requests
 
+from src.utils.ids import normalise_game_id
+
 logger = logging.getLogger(__name__)
 
 LEAGUE_GAME_LOG_URL = "https://stats.nba.com/stats/leaguegamelog"
@@ -196,7 +198,9 @@ def parse_league_game_log(payload: dict[str, Any], *, season: str) -> pd.DataFra
     out = frame[list(COLUMN_MAP)].rename(columns=COLUMN_MAP).copy()
 
     # Game ids are zero-padded strings; JSON may hand them back unpadded.
-    out["GAME_ID"] = out["GAME_ID"].astype(str).str.strip().str.zfill(10)
+    # This WAS the only place that knew it, which is how the feature joins came
+    # to disagree -- see utils.ids.
+    out["GAME_ID"] = normalise_game_id(out["GAME_ID"])
     out["PLAYER_ID"] = out["PLAYER_ID"].astype(str).str.strip()
     out["GAME_DATE"] = pd.to_datetime(out["GAME_DATE"], errors="coerce")
     out["SEASON"] = season

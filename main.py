@@ -1800,4 +1800,27 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ONE SLATE AT A TIME, ACROSS PROCESSES (A1) -- taken HERE, at the manual
+    # entry point, and in `scheduler_worker.run_slate` for the scheduled one.
+    # Those are the only two callers of `main`, so between them the lock covers
+    # both paths.
+    #
+    # NOT INSIDE main() ITSELF, which was the first attempt and was wrong: four
+    # AST tests across three files walk main()'s body for the steps it must
+    # wire, in order, and extracting that body to indent it under a `with`
+    # moved every one of those calls out of the function they assert on. The
+    # tests were right and the refactor was the mistake. Putting the lock at
+    # the two call sites also covers MORE than the first version did --
+    # `run_slate`'s board write and dispatch sit inside its scope, where
+    # wrapping main() alone left them out.
+    from src.utils.write_lock import write_lock
+
+    with write_lock() as _acquired:
+        if not _acquired:
+            logger.warning(
+                "Another process is already running a slate, so this one is "
+                "SKIPPED. Nothing was ingested, scored or written. This is a "
+                "deliberate decline, not a failure."
+            )
+            sys.exit(0)
+        sys.exit(main())
