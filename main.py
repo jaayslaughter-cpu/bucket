@@ -266,10 +266,23 @@ def preflight(require_db: bool = True) -> dict[str, Any]:
 
     guideline = load_master_guideline()
     if guideline is None:
+        # WHAT ACTUALLY HAPPENS, which is not what this said. Found in a
+        # Railway log 2026-10-12: the warning promised a fallback to
+        # "config.json `pickem.approved_sources`". Nothing reads such a file --
+        # ``config.json`` appeared in this repository exactly once, in this
+        # string, and has never existed in the tree. `ingest_prop_lines` leaves
+        # ``books = None`` and passes that to `pull_nba_prop_lines`, which
+        # applies NO bookmaker filter, so every source the feed returns is
+        # accepted. An operator reading the old text would have created a file
+        # that is ignored while believing their approved-source list was being
+        # enforced.
         logger.warning(
-            "MASTER GUIDELINE NOT FOUND at %s — prop-source selection falls back to "
-            "config.json `pickem.approved_sources`.",
-            MASTER_GUIDELINE_DEFAULT_PATH,
+            "MASTER GUIDELINE NOT FOUND at %s — so NO BOOKMAKER FILTER is "
+            "applied and every prop source the feed returns is accepted. To "
+            "restrict them, create that file with an `approved_prop_sources` "
+            "list (see %s.example), or point $PROPIQ_MASTER_GUIDELINE at one. "
+            "Nothing else in this repository reads a prop-source list.",
+            MASTER_GUIDELINE_DEFAULT_PATH, MASTER_GUIDELINE_DEFAULT_PATH,
         )
         report["master_guideline"] = {"applied": False}
     else:

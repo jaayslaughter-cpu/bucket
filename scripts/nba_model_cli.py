@@ -1757,6 +1757,14 @@ def espn_slate_cmd(
         # The only ones a pre-tip run may use; a game already in progress or
         # final is not a slate a projection can be written for.
         "pregame": len(result.pregame_only),
+        # And of those, the ones a slate run may actually project: a preseason
+        # fixture or a game against a team with no NBA mapping is pre-tip and
+        # still not projectable.
+        "projectable": len(result.projectable),
+        "excluded": [
+            f"{g.away_team} @ {g.home_team}: {reason}"
+            for g, reason in result.excluded
+        ],
         # Surfaced rather than swallowed: a code with no mapping means a game
         # that cannot be joined to the panel, not a game that does not exist.
         "unmapped_teams": result.unmapped_teams,

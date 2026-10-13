@@ -139,12 +139,51 @@ def _check_state_root() -> list[Check]:
             ))
     except OSError as exc:
         uid = os.getuid() if hasattr(os, "getuid") else "?"
+        # WHICH FAULT, AND SO WHICH REMEDY. Railway deploy 2026-10-12 reported
+        # "[Errno 13] Permission denied: '/var/lib/postgresql'" -- the PARENT
+        # of the state root -- under a message telling the operator to chown
+        # the volume. `mkdir(parents=True, exist_ok=True)` only reports a
+        # parent when the directory itself does not exist and cannot be
+        # created; a volume mounted at that path would already exist and the
+        # failure would land on the probe file inside it. Nothing was mounted
+        # there, and chown cannot fix a path that is not there.
+        #
+        # ENOENT and EACCES-on-an-absent-path are therefore reported as a
+        # MISSING MOUNT, and only an existing directory that refuses a write
+        # gets the ownership remedy.
+        missing_mount = not root.is_dir()
+        if missing_mount:
+            detail = (
+                f"{root} DOES NOT EXIST AND COULD NOT BE CREATED ({exc}), so "
+                f"NO VOLUME IS MOUNTED THERE -- a mounted volume would already "
+                f"be a directory, and this failure is on the path itself or "
+                f"its parent. Resolved via {how}: if that is "
+                f"{ENV_RAILWAY_VOLUME}, the variable names a path this service "
+                f"has no volume at (the shape when it was set by hand, or "
+                f"copied from a service that does have one -- e.g. the "
+                f"database's own /var/lib/postgresql/data). Attach a volume to "
+                f"THIS service and mount it at /app/data, which is what the "
+                f"Dockerfile documents; or point {ENV_STATE_DIR} at a "
+                f"directory that exists, accepting that a container path "
+                f"without a volume is EPHEMERAL and a redeploy destroys the "
+                f"artifacts and the calibration evidence. chown is not the "
+                f"remedy here: there is nothing to chown."
+            )
+        else:
+            detail = (
+                f"{root} EXISTS AND IS NOT WRITABLE ({exc}). A mounted volume "
+                f"shadows the image's chown and is commonly root-owned while "
+                f"this process runs as uid {uid}. chown it to that uid; see "
+                f"docs/deploy_railway.md."
+            )
         out.append(Check(
-            "state_root_writable", FAIL,
-            f"{root} IS NOT WRITABLE ({exc}). A mounted volume shadows the "
-            f"image's chown and is commonly root-owned while this process runs "
-            f"as uid {uid}. chown it to that uid; see docs/deploy_railway.md.",
-            {"path": str(root), "uid": str(uid)},
+            "state_root_writable", FAIL, detail,
+            {
+                "path": str(root), "uid": str(uid), "resolved_via": how,
+                # The distinguishing fact, kept as data and not only as prose.
+                "exists": str(not missing_mount),
+                "errno": str(getattr(exc, "errno", "?")),
+            },
         ))
     return out
 

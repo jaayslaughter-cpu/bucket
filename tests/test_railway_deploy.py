@@ -1100,3 +1100,85 @@ def test_run_board_reads_the_shared_market_list(monkeypatch):
     }
     assert "board_markets" in calls
     assert "PROPIQ_BOARD_MARKETS" not in ast.dump(run_board)
+
+
+def test_an_unmounted_state_root_is_not_diagnosed_as_an_ownership_problem(
+    monkeypatch,
+):
+    """
+    THE REMEDY MUST MATCH THE FAULT. Railway deploy 2026-10-12 reported:
+
+        [FAIL] state_root_writable: /var/lib/postgresql/data IS NOT WRITABLE
+        ([Errno 13] Permission denied: '/var/lib/postgresql'). A mounted volume
+        shadows the image's chown and is commonly root-owned while this process
+        runs as uid 10001. chown it to that uid
+
+    The error names the PARENT, which is what `mkdir(parents=True,
+    exist_ok=True)` reports when the directory it was asked about does not
+    exist and cannot be created. A volume mounted at that path would already
+    exist, and the failure would land on the probe file inside it instead. So
+    nothing was mounted there at all — and `chown` cannot fix a path that is
+    not there. An operator following that sentence spends their evening on the
+    wrong thing.
+
+    Reproduced here with /proc, which refuses mkdir for every uid, because this
+    container runs as root and cannot be denied by ownership.
+    """
+    from scripts.railway_healthcheck import FAIL, run_checks
+    from src.utils.volume import ENV_RAILWAY_VOLUME
+
+    monkeypatch.setenv(ENV_RAILWAY_VOLUME, "/proc/nonexistent/data")
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    checks = {c.name: c for c in run_checks(skip_db=True)}
+    probe = checks["state_root_writable"]
+
+    assert probe.status == FAIL
+    # The IMPERATIVE is what sends an operator to the wrong place. Saying
+    # "chown is not the remedy here" is the opposite, and must stay allowed.
+    assert "chown it" not in probe.detail.lower(), (
+        "the message still instructs a chown, which cannot work: the directory "
+        "the operator would chown does not exist"
+    )
+    assert "mounted" in probe.detail.lower() and "no volume" in probe.detail.lower(), (
+        "the message does not say that nothing is mounted at that path, which "
+        "is the actual fault"
+    )
+    assert "PROPIQ_STATE_DIR" in probe.detail, (
+        "the message does not name the override that resolves it"
+    )
+
+
+def test_an_unwritable_but_mounted_state_root_still_says_chown(monkeypatch, tmp_path):
+    """
+    The other branch, which must keep today's remedy: the directory is there
+    and this uid cannot write it, which IS an ownership problem.
+
+    Simulated by denying the write rather than by mode bits, because root
+    bypasses those.
+    """
+    import errno
+
+    from scripts.railway_healthcheck import FAIL, run_checks
+    from src.utils.volume import ENV_STATE_DIR
+
+    root = tmp_path / "mounted"
+    root.mkdir()
+    real_write = type(tmp_path).write_text
+
+    def deny(self, *a, **k):
+        if self.name == ".propiq_healthcheck_probe":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(type(tmp_path), "write_text", deny)
+    monkeypatch.setenv(ENV_STATE_DIR, str(root))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    checks = {c.name: c for c in run_checks(skip_db=True)}
+    probe = checks["state_root_writable"]
+
+    assert probe.status == FAIL
+    assert "chown" in probe.detail.lower(), (
+        "a directory that exists and refuses a write IS the root-owned-volume "
+        "case, and the chown remedy belongs there"
+    )
+    assert "no volume" not in probe.detail.lower()

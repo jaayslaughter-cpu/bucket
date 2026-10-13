@@ -342,17 +342,43 @@ def attach_forward_slate(
         result.notes.extend(list(getattr(slate, "notes", []) or [])[:3])
         return result
 
-    # PRE-TIP GAMES ONLY. A game already under way or finished is not something
-    # to project: its box score is the answer, and the panel is where it goes.
-    pregame = list(getattr(slate, "pregame_only", None) or [])
+    # PROJECTABLE GAMES ONLY -- pre-tip AND a fixture this model may be asked
+    # about. A game already under way or finished is not something to project:
+    # its box score is the answer, and the panel is where it goes. Neither is a
+    # PRESEASON game (found in production 2026-10-12, when five of them were
+    # built as an ordinary slate) or one whose opponent has no NBA mapping, so
+    # no DEF_*, DvP or MKT_* column has a counterparty.
+    #
+    # ``espn_schedule.SlateResult.projectable`` is the one reader for that
+    # question. Falls back LOUDLY for a slate object without it, because a
+    # pipeline that silently stops producing rows is the worse failure.
+    scheduled = list(getattr(slate, "games", None) or [])
+    pretip = list(getattr(slate, "pregame_only", None) or [])
+    projectable = list(getattr(slate, "projectable", None) or [])
+    if not hasattr(slate, "projectable"):
+        logger.warning(
+            "This slate object has no .projectable, so the preseason filter "
+            "cannot have run on it; falling back to pre-tip games."
+        )
+        projectable = pretip
     out = build_forward_rows(
-        panel, pregame, slate_date=slate_date, lookback_games=lookback_games
+        panel, projectable, slate_date=slate_date, lookback_games=lookback_games
     )
     unmapped = list(getattr(slate, "unmapped_teams", []) or [])
     if unmapped:
         out.notes.append(f"schedule had unmapped team code(s): {unmapped}")
+    # THREE COUNTS, because two of them used to be one. This note said "N
+    # pre-tip game(s) of M on the schedule" and N is now the PROJECTABLE count
+    # -- leaving the old wording would have made it describe the wrong number,
+    # which is the text-outliving-its-facts defect this repository fixed twice
+    # on PR #8. The gap between projectable and pre-tip is the filter's work.
     out.notes.append(
-        f"{len(pregame)} pre-tip game(s) of {len(getattr(slate, 'games', []) or [])} "
-        "on the schedule"
+        f"{len(projectable)} projectable game(s) of {len(pretip)} pre-tip, "
+        f"{len(scheduled)} on the schedule"
     )
+    for game, reason in list(getattr(slate, "excluded", None) or [])[:5]:
+        out.notes.append(
+            f"not projected — {getattr(game, 'away_team', '?')} @ "
+            f"{getattr(game, 'home_team', '?')}: {reason}"
+        )
     return out

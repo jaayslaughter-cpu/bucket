@@ -256,7 +256,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
   `scheduler_worker.py:1424` and into the deploy probe as a FAILURE at
-  `scripts/railway_healthcheck.py:254`.
+  `scripts/railway_healthcheck.py:293`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
 
@@ -268,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap in our tree.** `scheduler_worker.py:1945-1948` sets
+- **The gap in our tree.** `scheduler_worker.py:1962-1965` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
