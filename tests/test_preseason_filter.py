@@ -688,7 +688,11 @@ def test_the_fallback_path_publishes_no_projectable_counts(monkeypatch, caplog):
         "the fallback path still calls the unfiltered list projectable"
     )
     assert out["filtered"] is False
-    assert out["projectable"] is None and out["excluded"] is None, (
+    # ALL THREE, cubic PR #10: leaving `pretip` unasserted would let a
+    # regression publish one numeric count and still pass.
+    assert out["projectable"] is None, out["projectable"]
+    assert out["pretip"] is None, out["pretip"]
+    assert out["excluded"] is None, (
         "absent counts are published as numbers, so 0 exclusions reads as a "
         "measurement rather than as unmeasured"
     )
