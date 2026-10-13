@@ -238,9 +238,24 @@ def resolve_model_artifact(
 # MASTER GUIDELINE INTEGRATION POINT (placeholder — file not supplied yet)
 # ---------------------------------------------------------------------------
 
+def master_guideline_path(path: Path | None = None) -> Path:
+    """
+    WHICH guideline file is in play, override included.
+
+    One reader. cubic, PR #9: `preflight`'s warning named
+    ``MASTER_GUIDELINE_DEFAULT_PATH`` while the loader honoured
+    ``$PROPIQ_MASTER_GUIDELINE``, so an operator with the override set was told
+    to create a file that would never be read while the one that WOULD be read
+    stayed missing.
+    """
+    return path or Path(
+        os.environ.get("PROPIQ_MASTER_GUIDELINE", MASTER_GUIDELINE_DEFAULT_PATH)
+    )
+
+
 def load_master_guideline(path: Path | None = None) -> dict[str, Any] | None:
     """Return the parsed guideline, or None if absent (caller must log that)."""
-    resolved = path or Path(os.environ.get("PROPIQ_MASTER_GUIDELINE", MASTER_GUIDELINE_DEFAULT_PATH))
+    resolved = master_guideline_path(path)
     if not resolved.exists():
         return None
     import yaml
@@ -276,13 +291,15 @@ def preflight(require_db: bool = True) -> dict[str, Any]:
         # accepted. An operator reading the old text would have created a file
         # that is ignored while believing their approved-source list was being
         # enforced.
+        active = master_guideline_path()
         logger.warning(
             "MASTER GUIDELINE NOT FOUND at %s — so NO BOOKMAKER FILTER is "
             "applied and every prop source the feed returns is accepted. To "
-            "restrict them, create that file with an `approved_prop_sources` "
-            "list (see %s.example), or point $PROPIQ_MASTER_GUIDELINE at one. "
-            "Nothing else in this repository reads a prop-source list.",
-            MASTER_GUIDELINE_DEFAULT_PATH, MASTER_GUIDELINE_DEFAULT_PATH,
+            "restrict them, give THAT path an `approved_prop_sources` list "
+            "(%s.example shows the shape), or point $PROPIQ_MASTER_GUIDELINE "
+            "somewhere that exists. Nothing else in this repository reads a "
+            "prop-source list.",
+            active, MASTER_GUIDELINE_DEFAULT_PATH,
         )
         report["master_guideline"] = {"applied": False}
     else:

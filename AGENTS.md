@@ -131,9 +131,12 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:241`
-`load_master_guideline()` returns `None` and the caller logs it. The
-`.example` beside it is a placeholder shape, not the real file.
+`config/master_guideline_props.yaml` — not in the repo; `main.py:256`
+`load_master_guideline()` returns `None` and the caller logs it. ABSENT MEANS
+NO BOOKMAKER FILTER: `ingest_prop_lines` leaves `books = None`, so every prop
+source the feed returns is accepted. `approved_prop_sources` is the only key
+anything reads; the `.example` beside it says which keys are live and which
+are a shape to grow into.
 
 **Secrets:** environment variables only. Never a hardcoded key, credential or
 absolute local path. `.env.example` lists every variable the worker reads and

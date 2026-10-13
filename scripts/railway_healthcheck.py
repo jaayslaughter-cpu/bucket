@@ -151,8 +151,26 @@ def _check_state_root() -> list[Check]:
         # ENOENT and EACCES-on-an-absent-path are therefore reported as a
         # MISSING MOUNT, and only an existing directory that refuses a write
         # gets the ownership remedy.
-        missing_mount = not root.is_dir()
-        if missing_mount:
+        # THREE CASES, NOT TWO. cubic, PR #9: `not root.is_dir()` lumped "the
+        # path exists as a FILE" in with "nothing is mounted". `mkdir(exist_ok
+        # =True)` raises FileExistsError on an existing non-directory and
+        # `is_dir()` is then False, so the message claimed the path "DOES NOT
+        # EXIST" and that there was "nothing to chown" -- about a path that
+        # does exist, as a file, which is exactly the typo'd-variable case this
+        # text was written to triage. The remedy for it (remove the file, or
+        # point the variable at a directory) was never mentioned.
+        exists = root.exists()
+        is_dir = root.is_dir()
+        missing_mount = not exists
+        if exists and not is_dir:
+            detail = (
+                f"{root} EXISTS BUT IS NOT A DIRECTORY ({exc}), so no volume "
+                f"can be mounted there and nothing can be written under it. "
+                f"Resolved via {how}. Remove or rename that file, or point "
+                f"{ENV_STATE_DIR} at a directory. chown is not the remedy: the "
+                f"path is a file, not an unwritable directory."
+            )
+        elif missing_mount:
             detail = (
                 f"{root} DOES NOT EXIST AND COULD NOT BE CREATED ({exc}), so "
                 f"NO VOLUME IS MOUNTED THERE -- a mounted volume would already "
@@ -180,9 +198,12 @@ def _check_state_root() -> list[Check]:
             "state_root_writable", FAIL, detail,
             {
                 "path": str(root), "uid": str(uid), "resolved_via": how,
-                # The distinguishing fact, kept as data and not only as prose.
-                "exists": str(not missing_mount),
-                "errno": str(getattr(exc, "errno", "?")),
+                # The distinguishing facts, as data and not only as prose.
+                # BOOLEANS, not their str() forms: cubic, PR #9 -- `--json`
+                # serialised "False", which every client reads as truthy.
+                "exists": exists,
+                "is_dir": is_dir,
+                "errno": getattr(exc, "errno", None),
             },
         ))
     return out

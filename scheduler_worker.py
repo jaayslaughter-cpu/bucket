@@ -1604,15 +1604,35 @@ def schedule_prelock_jobs(
             "game": label, "run_at": run_at.isoformat(), "tipoff": tipoff.isoformat(),
         })
 
+    # WHAT THE DENOMINATOR IS. cubic, PR #9: this said "armed N of M pre-tip
+    # game(s)" while M had become the PROJECTABLE count, so a slate with two
+    # pre-tip games of which one was preseason read "armed 1 of 1 pre-tip
+    # game(s)", and an all-excluded slate read "armed 0 of 0" with no mention
+    # of the exclusions -- a quiet schedule, again. The three counts are
+    # different facts and each is named.
+    excluded = list(getattr(slate, "excluded", None) or [])
     logger.info(
-        "Pre-lock: armed %d of %d pre-tip game(s) at tip-off minus %d minutes. "
-        "Skipped %d: %s",
-        len(armed), len(games), lead, len(skipped),
+        "Pre-lock: armed %d of %d projectable game(s) (%d pre-tip, %d excluded) "
+        "at tip-off minus %d minutes. Skipped %d: %s",
+        len(armed), len(games), len(list(getattr(slate, "pregame_only", None) or [])),
+        len(excluded), lead, len(skipped),
         [s["reason"] for s in skipped[:4]] or "none",
     )
+    for game, reason in excluded:
+        logger.info(
+            "Pre-lock: NOT armed — %s @ %s: %s",
+            getattr(game, "away_team", "?"), getattr(game, "home_team", "?"), reason,
+        )
     return {
         "status": "OK", "armed": len(armed), "lead_minutes": lead,
         "jobs": armed, "skipped": skipped,
+        # Named separately so a caller cannot mistake one for the other.
+        "projectable": len(games),
+        "pretip": len(list(getattr(slate, "pregame_only", None) or [])),
+        "excluded": [
+            f"{getattr(g, 'away_team', '?')} @ {getattr(g, 'home_team', '?')}: {r}"
+            for g, r in excluded
+        ],
     }
 
 

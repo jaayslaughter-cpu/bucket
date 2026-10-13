@@ -132,6 +132,12 @@ def _read_season_type(
     ``absent`` means NOT REPORTED, which is not the same as "not preseason".
     ``parse_scoreboard`` keeps that distinction all the way to the note.
     """
+    # EVERY EVENT-LEVEL SOURCE BEFORE THE REQUEST-LEVEL ONE. cubic, PR #9
+    # (P1): the flat ``event["seasonType"]`` used to be checked AFTER
+    # ``payload.season``, so a request reporting season.type=2 beat an event
+    # reporting seasonType=1 and that preseason game stayed projectable --
+    # the exact leak this filter exists to close. The payload block describes
+    # the REQUEST; an event that speaks for itself always wins.
     candidates: list[tuple[str, Any]] = []
     season = event.get("season")
     if isinstance(season, dict):
@@ -140,10 +146,13 @@ def _read_season_type(
     comp = competitions[0] if isinstance(competitions, list) and competitions else None
     if isinstance(comp, dict) and isinstance(comp.get("season"), dict):
         candidates.append(("competition.season", comp["season"]))
+    if event.get("seasonType") is not None:
+        # A flat scalar rather than a block; wrapped so one loop reads them all.
+        candidates.append(("event.seasonType", {"type": event["seasonType"]}))
     if isinstance(payload, dict) and isinstance(payload.get("season"), dict):
-        # The request's own season block. For a single-date query that is the
-        # season type of its events; it is named as the source so a reader can
-        # see the value did not come from the event itself.
+        # LAST. For a single-date query this is the season type of its events,
+        # but it is the request's answer and not the event's -- named as the
+        # source so a reader can tell which they got.
         candidates.append(("payload.season", payload["season"]))
 
     for source, block in candidates:
@@ -157,9 +166,6 @@ def _read_season_type(
         if type_id is not None or name:
             return type_id, (str(name) if name else None), source
 
-    flat = _as_int(event.get("seasonType"))
-    if flat is not None:
-        return flat, None, "event.seasonType"
     return None, None, "absent"
 
 

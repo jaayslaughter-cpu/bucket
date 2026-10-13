@@ -1,20 +1,27 @@
-# PLACEHOLDER — replace with your real master guideline file.
+# TEMPLATE — copy to config/master_guideline_props.yaml and edit.
 #
-# This file does not exist in the repo yet; main.py's load_master_guideline()
-# looks for config/master_guideline_props.yaml (override via the
-# PROPIQ_MASTER_GUIDELINE env var). When absent, the pipeline logs a
-# warning and falls back to config.json's pickem.approved_sources.
+# `main.load_master_guideline()` reads config/master_guideline_props.yaml, or
+# whatever $PROPIQ_MASTER_GUIDELINE points at. WHEN IT IS ABSENT there is no
+# other source of a prop-source allowlist: `ingest_prop_lines` leaves the
+# bookmaker filter unset and EVERY source the feed returns is accepted. There
+# is no other fallback: nothing else in this repository reads a prop-source
+# allowlist.
 #
-# The shape below is a GUESS at what a props master guideline might
-# contain — adjust it to match your actual file, then update
-# ingest_prop_lines() in main.py to read whatever keys you really use.
+# `approved_prop_sources` is the key the code actually reads, at
+# `ingest_prop_lines` in main.py; it is passed to `pull_nba_prop_lines` as
+# `bookmakers`. The other keys below are NOT read by anything yet -- they are
+# here as a shape to grow into, and a value you set in them changes nothing
+# until something reads it.
 
+# READ by ingest_prop_lines. Omit the key entirely to accept every source.
 approved_prop_sources:
   - underdog
   - prizepicks
   - sleeper
 
-# Which file/source wins when two sources disagree on the same player+market
+# --- not read yet ----------------------------------------------------------
+
+# Which source wins when two disagree on the same player+market.
 source_precedence:
   - underdog
   - prizepicks

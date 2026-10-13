@@ -27,6 +27,7 @@ RESEARCH_ONLY. The text of a warning.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import main
 
@@ -68,6 +69,77 @@ def test_the_warning_states_what_actually_happens(monkeypatch, caplog):
     )
     assert "approved_prop_sources" in text, (
         "the warning does not name the key that WOULD restrict the sources"
+    )
+
+
+def test_the_warning_names_the_path_that_is_actually_read(monkeypatch, caplog):
+    """
+    cubic, PR #9: the warning named the DEFAULT path while the loader honoured
+    $PROPIQ_MASTER_GUIDELINE, so an operator with the override set was told to
+    create a file that would never be read.
+    """
+    monkeypatch.setenv("PROPIQ_MASTER_GUIDELINE", "/custom/elsewhere.yaml")
+    with caplog.at_level(logging.WARNING):
+        main.preflight(require_db=False)
+
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "/custom/elsewhere.yaml" in text, (
+        "the warning names the default path, not the override that is actually "
+        "resolved, so the file the operator creates will be ignored"
+    )
+
+
+def test_the_missing_guideline_path_really_leaves_the_filter_unset(monkeypatch):
+    """
+    cubic, PR #9: the AST check only proved ``books = None`` appeared somewhere
+    in the function. This drives the real call and asserts what
+    `pull_nba_prop_lines` receives, so a later assignment that re-enables
+    filtering cannot pass.
+    """
+    import sys
+    import types
+
+    seen: dict[str, object] = {}
+
+    def fake_pull(bookmakers=None, **kwargs):
+        seen["bookmakers"] = bookmakers
+        return []
+
+    module = types.ModuleType("src.ingestion.propline")
+    module.pull_nba_prop_lines = fake_pull
+    monkeypatch.setitem(sys.modules, "src.ingestion.propline", module)
+
+    main.ingest_prop_lines(None)
+    assert "bookmakers" in seen, "pull_nba_prop_lines was never called"
+    assert seen["bookmakers"] is None, (
+        f"the missing-guideline path passed bookmakers={seen['bookmakers']!r}, "
+        "so the warning's claim that no filter is applied is false"
+    )
+
+    # And the other direction: a guideline DOES restrict them.
+    seen.clear()
+    main.ingest_prop_lines({"approved_prop_sources": ["underdog"]})
+    assert seen["bookmakers"] == ["underdog"]
+
+
+def test_the_example_file_does_not_contradict_the_warning():
+    """
+    cubic, PR #9: the warning points an operator at the .example, which still
+    said the pipeline "falls back to config.json's pickem.approved_sources",
+    called its own shape "a GUESS", and told the reader to change
+    `ingest_prop_lines` to read whatever keys they use -- code that already
+    reads `approved_prop_sources`. AGENTS.md: when code and doc disagree, fix
+    both.
+    """
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "config/master_guideline_props.yaml.example"
+    ).read_text(encoding="utf-8")
+    assert "config.json" not in text, "the template still promises a config.json fallback"
+    assert "GUESS" not in text
+    assert "approved_prop_sources" in text
+    assert "every source the feed returns is accepted" in text.lower(), (
+        "the template does not state the consequence of its own absence"
     )
 
 

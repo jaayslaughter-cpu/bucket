@@ -446,3 +446,137 @@ def test_a_slate_object_without_the_filter_falls_back_loudly(caplog):
         "the fallback is silent, so a slate that skipped the preseason filter "
         "looks identical to one that applied it"
     )
+
+
+def test_the_events_own_season_type_beats_the_requests(monkeypatch):
+    """
+    cubic, PR #9 (P1): the flat ``event["seasonType"]`` was read AFTER
+    ``payload.season``, so a scoreboard whose request-level block said "regular
+    season" overrode an event that said "preseason" — and that game stayed
+    projectable. The leak the whole filter exists to close, in the one case
+    where the two disagree.
+    """
+    event = _event()
+    event["seasonType"] = SEASON_TYPE_PRESEASON
+    result = parse_scoreboard(
+        _payload(event, season={"year": 2027, "type": SEASON_TYPE_REGULAR})
+    )
+    game = result.games[0]
+    assert game.season_type_source == "event.seasonType", (
+        f"read from {game.season_type_source!r}: the request's season block "
+        "overrode the event's own"
+    )
+    assert game.is_preseason is True
+    assert result.projectable == []
+
+
+def test_the_request_level_block_is_still_the_last_resort():
+    """The other half: with nothing on the event, the request's block is better
+    than nothing — it just must not outrank the event."""
+    result = parse_scoreboard(
+        _payload(_event(), season={"year": 2027, "type": SEASON_TYPE_PRESEASON})
+    )
+    assert result.games[0].season_type_source == "payload.season"
+    assert result.projectable == []
+
+
+def test_an_all_excluded_slate_is_not_reported_as_an_off_day(monkeypatch):
+    """
+    cubic, PR #9: `build_forward_rows` saw the empty projectable list and
+    reported status EMPTY with "no scheduled games — a valid off-day", and
+    `slate.notes` — which carries the NO PROJECTABLE GAMES marker — was never
+    carried over. The run summary then read as a quiet night, which is the
+    confusion the exclusion machinery exists to prevent, one layer out.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import src.ingestion.espn_schedule as sched
+    from src.pipeline.forward_slate import attach_forward_slate
+    from tests.test_forward_slate import panel
+
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    result = _slate(
+        _game("401700001", season_type=SEASON_TYPE_PRESEASON,
+              tipoff=now + timedelta(hours=2), home="LAL", away="BOS"),
+        _game("401700002", season_type=SEASON_TYPE_PRESEASON,
+              tipoff=now + timedelta(hours=4), home="BOS", away="LAL"),
+    )
+    result.notes.append("2 preseason game(s) excluded from the projectable slate")
+    monkeypatch.setattr(sched, "load_slate", lambda *a, **k: result)
+    out = attach_forward_slate(panel(), slate_date="2026-10-12")
+
+    assert out.status == "ALL_EXCLUDED", (
+        f"status {out.status!r}: an all-excluded slate is indistinguishable "
+        "from an off-day"
+    )
+    text = " ".join(out.notes)
+    assert "NO PROJECTABLE GAMES" in text
+    assert "not an off-day" in text
+    assert "preseason game(s) excluded" in text, (
+        "the schedule's own notes were dropped, so the reason never reaches "
+        "the run summary"
+    )
+
+
+def test_every_exclusion_reason_reaches_the_notes(monkeypatch):
+    """cubic, PR #9: the reasons were sliced to five, so on a heavily excluded
+    slate the later games vanished from the summary."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.ingestion.espn_schedule as sched
+    from src.pipeline.forward_slate import attach_forward_slate
+    from tests.test_forward_slate import panel
+
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    games = [
+        _game(f"4017000{i:02d}", season_type=SEASON_TYPE_PRESEASON,
+              tipoff=now + timedelta(hours=2 + i), home="LAL", away="BOS")
+        for i in range(7)
+    ]
+    games.append(_game("401700099", season_type=SEASON_TYPE_REGULAR,
+                       tipoff=now + timedelta(hours=12), home="BOS", away="LAL"))
+    monkeypatch.setattr(sched, "load_slate", lambda *a, **k: _slate(*games))
+    out = attach_forward_slate(panel(), slate_date="2026-10-12")
+
+    dropped = [n for n in out.notes if "not projected" in n]
+    assert len(dropped) == 7, (
+        f"{len(dropped)} of 7 exclusions reached the notes — the rest were "
+        "silently truncated"
+    )
+
+
+def test_the_armed_log_does_not_call_the_projectable_count_pre_tip(
+    monkeypatch, caplog
+):
+    """
+    cubic, PR #9 (P3): "armed %d of %d pre-tip game(s)" kept its wording after
+    `games` became the projectable list, so a slate with two pre-tip games of
+    which one was preseason reported "armed 1 of 1 pre-tip game(s)". The
+    text-outliving-its-facts defect this PR fixes explicitly elsewhere.
+    """
+    import logging
+    from datetime import datetime, timedelta, timezone
+
+    import scheduler_worker as worker
+    from tests.test_scheduler_worker import FakeScheduler
+
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("PROPIQ_PRELOCK_LEAD_MINUTES", raising=False)
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    slate = _slate(
+        _game("401914130", season_type=SEASON_TYPE_PRESEASON,
+              tipoff=now + timedelta(hours=2), home="POR", away="GSW"),
+        _game("401898402", season_type=SEASON_TYPE_REGULAR,
+              tipoff=now + timedelta(hours=4), home="ATL", away="OKC"),
+    )
+    with caplog.at_level(logging.INFO):
+        out = worker.schedule_prelock_jobs(FakeScheduler(), now=now, slate=slate)
+
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "armed 1 of 1 pre-tip" not in text, (
+        "the log calls the projectable count 'pre-tip', so one of two pre-tip "
+        "games vanishes from the denominator"
+    )
+    assert "armed 1 of 1 projectable game(s) (2 pre-tip, 1 excluded)" in text
+    assert out["pretip"] == 2 and out["projectable"] == 1
+    assert out["excluded"] and "preseason" in out["excluded"][0]
