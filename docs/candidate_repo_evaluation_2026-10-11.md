@@ -256,7 +256,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
   `scheduler_worker.py:1424` and into the deploy probe as a FAILURE at
-  `scripts/railway_healthcheck.py:254`.
+  `scripts/railway_healthcheck.py:293`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
 
