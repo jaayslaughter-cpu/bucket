@@ -1125,8 +1125,11 @@ def test_an_unmounted_state_root_is_not_diagnosed_as_an_ownership_problem(
     container runs as root and cannot be denied by ownership.
     """
     from scripts.railway_healthcheck import FAIL, run_checks
-    from src.utils.volume import ENV_RAILWAY_VOLUME
+    from src.utils.volume import ENV_RAILWAY_VOLUME, ENV_STATE_DIR
 
+    # PROPIQ_STATE_DIR OUTRANKS the Railway variable, so an inherited one would
+    # send this test at a different directory entirely (cubic, PR #9).
+    monkeypatch.delenv(ENV_STATE_DIR, raising=False)
     monkeypatch.setenv(ENV_RAILWAY_VOLUME, "/proc/nonexistent/data")
     monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
     checks = {c.name: c for c in run_checks(skip_db=True)}
@@ -1182,3 +1185,82 @@ def test_an_unwritable_but_mounted_state_root_still_says_chown(monkeypatch, tmp_
         "case, and the chown remedy belongs there"
     )
     assert "no volume" not in probe.detail.lower()
+
+
+def test_a_state_root_that_is_a_file_says_so_rather_than_missing(monkeypatch, tmp_path):
+    """
+    cubic, PR #9: the third case. `mkdir(parents=True, exist_ok=True)` raises
+    FileExistsError for an existing non-directory and `is_dir()` is then False,
+    so the missing-mount branch claimed a path that DOES exist "DOES NOT EXIST"
+    and that there was nothing to chown. A typo'd $PROPIQ_STATE_DIR landing on
+    a file is exactly what this message triages.
+    """
+    from scripts.railway_healthcheck import FAIL, run_checks
+    from src.utils.volume import ENV_RAILWAY_VOLUME, ENV_STATE_DIR
+
+    as_a_file = tmp_path / "not-a-directory"
+    as_a_file.write_text("", encoding="utf-8")
+    monkeypatch.delenv(ENV_RAILWAY_VOLUME, raising=False)
+    monkeypatch.setenv(ENV_STATE_DIR, str(as_a_file))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    probe = {c.name: c for c in run_checks(skip_db=True)}["state_root_writable"]
+
+    assert probe.status == FAIL
+    assert "not a directory" in probe.detail.lower()
+    assert "does not exist" not in probe.detail.lower(), (
+        "the path exists -- as a file -- and saying otherwise sends the "
+        "operator looking for a missing mount"
+    )
+    assert probe.data["exists"] is True and probe.data["is_dir"] is False
+
+
+def test_the_probes_data_stays_json_typed(monkeypatch):
+    """cubic, PR #9: `str(False)` is the string "False", which every JSON client
+    reads as truthy."""
+    from scripts.railway_healthcheck import run_checks
+    from src.utils.volume import ENV_RAILWAY_VOLUME, ENV_STATE_DIR
+
+    monkeypatch.delenv(ENV_STATE_DIR, raising=False)
+    monkeypatch.setenv(ENV_RAILWAY_VOLUME, "/proc/nonexistent/data")
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    data = {c.name: c for c in run_checks(skip_db=True)}["state_root_writable"].data
+
+    assert data["exists"] is False, f"exists is {data['exists']!r}, not a bool"
+    assert data["is_dir"] is False
+    assert not isinstance(data["exists"], str)
+    # cubic, PR #10: errno was unguarded, so stringifying it again would pass.
+    assert isinstance(data["errno"], int), (
+        f"errno is {data['errno']!r} ({type(data['errno']).__name__}), and a "
+        "JSON client comparing it to a number would never match"
+    )
+
+
+def test_a_dangling_symlink_at_the_state_root_is_not_a_missing_mount(
+    monkeypatch, tmp_path
+):
+    """
+    cubic, PR #10: `Path.exists()` FOLLOWS the link and is False for a broken
+    one, while `mkdir(exist_ok=True)` still raises FileExistsError — so a stale
+    symlink fell into the missing-mount branch and the operator was told to
+    attach a volume, when the remedy is the one added for the file case: remove
+    the stale path.
+    """
+    from scripts.railway_healthcheck import FAIL, run_checks
+    from src.utils.volume import ENV_RAILWAY_VOLUME, ENV_STATE_DIR
+
+    dangling = tmp_path / "stale-link"
+    dangling.symlink_to(tmp_path / "nothing-here")
+    assert not dangling.exists() and dangling.is_symlink()
+
+    monkeypatch.delenv(ENV_RAILWAY_VOLUME, raising=False)
+    monkeypatch.setenv(ENV_STATE_DIR, str(dangling))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    probe = {c.name: c for c in run_checks(skip_db=True)}["state_root_writable"]
+
+    assert probe.status == FAIL
+    assert "not a directory" in probe.detail.lower()
+    assert "no volume is mounted there" not in probe.detail.lower(), (
+        "a stale symlink is reported as an unmounted volume, so the operator "
+        "goes looking for a mount instead of removing the link"
+    )
+    assert probe.data["exists"] is True
