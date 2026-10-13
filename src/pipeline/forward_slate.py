@@ -371,12 +371,33 @@ def attach_forward_slate(
     # carried over. The run summary then read as a quiet night -- the very
     # confusion the exclusion machinery exists to prevent, one layer out.
     if pretip and not projectable:
-        out.status = "ALL_EXCLUDED"
-        out.notes.append(
-            f"NO PROJECTABLE GAMES: {len(pretip)} pre-tip game(s) on the "
-            "schedule and every one excluded. This is not an off-day."
-        )
-        out.notes.extend(list(getattr(slate, "notes", None) or []))
+        # THREE FOLLOW-UPS FROM cubic ON PR #10, all inside this block:
+        #
+        #   1. it only APPENDED, so `build_forward_rows`' "no scheduled games
+        #      -- a valid off-day" note stayed directly above "this is not an
+        #      off-day" -- the contradiction the block exists to remove, two
+        #      lines apart in the same summary. The off-day note is now
+        #      DROPPED rather than argued with;
+        #   2. the marker was emitted twice, because `espn_schedule` already
+        #      appends its own under the same condition and this copied
+        #      `slate.notes` wholesale. One source now: ours is added only if
+        #      the schedule did not already say it;
+        #   3. an EMPTY PANEL returns DATA_NOT_AVAILABLE, and overwriting that
+        #      with ALL_EXCLUDED downgraded the root cause -- nothing could
+        #      have been projected regardless of the filter. It keeps
+        #      precedence.
+        off_day = "no scheduled games"
+        out.notes = [n for n in out.notes if off_day not in n]
+        carried = list(getattr(slate, "notes", None) or [])
+        marker = "NO PROJECTABLE GAMES"
+        if not any(marker in n for n in carried):
+            out.notes.append(
+                f"{marker}: {len(pretip)} pre-tip game(s) on the schedule and "
+                "every one excluded. This is not an off-day."
+            )
+        out.notes.extend(carried)
+        if out.status != "DATA_NOT_AVAILABLE":
+            out.status = "ALL_EXCLUDED"
     unmapped = list(getattr(slate, "unmapped_teams", []) or [])
     if unmapped:
         out.notes.append(f"schedule had unmapped team code(s): {unmapped}")

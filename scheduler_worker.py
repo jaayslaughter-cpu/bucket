@@ -1549,8 +1549,9 @@ def schedule_prelock_jobs(
     # FAILS OPEN, LOUDLY, for a slate object that predates the property: an
     # arming that silently stops happening is worse than one that warns, and
     # the same policy as ``utils.write_lock``.
+    filtered = hasattr(slate, "projectable")
     games = list(getattr(slate, "projectable", None) or [])
-    if not hasattr(slate, "projectable"):
+    if not filtered:
         logger.warning(
             "This slate object has no .projectable, so the preseason filter "
             "cannot have run on it; falling back to pre-tip games. A preseason "
@@ -1611,13 +1612,27 @@ def schedule_prelock_jobs(
     # of the exclusions -- a quiet schedule, again. The three counts are
     # different facts and each is named.
     excluded = list(getattr(slate, "excluded", None) or [])
-    logger.info(
-        "Pre-lock: armed %d of %d projectable game(s) (%d pre-tip, %d excluded) "
-        "at tip-off minus %d minutes. Skipped %d: %s",
-        len(armed), len(games), len(list(getattr(slate, "pregame_only", None) or [])),
-        len(excluded), lead, len(skipped),
-        [s["reason"] for s in skipped[:4]] or "none",
-    )
+    pretip = list(getattr(slate, "pregame_only", None) or [])
+    # ON THE FALLBACK PATH THESE COUNTS ARE NOT KNOWN. cubic, PR #10: with a
+    # slate object that predates `.projectable`, ``games`` is the UNFILTERED
+    # pre-tip list, so calling it "projectable" reported excluded fixtures as
+    # projectable and the absent `.excluded` as zero exclusions -- two false
+    # numbers presented as measurements. The line says which it is.
+    if filtered:
+        logger.info(
+            "Pre-lock: armed %d of %d projectable game(s) (%d pre-tip, %d "
+            "excluded) at tip-off minus %d minutes. Skipped %d: %s",
+            len(armed), len(games), len(pretip), len(excluded), lead,
+            len(skipped), [s["reason"] for s in skipped[:4]] or "none",
+        )
+    else:
+        logger.info(
+            "Pre-lock: armed %d of %d pre-tip game(s) at tip-off minus %d "
+            "minutes (UNFILTERED: this slate object has no .projectable, so "
+            "how many were excluded is not known). Skipped %d: %s",
+            len(armed), len(games), lead, len(skipped),
+            [s["reason"] for s in skipped[:4]] or "none",
+        )
     for game, reason in excluded:
         logger.info(
             "Pre-lock: NOT armed — %s @ %s: %s",
@@ -1626,13 +1641,16 @@ def schedule_prelock_jobs(
     return {
         "status": "OK", "armed": len(armed), "lead_minutes": lead,
         "jobs": armed, "skipped": skipped,
-        # Named separately so a caller cannot mistake one for the other.
-        "projectable": len(games),
-        "pretip": len(list(getattr(slate, "pregame_only", None) or [])),
+        # Named separately so a caller cannot mistake one for the other, and
+        # None rather than a number where the filter did not run: "not
+        # measured" must not read as zero.
+        "filtered": filtered,
+        "projectable": len(games) if filtered else None,
+        "pretip": len(pretip) if filtered else None,
         "excluded": [
             f"{getattr(g, 'away_team', '?')} @ {getattr(g, 'home_team', '?')}: {r}"
             for g, r in excluded
-        ],
+        ] if filtered else None,
     }
 
 

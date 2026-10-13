@@ -159,12 +159,18 @@ def _check_state_root() -> list[Check]:
         # does exist, as a file, which is exactly the typo'd-variable case this
         # text was written to triage. The remedy for it (remove the file, or
         # point the variable at a directory) was never mentioned.
-        exists = root.exists()
+        # ``lexists`` DOES NOT FOLLOW THE LINK. cubic, PR #10: for a dangling
+        # symlink `exists()` is False while `mkdir(exist_ok=True)` still raises
+        # FileExistsError, so the path fell into the missing-mount branch and
+        # the operator was told to attach a volume -- when the remedy is the
+        # one this check added for the file case: remove the stale path.
+        exists = os.path.lexists(root)
         is_dir = root.is_dir()
         missing_mount = not exists
         if exists and not is_dir:
             detail = (
-                f"{root} EXISTS BUT IS NOT A DIRECTORY ({exc}), so no volume "
+                f"{root} EXISTS BUT IS NOT A DIRECTORY ({exc}) -- a file, or "
+                f"a symlink with nothing at the other end -- so no volume "
                 f"can be mounted there and nothing can be written under it. "
                 f"Resolved via {how}. Remove or rename that file, or point "
                 f"{ENV_STATE_DIR} at a directory. chown is not the remedy: the "

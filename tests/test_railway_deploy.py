@@ -1228,3 +1228,39 @@ def test_the_probes_data_stays_json_typed(monkeypatch):
     assert data["exists"] is False, f"exists is {data['exists']!r}, not a bool"
     assert data["is_dir"] is False
     assert not isinstance(data["exists"], str)
+    # cubic, PR #10: errno was unguarded, so stringifying it again would pass.
+    assert isinstance(data["errno"], int), (
+        f"errno is {data['errno']!r} ({type(data['errno']).__name__}), and a "
+        "JSON client comparing it to a number would never match"
+    )
+
+
+def test_a_dangling_symlink_at_the_state_root_is_not_a_missing_mount(
+    monkeypatch, tmp_path
+):
+    """
+    cubic, PR #10: `Path.exists()` FOLLOWS the link and is False for a broken
+    one, while `mkdir(exist_ok=True)` still raises FileExistsError — so a stale
+    symlink fell into the missing-mount branch and the operator was told to
+    attach a volume, when the remedy is the one added for the file case: remove
+    the stale path.
+    """
+    from scripts.railway_healthcheck import FAIL, run_checks
+    from src.utils.volume import ENV_RAILWAY_VOLUME, ENV_STATE_DIR
+
+    dangling = tmp_path / "stale-link"
+    dangling.symlink_to(tmp_path / "nothing-here")
+    assert not dangling.exists() and dangling.is_symlink()
+
+    monkeypatch.delenv(ENV_RAILWAY_VOLUME, raising=False)
+    monkeypatch.setenv(ENV_STATE_DIR, str(dangling))
+    monkeypatch.setenv("PROPIQ_BOARD_MARKETS", "PTS")
+    probe = {c.name: c for c in run_checks(skip_db=True)}["state_root_writable"]
+
+    assert probe.status == FAIL
+    assert "not a directory" in probe.detail.lower()
+    assert "no volume is mounted there" not in probe.detail.lower(), (
+        "a stale symlink is reported as an unmounted volume, so the operator "
+        "goes looking for a mount instead of removing the link"
+    )
+    assert probe.data["exists"] is True

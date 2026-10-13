@@ -248,9 +248,17 @@ def master_guideline_path(path: Path | None = None) -> Path:
     to create a file that would never be read while the one that WOULD be read
     stayed missing.
     """
-    return path or Path(
-        os.environ.get("PROPIQ_MASTER_GUIDELINE", MASTER_GUIDELINE_DEFAULT_PATH)
-    )
+    if path is not None:
+        return path
+    # GUARDED LIKE EVERY OTHER ENV READER HERE (`_flag_env`, `_int_env`,
+    # `resolve_model_artifact`). cubic, PR #10: a set-but-EMPTY variable became
+    # ``Path('.')``, which always exists, so `load_master_guideline` went on to
+    # ``open('.')`` and preflight died with IsADirectoryError instead of logging
+    # the missing-guideline warning. A whitespace-padded value named a
+    # different nonexistent path. Predates this helper; this is now the one
+    # place it can be fixed.
+    override = (os.environ.get("PROPIQ_MASTER_GUIDELINE") or "").strip()
+    return Path(override) if override else MASTER_GUIDELINE_DEFAULT_PATH
 
 
 def load_master_guideline(path: Path | None = None) -> dict[str, Any] | None:

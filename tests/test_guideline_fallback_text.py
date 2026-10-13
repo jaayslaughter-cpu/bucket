@@ -178,3 +178,23 @@ def test_the_key_the_warning_names_is_the_key_the_code_reads():
         "`books` is no longer defaulted to None, so the warning's claim that "
         "no bookmaker filter is applied may be false"
     )
+
+
+def test_an_empty_override_does_not_crash_preflight(monkeypatch, caplog):
+    """
+    cubic, PR #10: an empty ``$PROPIQ_MASTER_GUIDELINE`` became ``Path('.')``,
+    which always exists, so `load_master_guideline` went on to ``open('.')``
+    and preflight died with IsADirectoryError instead of logging the warning.
+    Every other env reader in main.py guards with ``(… or "").strip()``.
+    """
+    for value in ("", "   "):
+        monkeypatch.setenv("PROPIQ_MASTER_GUIDELINE", value)
+        assert main.master_guideline_path() == main.MASTER_GUIDELINE_DEFAULT_PATH
+        with caplog.at_level(logging.WARNING):
+            report = main.preflight(require_db=False)
+        assert report["master_guideline"] == {"applied": False}
+
+
+def test_a_padded_override_is_stripped_not_taken_literally(monkeypatch):
+    monkeypatch.setenv("PROPIQ_MASTER_GUIDELINE", "  /custom/x.yaml  ")
+    assert str(main.master_guideline_path()) == "/custom/x.yaml"

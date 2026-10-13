@@ -580,3 +580,115 @@ def test_the_armed_log_does_not_call_the_projectable_count_pre_tip(
     assert "armed 1 of 1 projectable game(s) (2 pre-tip, 1 excluded)" in text
     assert out["pretip"] == 2 and out["projectable"] == 1
     assert out["excluded"] and "preseason" in out["excluded"][0]
+
+
+# --- cubic's follow-ups on PR #10 -----------------------------------------
+
+
+def test_the_off_day_note_is_dropped_not_argued_with(monkeypatch):
+    """
+    cubic, PR #10: the all-excluded block only APPENDED, so
+    `build_forward_rows`' "no scheduled games — a valid off-day" stayed two
+    lines above "this is not an off-day" in the same summary — the exact
+    contradiction the block exists to remove.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import src.ingestion.espn_schedule as sched
+    from src.pipeline.forward_slate import attach_forward_slate
+    from tests.test_forward_slate import panel
+
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    result = _slate(_game("401700001", season_type=SEASON_TYPE_PRESEASON,
+                          tipoff=now + timedelta(hours=2), home="LAL", away="BOS"))
+    monkeypatch.setattr(sched, "load_slate", lambda *a, **k: result)
+    out = attach_forward_slate(panel(), slate_date="2026-10-12")
+
+    text = " ".join(out.notes)
+    assert "no scheduled games" not in text, (
+        "the off-day note survives beside the not-an-off-day note"
+    )
+    assert "NO PROJECTABLE GAMES" in text
+
+
+def test_the_no_projectable_marker_is_not_emitted_twice(monkeypatch):
+    """cubic, PR #10: `espn_schedule` already appends the marker under the same
+    condition, and this copied slate.notes wholesale."""
+    from datetime import datetime, timedelta, timezone
+
+    import src.ingestion.espn_schedule as sched
+    from src.pipeline.forward_slate import attach_forward_slate
+    from tests.test_forward_slate import panel
+
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    result = _slate(_game("401700001", season_type=SEASON_TYPE_PRESEASON,
+                          tipoff=now + timedelta(hours=2), home="LAL", away="BOS"))
+    # What parse_scoreboard really puts there.
+    result.notes.append(
+        "NO PROJECTABLE GAMES: all 1 pre-tip game(s) were excluded."
+    )
+    monkeypatch.setattr(sched, "load_slate", lambda *a, **k: result)
+    out = attach_forward_slate(panel(), slate_date="2026-10-12")
+
+    markers = [n for n in out.notes if "NO PROJECTABLE GAMES" in n]
+    assert len(markers) == 1, f"the marker appears {len(markers)} times: {markers}"
+
+
+def test_an_empty_panel_outranks_the_all_excluded_status(monkeypatch):
+    """cubic, PR #10: an empty panel means nothing could be projected whatever
+    the filter did, so DATA_NOT_AVAILABLE must not be downgraded."""
+    from datetime import datetime, timedelta, timezone
+
+    import pandas as pd
+
+    import src.ingestion.espn_schedule as sched
+    from src.pipeline.forward_slate import attach_forward_slate
+
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+    result = _slate(_game("401700001", season_type=SEASON_TYPE_PRESEASON,
+                          tipoff=now + timedelta(hours=2), home="LAL", away="BOS"))
+    monkeypatch.setattr(sched, "load_slate", lambda *a, **k: result)
+    out = attach_forward_slate(pd.DataFrame(), slate_date="2026-10-12")
+
+    assert out.status == "DATA_NOT_AVAILABLE", (
+        f"status {out.status!r}: the empty panel is the root cause and it was "
+        "overwritten by the exclusion status"
+    )
+
+
+def test_the_fallback_path_publishes_no_projectable_counts(monkeypatch, caplog):
+    """
+    cubic, PR #10: with a slate object that predates `.projectable`, ``games``
+    is the UNFILTERED pre-tip list, so the line called excluded fixtures
+    projectable and the absent `.excluded` zero exclusions — two false numbers
+    presented as measurements. "Not measured" must not read as zero.
+    """
+    import logging
+    from datetime import datetime, timedelta, timezone
+
+    import scheduler_worker as worker
+    from tests.test_scheduler_worker import FakeScheduler
+
+    monkeypatch.delenv("PROPIQ_PRELOCK", raising=False)
+    monkeypatch.delenv("PROPIQ_PRELOCK_LEAD_MINUTES", raising=False)
+    now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
+
+    class OldSlate:
+        pregame_only = [
+            _game("401", season_type=SEASON_TYPE_REGULAR,
+                  tipoff=now + timedelta(hours=2)),
+        ]
+
+    with caplog.at_level(logging.INFO):
+        out = worker.schedule_prelock_jobs(FakeScheduler(), now=now, slate=OldSlate())
+
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "UNFILTERED" in text and "not known" in text
+    assert "projectable game(s)" not in text, (
+        "the fallback path still calls the unfiltered list projectable"
+    )
+    assert out["filtered"] is False
+    assert out["projectable"] is None and out["excluded"] is None, (
+        "absent counts are published as numbers, so 0 exclusions reads as a "
+        "measurement rather than as unmeasured"
+    )
