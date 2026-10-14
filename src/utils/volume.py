@@ -113,3 +113,220 @@ def artifact_dir_on(root: Path | None = None) -> Path:
             return base.joinpath(*parts[1:])
         return base / path
     return base / DEFAULT_ARTIFACT_SUBDIR
+
+
+# ---------------------------------------------------------------------------
+# WHY A FAILED WRITE PROBE FAILED, AND WHAT TO DO ABOUT IT
+# ---------------------------------------------------------------------------
+# ONE READER, because there are two probes. `scripts/railway_healthcheck.py`
+# and `scheduler_worker.check_state_dir` both write a file into the state root
+# and both report what happened, and on 2026-10-13 they contradicted each other
+# about the same directory three log lines apart: the healthcheck said "NO
+# VOLUME IS MOUNTED THERE ... chown is not the remedy here", the worker said
+# "most likely owned by root ... chown it to that uid". The healthcheck had been
+# taught the difference and the worker had not.
+#
+# Each caller still says WHAT LIVES in the directory it probed -- the artifact
+# store and the calibration report really do break differently -- but the
+# fault-to-remedy mapping lives here, once.
+
+#: The path does not exist at all and could not be created.
+FAULT_MISSING_MOUNT = "missing_mount"
+#: Something IS there, but it is not a directory: a file, or a stale symlink.
+FAULT_NOT_A_DIRECTORY = "not_a_directory"
+#: A real directory that refuses the write on permissions.
+FAULT_NOT_WRITABLE = "not_writable"
+#: A real directory on a READ-ONLY filesystem. No chown fixes this.
+FAULT_READ_ONLY_FS = "read_only_fs"
+#: A real, writable directory on a FULL filesystem. Nothing about permissions
+#: is wrong and nothing an operator does to them will help.
+FAULT_NO_SPACE = "no_space"
+
+
+def first_non_directory_ancestor(path: Path) -> Path | None:
+    """
+    The nearest existing ancestor that is NOT a directory, or None.
+
+    cubic, PR #11: the classifier looked only at the absent leaf, so
+    ``PROPIQ_STATE_DIR=/tmp/file/state`` with a FILE at ``/tmp/file`` read as a
+    missing mount and the operator was told to attach a volume. ``mkdir``
+    raises ENOTDIR there, not ENOENT, and the remedy is to move the file.
+    """
+    target = Path(path)
+    for candidate in (target, *target.parents):
+        if os.path.lexists(candidate) and not candidate.is_dir():
+            return candidate
+    return None
+
+
+def classify_unwritable(path: Path, exc: BaseException | None = None) -> str:
+    """
+    Which fault a failed probe hit. ``exc`` is the error the probe raised.
+
+    THE ERRNO DECIDES WHAT THE PATH CANNOT. cubic, PR #11: an existing
+    directory on a read-only mount (EROFS) or a full disk (ENOSPC) was
+    classified as "not writable", whose remedy is chown -- advice that cannot
+    work for either. The errno is the only thing that separates them from a
+    permissions failure, so it is read when offered and the path's own shape is
+    the fallback.
+
+    ``lexists`` RATHER THAN ``exists``, because `Path.exists()` follows a
+    symlink and returns False for a broken one -- so a stale link would be
+    classified as a missing mount, and the operator sent looking for a volume
+    instead of removing the link.
+    """
+    import errno as _errno
+
+    code = getattr(exc, "errno", None)
+    if code == _errno.EROFS:
+        return FAULT_READ_ONLY_FS
+    if code == _errno.ENOSPC:
+        return FAULT_NO_SPACE
+    if code == _errno.ENOTDIR or first_non_directory_ancestor(path) is not None:
+        return FAULT_NOT_A_DIRECTORY
+    if not os.path.lexists(path):
+        return FAULT_MISSING_MOUNT
+    if not Path(path).is_dir():
+        return FAULT_NOT_A_DIRECTORY
+    return FAULT_NOT_WRITABLE
+
+
+def unwritable_remedy(
+    path: Path,
+    fault: str,
+    *,
+    uid: object = "?",
+    how: str | None = None,
+    mount_point: bool = True,
+) -> str:
+    """
+    What an operator should actually do, for the fault ``classify_unwritable``
+    found. Never a remedy the fault rules out.
+
+    ``how`` is ``resolve_state_root``'s second element. The Railway hypothesis
+    is named ONLY when the platform's own variable produced the path: an
+    earlier version interpolated ``how`` into "Resolved via {how}: if that is
+    RAILWAY_VOLUME_MOUNT_PATH ...", which read as a sentence asking whether the
+    source was the source it had just been handed.
+
+    ``mount_point`` says whether a VOLUME is supposed to be there. The state
+    root is one; the calibration report's directory, which an operator can
+    point anywhere, is not -- and telling them to attach a volume because
+    ``$PROPIQ_CALIBRATION_REPORT`` names a missing directory would be the
+    wrong remedy with confident wording, which is the failure this whole
+    helper exists to stop.
+    """
+    if fault == FAULT_NOT_A_DIRECTORY:
+        where = (
+            f"point ${ENV_STATE_DIR} at a directory"
+            if mount_point
+            else "point the variable that names it at a directory"
+        )
+        # WHICH path is the obstruction: it may be an ANCESTOR, not the target.
+        obstruction = first_non_directory_ancestor(path)
+        subject = (
+            f"{obstruction} EXISTS BUT IS NOT A DIRECTORY, and {path} would "
+            "have to live under it"
+            if obstruction is not None and obstruction != Path(path)
+            else f"{path} EXISTS BUT IS NOT A DIRECTORY"
+        )
+        return (
+            f"{subject} -- a file, or a symlink with nothing at the other end "
+            f"-- so nothing can be written under it. Remove or rename that "
+            f"path, or {where}. chown cannot help: the problem is what the path "
+            "IS, not who owns it."
+        )
+    if fault == FAULT_READ_ONLY_FS:
+        # cubic, PR #11: this told the operator to point the STATE ROOT
+        # elsewhere even when the path that failed was the calibration
+        # report's, which is configured independently -- the wrong knob, named
+        # confidently.
+        elsewhere = (
+            f"point ${ENV_STATE_DIR} at a writable filesystem"
+            if mount_point
+            else "point the variable that names this directory at a writable "
+                 "filesystem"
+        )
+        return (
+            f"{path} IS ON A READ-ONLY FILESYSTEM. Nothing can be written there "
+            "whoever owns it, so permissions are not the problem: the mount "
+            f"itself is read-only. Remount it read-write, or {elsewhere}. A "
+            "redeploy will not change this."
+        )
+    if fault == FAULT_NO_SPACE:
+        small = (
+            "an artifact and a calibration report are small"
+            if mount_point
+            else "a calibration report is small"
+        )
+        return (
+            f"{path} IS ON A FULL FILESYSTEM. The directory and its permissions "
+            f"are fine; there is no room to write. Free space on that filesystem "
+            f"or give it more -- {small}, so this usually means something else "
+            "on it has grown."
+        )
+    if fault == FAULT_MISSING_MOUNT and not mount_point:
+        return (
+            f"{path} DOES NOT EXIST AND COULD NOT BE CREATED, and its parent is "
+            "not writable by this process either. No volume belongs here -- this "
+            "directory is wherever it was configured to be -- so create it and "
+            f"give it to uid {uid}, or point the variable that names it at a "
+            "directory that already exists. chown is not the remedy: there is "
+            "nothing there to chown."
+        )
+    if fault == FAULT_MISSING_MOUNT:
+        from_railway = how == ENV_RAILWAY_VOLUME
+        source = (
+            f"${ENV_RAILWAY_VOLUME} names a path this service has no volume at, "
+            "which is the shape when it was set by hand or copied from a service "
+            "that does have one -- the database's own "
+            "/var/lib/postgresql/data, for instance. "
+            if from_railway
+            else f"The path came from {how}. " if how else ""
+        )
+        # WHERE TO MOUNT IT: the path actually in play. cubic, PR #11: this
+        # always named /app/data, so an operator who had set $PROPIQ_STATE_DIR
+        # to something else would mount the Dockerfile's path and leave the
+        # directory this service really uses absent.
+        from_override = how == ENV_STATE_DIR
+        if from_override:
+            fix = (
+                f"Either mount a volume at {path} -- the path ${ENV_STATE_DIR} "
+                f"names -- or clear ${ENV_STATE_DIR} so the state root falls "
+                "back to /app/data, which is where the Dockerfile mounts one."
+            )
+        else:
+            fix = (
+                f"Attach a volume to THIS service and mount it at {path}, which "
+                f"is the path in play (the Dockerfile documents /app/data); or "
+                f"point ${ENV_STATE_DIR} at a directory that exists, accepting "
+                "that a container path with no volume behind it is EPHEMERAL "
+                "and a redeploy destroys the artifacts and the calibration "
+                "evidence."
+            )
+        return (
+            f"{path} DOES NOT EXIST AND COULD NOT BE CREATED, so NO VOLUME IS "
+            f"MOUNTED THERE: a mounted volume would already be a directory, and "
+            f"this failure is on the path or its parent. {source}{fix} chown is "
+            "not the remedy: there is nothing there to chown."
+        )
+    # WHAT WAS OBSERVED, NOT WHO WE GUESS OWNS IT. cubic, PR #11: this said
+    # "it is owned by another uid", a specific claim the probe never
+    # established -- a directory this very process owns, mode 0500, fails the
+    # same way. Both candidate causes are named; neither is asserted.
+    if not mount_point:
+        return (
+            f"{path} EXISTS AND THE WRITE WAS REFUSED for uid {uid}: either its "
+            "owner is a different uid, or its mode denies writing to this one. "
+            "chown it to that uid or widen its mode, or point the variable that "
+            "names it somewhere this process can write -- under the state root "
+            "is the usual answer, because that is the directory the deploy "
+            "already has to get right."
+        )
+    return (
+        f"{path} EXISTS AND THE WRITE WAS REFUSED for uid {uid}: either its "
+        "owner is a different uid, or its mode denies writing to this one. A "
+        "mounted volume shadows the image's chown and is commonly root-owned, "
+        f"which is the usual cause here -- chown it to uid {uid}, widen its "
+        "mode, or run the service as root. See docs/deploy_railway.md."
+    )

@@ -42,7 +42,9 @@ from src.settlement.boxscore_fetcher import (
     REQUEST_TIMEOUT,
     RETRY_ATTEMPTS,
     RETRY_BACKOFF,
+    TOO_MANY_REQUESTS,
     normalize_game_id,
+    retry_after_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,34 @@ def fetch_playbyplay(
                     f"404 for game {gid} — the game id does not exist or its "
                     "play-by-play is not posted yet."
                 )
+            if resp.status_code == TOO_MANY_REQUESTS:
+                # THE ONE 4xx THAT IS TRANSIENT, and it was missing here while
+                # `boxscore_fetcher` -- the module this one imports its retry
+                # constants from -- has had it since autonomy_audit P4. Without
+                # this branch a 429 fell through to `raise_for_status`, was
+                # caught below as a generic transport error, and retried on a
+                # schedule of our own choosing with the server's Retry-After
+                # ignored. Guessing a backoff against cdn.nba.com's rate
+                # limiter is how access gets revoked.
+                retry_after = resp.headers.get("Retry-After")
+                # THE SHARED RULE, not a second copy of it. cubic, PR #11: this
+                # was a verbatim copy of `fetch_boxscore`'s policy, which is
+                # exactly how the original defect came to be fixed in one
+                # client and left in the other.
+                wait = retry_after_seconds(resp.headers, RETRY_BACKOFF ** attempt)
+                if attempt < RETRY_ATTEMPTS:
+                    logger.warning(
+                        "playbyplay: 429 for %s, attempt %d/%d; waiting %.1fs%s",
+                        gid, attempt, RETRY_ATTEMPTS, wait,
+                        " (Retry-After)" if retry_after else "",
+                    )
+                    time.sleep(wait)
+                    continue
+                raise PlayByPlayError(
+                    f"NBA CDN rate-limited {gid} on all {RETRY_ATTEMPTS} "
+                    "attempts. Play-by-play is a backfill input, not a slate "
+                    "dependency, so the next run picks this game up."
+                )
             resp.raise_for_status()
             return resp.json()
         except PlayByPlayError:
@@ -123,7 +153,12 @@ def fetch_playbyplay(
         except requests.exceptions.RequestException as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF * attempt)
+                # ** not *: 2s, 4s, 8s. The constant is documented as the BASE
+                # of `RETRY_BACKOFF ** attempt`; this read it as a multiplier,
+                # which at RETRY_ATTEMPTS=3 happens to produce the same two
+                # waits and so hid itself. Linear backoff against a limiter
+                # that is still saturated just retries into the same wall.
+                time.sleep(RETRY_BACKOFF ** attempt)
 
     raise PlayByPlayError(
         f"Failed to fetch play-by-play for {gid} after {RETRY_ATTEMPTS} attempts"

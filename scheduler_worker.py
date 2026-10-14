@@ -599,7 +599,11 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     """
     from pathlib import Path
 
-    from src.utils.volume import resolve_state_root
+    from src.utils.volume import (
+        classify_unwritable,
+        resolve_state_root,
+        unwritable_remedy,
+    )
 
     # BOTH DIRECTORIES THAT MATTER, because they can differ and each breaks
     # something different when it is not writable.
@@ -632,48 +636,77 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     # it, where no volume is involved and the artifacts are not affected. The
     # same defect this repository has two test files guarding against: text
     # outliving the facts it describes.
+    # WHAT LIVES HERE is this function's to say; WHY THE WRITE FAILED and what
+    # to do about it belongs to `utils.volume`, once, because there are two
+    # probes. Found in a Railway log 2026-10-13: the healthcheck said "NO VOLUME
+    # IS MOUNTED THERE ... chown is not the remedy here" and this check said
+    # "most likely owned by root ... chown it to that uid", about the same path,
+    # three log lines apart. I had taught one of the two the difference. The
+    # fault-to-remedy mapping is now `classify_unwritable` + `unwritable_remedy`
+    # and neither probe holds a copy of it.
     uid = os.getuid() if hasattr(os, "getuid") else "?"
-    state_root_cause = (
+    state_root_contents = (
         "The model artifacts and, by default, the calibration report live here, "
         "so score_prob_over will find no model and the publication gate will "
-        "withhold every card. If this is a mounted volume it is most likely "
-        f"owned by root while this process runs as uid {uid} -- chown it to that "
-        "uid, or run the service as root."
+        "withhold every card."
     )
-    report_cause = (
+    report_contents = (
         "Settlement writes the calibration report here at 03:30 PT and the "
         "09:00 PT slate reads it, so the gate will withhold every model-sourced "
         "card; market-grounded figures are unaffected, and the model artifacts "
-        "live elsewhere. This directory is configured outside the state root, so "
-        "it is most likely owned by root or another uid while this process runs "
-        f"as uid {uid} -- chown it to that uid, or configure the report under the "
-        "state root."
+        "live elsewhere."
     )
 
+    # The fourth element is (resolved_via, is_a_mount_point): only the state
+    # root is somewhere a VOLUME belongs.
     if path is not None:
-        targets = [(Path(path).parent, "CALIBRATION REPORT DIRECTORY", report_cause)]
+        targets = [
+            (Path(path).parent, "CALIBRATION REPORT DIRECTORY", report_contents,
+             (None, False))
+        ]
     else:
-        root = resolve_state_root()[0]
-        targets = [(root, "STATE ROOT", state_root_cause)]
+        root, how = resolve_state_root()
+        targets = [(root, "STATE ROOT", state_root_contents, (how, True))]
         report_dir = Path(
             os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
         ).parent
         # Compare resolved paths: "outputs" and "/app/outputs" are the same
         # directory and probing it twice would log a duplicate.
         if report_dir.resolve() != root.resolve():
-            targets.append((report_dir, "CALIBRATION REPORT DIRECTORY", report_cause))
+            targets.append(
+                (report_dir, "CALIBRATION REPORT DIRECTORY", report_contents,
+                 (None, False))
+            )
 
     failures: list[dict[str, str]] = []
-    for candidate, label, cause in targets:
+    for candidate, label, contents, (resolved_via, is_mount) in targets:
+        # ONE PROBE FILE PER PROCESS. cubic, PR #11: a fixed
+        # ``.propiq_write_probe`` meant two probes racing -- the boot
+        # healthcheck and this check run seconds apart in the same container --
+        # could fail on each other's file, and a stale probe DIRECTORY left by
+        # a killed run made `write_text` raise IsADirectoryError, which was
+        # then reported as the PARENT being unwritable. The parent is fine in
+        # both cases.
+        tmp = candidate / f".propiq_write_probe.{os.getpid()}"
         try:
             candidate.mkdir(parents=True, exist_ok=True)
-            tmp = candidate / ".propiq_write_probe"
             tmp.write_text("ok", encoding="utf-8")
             tmp.unlink()
         except OSError as exc:
-            failures.append(
-                {"path": str(candidate), "error": str(exc), "what": label, "cause": cause}
-            )
+            # AFTER the failure, because which fault it was cannot be known
+            # before it. The ERROR is passed in: an EROFS or ENOSPC on a
+            # perfectly-owned directory must not be diagnosed as ownership.
+            fault = classify_unwritable(candidate, exc)
+            failures.append({
+                "path": str(candidate),
+                "error": str(exc),
+                "what": label,
+                "fault": fault,
+                "cause": f"{contents} " + unwritable_remedy(
+                    candidate, fault, uid=uid, how=resolved_via,
+                    mount_point=is_mount,
+                ),
+            })
 
     if failures:
         # EVERY failure, one line each. cubic, PR #8: this read failures[0] and
@@ -692,18 +725,21 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
             "path": failures[0]["path"],
             "writable": False,
             "error": failures[0]["error"],
+            # WHICH fault, beside path/error, which are also the first
+            # failure's. A caller that wants them all reads ``failures``.
+            "fault": failures[0]["fault"],
             "failures": failures,
-            "checked": [str(t) for t, _, _ in targets],
+            "checked": [str(t) for t, _, _, _ in targets],
         }
     logger.info(
         "State director%s writable: %s.",
         "y is" if len(targets) == 1 else "ies are",
-        ", ".join(str(t) for t, _, _ in targets),
+        ", ".join(str(t) for t, _, _, _ in targets),
     )
     return {
         "path": str(targets[0][0]),
         "writable": True,
-        "checked": [str(t) for t, _, _ in targets],
+        "checked": [str(t) for t, _, _, _ in targets],
     }
 
 
