@@ -680,15 +680,23 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
 
     failures: list[dict[str, str]] = []
     for candidate, label, contents, (resolved_via, is_mount) in targets:
+        # ONE PROBE FILE PER PROCESS. cubic, PR #11: a fixed
+        # ``.propiq_write_probe`` meant two probes racing -- the boot
+        # healthcheck and this check run seconds apart in the same container --
+        # could fail on each other's file, and a stale probe DIRECTORY left by
+        # a killed run made `write_text` raise IsADirectoryError, which was
+        # then reported as the PARENT being unwritable. The parent is fine in
+        # both cases.
+        tmp = candidate / f".propiq_write_probe.{os.getpid()}"
         try:
             candidate.mkdir(parents=True, exist_ok=True)
-            tmp = candidate / ".propiq_write_probe"
             tmp.write_text("ok", encoding="utf-8")
             tmp.unlink()
         except OSError as exc:
             # AFTER the failure, because which fault it was cannot be known
-            # before it.
-            fault = classify_unwritable(candidate)
+            # before it. The ERROR is passed in: an EROFS or ENOSPC on a
+            # perfectly-owned directory must not be diagnosed as ownership.
+            fault = classify_unwritable(candidate, exc)
             failures.append({
                 "path": str(candidate),
                 "error": str(exc),

@@ -44,6 +44,7 @@ from src.settlement.boxscore_fetcher import (
     RETRY_BACKOFF,
     TOO_MANY_REQUESTS,
     normalize_game_id,
+    retry_after_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,10 +128,11 @@ def fetch_playbyplay(
                 # ignored. Guessing a backoff against cdn.nba.com's rate
                 # limiter is how access gets revoked.
                 retry_after = resp.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else RETRY_BACKOFF ** attempt
-                except (TypeError, ValueError):
-                    wait = RETRY_BACKOFF ** attempt
+                # THE SHARED RULE, not a second copy of it. cubic, PR #11: this
+                # was a verbatim copy of `fetch_boxscore`'s policy, which is
+                # exactly how the original defect came to be fixed in one
+                # client and left in the other.
+                wait = retry_after_seconds(resp.headers, RETRY_BACKOFF ** attempt)
                 if attempt < RETRY_ATTEMPTS:
                     logger.warning(
                         "playbyplay: 429 for %s, attempt %d/%d; waiting %.1fs%s",

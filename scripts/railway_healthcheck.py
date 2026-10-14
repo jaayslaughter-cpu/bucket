@@ -123,7 +123,9 @@ def _check_state_root() -> list[Check]:
     # it, because refusing to probe is worse than probing a path it made, but
     # it reports which happened.
     existed = root.is_dir()
-    probe = root / ".propiq_healthcheck_probe"
+    # Per-process, for the same reason `check_state_dir` is: this and the
+    # worker's own probe run seconds apart in one container.
+    probe = root / f".propiq_healthcheck_probe.{os.getpid()}"
     try:
         root.mkdir(parents=True, exist_ok=True)
         probe.write_text("ok", encoding="utf-8")
@@ -147,7 +149,7 @@ def _check_state_root() -> list[Check]:
         # is not the remedy" while the worker said "chown it to that uid", three
         # log lines apart about one path -- because the three-way split lived
         # here and nowhere else.
-        fault = classify_unwritable(root)
+        fault = classify_unwritable(root, exc)
         out.append(Check(
             "state_root_writable", FAIL,
             unwritable_remedy(root, fault, uid=uid, how=how),

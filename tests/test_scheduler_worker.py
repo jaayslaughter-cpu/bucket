@@ -435,7 +435,7 @@ def test_a_writable_state_dir_reports_writable(tmp_path, monkeypatch):
     monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "calibration.json"))
     out = worker.check_state_dir()
     assert out["writable"] is True
-    assert not list(tmp_path.glob(".propiq_write_probe")), "the probe file was left behind"
+    assert not list(tmp_path.glob(".propiq_write_probe*")), "the probe file was left behind"
 
 
 @pytest.mark.skipif(
@@ -510,7 +510,7 @@ def test_the_state_root_variant_still_names_the_root_owned_volume(
     real_write = type(tmp_path).write_text
 
     def deny(self, *a, **k):
-        if self.name == ".propiq_write_probe":
+        if self.name.startswith(".propiq_write_probe"):
             raise PermissionError(13, "Permission denied", str(self))
         return real_write(self, *a, **k)
 
@@ -526,7 +526,10 @@ def test_the_state_root_variant_still_names_the_root_owned_volume(
         "the state root's ownership branch no longer names the root-owned "
         "volume, which is the documented Railway failure"
     )
-    assert "chown it to that uid" in text
+    # The remedy, in the wording the shared helper now uses: it offers chown
+    # AND the mode, because the probe establishes neither.
+    assert "chown it to uid" in text
+    assert "widen its mode" in text
     assert "docs/deploy_railway.md" in text
 
 

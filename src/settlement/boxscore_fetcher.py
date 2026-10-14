@@ -58,6 +58,41 @@ RETRY_ATTEMPTS = 3
 #: exponential backoff nor a 429 branch, while `ingestion/espn_client` and
 #: `ingestion/propline` had both.
 RETRY_BACKOFF = 2.0
+#: A server asking us to wait an hour is not something to obey inside a slate
+#: or settlement job; cap it and let the caller fail rather than hang. Same
+#: value and reasoning as `ingestion/espn_client.MAX_RETRY_AFTER_SECONDS`.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def retry_after_seconds(headers: Any, fallback: float) -> float:
+    """
+    The server's ``Retry-After`` in seconds, else ``fallback``.
+
+    ONE RULE FOR BOTH CDN CLIENTS. cubic, PR #11: each parsed the header with a
+    bare ``float(...)``, which accepts ``-1`` (``time.sleep`` raises), ``nan``
+    (raises) and ``inf`` (never returns) -- turning a rate limit into a crashed
+    or hung fetch -- while the HTTP-date form fell through silently.
+
+    Only the plain integer-seconds form is honoured. The date form is IGNORED
+    rather than parsed approximately, because a wrong date parse sleeps for
+    either no time or a very long one; `ingestion/espn_client` made the same
+    call for the same reason and this is that rule, shared.
+    """
+    import math
+
+    try:
+        raw = headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return float(fallback)
+    if raw is None:
+        return float(fallback)
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not math.isfinite(seconds) or seconds <= 0:
+        return float(fallback)
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 #: The one 4xx that IS transient: the request is fine, there have just been too
 #: many of them. Falling through to `raise_for_status` abandoned a night's
 #: grading over rate limiting.
@@ -102,10 +137,7 @@ def fetch_boxscore(game_id: str | int, session: requests.Session | None = None) 
                 # backoff against a rate limiter is how access gets revoked.
                 # `espn_client` and `propline` both already do this.
                 retry_after = resp.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else RETRY_BACKOFF ** attempt
-                except (TypeError, ValueError):
-                    wait = RETRY_BACKOFF ** attempt
+                wait = retry_after_seconds(resp.headers, RETRY_BACKOFF ** attempt)
                 if attempt < RETRY_ATTEMPTS:
                     logger.warning(
                         "boxscore: 429 for %s, attempt %d/%d; waiting %.1fs%s",

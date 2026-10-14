@@ -1169,7 +1169,7 @@ def test_an_unwritable_but_mounted_state_root_still_says_chown(monkeypatch, tmp_
     real_write = type(tmp_path).write_text
 
     def deny(self, *a, **k):
-        if self.name == ".propiq_healthcheck_probe":
+        if self.name.startswith(".propiq_healthcheck_probe"):
             raise PermissionError(errno.EACCES, "Permission denied", str(self))
         return real_write(self, *a, **k)
 

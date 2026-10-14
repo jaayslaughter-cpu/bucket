@@ -157,7 +157,7 @@ def test_every_failing_directory_is_reported_not_just_the_first(monkeypatch, tmp
     real_write = type(tmp_path).write_text
 
     def deny(self, *a, **k):
-        if self.name == ".propiq_write_probe":
+        if self.name.startswith(".propiq_write_probe"):
             raise PermissionError(f"denied: {self.parent}")
         return real_write(self, *a, **k)
 
@@ -200,7 +200,7 @@ def test_the_message_names_what_actually_lives_in_the_broken_directory(
     real_write = type(tmp_path).write_text
 
     def deny_report_only(self, *a, **k):
-        if self.name == ".propiq_write_probe" and self.parent == report:
+        if self.name.startswith(".propiq_write_probe") and self.parent == report:
             raise PermissionError("denied")
         return real_write(self, *a, **k)
 
