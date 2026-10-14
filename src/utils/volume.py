@@ -237,18 +237,33 @@ def unwritable_remedy(
             "IS, not who owns it."
         )
     if fault == FAULT_READ_ONLY_FS:
+        # cubic, PR #11: this told the operator to point the STATE ROOT
+        # elsewhere even when the path that failed was the calibration
+        # report's, which is configured independently -- the wrong knob, named
+        # confidently.
+        elsewhere = (
+            f"point ${ENV_STATE_DIR} at a writable filesystem"
+            if mount_point
+            else "point the variable that names this directory at a writable "
+                 "filesystem"
+        )
         return (
             f"{path} IS ON A READ-ONLY FILESYSTEM. Nothing can be written there "
             "whoever owns it, so permissions are not the problem: the mount "
-            "itself is read-only. Remount it read-write, or point the state "
-            "root at a writable filesystem. A redeploy will not change this."
+            f"itself is read-only. Remount it read-write, or {elsewhere}. A "
+            "redeploy will not change this."
         )
     if fault == FAULT_NO_SPACE:
+        small = (
+            "an artifact and a calibration report are small"
+            if mount_point
+            else "a calibration report is small"
+        )
         return (
             f"{path} IS ON A FULL FILESYSTEM. The directory and its permissions "
-            "are fine; there is no room to write. Free space on that volume or "
-            "give it more -- an artifact and a calibration report are small, so "
-            "this usually means something else on the volume has grown."
+            f"are fine; there is no room to write. Free space on that filesystem "
+            f"or give it more -- {small}, so this usually means something else "
+            "on it has grown."
         )
     if fault == FAULT_MISSING_MOUNT and not mount_point:
         return (

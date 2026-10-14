@@ -69,9 +69,12 @@ def retry_after_seconds(headers: Any, fallback: float) -> float:
     The server's ``Retry-After`` in seconds, else ``fallback``.
 
     ONE RULE FOR BOTH CDN CLIENTS. cubic, PR #11: each parsed the header with a
-    bare ``float(...)``, which accepts ``-1`` (``time.sleep`` raises), ``nan``
-    (raises) and ``inf`` (never returns) -- turning a rate limit into a crashed
-    or hung fetch -- while the HTTP-date form fell through silently.
+    bare ``float(...)``, which accepts values ``time.sleep`` refuses. Measured,
+    rather than assumed: ``-1`` raises ValueError("sleep length must be
+    non-negative"), ``nan`` raises ValueError("Invalid value NaN"), and ``inf``
+    raises OverflowError("timestamp out of range for platform time_t") -- so
+    all three turn a rate limit into a CRASHED fetch, not a hung one. The
+    HTTP-date form fell through silently.
 
     Only the plain integer-seconds form is honoured. The date form is IGNORED
     rather than parsed approximately, because a wrong date parse sleeps for

@@ -468,23 +468,68 @@ def test_an_unwritable_state_dir_is_named_rather_than_surfacing_later(
         )
         with caplog.at_level(logging.ERROR):
             out = worker.check_state_dir()
-        assert out["writable"] is False
-        assert out["fault"] == "not_writable", out["fault"]
-        assert "NOT WRITABLE" in caplog.text
-        # OWNERSHIP, named without overclaiming WHOSE. This asserted "owned by
-        # root", which only held while one text served every directory: the
-        # path here is the CALIBRATION REPORT's, wherever
-        # $PROPIQ_CALIBRATION_REPORT points, and it can be owned by any uid.
-        # The volume-specific root hypothesis belongs to the state root, and
-        # `test_the_state_root_variant_still_names_the_root_owned_volume`
-        # below holds that half.
-        assert "owned by another uid" in caplog.text
-        assert "chown it" in caplog.text
-        assert "still writes to Postgres" in caplog.text, (
-            "the operator should know what still works"
-        )
+        _assert_refused_write_was_diagnosed(out, caplog.text)
     finally:
         locked.chmod(0o700)
+
+
+def _assert_refused_write_was_diagnosed(out: dict, text: str) -> None:
+    """
+    What a refused write must produce, WITHOUT pinning the prose.
+
+    THIS HELPER EXISTS BECAUSE THE TEST ABOVE ONLY RUNS IN CI. It is skipped
+    under root -- root ignores mode bits -- so every local run skips it, and
+    twice now a rewording of the shared remedy passed here and failed there:
+    once on "owned by root" and once on "owned by another uid". A CI-only test
+    that asserts a sentence fragment is a tripwire for whoever edits the
+    sentence, so this asserts the FAULT CODE and the ACTIONS offered, and the
+    root-independent test below exercises the same branch locally.
+    """
+    assert out["writable"] is False
+    assert out["fault"] == "not_writable", out["fault"]
+    assert "NOT WRITABLE" in text
+    assert "WRITE WAS REFUSED" in text
+    # Both candidate causes and both remedies, since the probe establishes
+    # neither ownership nor mode.
+    assert "chown" in text.lower()
+    assert "mode" in text.lower()
+    assert "still writes to Postgres" in text, (
+        "the operator should know what still works"
+    )
+
+
+def test_a_refused_write_on_the_report_directory_is_diagnosed(
+    monkeypatch, tmp_path, caplog
+):
+    """
+    THE SAME BRANCH AS THE ROOT-SKIPPED TEST ABOVE, root-independent: the write
+    is denied directly rather than by mode bits, so this runs under any uid and
+    the assertions above are exercised locally instead of only in CI.
+    """
+    import logging
+
+    import src.utils.volume as volume
+
+    root = tmp_path / "vol"
+    report = tmp_path / "elsewhere"
+    root.mkdir()
+    report.mkdir()
+    monkeypatch.setattr(volume, "resolve_state_root", lambda: (root, "test"))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(report / "calibration.json"))
+
+    real_write = type(tmp_path).write_text
+
+    def deny_report_only(self, *a, **k):
+        if self.name.startswith(".propiq_write_probe") and self.parent == report:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(type(tmp_path), "write_text", deny_report_only)
+    with caplog.at_level(logging.ERROR):
+        out = worker.check_state_dir()
+
+    _assert_refused_write_was_diagnosed(out, caplog.text)
+    assert "CALIBRATION REPORT DIRECTORY" in caplog.text
 
 
 def test_the_state_root_variant_still_names_the_root_owned_volume(

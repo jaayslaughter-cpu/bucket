@@ -175,8 +175,8 @@ def test_both_cdn_clients_send_the_browser_headers():
 @pytest.mark.parametrize("raw, expected", [
     ("7", 7.0),                 # the plain integer-seconds form
     ("-1", None),               # negative: nonsense, fall back
-    ("nan", None),              # time.sleep(nan) raises
-    ("inf", None),              # time.sleep(inf) never returns
+    ("nan", None),              # ValueError("Invalid value NaN")
+    ("inf", None),              # OverflowError, not a hang -- measured
     ("0", None),                # zero is not a wait
     ("Wed, 21 Oct 2026 07:28:00 GMT", None),   # HTTP-date form, not parsed
     ("", None),
@@ -185,9 +185,10 @@ def test_both_cdn_clients_send_the_browser_headers():
 def test_retry_after_is_validated_before_it_reaches_sleep(raw, expected):
     """
     cubic, PR #11: ``float(retry_after)`` accepted ``-1``, ``nan`` and ``inf``
-    and passed them to `time.sleep` — which raises on the first two and never
-    returns on the third, turning a rate limit into a hung or crashed fetch.
-    The HTTP-date form fell through to the local schedule silently.
+    and passed them to `time.sleep`, which refuses all three — ValueError,
+    ValueError and OverflowError respectively, measured rather than assumed, so
+    the failure is a CRASHED fetch in every case and not a hang. The HTTP-date
+    form fell through to the local schedule silently.
 
     `ingestion/espn_client._retry_after_seconds` already did all of this
     correctly; this is the same rule, in one place, for both CDN clients.
