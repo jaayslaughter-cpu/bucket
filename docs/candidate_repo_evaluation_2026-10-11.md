@@ -219,7 +219,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   refusal raises rather than warns, because the alternative is a staleness
   banner the reader has to notice — "and the whole point is that they would
   not."
-- **The gap in our tree, verified.** `scripts/railway_healthcheck.py:152`
+- **The gap in our tree, verified.** `scripts/railway_healthcheck.py:267`
   checked that artifacts *exist*, parse, and were not fit on demo-sized data —
   never how old they are. There was no `model_age` or `MAX_MODEL_AGE` anywhere.
   We bound **data** freshness (`main.market_frames_freshness`, default 10 days)
@@ -255,8 +255,8 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/quant/publication_gate.py:378` as a second verdict beside
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
-  `scheduler_worker.py:1424` and into the deploy probe as a FAILURE at
-  `scripts/railway_healthcheck.py:320`.
+  `scheduler_worker.py:1452` and into the deploy probe as a FAILURE at
+  `scripts/railway_healthcheck.py:267`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
 
@@ -268,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap in our tree.** `scheduler_worker.py:2000-2003` sets
+- **The gap in our tree.** `scheduler_worker.py:2028-2031` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can

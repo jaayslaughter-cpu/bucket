@@ -113,3 +113,129 @@ def artifact_dir_on(root: Path | None = None) -> Path:
             return base.joinpath(*parts[1:])
         return base / path
     return base / DEFAULT_ARTIFACT_SUBDIR
+
+
+# ---------------------------------------------------------------------------
+# WHY A FAILED WRITE PROBE FAILED, AND WHAT TO DO ABOUT IT
+# ---------------------------------------------------------------------------
+# ONE READER, because there are two probes. `scripts/railway_healthcheck.py`
+# and `scheduler_worker.check_state_dir` both write a file into the state root
+# and both report what happened, and on 2026-10-13 they contradicted each other
+# about the same directory three log lines apart: the healthcheck said "NO
+# VOLUME IS MOUNTED THERE ... chown is not the remedy here", the worker said
+# "most likely owned by root ... chown it to that uid". The healthcheck had been
+# taught the difference and the worker had not.
+#
+# Each caller still says WHAT LIVES in the directory it probed -- the artifact
+# store and the calibration report really do break differently -- but the
+# fault-to-remedy mapping lives here, once.
+
+#: The path does not exist at all and could not be created.
+FAULT_MISSING_MOUNT = "missing_mount"
+#: Something IS there, but it is not a directory: a file, or a stale symlink.
+FAULT_NOT_A_DIRECTORY = "not_a_directory"
+#: A real directory that refuses a write -- the root-owned-volume case.
+FAULT_NOT_WRITABLE = "not_writable"
+
+
+def classify_unwritable(path: Path) -> str:
+    """
+    Which of the three faults a failed probe hit.
+
+    ``lexists`` RATHER THAN ``exists``, because `Path.exists()` follows a
+    symlink and returns False for a broken one -- so a stale link would be
+    classified as a missing mount, and the operator sent looking for a volume
+    instead of removing the link. ``mkdir(parents=True, exist_ok=True)`` raises
+    ``FileExistsError`` for a non-directory, which is exactly when this runs.
+    """
+    if not os.path.lexists(path):
+        return FAULT_MISSING_MOUNT
+    if not Path(path).is_dir():
+        return FAULT_NOT_A_DIRECTORY
+    return FAULT_NOT_WRITABLE
+
+
+def unwritable_remedy(
+    path: Path,
+    fault: str,
+    *,
+    uid: object = "?",
+    how: str | None = None,
+    mount_point: bool = True,
+) -> str:
+    """
+    What an operator should actually do, for the fault ``classify_unwritable``
+    found. Never a remedy the fault rules out.
+
+    ``how`` is ``resolve_state_root``'s second element. The Railway hypothesis
+    is named ONLY when the platform's own variable produced the path: an
+    earlier version interpolated ``how`` into "Resolved via {how}: if that is
+    RAILWAY_VOLUME_MOUNT_PATH ...", which read as a sentence asking whether the
+    source was the source it had just been handed.
+
+    ``mount_point`` says whether a VOLUME is supposed to be there. The state
+    root is one; the calibration report's directory, which an operator can
+    point anywhere, is not -- and telling them to attach a volume because
+    ``$PROPIQ_CALIBRATION_REPORT`` names a missing directory would be the
+    wrong remedy with confident wording, which is the failure this whole
+    helper exists to stop.
+    """
+    if fault == FAULT_NOT_A_DIRECTORY:
+        where = (
+            f"point ${ENV_STATE_DIR} at a directory"
+            if mount_point
+            else "point the variable that names it at a directory"
+        )
+        return (
+            f"{path} EXISTS BUT IS NOT A DIRECTORY -- a file, or a symlink with "
+            f"nothing at the other end -- so nothing can be written under it. "
+            f"Remove or rename that path, or {where}. chown cannot help: the "
+            "problem is what the path IS, not who owns it."
+        )
+    if fault == FAULT_MISSING_MOUNT and not mount_point:
+        return (
+            f"{path} DOES NOT EXIST AND COULD NOT BE CREATED, and its parent is "
+            "not writable by this process either. No volume belongs here -- this "
+            "directory is wherever it was configured to be -- so create it and "
+            f"give it to uid {uid}, or point the variable that names it at a "
+            "directory that already exists. chown is not the remedy: there is "
+            "nothing there to chown."
+        )
+    if fault == FAULT_MISSING_MOUNT:
+        from_railway = how == ENV_RAILWAY_VOLUME
+        source = (
+            f"${ENV_RAILWAY_VOLUME} names a path this service has no volume at, "
+            "which is the shape when it was set by hand or copied from a service "
+            "that does have one -- the database's own "
+            "/var/lib/postgresql/data, for instance. "
+            if from_railway
+            else f"The path came from {how}. " if how else ""
+        )
+        return (
+            f"{path} DOES NOT EXIST AND COULD NOT BE CREATED, so NO VOLUME IS "
+            f"MOUNTED THERE: a mounted volume would already be a directory, and "
+            f"this failure is on the path or its parent. {source}Attach a volume "
+            "to THIS service and mount it at /app/data, which is what the "
+            f"Dockerfile documents; or point ${ENV_STATE_DIR} at a directory "
+            "that exists, accepting that a container path with no volume behind "
+            "it is EPHEMERAL and a redeploy destroys the artifacts and the "
+            "calibration evidence. chown is not the remedy: there is nothing "
+            "there to chown."
+        )
+    if not mount_point:
+        # No volume is involved, so the volume hypothesis is not offered: this
+        # is a directory somebody pointed a variable at, and it is owned by
+        # another uid.
+        return (
+            f"{path} EXISTS AND IS NOT WRITABLE: it is owned by another uid "
+            f"while this process runs as uid {uid}. chown it to that uid, or "
+            "point the variable that names it somewhere this process can write "
+            "-- under the state root is the usual answer, because that is the "
+            "directory the deploy already has to get right."
+        )
+    return (
+        f"{path} EXISTS AND IS NOT WRITABLE. A mounted volume shadows the "
+        f"image's chown and is commonly root-owned while this process runs as "
+        f"uid {uid} -- chown it to that uid, or run the service as root. See "
+        "docs/deploy_railway.md."
+    )

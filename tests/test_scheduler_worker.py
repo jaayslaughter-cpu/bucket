@@ -494,7 +494,16 @@ def test_the_probe_never_raises_and_still_names_the_cause(monkeypatch, caplog):
     assert out["writable"] is False
     assert out["error"]
     assert "NOT WRITABLE" in caplog.text
-    assert "owned by root" in caplog.text
+    # THE CAUSE, AND THE RIGHT ONE. This used to require "owned by root" for a
+    # path that DOES NOT EXIST -- the conflation `utils.volume.classify_
+    # unwritable` was added to end, asserted. /proc/nonexistent cannot be
+    # chowned because there is nothing there, so the probe must name the fault
+    # it found rather than the hypothesis that fits the other one.
+    assert out["fault"] == "missing_mount", out["fault"]
+    assert "DOES NOT EXIST" in caplog.text
+    assert "owned by root" not in caplog.text, (
+        "an absent path is still diagnosed as an ownership problem"
+    )
     assert "still writes to Postgres" in caplog.text, (
         "the operator should know what still works"
     )

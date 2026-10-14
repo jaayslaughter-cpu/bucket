@@ -84,7 +84,9 @@ def _check_state_root() -> list[Check]:
         ENV_RAILWAY_VOLUME,
         ENV_STATE_DIR,
         artifact_dir_on,
+        classify_unwritable,
         resolve_state_root,
+        unwritable_remedy,
     )
 
     root, how = resolve_state_root()
@@ -139,76 +141,21 @@ def _check_state_root() -> list[Check]:
             ))
     except OSError as exc:
         uid = os.getuid() if hasattr(os, "getuid") else "?"
-        # WHICH FAULT, AND SO WHICH REMEDY. Railway deploy 2026-10-12 reported
-        # "[Errno 13] Permission denied: '/var/lib/postgresql'" -- the PARENT
-        # of the state root -- under a message telling the operator to chown
-        # the volume. `mkdir(parents=True, exist_ok=True)` only reports a
-        # parent when the directory itself does not exist and cannot be
-        # created; a volume mounted at that path would already exist and the
-        # failure would land on the probe file inside it. Nothing was mounted
-        # there, and chown cannot fix a path that is not there.
-        #
-        # ENOENT and EACCES-on-an-absent-path are therefore reported as a
-        # MISSING MOUNT, and only an existing directory that refuses a write
-        # gets the ownership remedy.
-        # THREE CASES, NOT TWO. cubic, PR #9: `not root.is_dir()` lumped "the
-        # path exists as a FILE" in with "nothing is mounted". `mkdir(exist_ok
-        # =True)` raises FileExistsError on an existing non-directory and
-        # `is_dir()` is then False, so the message claimed the path "DOES NOT
-        # EXIST" and that there was "nothing to chown" -- about a path that
-        # does exist, as a file, which is exactly the typo'd-variable case this
-        # text was written to triage. The remedy for it (remove the file, or
-        # point the variable at a directory) was never mentioned.
-        # ``lexists`` DOES NOT FOLLOW THE LINK. cubic, PR #10: for a dangling
-        # symlink `exists()` is False while `mkdir(exist_ok=True)` still raises
-        # FileExistsError, so the path fell into the missing-mount branch and
-        # the operator was told to attach a volume -- when the remedy is the
-        # one this check added for the file case: remove the stale path.
-        exists = os.path.lexists(root)
-        is_dir = root.is_dir()
-        missing_mount = not exists
-        if exists and not is_dir:
-            detail = (
-                f"{root} EXISTS BUT IS NOT A DIRECTORY ({exc}) -- a file, or "
-                f"a symlink with nothing at the other end -- so no volume "
-                f"can be mounted there and nothing can be written under it. "
-                f"Resolved via {how}. Remove or rename that file, or point "
-                f"{ENV_STATE_DIR} at a directory. chown is not the remedy: the "
-                f"path is a file, not an unwritable directory."
-            )
-        elif missing_mount:
-            detail = (
-                f"{root} DOES NOT EXIST AND COULD NOT BE CREATED ({exc}), so "
-                f"NO VOLUME IS MOUNTED THERE -- a mounted volume would already "
-                f"be a directory, and this failure is on the path itself or "
-                f"its parent. Resolved via {how}: if that is "
-                f"{ENV_RAILWAY_VOLUME}, the variable names a path this service "
-                f"has no volume at (the shape when it was set by hand, or "
-                f"copied from a service that does have one -- e.g. the "
-                f"database's own /var/lib/postgresql/data). Attach a volume to "
-                f"THIS service and mount it at /app/data, which is what the "
-                f"Dockerfile documents; or point {ENV_STATE_DIR} at a "
-                f"directory that exists, accepting that a container path "
-                f"without a volume is EPHEMERAL and a redeploy destroys the "
-                f"artifacts and the calibration evidence. chown is not the "
-                f"remedy here: there is nothing to chown."
-            )
-        else:
-            detail = (
-                f"{root} EXISTS AND IS NOT WRITABLE ({exc}). A mounted volume "
-                f"shadows the image's chown and is commonly root-owned while "
-                f"this process runs as uid {uid}. chown it to that uid; see "
-                f"docs/deploy_railway.md."
-            )
+        # ONE READER for which fault this was and what to do about it, shared
+        # with `scheduler_worker.check_state_dir`. They disagreed in production
+        # on 2026-10-13 -- this check said "NO VOLUME IS MOUNTED THERE ... chown
+        # is not the remedy" while the worker said "chown it to that uid", three
+        # log lines apart about one path -- because the three-way split lived
+        # here and nowhere else.
+        fault = classify_unwritable(root)
         out.append(Check(
-            "state_root_writable", FAIL, detail,
+            "state_root_writable", FAIL,
+            unwritable_remedy(root, fault, uid=uid, how=how),
             {
                 "path": str(root), "uid": str(uid), "resolved_via": how,
-                # The distinguishing facts, as data and not only as prose.
-                # BOOLEANS, not their str() forms: cubic, PR #9 -- `--json`
-                # serialised "False", which every client reads as truthy.
-                "exists": exists,
-                "is_dir": is_dir,
+                "fault": fault,
+                "exists": os.path.lexists(root),
+                "is_dir": root.is_dir(),
                 "errno": getattr(exc, "errno", None),
             },
         ))
