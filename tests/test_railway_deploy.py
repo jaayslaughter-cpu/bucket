@@ -576,6 +576,14 @@ def test_seeding_copies_the_mean_head_not_only_the_booster(monkeypatch, tmp_path
     (source / "distribution_PTS.json").write_text("{}", encoding="utf-8")
     root = tmp_path / "volume"
     monkeypatch.setenv(ENV_STATE_DIR, str(root))
+    # `seed` now verifies the resolver will actually USE what it wrote, and
+    # returns 2 when it will not (see tests/test_seed_volume_guard.py). A tmp
+    # state root is the mismatching case, so point $PROPIQ_MODEL at the seeded
+    # file: that keeps `code == 0` meaning "copied AND usable" rather than
+    # weakening the assertion to accommodate the guard.
+    monkeypatch.setenv(
+        "PROPIQ_MODEL", str(artifact_dir_on(root) / "xgboost_PTS.json")
+    )
 
     code, lines = seed(source, apply=True, force=False, allow_demo=False)
     assert code == 0, lines
@@ -610,6 +618,11 @@ def test_seeding_refuses_the_demo_artifact_unless_asked(monkeypatch, tmp_path):
     _seed(source, "PTS", rows=MIN_PLAUSIBLE_TRAIN_ROWS - 1)
     root = tmp_path / "volume"
     monkeypatch.setenv(ENV_STATE_DIR, str(root))
+    # As above: $PROPIQ_MODEL onto the seeded path, so the second call's
+    # `code == 0` still means "copied AND the resolver will use it".
+    monkeypatch.setenv(
+        "PROPIQ_MODEL", str(artifact_dir_on(root) / "xgboost_PTS.json")
+    )
 
     code, lines = seed(source, apply=True, force=False, allow_demo=False)
     assert code == 1 and not artifact_dir_on(root).exists()
