@@ -28,7 +28,23 @@ import pytest
 import scripts.ingest_workbook as ing
 from src.db.session import database_target
 
-WORKBOOK = "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx"
+
+#: A STAND-IN, not the licensed export. These tests monkeypatch
+#: `main.ingest_market_lines`, so nothing ever parses this file -- the only
+#: property that matters is that the path EXISTS, because `main` checks that
+#: before it touches a database.
+#:
+#: It used to be the real workbook's path, and that broke CI from the commit
+#: this file arrived in: `data/external/bigdataball/*.xlsx` is gitignored
+#: (licensed), so in CI `main` returned EXIT_NO_WORKBOOK before reaching any
+#: of the code under test and seven tests failed. Every local run passed
+#: because the file was on disk. A test that depends on an untracked file is
+#: a test that only runs where somebody happens to have it.
+@pytest.fixture
+def workbook(tmp_path):
+    path = tmp_path / "2025-2026_NBA_Box_Score_Team-Stats.xlsx"
+    path.write_bytes(b"not a real workbook; never parsed in these tests")
+    return str(path)
 
 
 # --- the target is named, and the credential is not -----------------------
@@ -66,14 +82,14 @@ def test_an_unparseable_url_is_not_echoed_back():
 # --- refusals ---------------------------------------------------------------
 
 
-def test_a_missing_workbook_has_its_own_exit_code_and_touches_no_database(monkeypatch):
+def test_a_missing_workbook_has_its_own_exit_code_and_touches_no_database(monkeypatch, workbook):
     called: list[str] = []
     monkeypatch.setattr(ing, "_counts", lambda: called.append("counts") or {})
     assert ing.main(["--xlsx", "/no/such/file.xlsx"]) == ing.EXIT_NO_WORKBOOK
     assert called == [], "a missing workbook opened a database connection anyway"
 
 
-def test_a_schema_behind_the_code_refuses_and_writes_nothing(monkeypatch):
+def test_a_schema_behind_the_code_refuses_and_writes_nothing(monkeypatch, workbook):
     """
     A refusal that still wrote would be the worst outcome of the three: the
     rows land in a schema the code does not match, and the next run reports a
@@ -99,7 +115,7 @@ def test_a_schema_behind_the_code_refuses_and_writes_nothing(monkeypatch):
         pipeline, "ingest_market_lines", lambda *a, **k: wrote.append(a) or (None, None)
     )
 
-    assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_SCHEMA_BEHIND
+    assert ing.main(["--xlsx", workbook]) == ing.EXIT_SCHEMA_BEHIND
     assert wrote == [], "it refused on a pending migration and ingested anyway"
 
 
@@ -120,12 +136,12 @@ def test_drift_alone_is_enough_to_refuse(monkeypatch):
     assert problems
 
 
-def test_an_unreachable_database_is_not_reported_as_an_ingest_failure(monkeypatch):
+def test_an_unreachable_database_is_not_reported_as_an_ingest_failure(monkeypatch, workbook):
     import src.db.session as session
 
     monkeypatch.setattr(session, "database_target", lambda *a, **k: "postgresql://x/y")
     monkeypatch.setattr(session, "healthcheck", lambda: (False, "connection refused"))
-    assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_NO_DATABASE
+    assert ing.main(["--xlsx", workbook]) == ing.EXIT_NO_DATABASE
 
 
 # --- the write path ---------------------------------------------------------
@@ -170,7 +186,7 @@ def _counts_dict(team: int, market: int):
     }
 
 
-def test_the_counts_are_read_on_both_sides_of_the_ingest(monkeypatch):
+def test_the_counts_are_read_on_both_sides_of_the_ingest(monkeypatch, workbook):
     """
     "It ran" and "it landed" are two statements. Reading the tables only
     afterwards cannot tell an ingest of 2,644 rows from a table that already
@@ -189,11 +205,11 @@ def test_the_counts_are_read_on_both_sides_of_the_ingest(monkeypatch):
         "ingest_market_lines",
         lambda *a, **k: (pd.DataFrame({"x": range(2644)}), pd.DataFrame({"x": range(2644)})),
     )
-    assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_OK
+    assert ing.main(["--xlsx", workbook]) == ing.EXIT_OK
     assert len(reads) == 2, f"the tables were read {len(reads)} time(s), not before and after"
 
 
-def test_the_target_is_named_before_the_write_not_after(monkeypatch, caplog):
+def test_the_target_is_named_before_the_write_not_after(monkeypatch, caplog, workbook):
     """
     Printing the target after the rows are committed is a receipt, not a
     chance to hit ^C. The ordering is the whole value.
@@ -216,13 +232,13 @@ def test_the_target_is_named_before_the_write_not_after(monkeypatch, caplog):
 
     monkeypatch.setattr(pipeline, "ingest_market_lines", _ingest)
     with caplog.at_level(logging.INFO):
-        assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_OK
+        assert ing.main(["--xlsx", workbook]) == ing.EXIT_OK
     assert named_before_write == [True], (
         "the database was written before anything said which database it was"
     )
 
 
-def test_an_ingest_that_raises_is_its_own_exit_code(monkeypatch):
+def test_an_ingest_that_raises_is_its_own_exit_code(monkeypatch, workbook):
     import main as pipeline
 
     _wire_a_healthy_database(monkeypatch, [_counts_dict(0, 0), _counts_dict(0, 0)])
@@ -231,10 +247,10 @@ def test_an_ingest_that_raises_is_its_own_exit_code(monkeypatch):
         raise RuntimeError("workbook sheet missing")
 
     monkeypatch.setattr(pipeline, "ingest_market_lines", _boom)
-    assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_INGEST_FAILED
+    assert ing.main(["--xlsx", workbook]) == ing.EXIT_INGEST_FAILED
 
 
-def test_an_upsert_that_adds_no_new_rows_is_a_success(monkeypatch):
+def test_an_upsert_that_adds_no_new_rows_is_a_success(monkeypatch, workbook):
     """
     Re-running the ingest updates every row in place and adds none. That is
     the idempotent case, not a failure, and a script that exits non-zero on it
@@ -252,10 +268,10 @@ def test_an_upsert_that_adds_no_new_rows_is_a_success(monkeypatch):
         "ingest_market_lines",
         lambda *a, **k: (pd.DataFrame({"x": [1]}), pd.DataFrame({"x": [1]})),
     )
-    assert ing.main(["--xlsx", WORKBOOK]) == ing.EXIT_OK
+    assert ing.main(["--xlsx", workbook]) == ing.EXIT_OK
 
 
-def test_a_dry_run_needs_no_database_and_persists_nothing(monkeypatch):
+def test_a_dry_run_needs_no_database_and_persists_nothing(monkeypatch, workbook):
     import pandas as pd
 
     import main as pipeline
@@ -280,14 +296,14 @@ def test_a_dry_run_needs_no_database_and_persists_nothing(monkeypatch):
         )
 
     monkeypatch.setattr(pipeline, "ingest_market_lines", _ingest)
-    assert ing.main(["--xlsx", WORKBOOK, "--dry-run"]) == ing.EXIT_OK
+    assert ing.main(["--xlsx", workbook, "--dry-run"]) == ing.EXIT_OK
     assert seen == [False], "a dry run asked the loader to persist"
 
 
 # --- a front door, not a second implementation ------------------------------
 
 
-def test_it_calls_the_slate_s_own_loader_and_does_not_reimplement_it():
+def test_it_calls_the_slate_s_own_loader_and_does_not_reimplement_it(workbook):
     """
     The defect this repository keeps finding is two readers of one fact. A
     one-off ingest that parsed the workbook or built its own upsert would be a
