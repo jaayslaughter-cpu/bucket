@@ -208,6 +208,12 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         # zero. See migrations/006_player_game_log_fouls.sql for why a zero
         # default would be a fabrication rather than a convenience.
         "pf": pd.to_numeric(df.get("PF"), errors="coerce"),
+        # The shot volume behind the points. Absent from this table until
+        # migration 009, which is why `features/scoring_efficiency` attached
+        # nothing and the PTS contract's TS_PCT/FT_RATE features were missing
+        # on every row. `.get` so a panel without them still writes.
+        "fga": pd.to_numeric(df.get("FGA"), errors="coerce"),
+        "fta": pd.to_numeric(df.get("FTA"), errors="coerce"),
         # The position the player STARTED at, when the caller has one. The
         # league game log does not carry it, so on the live path this is
         # normally absent here and filled later by
@@ -240,7 +246,7 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         raise ValueError("DATA_NOT_AVAILABLE: no player-log rows survived date parsing")
 
     # Integer columns in the model; a float like 30.0 would be rejected.
-    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf"):
+    for col in ("pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf", "fga", "fta"):
         work[col] = work[col].astype("Int64")
 
     work["is_neutral_site"] = _lookup_neutral_site(work)
@@ -268,6 +274,13 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
                         "player_name", "game_date", "season", "team_abbr",
                         "opponent_abbr", "is_home", "is_neutral_site", "minutes",
                         "pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pf",
+                        # fga/fta belong here for the reason stated above, and
+                        # it is not hypothetical: 214,381 rows were already in
+                        # this table when migration 009 added the columns, so
+                        # every one of them took the DO UPDATE path. Left out,
+                        # they would have stayed NULL and the PTS model would
+                        # have gone on abstaining with the columns in place.
+                        "fga", "fta",
                         "starting_position", "source",
                     )
                 },
@@ -727,6 +740,15 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             # every bench appearance after it -- the layer cannot tell those
             # apart and does not need to, since both mean "no bucket from
             # this game".
+            # FGA/FTA: the READ side needs them too, and that is a separate
+            # place from the write side. Migration 009 added the columns and
+            # `upsert_player_game_logs` filled all 214,381 rows, and the PTS
+            # model went on abstaining -- because this dict is what becomes
+            # the panel, `features/scoring_efficiency` declares
+            # REQUIRED_COLS = ("PTS", "FGA", "FTA"), and a column absent here
+            # is absent from the matrix however well it is stored.
+            "FGA": r.fga,
+            "FTA": r.fta,
             "STARTING_POSITION": r.starting_position,
         }
         for r in result
