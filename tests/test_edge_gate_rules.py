@@ -173,8 +173,12 @@ def test_two_different_players_sharing_one_id_are_not_one_player():
     second.player_name = "Second Player"
 
     out, abstained = db.one_recommendation_per_player_market([first, second])
+    # `len` FIRST: `all()` over an empty list is true, so without this the
+    # test passes against a helper that drops every candidate it is given.
+    assert len(out) == 2
     assert abstained == 0, "two different players were treated as one"
     assert all(c.decision_status == "RECOMMENDED" for c in out)
+    assert {c.player_name for c in out} == {"First Player", "Second Player"}
 
 
 def test_two_players_sharing_a_name_are_not_one_player():
@@ -189,8 +193,10 @@ def test_two_players_sharing_a_name_are_not_one_player():
     first.player_name = second.player_name = "Mike Dunleavy"
 
     out, abstained = db.one_recommendation_per_player_market([first, second])
+    assert len(out) == 2
     assert abstained == 0, "two players with one name were treated as one"
     assert all(c.decision_status == "RECOMMENDED" for c in out)
+    assert {c.player_id for c in out} == {"p1", "p2"}
 
 
 def test_one_player_under_two_spellings_is_the_accepted_cost():
@@ -206,8 +212,10 @@ def test_one_player_under_two_spellings_is_the_accepted_cost():
     first.player_name = "PJ Washington"
     second.player_name = "P.J. Washington"
 
-    _, abstained = db.one_recommendation_per_player_market([first, second])
+    out, abstained = db.one_recommendation_per_player_market([first, second])
+    assert len(out) == 2
     assert abstained == 0
+    assert all(c.decision_status == "RECOMMENDED" for c in out)
 
 
 # --- rule 2: a stale slate yields zero, not a subset ------------------------
