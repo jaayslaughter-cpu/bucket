@@ -591,30 +591,86 @@ def market_age_limit_minutes(explicit: int | None = None) -> int | None:
     nothing reads is a knob that does nothing, which is worse than no knob --
     an operator sets it, sees no change, and concludes the gate is broken.
 
-    Set it to ``0`` or ``off`` to disable the gate deliberately.
+    Set it to ``0`` or ``off`` to disable the gate deliberately. Both sources
+    go through `_limit_from_value`, so an argument and an env var cannot come
+    to different conclusions about the same number.
     """
     if explicit is not None:
-        return explicit
+        return _limit_from_value(explicit, f"max_market_age_minutes={explicit!r}")
     raw = (os.environ.get(ENV_MAX_MARKET_AGE) or "").strip().lower()
     if not raw:
         return DEFAULT_MAX_MARKET_AGE_MINUTES
-    if raw in ("0", "off", "none", "disabled"):
+    if raw in ("off", "none", "disabled"):
         return None
+    return _limit_from_value(raw, f"${ENV_MAX_MARKET_AGE} is {raw!r}")
+
+
+def _limit_from_value(raw: Any, origin: str) -> int | None:
+    """
+    One number to one limit: zero disables, a positive whole number of
+    minutes is the limit, anything else warns and takes the default.
+
+    EVERY BRANCH HERE IS A DEFECT THAT WAS REAL. An explicit ``0`` used to
+    return straight out as ``0``, which does not disable the gate -- it sets
+    the limit to zero minutes, so every market on earth reads as stale and
+    the board comes back EMPTY. The quiet failure mode of the gate is
+    supposed to be "not wired yet", never "no plays today".
+
+    A NEGATIVE limit used to disable the gate SILENTLY, which is backwards:
+    ``-60`` is a typo, and the direction a typo must never resolve in is
+    "stop checking". It warns and takes the default now.
+
+    ``inf`` used to CRASH the board. ``int(float("inf"))`` raises
+    OverflowError, not ValueError, so an operator's ``=inf`` took down
+    board construction instead of being refused like every other
+    unusable value. (``nan`` does raise ValueError -- the two are not
+    symmetric, which is exactly why guessing the exception was wrong.)
+    """
     try:
-        value = int(float(raw))
-    except (TypeError, ValueError):
+        value = int(float(str(raw).strip()))
+    except (OverflowError, TypeError, ValueError):
         logger.warning(
-            "$%s is %r, which is not a number of minutes — using the %d-minute "
+            "%s, which is not a number of minutes — using the %d-minute "
             "default rather than guessing.",
-            ENV_MAX_MARKET_AGE, raw, DEFAULT_MAX_MARKET_AGE_MINUTES,
+            origin, DEFAULT_MAX_MARKET_AGE_MINUTES,
         )
         return DEFAULT_MAX_MARKET_AGE_MINUTES
-    return value if value > 0 else None
+    if value == 0:
+        return None
+    if value < 0:
+        logger.warning(
+            "%s, which is not a number of minutes — using the %d-minute "
+            "default rather than silently switching the staleness gate off.",
+            origin, DEFAULT_MAX_MARKET_AGE_MINUTES,
+        )
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    return value
 
 
-def _recommended_key(cand: "BettingDecisionCandidate") -> tuple[str, str]:
-    """What counts as "the same opinion" for the one-pick rule."""
-    return (str(cand.player_id or cand.player_name or ""), str(cand.target_market))
+def _recommended_key(cand: "BettingDecisionCandidate") -> tuple[str, str, str]:
+    """
+    What counts as "the same opinion" for the one-pick rule.
+
+    BOTH THE ID AND THE NAME, not ``player_id or player_name``. That first
+    version trusted the id completely, so two DIFFERENT players sharing one
+    id -- a fuzzy name-to-id resolution mapping two Williamses onto one
+    player, or a placeholder id in a fixture -- collapsed into a single key
+    and one of them lost its flag. Found by exactly that: a board of
+    "Leaner" and "Priced" under one `player_id`, where the whole model-lean
+    side of the board was being suppressed and nothing noticed, because the
+    demoted candidate stayed on the board wearing an ABSTAIN.
+
+    Silently dropping a legitimate finding is the worse of the two errors
+    available here. The other -- one real player reaching the board twice
+    under two spellings of their name -- needs a duplicate slate row for one
+    (player, market), which is an upstream defect this gate is not the right
+    place to paper over.
+    """
+    return (
+        str(cand.player_id or "").strip().lower(),
+        str(cand.player_name or "").strip().lower(),
+        str(cand.target_market),
+    )
 
 
 def one_recommendation_per_player_market(
@@ -789,6 +845,16 @@ def build_decision_board(
             "Abstained on %d candidate(s): another line on the same player "
             "and market was already recommended.", abstained,
         )
+        # DEMOTION CHANGES THE FIRST SORT KEY, so the sort above is now stale
+        # and `consider_only` was applied before any of this happened. Left
+        # alone, a demoted ABSTAIN keeps the high position it held while it
+        # was still RECOMMENDED -- so `top_n=5` could spend a slot on it and
+        # cut a genuine recommendation ranked below it, and a
+        # `consider_only=True` caller, who asked for recommendations only,
+        # would be handed an ABSTAIN. Re-apply both.
+        cands.sort(key=_sort_key)
+        if consider_only:
+            cands = [c for c in cands if c.decision_status == "RECOMMENDED"]
 
     if top_n is not None and top_n > 0:
         cands = cands[: int(top_n)]

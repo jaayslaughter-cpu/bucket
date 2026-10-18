@@ -34,7 +34,7 @@ from typing import Any
 import requests
 
 from src.ingestion import dfs_pricing
-from src.utils.http_retry import retry_after_seconds, sanitise_seconds
+from src.utils.http_retry import retry_after_seconds, valid_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -344,11 +344,12 @@ class PropLineClient:
         # retry budget against a limiter that told us how long to wait, or too
         # slow mid-slate.
         #
-        # Both paths go through `sanitise_seconds`, so the body hint gets the
+        # Both paths go through `valid_seconds`, so the body hint gets the
         # same finite/positive/capped guard as the header. A body that is not
-        # JSON, or carries no hint, falls through to the header and then to the
-        # caller's backoff -- never to a crash, because this is the code that
-        # runs when the provider is already unhappy.
+        # JSON, carries no hint, or carries an unusable one falls through to
+        # the header and then to the caller's backoff -- never to a crash,
+        # because this is the code that runs when the provider is already
+        # unhappy.
         body_hint = None
         try:
             detail = (response.json() or {}).get("detail")
@@ -357,8 +358,16 @@ class PropLineClient:
         except (ValueError, AttributeError, TypeError):
             body_hint = None
 
+        # ONLY A USABLE HINT WINS. `sanitise_seconds` cannot answer this
+        # question: it collapses "nothing usable here" into the caller's
+        # fallback, so `{"retry_after_seconds": "soon"}` arriving next to a
+        # perfectly good `Retry-After: 30` would discard the 30 and back off
+        # locally. The precedence is body, THEN header, THEN the caller --
+        # which means every step has to be able to decline.
         if body_hint is not None:
-            return sanitise_seconds(body_hint, fallback)
+            body_wait = valid_seconds(body_hint)
+            if body_wait is not None:
+                return body_wait
         return retry_after_seconds(response.headers, fallback)
 
     def _request(

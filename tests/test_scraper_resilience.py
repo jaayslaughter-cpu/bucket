@@ -498,6 +498,29 @@ def test_a_string_detail_is_not_mistaken_for_a_hint():
     assert _propline_wait(_Body(body={"detail": "rate limited"}, header="12")) == 12.0
 
 
+@pytest.mark.parametrize("hint", ["not a number", "", 0, -1, float("nan"),
+                                  float("inf"), None, [], {}])
+def test_an_unusable_body_hint_falls_back_to_the_header(hint):
+    """
+    THE PRECEDENCE IS BODY, THEN HEADER, THEN THE CALLER -- which means every
+    step has to be able to decline. The first version asked
+    `sanitise_seconds` whether the hint was usable, but that function cannot
+    say: it folds "nothing usable here" into the caller's fallback. So a
+    junk hint next to a perfectly good `Retry-After: 30` discarded the 30 and
+    backed off locally, against a limiter that had just said how long to wait.
+    """
+    assert _propline_wait(
+        _Body(body={"detail": {"retry_after_seconds": hint}}, header="30")
+    ) == 30.0
+
+
+def test_an_unusable_body_hint_with_no_header_reaches_the_caller():
+    """And with nothing anywhere, the caller's own backoff -- never a crash."""
+    assert _propline_wait(
+        _Body(body={"detail": {"retry_after_seconds": "soon"}})
+    ) == 2.0
+
+
 @pytest.mark.parametrize(
     "hint,expected",
     [

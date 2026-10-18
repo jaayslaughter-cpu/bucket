@@ -153,6 +153,63 @@ def test_the_rule_runs_after_the_sort_in_the_board():
     assert src.index("cands.sort(") < src.index(call)
 
 
+def test_two_different_players_sharing_one_id_are_not_one_player():
+    """
+    THE COLLAPSE THIS RULE CAN CAUSE, which is worse than the contradiction
+    it prevents. The key was `player_id or player_name`, so it trusted the id
+    completely: two different players carrying one id -- a fuzzy
+    name-to-id resolution mapping two Williamses together, or a shared
+    placeholder -- became one key and the second player lost its flag.
+
+    It stayed invisible because the demoted candidate remains on the board
+    wearing an ABSTAIN, so only a `consider_only` caller would ever have
+    noticed a whole player missing. `tests/test_decision_board`'s
+    `test_a_model_lean_never_outranks_a_priced_edge` was that caller, and it
+    had been silently losing its entire model-lean side.
+    """
+    first = _cand("shared-id", "PTS", "over", 24.5, score=2.0)
+    second = _cand("shared-id", "PTS", "over", 24.5, score=1.0)
+    first.player_name = "First Player"
+    second.player_name = "Second Player"
+
+    out, abstained = db.one_recommendation_per_player_market([first, second])
+    assert abstained == 0, "two different players were treated as one"
+    assert all(c.decision_status == "RECOMMENDED" for c in out)
+
+
+def test_two_players_sharing_a_name_are_not_one_player():
+    """
+    The id half of the key, and why it cannot be dropped in favour of the
+    name alone: the NBA has carried exact duplicate names, and the id is the
+    authoritative identity field. A mutation removing it survived until this
+    test existed.
+    """
+    first = _cand("p1", "PTS", "over", 24.5, score=2.0)
+    second = _cand("p2", "PTS", "over", 24.5, score=1.0)
+    first.player_name = second.player_name = "Mike Dunleavy"
+
+    out, abstained = db.one_recommendation_per_player_market([first, second])
+    assert abstained == 0, "two players with one name were treated as one"
+    assert all(c.decision_status == "RECOMMENDED" for c in out)
+
+
+def test_one_player_under_two_spellings_is_the_accepted_cost():
+    """
+    The other side of that trade, stated so it is a decision and not a
+    surprise: the same player reaching the board twice under two spellings
+    does NOT dedupe. It takes a duplicate slate row for one (player, market)
+    to get there, which is an upstream defect this gate is the wrong place to
+    paper over -- and the alternative is suppressing real findings silently.
+    """
+    first = _cand("p1", "PTS", "over", 24.5, score=2.0)
+    second = _cand("p1", "PTS", "under", 27.5, score=1.0)
+    first.player_name = "PJ Washington"
+    second.player_name = "P.J. Washington"
+
+    _, abstained = db.one_recommendation_per_player_market([first, second])
+    assert abstained == 0
+
+
 # --- rule 2: a stale slate yields zero, not a subset ------------------------
 
 
@@ -236,15 +293,10 @@ def test_an_unset_limit_falls_back_to_the_env_default():
     assert out == [], "a 30-day-old market was published under the default limit"
 
 
-def test_the_gate_can_be_disabled_deliberately():
-    import os
-
-    try:
-        os.environ[db.ENV_MAX_MARKET_AGE] = "off"
-        out = db.build_decision_board([_row()], market_as_of=_minutes_ago(43200))
-        assert out != [], "'off' did not disable the gate"
-    finally:
-        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+def test_the_gate_can_be_disabled_deliberately(monkeypatch):
+    monkeypatch.setenv(db.ENV_MAX_MARKET_AGE, "off")
+    out = db.build_decision_board([_row()], market_as_of=_minutes_ago(43200))
+    assert out != [], "'off' did not disable the gate"
 
 
 def test_an_explicit_limit_with_no_observation_time_warns(caplog):
@@ -254,10 +306,15 @@ def test_an_explicit_limit_with_no_observation_time_warns(caplog):
     board is built unguarded AND says so.
     """
     with caplog.at_level(logging.WARNING):
-        db.build_decision_board([_row()], market_as_of=None, max_market_age_minutes=60)
+        out = db.build_decision_board(
+            [_row()], market_as_of=None, max_market_age_minutes=60,
+        )
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "NOT CHECKED" in text
     assert "This is not a pass." in text
+    # The log line is not the behaviour. Without this a refusal could hide
+    # behind the warning: it would say "built unguarded" and return nothing.
+    assert out != [], "the board was refused, not built unguarded"
 
 
 def test_the_env_default_with_no_observation_time_is_silent(caplog):
@@ -274,14 +331,26 @@ def test_the_env_default_with_no_observation_time_is_silent(caplog):
 @pytest.mark.parametrize("bad", ["not a date", "", object()])
 def test_an_unparseable_observation_time_is_treated_as_unknown(bad, caplog):
     with caplog.at_level(logging.WARNING):
-        db.build_decision_board([], market_as_of=bad, max_market_age_minutes=60)
+        out = db.build_decision_board(
+            [_row()], market_as_of=bad, max_market_age_minutes=60,
+        )
     assert "NOT CHECKED" in " ".join(r.getMessage() for r in caplog.records)
+    # `_row()`, not `[]`: an empty slate returns an empty board whether the
+    # gate refused or not, so the old version of this test would have passed
+    # against an implementation that treated an unreadable timestamp as a
+    # hard refusal -- the opposite of what it claims to assert.
+    assert out != [], "an unreadable timestamp became a refusal"
 
 
 def test_market_age_handles_naive_and_aware_timestamps():
     """A naive observation time against an aware now (or the reverse) must
     not raise -- this runs on the publication path."""
+    # naive observation, aware now
     assert db.market_age_minutes("2026-10-20T17:00:00", NOW) == pytest.approx(60.0)
+    # aware observation, NAIVE now -- the other branch, which nothing reached
+    assert db.market_age_minutes(
+        NOW - pd.Timedelta(minutes=45), NOW.tz_localize(None),
+    ) == pytest.approx(45.0)
     assert db.market_age_minutes(NOW - pd.Timedelta(minutes=30), NOW) == pytest.approx(30.0)
     assert db.market_age_minutes(None) is None
 
@@ -302,48 +371,144 @@ def test_pairing_is_same_book_same_point_both_sides():
     already pairs on (book, market, player, point); the test is here so a
     future change to that key is a deliberate one.
     """
-    import inspect
-
     from src.ingestion import propline
 
-    src = inspect.getsource(propline.normalize_event_props)
-    assert "(book_key, stat, player, point_value)" in src
+    # One player, one market, four outcomes: two books x two points, with
+    # each side split across the pair. If the key were player-alone, or
+    # dropped the book or the point, these would splice together.
+    payload = {
+        "id": "0022600001",
+        "commence_time": "2026-10-20T23:00:00Z",
+        "bookmakers": [
+            {
+                "key": book,
+                "markets": [{
+                    "key": "player_points",
+                    "outcomes": [
+                        {"name": "Over", "description": "A Player",
+                         "point": point, "price": -110},
+                        {"name": "Under", "description": "A Player",
+                         "point": point, "price": -110},
+                    ],
+                }],
+            }
+            for book in ("draftkings", "fanduel")
+            for point in (24.5, 27.5)
+        ],
+    }
+
+    rows = propline.normalize_event_props(payload)
+    keys = {(r.source, r.market, r.player_name, r.line) for r in rows}
+    assert len(rows) == 4, f"rows collapsed or multiplied: {len(rows)}"
+    assert keys == {
+        ("draftkings", "PTS", "A Player", 24.5),
+        ("draftkings", "PTS", "A Player", 27.5),
+        ("fanduel", "PTS", "A Player", 24.5),
+        ("fanduel", "PTS", "A Player", 27.5),
+    }
+    # Both sides landed on ONE row per key -- that is what "paired" means.
+    for row in rows:
+        assert (
+            row.over_odds_american is not None
+            and row.under_odds_american is not None
+        ), f"{row.source} {row.line} did not pair both sides"
 
 
-def test_the_env_var_is_actually_read():
+def test_the_env_var_is_actually_read(monkeypatch):
     """
     `tests/test_scheduler_worker` caught this: the limit's env var existed
     only as a name in a log line, so an operator could set it, see no change,
     and conclude the gate was broken. A documented knob that does nothing is
     worse than no knob.
     """
-    import os
-
-    os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+    monkeypatch.delenv(db.ENV_MAX_MARKET_AGE, raising=False)
     assert db.market_age_limit_minutes() == db.DEFAULT_MAX_MARKET_AGE_MINUTES
-    try:
-        os.environ[db.ENV_MAX_MARKET_AGE] = "90"
-        assert db.market_age_limit_minutes() == 90
-        assert db.market_age_limit_minutes(15) == 15, "an explicit limit must win"
-        for off in ("0", "off", "none", "disabled"):
-            os.environ[db.ENV_MAX_MARKET_AGE] = off
-            assert db.market_age_limit_minutes() is None, f"{off!r} did not disable"
-    finally:
-        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+    monkeypatch.setenv(db.ENV_MAX_MARKET_AGE, "90")
+    assert db.market_age_limit_minutes() == 90
+    assert db.market_age_limit_minutes(15) == 15, "an explicit limit must win"
+    for off in ("0", "off", "none", "disabled"):
+        monkeypatch.setenv(db.ENV_MAX_MARKET_AGE, off)
+        assert db.market_age_limit_minutes() is None, f"{off!r} did not disable"
 
 
-def test_an_unparseable_limit_falls_back_rather_than_guessing(caplog):
-    import os
+@pytest.mark.parametrize("bad", ["soon", "inf", "-inf", "nan", "60 minutes", "-60"])
+def test_an_unusable_limit_falls_back_rather_than_guessing(bad, caplog, monkeypatch):
+    """
+    EVERY UNUSABLE VALUE LANDS IN THE SAME PLACE: a warning and the default.
 
-    try:
-        os.environ[db.ENV_MAX_MARKET_AGE] = "soon"
-        with caplog.at_level(logging.WARNING):
-            assert db.market_age_limit_minutes() == db.DEFAULT_MAX_MARKET_AGE_MINUTES
-        assert "not a number of minutes" in " ".join(
-            r.getMessage() for r in caplog.records
-        )
-    finally:
-        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+    `inf` is the one that mattered. `int(float("inf"))` raises OverflowError
+    where `nan` raises ValueError, so catching ValueError alone let an
+    operator's `=inf` crash board construction rather than be refused. And
+    `-60` used to return None, switching the staleness gate off silently --
+    a typo must never resolve in the direction of "stop checking".
+    """
+    monkeypatch.setenv(db.ENV_MAX_MARKET_AGE, bad)
+    with caplog.at_level(logging.WARNING):
+        assert db.market_age_limit_minutes() == db.DEFAULT_MAX_MARKET_AGE_MINUTES
+    assert "not a number of minutes" in " ".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_an_explicit_zero_disables_the_gate_rather_than_emptying_the_board():
+    """
+    A LIMIT OF ZERO IS NOT A LIMIT OF ZERO MINUTES. `explicit` used to return
+    straight out, so `max_market_age_minutes=0` -- documented as the way to
+    turn the gate off -- set the limit to zero instead and every market on
+    earth read as stale. The caller asked for no gate and got an empty board.
+    """
+    assert db.market_age_limit_minutes(0) is None
+    out = db.build_decision_board(
+        [_row()], market_as_of=_minutes_ago(43200), max_market_age_minutes=0,
+    )
+    assert out != [], "an explicit 0 emptied the board instead of disabling the gate"
+
+
+def test_an_explicit_negative_limit_warns_and_takes_the_default(caplog):
+    """Same rule as the env var, because both go through one reader."""
+    with caplog.at_level(logging.WARNING):
+        assert db.market_age_limit_minutes(-60) == db.DEFAULT_MAX_MARKET_AGE_MINUTES
+    assert "not a number of minutes" in " ".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_a_demoted_candidate_does_not_keep_its_place(caplog):
+    """
+    DEMOTION INVALIDATES THE SORT. The abstain pass runs after `cands.sort()`
+    and after the `consider_only` filter, so a candidate demoted to ABSTAIN
+    kept the high position it held while it was still RECOMMENDED. `top_n=1`
+    then spent its only slot on the abstention and cut the genuine
+    recommendation ranked below it, and `consider_only=True` -- which means
+    "recommendations only" -- handed back an ABSTAIN.
+    """
+    rows = [
+        # Two lines on ONE player: the second is demoted by the abstain pass.
+        _row(research_line=24.5, model_p_over=0.70, model_p_under=0.30),
+        _row(research_line=27.5, model_p_over=0.62, model_p_under=0.38),
+        # A genuine second recommendation, ranked BELOW the one that gets
+        # demoted (lean 0.08 against 0.12) -- so a stale sort puts the
+        # abstention above it and `top_n=2` cuts this one instead.
+        _row(player_id="p2", player_name="B Player",
+             research_line=20.5, model_p_over=0.58, model_p_under=0.42),
+    ]
+
+    unfiltered = db.build_decision_board(rows)
+    assert [c.decision_status for c in unfiltered].count("ABSTAIN") >= 1, (
+        "fixture demoted nothing, so this test proves nothing"
+    )
+
+    out = db.build_decision_board(rows, consider_only=True, top_n=2)
+    assert len(out) == 2, f"expected two recommendations, got {len(out)}"
+    assert all(c.decision_status == "RECOMMENDED" for c in out), (
+        "consider_only returned an ABSTAIN: "
+        f"{[(c.player_name, c.line, c.decision_status) for c in out]}"
+    )
+    assert {c.player_name for c in out} == {"Demo", "B Player"}, (
+        "the demoted line kept its place and cut a real recommendation: "
+        f"{[(c.player_name, c.line) for c in out]}"
+    )
+    assert [c.rank for c in out] == [1, 2]
 
 
 def test_a_caller_passing_no_observation_time_is_unaffected():
