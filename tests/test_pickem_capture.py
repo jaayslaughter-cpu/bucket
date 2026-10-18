@@ -57,10 +57,14 @@ SYNTHETIC_BOARD = {
     ],
     "lines": [
         {"id": "l1", "player_ref": "p1", "stat": "points", "value": "24.5",
-         "multiplier": 1.0, "observed_at": "2026-10-18T17:28:00Z",
+         "multiplier": 1.0, "multiplier_under": 1.0,
+         "higher_odds": "-120", "lower_odds": "-114", "higher_decimal": "1.84",
+         "observed_at": "2026-10-18T17:28:00Z",
          "tip": "2026-10-19T02:10:00Z"},
         {"id": "l2", "player_ref": "p2", "stat": "rebounds", "value": 9.5,
-         "multiplier": 1.25, "observed_at": "2026-10-18T17:28:00Z",
+         "multiplier": 1.25, "multiplier_under": 1.0,
+         "higher_odds": "-135", "lower_odds": "+105",
+         "observed_at": "2026-10-18T17:28:00Z",
          "tip": "2026-10-19T02:10:00Z"},
         {"id": "l3", "player_ref": "p3", "stat": "points", "value": 18.5,
          "multiplier": 1.0},
@@ -85,7 +89,10 @@ SYNTHETIC_MAPPING = {
                 "player_name": ["lookup:players:player_ref:full_name"],
                 "market": ["stat"],
                 "line": ["value"],
+                "over_odds_american": ["higher_odds"],
+                "under_odds_american": ["lower_odds"],
                 "payout_multiplier": ["multiplier"],
+                "payout_multiplier_under": ["multiplier_under"],
                 "captured_at_utc": ["observed_at"],
                 "team_abbr": ["lookup:players:player_ref:team"],
                 "game_time": ["tip"],
@@ -116,21 +123,59 @@ def board_file(tmp_path):
 
 
 @pytest.mark.parametrize("source", ["underdog", "sleeper"])
-def test_the_shipped_config_declares_no_board_paths(source):
+def test_a_shipped_path_is_backed_by_a_stated_source(source):
     """
-    THE CENTRAL CLAIM OF THIS SUBSYSTEM. If a default path ever appears here
-    without somebody having recorded a real response, this test is the thing
-    that was supposed to stop it.
+    THE CENTRAL CLAIM OF THIS SUBSYSTEM, in the form it takes now.
+
+    It used to be "no paths are shipped at all", because nobody here had seen
+    a response. On 2026-10-18 the Apify Actor listings supplied documented
+    output records, so paths ARE shipped -- and the claim becomes: a shipped
+    path must be traceable to a stated source. `verified_against` is where
+    that statement lives, and a mapping with paths and no provenance is the
+    thing this test exists to catch.
+    """
+    import yaml
+
+    shipped = yaml.safe_load(open("config/pickem_sources.yaml", encoding="utf-8"))
+    config = load_source_config(source)
+    has_paths = any(config.fields.get(name) for name in REQUIRED_FIELDS)
+    if has_paths:
+        provenance = (shipped.get("verified_against") or "").strip()
+        assert provenance, (
+            f"{source} ships field paths with no `verified_against` in "
+            f"config/pickem_sources.yaml. A path nobody can trace to a real "
+            f"response is an invented API payload."
+        )
+        assert shipped.get("as_of"), "paths are shipped with no `as_of` date"
+
+
+@pytest.mark.parametrize("source", ["underdog", "sleeper"])
+def test_a_paid_transport_ships_switched_off(source):
+    """
+    The Apify Actors bill per line. `enabled` is the only thing between an
+    unattended scheduled capture and somebody's balance, so it ships false
+    and `configured` must READ it -- a flag that reads as off and is never
+    consulted is worse than no flag.
     """
     config = load_source_config(source)
-    assert not config.configured
-    for name in REQUIRED_FIELDS:
-        assert config.fields[name] == (), (
-            f"config/pickem_sources.yaml ships a path for {source}.{name}. If it "
-            f"came from a recorded response, say so in `verified_against` and "
-            f"update this test; if it came from memory, it is an invented API "
-            f"payload and must come out."
-        )
+    assert config.enabled is False, (
+        f"{source} ships enabled, and its transport bills per line"
+    )
+    assert not config.configured, (
+        "a disabled source reports configured, so a capture would run and bill"
+    )
+
+
+@pytest.mark.parametrize("source", ["underdog", "sleeper"])
+def test_a_disabled_source_makes_no_paid_call(monkeypatch, source):
+    """The guarantee behind that flag, asserted rather than assumed."""
+    def _refuse(*a, **k):
+        raise AssertionError("a disabled source started a paid Apify run")
+
+    monkeypatch.setattr(pickem_board, "fetch_apify_dataset", _refuse)
+    puller = {"underdog": underdog_props.pull_underdog_board,
+              "sleeper": sleeper_props.pull_sleeper_board}[source]
+    assert puller().status == STATUS_NOT_CONFIGURED
 
 
 @pytest.mark.parametrize("source", ["underdog", "sleeper"])
@@ -149,12 +194,17 @@ def test_an_unconfigured_source_is_not_reported_as_an_empty_board(source):
 
 
 @pytest.mark.parametrize("source", ["underdog", "sleeper"])
-def test_the_unconfigured_message_names_the_file_and_the_missing_keys(source):
+def test_the_unconfigured_message_names_the_file_and_what_is_missing(source):
+    """
+    What is missing changed when the mapping was filled in: for both sources
+    it is now `enabled`, not the field paths. The message has to name the
+    thing that is actually blocking, or an operator edits the wrong line.
+    """
     puller = {"underdog": underdog_props.pull_underdog_board,
               "sleeper": sleeper_props.pull_sleeper_board}[source]
     message = puller().message or ""
     assert "config/pickem_sources.yaml" in message
-    assert "fields.player_name" in message
+    assert "enabled: true" in message
     assert "--describe" in message, "it says what is missing but not how to find it"
 
 
@@ -440,30 +490,104 @@ def test_non_json_is_reported():
 # --- a pick'em row can never look like a two-way price ----------------------
 
 
-def test_a_captured_row_is_always_pickem_flagged(mapping_file):
+def test_underdog_at_multiplier_one_is_not_flagged_as_pickem(mapping_file):
+    """
+    THE DEFECT THIS FILE SHIPPED WITH, now a test. The first version of
+    `to_prop_line_row` forced ``is_pickem=True`` on every captured row, and
+    this test asserted it -- so the test encoded the mistake rather than
+    catching it.
+
+    `ingestion/propline` had carried the correct answer for months, with the
+    reasoning written out: PrizePicks quotes synthetic prices and IS a pick'em
+    board however numeric they look, while **Underdog at payout_multiplier
+    1.0 is a genuine two-way price**. `market_ev_gate` abstains when
+    `is_pickem` is set OR `payout_multiplier` is not None, so flagging a
+    standard Underdog pick threw away a de-viggable quote and then set two
+    flags to make sure nothing could use it.
+
+    The Apify Actor made it concrete: it returns higher/lower American odds at
+    multiplier "1.0". `dfs_pricing.classify` is now the one rule both callers
+    read.
+    """
     config = load_source_config("underdog", mapping_file)
     lines, _, _ = rows_from_payload(SYNTHETIC_BOARD, config)
-    for row in (line.to_prop_line_row() for line in lines):
-        assert row.is_pickem is True, (
-            "a pick'em row reached the pipeline unflagged, so market_ev_gate "
-            "would de-vig a payout multiplier as though it were a price"
+    row = lines[0].to_prop_line_row()
+    assert row.is_pickem is False, (
+        "a standard Underdog pick was flagged pick'em, so market_ev_gate "
+        "will abstain on a real two-way price"
+    )
+    assert row.payout_multiplier is None, (
+        "a 1.0 multiplier was recorded; the gate abstains whenever it is set"
+    )
+
+
+def test_prizepicks_is_pickem_however_numeric_its_prices_look():
+    """The other half of the same rule, and the reason it is not just
+    'multiplier == 1.0 means two-way'."""
+    from src.ingestion.pickem_schema import PickemPropLine
+
+    row = PickemPropLine(
+        source="prizepicks", player_name="A Player", market="PTS", line=24.5,
+        over_odds_american=100, under_odds_american=100,
+        payout_multiplier=1.0, payout_multiplier_under=1.0,
+    ).to_prop_line_row()
+    assert row.is_pickem is True
+
+
+def test_a_boost_on_either_side_alone_makes_the_row_abstain():
+    """
+    The board posts a multiplier PER SIDE. Reading only the over side would
+    pass a row boosted on the under -- whose quoted prices no longer carry
+    the full payout -- straight into the EV gate as comparable.
+    """
+    from src.ingestion.pickem_schema import PickemPropLine
+
+    for over, under in ((1.0, 1.5), (1.25, 1.0), (1.0, 0.8)):
+        row = PickemPropLine(
+            source="underdog", player_name="A Player", market="PTS", line=24.5,
+            over_odds_american=-120, under_odds_american=-114,
+            payout_multiplier=over, payout_multiplier_under=under,
+        ).to_prop_line_row()
+        assert row.payout_multiplier is not None, (
+            f"a row boosted {over}/{under} was recorded as an ordinary price"
         )
 
 
-def test_a_captured_row_carries_no_odds_at_all(mapping_file):
-    """Absent, not 0 and not +100: a board that posts no price must not
-    produce a number something downstream could price from."""
+def test_both_sides_odds_survive_the_conversion(mapping_file):
+    """
+    What the first version discarded. A board that publishes per-side
+    American odds must not have them dropped on the way in -- that is the
+    one thing making the row de-viggable at all.
+    """
     config = load_source_config("underdog", mapping_file)
     lines, _, _ = rows_from_payload(SYNTHETIC_BOARD, config)
-    for row in (line.to_prop_line_row() for line in lines):
-        assert row.over_odds_american is None
-        assert row.under_odds_american is None
+    row = lines[0].to_prop_line_row()
+    assert (row.over_odds_american, row.under_odds_american) == (-120, -114)
 
 
-def test_the_multiplier_survives_the_conversion(mapping_file):
-    config = load_source_config("underdog", mapping_file)
-    lines, _, _ = rows_from_payload(SYNTHETIC_BOARD, config)
-    assert [line.to_prop_line_row().payout_multiplier for line in lines] == [1.0, 1.25]
+def test_a_board_posting_no_price_leaves_the_odds_absent():
+    """Absent, never 0 and never a synthetic +100: a number here is something
+    downstream could price from."""
+    from src.ingestion.pickem_schema import PickemPropLine
+
+    row = PickemPropLine(
+        source="sleeper", player_name="A Player", market="PTS", line=24.5
+    ).to_prop_line_row()
+    assert row.over_odds_american is None
+    assert row.under_odds_american is None
+
+
+def test_decimal_odds_are_not_mistaken_for_american_ones():
+    """
+    The Actor emits BOTH -- `higher_american_odds: "-120"` and
+    `higher_decimal_odds: "1.84"`. A mapping pointed at the decimal field by
+    mistake must yield no price rather than the integer 1.
+    """
+    from src.ingestion.propline import _american
+
+    assert _american("-120") == -120
+    assert _american("1.84") is None
+    assert _american("0") is None
 
 
 # --- the archive ------------------------------------------------------------
@@ -675,3 +799,326 @@ def test_the_forbidden_leagues_are_checked_before_the_allowlist():
     from src.ingestion.pickem_schema import FORBIDDEN_LEAGUES
 
     assert "ncaa" in FORBIDDEN_LEAGUES and "college" in FORBIDDEN_LEAGUES
+
+
+# --- the Apify transport: a PAID run ----------------------------------------
+#
+# The one documented output record from the Actor listing, verbatim, so the
+# shipped mapping is checked against the thing it was written from rather than
+# against a shape invented for the test. It is the MLB example -- the only
+# full record the listing publishes -- with its league left as MLB so the NBA
+# filter can be exercised on it too.
+
+DOCUMENTED_ACTOR_RECORD = {
+    "projection_id": "4d9eeecb-42c7-46bb-8463-62521b312df9",
+    "line": 1.5,
+    "stat": "hits_runs_rbis",
+    "stat_display": "Hits + Runs + RBIs",
+    "status": "active",
+    "is_live": False,
+    "flash_line": None,
+    "rank": 1101351010500,
+    "updated_at": "2026-04-07T07:17:21Z",
+    "player_name": "José Ramírez",
+    "player_team": "CLE",
+    "player_team_name": "Cleveland Guardians",
+    "player_position": "3B",
+    "player_position_full": "Third Baseman",
+    "player_country": None,
+    "player_image": "https://assets.underdogfantasy.com/player-images/mlb/x.png",
+    "player_jersey": "11",
+    "player_id": "92506501-2fd3-478f-a749-bcd02919ece8",
+    "league": "MLB",
+    "game_start": "2026-04-07T17:10:00Z",
+    "game_status": "scheduled",
+    "season_type": "regular",
+    "home_team": "CLE",
+    "away_team": "KC",
+    "home_team_name": "Cleveland Guardians",
+    "away_team_name": "Kansas City Royals",
+    "line_type": "balanced",
+    "live_event_stat": None,
+    "category": "player_prop",
+    "has_alternates": True,
+    "provider": "swish",
+    "expires_at": None,
+    "higher_american_odds": "-120",
+    "higher_decimal_odds": "1.84",
+    "higher_payout_multiplier": "1.0",
+    "lower_american_odds": "-114",
+    "lower_decimal_odds": "1.88",
+    "lower_payout_multiplier": "1.0",
+    "venue_name": "Progressive Field",
+    "venue_type": "outdoor",
+    "weather_condition": None,
+    "weather_temperature": None,
+    "home_pitcher": "G. Williams",
+    "away_pitcher": "N. Cameron",
+    "home_pitcher_hand": "RHP",
+    "away_pitcher_hand": "LHP",
+}
+
+
+def _nba_variant(**overrides):
+    """The documented record as an NBA row, so the shipped mapping can be run
+    against it. Only the fields the mapping reads are changed."""
+    row = dict(DOCUMENTED_ACTOR_RECORD)
+    row.update({
+        "league": "NBA",
+        "stat": "points",
+        "stat_display": "Points",
+        "line": 24.5,
+        "player_team": "LAL",
+    })
+    row.update(overrides)
+    return row
+
+
+def test_the_shipped_underdog_mapping_reads_the_documented_record():
+    """
+    The shipped paths, against the Actor's own published output. If this fails
+    the mapping in config/pickem_sources.yaml no longer matches what that
+    listing documents.
+    """
+    config = load_source_config("underdog")
+    # `enabled` is false by design, so the mapping is exercised directly.
+    lines, unresolved, dropped = rows_from_payload(
+        {"items": [_nba_variant()]}, config
+    )
+    assert len(lines) == 1, f"unresolved={unresolved} dropped={dropped}"
+    line = lines[0]
+    assert line.player_name == "José Ramírez"
+    assert line.market == "PTS"
+    assert line.line == 24.5
+    assert (line.over_odds_american, line.under_odds_american) == (-120, -114)
+    assert line.payout_multiplier == 1.0
+    assert line.payout_multiplier_under == 1.0
+    assert line.team_abbr == "LAL"
+    assert line.board_id == "4d9eeecb-42c7-46bb-8463-62521b312df9"
+    assert line.captured_at_utc == datetime(2026, 4, 7, 7, 17, 21, tzinfo=UTC)
+
+
+def test_the_documented_record_becomes_a_de_viggable_row():
+    """The whole point of carrying both sides: a standard Underdog pick must
+    reach the pipeline as a two-way price, not as an abstention."""
+    config = load_source_config("underdog")
+    lines, _, _ = rows_from_payload({"items": [_nba_variant()]}, config)
+    row = lines[0].to_prop_line_row()
+    assert row.is_pickem is False
+    assert row.payout_multiplier is None
+    assert (row.over_odds_american, row.under_odds_american) == (-120, -114)
+
+
+def test_a_non_nba_row_is_dropped_by_the_shipped_filter():
+    """The Actor input asks for NBA only; the filter is the belt to that
+    brace, because a league filter that silently stopped working would bill
+    for and ingest every other sport."""
+    config = load_source_config("underdog")
+    lines, _, dropped = rows_from_payload(
+        {"items": [DOCUMENTED_ACTOR_RECORD]}, config
+    )
+    assert lines == []
+    assert dropped.get("not NBA") == 1
+
+
+def test_a_compound_stat_maps_through_the_display_name():
+    """
+    The listing documents NBA display names ("Pts + Rebs + Asts") but not
+    their machine keys, so only the display spelling is shipped for compound
+    stats and `stat_display` is what has to match them.
+    """
+    config = load_source_config("underdog")
+    row = _nba_variant(stat="some_unpublished_key", stat_display="Pts + Rebs + Asts")
+    lines, _, dropped = rows_from_payload({"items": [row]}, config)
+    assert [line.market for line in lines] == ["PRA"], f"dropped={dropped}"
+
+
+def test_an_unknown_stat_is_dropped_rather_than_guessed():
+    config = load_source_config("underdog")
+    row = _nba_variant(stat="double_double", stat_display="Double-Double")
+    lines, _, dropped = rows_from_payload({"items": [row]}, config)
+    assert lines == []
+    assert any("unmapped market" in reason for reason in dropped)
+
+
+def test_a_bare_dataset_array_is_wrapped_so_the_rows_path_is_stable(monkeypatch):
+    """
+    run-sync-get-dataset-items answers with the item array itself. The
+    mapping's `rows` path has to mean the same thing either way, so the
+    transport wraps a bare list rather than the parser special-casing it.
+    """
+    class _Resp:
+        status_code = 200
+        headers: dict = {}
+
+        @staticmethod
+        def json():
+            return [_nba_variant()]
+
+    class _Session:
+        def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setenv("APIFY_API_TOKEN", "tok")
+    payload, status, error = pickem_board.fetch_apify_dataset(
+        {"actor": "zen-studio/underdog-player-props"}, session=_Session()
+    )
+    assert error is None and status == 200
+    assert isinstance(payload, dict) and isinstance(payload["items"], list)
+
+
+def test_the_actor_slug_uses_apifys_url_form():
+    """`owner/name` is the slug people write; `owner~name` is what the URL
+    takes, which is the form the Actor listing's own API examples use."""
+    assert (
+        pickem_board.apify_actor_slug("zen-studio/underdog-player-props")
+        == "zen-studio~underdog-player-props"
+    )
+
+
+def test_no_run_is_attempted_without_a_token(monkeypatch):
+    """A paid call needs a credential; without one this must not reach the
+    network at all."""
+    monkeypatch.delenv("APIFY_API_TOKEN", raising=False)
+
+    class _Session:
+        def post(self, *a, **k):
+            raise AssertionError("a run was attempted with no token")
+
+    payload, status, error = pickem_board.fetch_apify_dataset(
+        {"actor": "zen-studio/underdog-player-props"}, session=_Session()
+    )
+    assert payload is None
+    assert "APIFY_API_TOKEN" in (error or "")
+    assert "bill per line" in (error or "")
+
+
+def test_the_token_never_appears_in_an_error(monkeypatch):
+    monkeypatch.setenv("APIFY_API_TOKEN", "apify_api_SECRETVALUE")
+
+    class _Resp:
+        status_code = 401
+        headers: dict = {}
+
+    class _Session:
+        def post(self, *a, **k):
+            return _Resp()
+
+    _, _, error = pickem_board.fetch_apify_dataset(
+        {"actor": "zen-studio/underdog-player-props"}, session=_Session()
+    )
+    assert "SECRETVALUE" not in (error or "")
+    assert "rotate it" in (error or "")
+
+
+def test_the_token_goes_in_a_header_not_the_query_string(monkeypatch):
+    """A key in a URL lands in access logs, proxy logs and any Referer sent
+    onward. Same rule as propline._auth_headers."""
+    monkeypatch.setenv("APIFY_API_TOKEN", "tok")
+    seen: dict = {}
+
+    class _Resp:
+        status_code = 200
+        headers: dict = {}
+
+        @staticmethod
+        def json():
+            return []
+
+    class _Session:
+        def post(self, url, **kwargs):
+            seen["url"] = url
+            seen["headers"] = kwargs.get("headers") or {}
+            return _Resp()
+
+    pickem_board.fetch_apify_dataset(
+        {"actor": "zen-studio/underdog-player-props"}, session=_Session()
+    )
+    assert "tok" not in seen["url"]
+    assert seen["headers"]["Authorization"] == "Bearer tok"
+
+
+@pytest.mark.parametrize("status,needle", [(401, "rotate it"), (402, "payment"), (404, "no Actor")])
+def test_a_credential_or_billing_problem_is_named_and_not_retried(
+    monkeypatch, status, needle
+):
+    monkeypatch.setenv("APIFY_API_TOKEN", "tok")
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = status
+        headers: dict = {}
+
+    class _Session:
+        def post(self, *a, **k):
+            calls["n"] += 1
+            return _Resp()
+
+    _, got, error = pickem_board.fetch_apify_dataset(
+        {"actor": "zen-studio/underdog-player-props"}, session=_Session()
+    )
+    assert got == status
+    assert needle in (error or "")
+    assert calls["n"] == 1, f"HTTP {status} was retried {calls['n']} times"
+
+
+def test_the_nba_only_input_is_what_ships():
+    """
+    Cost and correctness are the same decision here: every line from another
+    league would be billed and then dropped by the filter.
+    """
+    config = load_source_config("underdog")
+    assert config.apify["input"]["leagues"] == ["NBA"]
+    stat_types = config.apify["input"]["statTypes"]
+    for stat in ("Points", "Rebounds", "Assists"):
+        assert stat in stat_types
+
+
+def test_the_cost_of_a_paid_transport_is_stated_in_the_config():
+    """
+    An operator flipping `enabled` has to be able to see the price without
+    leaving the file.
+    """
+    text = open("config/pickem_sources.yaml", encoding="utf-8").read()
+    assert "$0.15 per 1,000" in text
+    assert "enabled: false" in text
+
+
+def test_the_market_field_prefers_the_path_that_maps_not_the_first_that_resolves(
+    mapping_file,
+):
+    """
+    Found by the test above failing. Every other field takes the first
+    candidate path holding a value; `market` must take the first holding a
+    RECOGNISED stat. The Actor emits `stat` and `stat_display`, and its
+    listing publishes NBA display names but not the compound stats' machine
+    keys -- so an unpublished key in `stat` would win the race and drop a row
+    `stat_display` maps correctly.
+    """
+    config = load_source_config("underdog", mapping_file)
+    both = type(config)(
+        **{**config.__dict__, "fields": {**config.fields, "market": ("stat", "stat_alt")}}
+    )
+    payload = {
+        "players": [{"pid": "p1", "full_name": "Example Player", "sport": "NBA"}],
+        "lines": [{
+            "id": "l1", "player_ref": "p1",
+            "stat": "an_unpublished_key",   # resolves, maps to nothing
+            "stat_alt": "points",           # resolves AND maps
+            "value": 24.5,
+        }],
+    }
+    lines, _, dropped = rows_from_payload(payload, both)
+    assert [line.market for line in lines] == ["PTS"], f"dropped={dropped}"
+
+
+def test_an_unmapped_market_names_the_value_it_actually_saw(mapping_file):
+    """The drop reason has to carry the board's own spelling, or an operator
+    cannot add it to `market_aliases`."""
+    config = load_source_config("underdog", mapping_file)
+    payload = {
+        "players": [{"pid": "p1", "full_name": "Example Player", "sport": "NBA"}],
+        "lines": [{"id": "l1", "player_ref": "p1", "stat": "fantasy_points", "value": 30.5}],
+    }
+    _, _, dropped = rows_from_payload(payload, config)
+    assert any("fantasy_points" in reason for reason in dropped)

@@ -57,7 +57,22 @@ FORBIDDEN_LEAGUES = ("ncaa", "college")
 #: a statistic or a number is not a partial row, it is not a row.
 REQUIRED_FIELDS = ("player_name", "market", "line")
 OPTIONAL_FIELDS = (
+    #: BOTH SIDES' AMERICAN ODDS, where the board publishes them. Underdog
+    #: does: the Apify actor returns `higher_american_odds` / 
+    #: `lower_american_odds`, higher being OVER. Capturing a line without
+    #: them and then flagging the row would discard a genuinely de-viggable
+    #: two-way price, which is what the first version of this module did.
+    "over_odds_american",
+    "under_odds_american",
+    #: PrizePicks' standard / goblin / demon. Read by `dfs_pricing`.
+    "dfs_odds_type",
+    #: ONE MULTIPLIER PER SIDE, because the board posts one per side. The
+    #: Apify Underdog actor returns `higher_payout_multiplier` AND
+    #: `lower_payout_multiplier`, and a boost on one side alone is exactly
+    #: the case that makes a row look like an edge when it is a different
+    #: product. Reading only one of them would miss half of those.
     "payout_multiplier",
+    "payout_multiplier_under",
     "captured_at_utc",
     "team_abbr",
     "opponent_abbr",
@@ -86,7 +101,14 @@ class PickemPropLine:
     #: looks like a board that never moved. Same rule as
     #: `PropLineRow.captured_at_utc`.
     captured_at_utc: datetime | None = None
+    #: As the board posted them. "Higher" is OVER and "lower" is UNDER.
+    over_odds_american: int | None = None
+    under_odds_american: int | None = None
+    #: The board's own product label, where it has one (PrizePicks).
+    dfs_odds_type: str | None = None
+    #: The OVER/higher side's multiplier, and the UNDER/lower side's.
     payout_multiplier: float | None = None
+    payout_multiplier_under: float | None = None
     team_abbr: str | None = None
     opponent_abbr: str | None = None
     game_time: datetime | None = None
@@ -95,30 +117,63 @@ class PickemPropLine:
     player_id: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def boosted_payout_multiplier(self) -> float | None:
+        """
+        Whichever side is furthest from 1.0, or None when neither is.
+
+        A boost or discount on ONE side makes the whole row incomparable --
+        the quoted prices no longer carry the full payout -- so the side that
+        departs from 1.0 is the one `dfs_pricing` has to be asked about.
+        Reading the over side alone would pass a row boosted on the under.
+        """
+        candidates = [
+            value
+            for value in (self.payout_multiplier, self.payout_multiplier_under)
+            if value is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda value: abs(value - 1.0))
+
     def to_prop_line_row(self) -> Any:
         """
-        The same row in the pipeline's own shape, as a pick'em row.
+        The same row in the pipeline's own shape.
 
-        `is_pickem` is forced True here rather than passed in. It is the flag
-        `market_ev_gate` reads to refuse EV on a one-way price, and a caller
-        that could choose it would eventually choose wrong -- on the one path
-        where a multiplier would be treated as a de-viggable quote.
+        WHETHER THIS IS A PICK'EM ROW IS NOT DECIDED HERE. The first version
+        of this method forced ``is_pickem=True``, dropped both sides' odds and
+        passed the multiplier straight through -- four decisions, every one of
+        them contradicting the rule `ingestion/propline` had carried for
+        months. `market_ev_gate` abstains when `is_pickem` is set OR
+        `payout_multiplier` is not None, so for a standard Underdog pick at
+        multiplier 1.0 -- which publishes real per-side American odds -- that
+        threw away a de-viggable two-way price and then set two flags to make
+        sure nothing could use it.
+
+        `dfs_pricing.classify` is that rule, and both callers now read it.
         """
+        from src.ingestion.dfs_pricing import classify
         from src.ingestion.propline import PropLineRow
 
+        pricing = classify(
+            self.source,
+            dfs_odds_type=self.dfs_odds_type,
+            payout_multiplier=self.boosted_payout_multiplier,
+        )
         return PropLineRow(
             source=self.source,
             player_name=self.player_name,
             market=self.market,
             line=self.line,
-            # A pick'em board posts no two-way price. Not 0, not +100: absent.
-            over_odds_american=None,
-            under_odds_american=None,
+            # As posted. A board that publishes no price leaves these None --
+            # absent, never 0 and never a synthetic +100.
+            over_odds_american=self.over_odds_american,
+            under_odds_american=self.under_odds_american,
             nba_player_id=self.player_id,
             game_date=self.game_date,
             captured_at_utc=self.captured_at_utc,
-            is_pickem=True,
-            payout_multiplier=self.payout_multiplier,
+            is_pickem=pricing.is_pickem,
+            payout_multiplier=pricing.stored_payout_multiplier,
             status=STATUS_VALID,
             raw=self.raw,
         )
@@ -267,16 +322,27 @@ class PickemSourceConfig:
     sport_keep_values: tuple[str, ...]
     local_dir: str | None
     market_aliases: dict[str, str]
+    #: How the bytes arrive: "http" (a public board URL), "local" (operator-
+    #: supplied JSON) or "apify" (a paid Actor run).
+    transport: str = "http"
+    #: The `apify` block, when transport is "apify".
+    apify: dict[str, Any] = field(default_factory=dict)
 
     @property
     def configured(self) -> bool:
         """
         Whether this source can produce a row at all.
 
-        A board URL with no row path, or row paths with no required field, is
-        NOT configured. Reporting it as configured and then returning nothing
-        is the "quiet night" failure this contract exists to prevent.
+        `enabled` IS PART OF THIS, and that matters more since a transport
+        can cost money: the Apify actors bill per line. A flag that reads as
+        off and is never consulted is how an unattended scheduled capture
+        spends somebody's balance. A board URL with no row path, or row paths
+        with no required field, is likewise not configured -- reporting
+        configured and then returning nothing is the "quiet night" failure
+        this contract exists to prevent.
         """
+        if not self.enabled:
+            return False
         if not self.rows_paths:
             return False
         return all(self.fields.get(name) for name in REQUIRED_FIELDS)
@@ -284,6 +350,11 @@ class PickemSourceConfig:
     def why_not_configured(self) -> str:
         """What exactly to fill in, by name."""
         missing: list[str] = []
+        if not self.enabled:
+            missing.append(
+                "`enabled: true` (off by default — a capture through a paid "
+                "transport must be switched on deliberately)"
+            )
         if not self.rows_paths:
             missing.append("`rows` (the path to the array of lines)")
         for name in REQUIRED_FIELDS:
@@ -359,6 +430,8 @@ def load_source_config(
         ),
         local_dir=spec.get("local_dir"),
         market_aliases=aliases,
+        transport=str(spec.get("transport") or "http").strip().lower(),
+        apify=dict(spec.get("apify") or {}),
     )
 
 
@@ -489,12 +562,29 @@ def rows_from_payload(
             drop("no player")
             continue
 
-        raw_market, _ = _resolve_field(row, config.fields.get("market", ()), lookups)
+        # MARKET RESOLVES DIFFERENTLY FROM EVERY OTHER FIELD, and it has to.
+        # `first_resolved` takes the first candidate path that holds a value;
+        # for a market the first path that holds a RECOGNISED STAT is what is
+        # wanted, and those are not the same. The Apify Actor emits both
+        # `stat` (machine key) and `stat_display` (display name), and its
+        # listing publishes NBA display names but not the machine keys for
+        # the compound stats -- so an unpublished key in `stat` would win the
+        # race and drop a row that `stat_display` maps perfectly well.
+        market, raw_market = None, None
+        for path in config.fields.get("market", ()):
+            value, _ = _resolve_field(row, (path,), lookups)
+            if value is None:
+                continue
+            if raw_market is None:
+                raw_market = value  # remembered for the message
+            hit = config.market_aliases.get(str(value).strip().lower())
+            if hit is not None:
+                market, raw_market = hit, value
+                break
         if raw_market is None:
             miss("market")
             drop("no market")
             continue
-        market = config.market_aliases.get(str(raw_market).strip().lower())
         if market is None:
             drop(f"unmapped market {str(raw_market)[:40]!r}")
             continue
@@ -508,6 +598,21 @@ def rows_from_payload(
 
         multiplier = _as_float(
             _resolve_field(row, config.fields.get("payout_multiplier", ()), lookups)[0]
+        )
+        multiplier_under = _as_float(
+            _resolve_field(
+                row, config.fields.get("payout_multiplier_under", ()), lookups
+            )[0]
+        )
+        # Parsed by PropLine's own reader: "-120" is a price, "1.84" is
+        # DECIMAL odds and must not be mistaken for one, and 0 is not a price.
+        from src.ingestion.propline import _american
+
+        over_odds = _american(
+            _resolve_field(row, config.fields.get("over_odds_american", ()), lookups)[0]
+        )
+        under_odds = _american(
+            _resolve_field(row, config.fields.get("under_odds_american", ()), lookups)[0]
         )
         captured = _as_datetime(
             _resolve_field(row, config.fields.get("captured_at_utc", ()), lookups)[0]
@@ -539,7 +644,11 @@ def rows_from_payload(
                 market=market,
                 line=line,
                 captured_at_utc=captured,
+                over_odds_american=over_odds,
+                under_odds_american=under_odds,
+                dfs_odds_type=text("dfs_odds_type"),
                 payout_multiplier=multiplier,
+                payout_multiplier_under=multiplier_under,
                 team_abbr=text("team_abbr"),
                 opponent_abbr=text("opponent_abbr"),
                 game_time=game_time,

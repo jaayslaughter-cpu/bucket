@@ -160,6 +160,139 @@ def newest_local_payload(directory: str | Path) -> tuple[Any, str | None, str | 
         return None, str(newest), f"{newest} is not readable JSON: {exc}"
 
 
+
+# ---------------------------------------------------------------------------
+# the Apify transport: a PAID Actor run
+# ---------------------------------------------------------------------------
+
+#: Standard Apify REST. The `owner~name` slug form is the one the Actor's own
+#: listing uses (`GET /v2/acts/zen-studio~underdog-player-props/builds/
+#: default`); the run-sync path is Apify's documented synchronous run. Kept in
+#: config as `apify.endpoint` so a change at their end is an edit, not a
+#: release.
+APIFY_RUN_SYNC_TEMPLATE = (
+    "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
+)
+ENV_APIFY_TOKEN = "APIFY_API_TOKEN"
+
+#: An Actor run is not a page fetch. These boards take tens of seconds.
+APIFY_TIMEOUT_SECONDS = 180.0
+
+
+def apify_actor_slug(actor: str) -> str:
+    """``owner/name`` as Apify's URL form ``owner~name``."""
+    return str(actor).strip().replace("/", "~")
+
+
+def fetch_apify_dataset(
+    spec: dict[str, Any],
+    *,
+    session: requests.Session | None = None,
+) -> tuple[Any, int | None, str | None]:
+    """
+    Run one Apify Actor synchronously and return its dataset items.
+
+    THIS CALL COSTS MONEY -- these Actors bill per line captured -- so it is
+    reached only from a source whose `enabled` is true, and nothing here
+    retries a refusal or a payment problem. Never raises, and never logs the
+    token.
+    """
+    import os
+
+    actor = str(spec.get("actor") or "").strip()
+    if not actor:
+        return None, None, "the apify block names no `actor`"
+
+    token_env = str(spec.get("token_env") or ENV_APIFY_TOKEN)
+    token = (os.environ.get(token_env) or "").strip()
+    if not token:
+        return None, None, (
+            f"${token_env} is not set, so no Apify run was attempted. Get a "
+            f"token from https://console.apify.com/account/integrations. These "
+            f"Actors bill per line: see the cost note in "
+            f"config/pickem_sources.yaml before the first paid run."
+        )
+
+    template = str(spec.get("endpoint") or APIFY_RUN_SYNC_TEMPLATE)
+    url = template.format(actor=apify_actor_slug(actor))
+    run_input = dict(spec.get("input") or {})
+    timeout = float(spec.get("timeout_seconds") or APIFY_TIMEOUT_SECONDS)
+
+    http = session or requests
+    delay = BACKOFF_BASE
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = http.post(
+                url,
+                json=run_input,
+                headers={
+                    # The token goes in a header, never the query string: a
+                    # key in a URL lands in access logs, proxy logs and any
+                    # Referer sent onward. Same rule as `propline._auth_headers`.
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            if attempt == MAX_ATTEMPTS:
+                return None, None, f"{type(exc).__name__}: {exc}"
+            time.sleep(delay)
+            delay *= 2
+            continue
+
+        status = response.status_code
+
+        if status in (401, 403):
+            # A credential problem. Retrying spends nothing but tells us
+            # nothing either, and the token must not appear in the message.
+            return None, status, (
+                f"Apify rejected the token (HTTP {status}). Check ${token_env}; "
+                f"rotate it if it may have been exposed."
+            )
+        if status == 402:
+            return None, status, (
+                "Apify reports a payment or plan limit (HTTP 402). These "
+                "Actors bill per line; nothing was captured."
+            )
+        if status == 404:
+            return None, status, (
+                f"Apify has no Actor {actor!r} (HTTP 404), or the run-sync "
+                f"path has moved. Check `apify.actor` and `apify.endpoint` in "
+                f"config/pickem_sources.yaml."
+            )
+        if status == 429 or status >= 500:
+            if attempt == MAX_ATTEMPTS:
+                return None, status, f"Apify HTTP {status} after {attempt} attempt(s)"
+            wait = retry_after_seconds(response.headers, delay)
+            logger.warning(
+                "Apify %s — HTTP %s, waiting %.1fs (attempt %d/%d)",
+                actor, status, wait, attempt, MAX_ATTEMPTS,
+            )
+            time.sleep(wait)
+            delay *= 2
+            continue
+        if status >= 400:
+            return None, status, f"Apify HTTP {status}"
+
+        try:
+            items = response.json()
+        except ValueError as exc:
+            return None, status, f"Apify returned non-JSON: {exc}"
+
+        # run-sync-get-dataset-items answers with the ITEM ARRAY itself. The
+        # mapping's `rows` path is read against whatever shape arrives, so a
+        # bare list is wrapped under a known key rather than special-cased
+        # in the parser.
+        if isinstance(items, list):
+            return {"items": items}, status, None
+        return items, status, None
+
+    return None, None, f"Apify unreachable after {MAX_ATTEMPTS} attempts"
+
+
 def capture(
     config: PickemSourceConfig,
     *,
@@ -192,6 +325,10 @@ def capture(
             error = None
         except (OSError, ValueError) as exc:
             payload, error = None, f"{from_file} is not readable JSON: {exc}"
+    elif config.transport == "apify":
+        payload, http_status, error = fetch_apify_dataset(
+            config.apify, session=session
+        )
     elif config.board_url:
         payload, http_status, error = fetch_board_payload(
             config.board_url, session=session

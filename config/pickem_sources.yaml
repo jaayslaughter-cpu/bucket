@@ -1,100 +1,162 @@
-# config/pickem_sources.yaml — where each pick'em board lives and how to read it.
+# config/pickem_sources.yaml — where each pick'em board comes from, and how to
+# read it.
 #
-# UNCONFIGURED ON PURPOSE. Every `board_url` below is null and every field
-# mapping is empty, because nobody working on this repository has seen a live
-# board response: the build container cannot reach either host (the
-# environment's network policy denies them). Filling these in with plausible
-# key names would be inventing an API payload, which `AGENTS.md` forbids
-# outright. Until an operator fills a source in, its client reports
-# NOT_CONFIGURED and names this file. It never reports an empty board, because
-# "we are not set up" and "the board posted nothing" send you to two different
-# places.
+# ============================  COST  ========================================
+# The Apify Actors below BILL PER LINE: $0.15 per 1,000, and lines excluded by
+# the filters are not billed. Both sources ship with `enabled: false` and
+# nothing runs until that is flipped, deliberately, per source — an unattended
+# capture is exactly where an unread flag spends somebody's balance.
 #
-# HOW TO FILL ONE IN, without guessing:
+# The Actor listing publishes per-league counts for other leagues, not for NBA:
+# MLB ~2,300 lines/day (~$0.35), NFL ~3,900 (~$0.59), College Football ~1,900,
+# all 21 leagues ~11,500 (~$1.73). NBA's own count is NOT published there, so
+# treat a full NBA board as somewhere in the $0.29–$0.59 range per pull and
+# measure it on the first run rather than trusting that estimate. The free tier
+# is 5 lifetime runs at 50 results each — enough to verify this mapping without
+# paying anything.
 #
-#   1. From a machine that can reach the board, save one response:
-#        curl -sS '<board url>' > /tmp/underdog_board.json
-#   2. Print its real paths and sample values:
-#        python -m scripts.pull_pickem_props --describe /tmp/underdog_board.json
-#   3. Copy the paths you want into `rows` and `fields` below. `rows` is the
-#      path to the ARRAY of lines; every `fields` path is read RELATIVE to one
-#      row of that array.
-#   4. Check it against the same file before trusting it on the wire:
-#        python -m scripts.pull_pickem_props --source underdog --from-file /tmp/underdog_board.json
+# `statTypes` below is set to the markets this project actually models, which
+# is both a cost control and a correctness one: a line we cannot map is a line
+# we should not be billed for.
+# ============================================================================
 #
-# Each field takes a LIST of candidate paths, tried in order. That is how a
-# shape change is rolled through: add the new path above the old one, deploy,
-# and remove the old one once the board has moved. A field whose candidates
-# all fail is reported as unresolved, by name, and its row is dropped.
+# VERIFIED AGAINST: the Actor listings' own documented output records, supplied
+# 2026-10-18. NOT against a live run — this build container cannot reach
+# api.apify.com. So check it before trusting it, which costs nothing:
+#
+#   1. Record one response (free tier, or from a machine with network):
+#        python -m scripts.pull_pickem_props --source underdog > /tmp/run.log
+#      or save an Apify dataset export to /tmp/board.json
+#   2. Print its real paths:
+#        python -m scripts.pull_pickem_props --describe /tmp/board.json
+#   3. Run the mapping against that file, free and offline:
+#        python -m scripts.pull_pickem_props --source underdog --from-file /tmp/board.json
+#
+# Each field takes a LIST of candidate paths, tried in order, read RELATIVE to
+# one row of `rows`. That is how a shape change is rolled through: add the new
+# path above the old one, deploy, remove the old one once the board has moved.
+# A field whose candidates all fail is reported as unresolved, by name.
 #
 # `lookups` handles a NORMALISED payload — entities in sibling arrays keyed by
-# id rather than nested inside each row. Declare the array and its id field,
-# then reference it from a field path as:
-#     lookup:<name>:<path to the id, relative to the row>:<path inside the entity>
+# id. Declare the array and its id field, then reference it as:
+#     lookup:<name>:<path to the id, relative to the row>:<path in the entity>
 #
-# RESEARCH_ONLY. Lines and multipliers, captured with a timestamp. A pick'em
-# multiplier is not a two-way price and is never treated as one.
+# RESEARCH_ONLY. Lines, odds and multipliers, captured with a timestamp.
 
-as_of: null  # set to the date you verified the mapping against a real response
-verified_against: null  # e.g. "recorded board response 2026-10-20"
+as_of: "2026-10-18"
+verified_against: >
+  zen-studio/underdog-player-props and zen-studio/sleeper-player-props Actor
+  listings (documented output records), 2026-10-18. Not yet checked against a
+  live run from this repository.
 
 sources:
 
   underdog:
+    # OFF until somebody decides to spend money. See the cost block above.
     enabled: false
-    # The board endpoint. No credential: if a board needs one, it is not a
-    # public board and capturing it is not what was approved.
+    transport: apify
+    apify:
+      actor: zen-studio/underdog-player-props
+      token_env: APIFY_API_TOKEN
+      # Overridable so a path change at Apify is a config edit, not a release.
+      # endpoint: https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items
+      timeout_seconds: 180
+      input:
+        # NBA ONLY. This project models nothing else, and every other league
+        # on the board would be billed and then dropped by `sport_filter`.
+        leagues: ["NBA"]
+        # The markets this project models, as the listing documents them for
+        # NBA. Display names are accepted alongside machine keys, and these
+        # are copied from the listing verbatim rather than guessed.
+        statTypes: "Points, Rebounds, Assists, 3-Pointers Made, Steals, Blocks, Pts + Rebs + Asts"
     board_url: null
-    # Overridable per deployment without editing this file.
-    url_env: PROPIQ_UNDERDOG_BOARD_URL
-    # Only NBA rows are kept. The filter runs on whatever path `fields.sport`
-    # resolves to; with no mapping it keeps nothing rather than everything.
-    sport_filter:
-      field_paths: []
-      keep_values: ["NBA", "basketball_nba"]
-    rows: []
+    local_dir: null
+
+    # The Actor emits one row per prop with BOTH sides embedded, so `rows` is
+    # the dataset item array itself. `pickem_board` wraps a bare JSON array
+    # under `items` so this path is stable either way.
+    rows: ["items"]
     lookups: {}
+
+    sport_filter:
+      field_paths: ["league"]
+      keep_values: ["NBA"]
+
     fields:
-      player_name: []
-      market: []
-      line: []
-      payout_multiplier: []
-      captured_at_utc: []
-      team_abbr: []
+      player_name: ["player_name"]
+      # Machine key first ("points"), display name as the fallback ("Points").
+      # Both are emitted, and `market_aliases` below lists both spellings, so
+      # a renamed machine key still maps through `stat_display`.
+      market: ["stat", "stat_display"]
+      line: ["line"]
+      # BOTH SIDES. "Higher" is OVER, "lower" is UNDER — the listing says so
+      # outright. These are real American odds at multiplier 1.0, which is
+      # why `dfs_pricing` does NOT flag a standard Underdog pick as pick'em.
+      over_odds_american: ["higher_american_odds"]
+      under_odds_american: ["lower_american_odds"]
+      dfs_odds_type: []
+      payout_multiplier: ["higher_payout_multiplier"]
+      payout_multiplier_under: ["lower_payout_multiplier"]
+      # The board's own last-changed time, not when we read it.
+      captured_at_utc: ["updated_at"]
+      team_abbr: ["player_team"]
       opponent_abbr: []
-      game_time: []
-      board_id: []
-      player_id: []
+      game_time: ["game_start"]
+      board_id: ["projection_id"]
+      player_id: ["player_id"]
 
   sleeper:
+    # OFF until somebody decides to spend money. See the cost block above.
     enabled: false
-    # SLEEPER HAS NO PUBLIC PICK'EM BOARD. Recorded in docs/pickem_props.md
-    # from a logged-in check on 2026-09-15: sleeper.com/nba is scores and
-    # recap, sleeper.com/picks is marketing and an app install, and Player
-    # Picks appear app-gated. So the sanctioned path here is OPERATOR-SUPPLIED
-    # JSON, not a scrape and not a bot-wall bypass. Drop board responses in
-    # `local_dir` and the client reads the newest one.
+    # The 2026-09-15 logged-in check found no readable public Sleeper board
+    # (sleeper.com/nba is scores and recap, /picks is marketing and an app
+    # install, Player Picks app-gated), so capture goes through the Actor.
+    # Operator-supplied JSON in `local_dir` remains the free alternative and
+    # the `--from-file` path uses it.
+    transport: apify
+    apify:
+      actor: zen-studio/sleeper-player-props
+      token_env: APIFY_API_TOKEN
+      timeout_seconds: 180
+      input:
+        leagues: ["NBA"]
     board_url: null
-    url_env: PROPIQ_SLEEPER_BOARD_URL
     local_dir: data/external/pickem/sleeper
-    rows: []
-    lookups: {}
-    fields:
-      player_name: []
-      market: []
-      line: []
-      payout_multiplier: []
-      captured_at_utc: []
-      team_abbr: []
-      opponent_abbr: []
-      game_time: []
-      board_id: []
-      player_id: []
 
-  # PrizePicks is deliberately absent. docs/pickem_props.md bans getting past
-  # a Cloudflare / Akamai / DataDome wall, and its board was expected to be
-  # behind one. Its lines already reach this pipeline through PropLine's
-  # DFS_BOOKS, which is the sanctioned route.
+    # UNVERIFIED FOR THIS ACTOR. The listing states its field names are
+    # aligned with the Underdog and PrizePicks Actors "where fields overlap",
+    # and names `player_name`, `stat`, `line`, `league` and `game_start` as
+    # shared — but it publishes no full example record of its own. So the
+    # shared fields are mapped and the rest are left empty rather than
+    # assumed: run `--describe` over one response and fill them in.
+    rows: ["items"]
+    lookups: {}
+
+    sport_filter:
+      field_paths: ["league"]
+      keep_values: ["NBA"]
+
+    fields:
+      player_name: ["player_name"]
+      market: ["stat", "stat_display"]
+      line: ["line"]
+      over_odds_american: []
+      under_odds_american: []
+      dfs_odds_type: []
+      payout_multiplier: []
+      payout_multiplier_under: []
+      captured_at_utc: ["updated_at"]
+      team_abbr: ["player_team"]
+      opponent_abbr: []
+      game_time: ["game_start"]
+      board_id: []
+      player_id: ["player_id"]
+
+  # PrizePicks is deliberately absent. `zen-studio/prizepicks-player-props`
+  # exists and would fit this same transport, but PrizePicks lines already
+  # reach this pipeline through PropLine's DFS_BOOKS, and PropLine timestamps
+  # and normalises them for us at no extra cost per line. Adding it here would
+  # be a second reader of the same board.
 
 # Board market name -> the stat this project models. A board market that maps
 # to none of these is reported as unmapped, never guessed into the nearest
@@ -103,14 +165,19 @@ sources:
 #
 # THE KEYS ARE NOT A SECOND LIST OF STATS. They must all appear in
 # `propline.DEFAULT_MARKET_MAP`, which is where this project decides what it
-# models; `tests/test_pickem_capture.py` fails if one does not. The VALUES are
-# board spellings and are guesses about nothing -- a spelling that never
-# appears simply never matches.
+# models; `tests/test_pickem_capture.py` fails if one does not.
+#
+# The VALUES hold both spellings the Actor emits. The NBA display names come
+# from the listing verbatim; the machine keys for the simple stats follow the
+# documented pattern (`Points` -> `points`), and for the COMPOUND stats the
+# machine key is NOT published, so only the display name is listed for those
+# and `stat_display` is what matches them.
 market_aliases:
-  PTS: ["points", "pts", "player_points"]
-  REB: ["rebounds", "reb", "player_rebounds", "total_rebounds"]
-  AST: ["assists", "ast", "player_assists"]
-  FG3M: ["three_points_made", "fg3m", "threes", "player_threes"]
-  STL: ["steals", "stl", "player_steals"]
-  BLK: ["blocks", "blk", "player_blocks"]
-  PRA: ["pts_rebs_asts", "pra", "points_rebounds_assists", "player_points_rebounds_assists"]
+  PTS: ["points", "Points", "player_points", "pts"]
+  REB: ["rebounds", "Rebounds", "player_rebounds", "reb", "total_rebounds"]
+  AST: ["assists", "Assists", "player_assists", "ast"]
+  FG3M: ["3-pointers made", "three_points_made", "threes", "player_threes", "fg3m"]
+  STL: ["steals", "Steals", "player_steals", "stl"]
+  BLK: ["blocks", "Blocks", "player_blocks", "blk"]
+  PRA: ["pts + rebs + asts", "pts_rebs_asts", "points_rebounds_assists",
+        "player_points_rebounds_assists", "pra"]

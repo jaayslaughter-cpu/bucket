@@ -33,6 +33,7 @@ from typing import Any
 
 import requests
 
+from src.ingestion import dfs_pricing
 from src.utils.http_retry import retry_after_seconds
 
 logger = logging.getLogger(__name__)
@@ -727,31 +728,36 @@ def _is_outcome_live(outcome: dict[str, Any], market_last_update: datetime | Non
 
 def _dfs_row_is_comparable(book_key: str, outcome: dict[str, Any]) -> tuple[bool, str | None]:
     """
-    Decide whether a DFS row is comparable to sportsbook consensus.
+    Whether a DFS row is comparable to sportsbook consensus.
 
-    Two separate traps, both of which make a row look like a mispriced edge
-    when it is simply a different product:
-
-    - PrizePicks posts ``goblin`` (easier line, lower payout) and ``demon``
-      (harder line, higher payout) alongside its ``standard`` market line.
-      Only ``standard`` is the market line.
-    - Underdog scales payouts with ``payout_multiplier``. Anything but 1.0
-      is a boost or discount, so the quoted price does not carry the full
-      payout and cannot be compared like-for-like.
+    THE RULE ITSELF IS NOT HERE ANY MORE. It moved to
+    `ingestion/dfs_pricing.classify` when the pick'em capture clients became
+    a second caller and got it wrong -- flagging a standard Underdog pick as
+    pick'em, which makes the EV gate abstain on a genuinely de-viggable
+    two-way price. This reads the one rule and keeps the signature its
+    callers and tests use.
     """
-    dfs_type = outcome.get("dfs_odds_type")
-    if dfs_type is not None and str(dfs_type).lower() != "standard":
-        return False, f"PrizePicks {dfs_type} line, not the standard market line"
+    pricing = dfs_pricing.classify(
+        book_key,
+        dfs_odds_type=outcome.get("dfs_odds_type"),
+        payout_multiplier=outcome.get("payout_multiplier"),
+    )
+    return pricing.comparable, pricing.reason
 
-    multiplier = outcome.get("payout_multiplier")
-    if multiplier is not None:
-        try:
-            value = float(multiplier)
-        except (TypeError, ValueError):
-            return False, f"unreadable payout_multiplier {multiplier!r}"
-        if abs(value - 1.0) > 1e-9:
-            return False, f"payout_multiplier {value} — boosted/discounted pick"
-    return True, None
+
+def _pricing_for_row(book_key: str, data: dict[str, Any]) -> dfs_pricing.DfsPricing:
+    """`dfs_pricing.classify` for an already-paired row.
+
+    Rows reaching this point already passed `_dfs_row_is_comparable`, so the
+    multiplier here is absent or 1.0 and the classification is about which
+    BOOK it came from. Asking the shared rule anyway, rather than restating
+    its conclusion, is what stops the two drifting again.
+    """
+    return dfs_pricing.classify(
+        book_key,
+        dfs_odds_type=data.get("dfs_odds_type"),
+        payout_multiplier=data.get("payout_multiplier"),
+    )
 
 
 def normalize_event_props(
@@ -892,16 +898,18 @@ def normalize_event_props(
             nba_game_id=event_id,
             game_date=game_date,
             captured_at_utc=data["captured_at"],
+            # BOTH OF THESE COME FROM ONE RULE, `dfs_pricing.classify`.
             # PrizePicks quotes synthetic +100/+100 whose real payout comes
             # from parlay correct-count, so it is a pick'em board however
-            # numeric its prices look. Underdog at multiplier 1.0 is a
-            # genuine two-way price and is NOT flagged — see below.
-            is_pickem=(book_key == "prizepicks"),
-            # Only a real scaling factor lands here. A standard 1.0 pick is
-            # left None on purpose: market_ev_gate abstains whenever this is
-            # set, and treating "multiplier present and equal to 1.0" as a
-            # pick'em would throw away Underdog's real de-viggable prices.
-            payout_multiplier=None,
+            # numeric its prices look; Underdog at multiplier 1.0 is a
+            # genuine two-way price and is NOT flagged. A standard 1.0 pick
+            # stores no multiplier on purpose: market_ev_gate abstains
+            # whenever it is set, and recording "present and equal to 1.0"
+            # would throw away Underdog's real de-viggable prices.
+            is_pickem=_pricing_for_row(book_key, data).is_pickem,
+            payout_multiplier=_pricing_for_row(
+                book_key, data
+            ).stored_payout_multiplier,
             status="VALID",
             raw=raw,
         ))

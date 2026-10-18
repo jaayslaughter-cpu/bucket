@@ -1,22 +1,51 @@
 # Timestamped pick'em prop-line sources
 
-> ## STATUS: BUILT, SHIPPED UNCONFIGURED.
+> ## STATUS: BUILT AND MAPPED. SHIPPED SWITCHED OFF, BECAUSE IT COSTS MONEY.
 >
-> The Underdog and Sleeper capture clients were written on 2026-10-18. What
-> this document described for a year, and did not have, now exists:
-> `src/ingestion/pickem_schema.py`, `src/ingestion/pickem_board.py`,
-> `src/ingestion/pickem_store.py`, `src/ingestion/pickem.py`,
-> `src/ingestion/underdog_props.py`, `src/ingestion/sleeper_props.py`,
-> `scripts/pull_pickem_props.py`, `config/pickem_sources.yaml`.
+> **Provider decision (2026-10-18):** Underdog and Sleeper boards are captured
+> through the Apify Actors `zen-studio/underdog-player-props` and
+> `zen-studio/sleeper-player-props`, not by scraping either site ourselves.
+> The field mapping in `config/pickem_sources.yaml` is written from those
+> Actors' own documented output records.
 >
-> **They ship with no board URLs and no field paths, on purpose.** Nobody
-> working on this repository has seen a live response from either board: the
-> build container's network policy denies both hosts, so no payload shape here
-> is anybody's recollection. Each source reports `NOT_CONFIGURED` — never an
-> empty board — and names what to fill in. The three steps are in the header of
-> `config/pickem_sources.yaml` and start with recording one response and
-> running `python -m scripts.pull_pickem_props --describe <file>`, which prints
-> that response's real paths.
+> **This bills per line: $0.15 per 1,000, and filtered-out lines are not
+> billed.** Both sources therefore ship `enabled: false`, and
+> `PickemSourceConfig.configured` reads that flag, so nothing can run and
+> spend until somebody flips it deliberately. The Actor listing publishes
+> per-league counts for other leagues but not NBA (MLB ~2,300/day ≈ $0.35,
+> NFL ~3,900 ≈ $0.59, all 21 leagues ~11,500 ≈ $1.73), so treat a full NBA
+> board as roughly $0.29–$0.59 a pull and **measure it on the first run**. The
+> free tier is 5 lifetime runs at 50 results each, which is enough to verify
+> the mapping for nothing.
+>
+> **Why a paid provider rather than a direct client.** A direct client would
+> mean reading Underdog's internal endpoint ourselves, and the thing that
+> makes that work from a datacentre is the bot-wall handling this document
+> bans below. The Actor operates its own residential-proxy infrastructure —
+> that is a service we buy, not evasion we build, the same relationship this
+> project already has with PropLine. `AGENTS.md` §5 permits it under the
+> pick'em carve-out ("Pick'em capture ... is timestamped research only"); it
+> is not another sportsbook odds API and it is not us scraping.
+>
+> **What is NOT verified.** No live run has happened from this repository —
+> this build container's network policy denies `api.apify.com`. The mapping
+> matches the published output records and is exercised against the Underdog
+> listing's full 46-field example in `tests/test_pickem_capture.py`. Sleeper's
+> listing publishes no full example, so only the fields it states are shared
+> with the Underdog Actor are mapped and the rest are left empty rather than
+> assumed. Check both for free before trusting either:
+>
+>     python -m scripts.pull_pickem_props --describe /tmp/board.json
+>     python -m scripts.pull_pickem_props --source underdog --from-file /tmp/board.json
+>
+> **An Underdog row is a two-way price, not a pick'em row.** The Actor returns
+> `higher_american_odds` and `lower_american_odds` at
+> `payout_multiplier: "1.0"`, and `ingestion/dfs_pricing` — the one rule this
+> and `ingestion/propline` both read — does **not** flag it. The first version
+> of the capture adapter did, dropping both prices and setting two flags that
+> make `market_ev_gate` abstain. See that module's docstring. PrizePicks is
+> still pick'em however numeric its prices look, and a boost on **either**
+> side makes a row incomparable.
 >
 > **History, kept because the lesson was expensive.** Until 2026-10-18 this
 > document described the whole subsystem in the present tense — a status table
@@ -30,8 +59,9 @@
 >
 > Still not written, deliberately:
 >
-> - `src/ingestion/prizepicks_props.py` (planned) — bot-walled, and getting
->   past one is banned below.
+> - `src/ingestion/prizepicks_props.py` (planned) — `zen-studio/prizepicks-player-props`
+>   would fit the same transport, but PropLine already delivers PrizePicks
+>   lines through `DFS_BOOKS` at no per-line cost. A second reader of one board.
 > - `src/ingestion/sleeper.py` (planned) — player metadata. Injuries come from
 >   ESPN via `src/ingestion/espn_availability.py`, so nothing waits on it.
 
@@ -59,18 +89,20 @@ Web notes (logged-in check 2026-09-15):
 
 | Source | Client | State |
 |--------|--------|-------|
-| **Underdog** | `src/ingestion/underdog_props.py` | Built. Unconfigured: set `board_url` (or `$PROPIQ_UNDERDOG_BOARD_URL`) and the field paths. Underdog lines already reach the pipeline via PropLine's `DFS_BOOKS`; this captures the board on our own clock, which that route cannot give |
-| **Sleeper** | `src/ingestion/sleeper_props.py` | Built. Reads **operator-supplied JSON** from `data/external/pickem/sleeper/`, because the 2026-09-15 logged-in check found no readable public board: sleeper.com/nba is scores and recap, sleeper.com/picks is marketing and an app install, Player Picks app-gated. If a public path is ever found, set `board_url` and the same client fetches it with no code change |
-| **PrizePicks** | `src/ingestion/prizepicks_props.py` (planned) | Not written. Its board was expected behind a bot wall; see "Still banned" |
+| **Underdog** | `src/ingestion/underdog_props.py` | Built and mapped from the Actor's documented 46-field record. `enabled: false` — flipping it starts billing. NBA-only input, with `statTypes` narrowed to the markets this project models, which is both a cost control and a correctness one |
+| **Sleeper** | `src/ingestion/sleeper_props.py` | Built. Same transport; only the fields its listing states are shared with the Underdog Actor are mapped, the rest left empty rather than assumed. Operator-supplied JSON in `data/external/pickem/sleeper/` remains the free path and is what `--from-file` reads |
+| **PrizePicks** | `src/ingestion/prizepicks_props.py` (planned) | Not written. Its lines arrive via PropLine's `DFS_BOOKS` already |
 
-Shared by both: `src/ingestion/pickem_board.py` reads the bytes (wire or file),
-`src/ingestion/pickem_schema.py` holds the contract and the path mapper,
-`src/ingestion/pickem_store.py` archives each snapshot, and
-`src/ingestion/pickem.py` runs the batch.
+Shared by all of them: `src/ingestion/pickem_board.py` reads the bytes (Apify
+run, public URL, or recorded file), `src/ingestion/pickem_schema.py` holds the
+contract and the path mapper, `src/ingestion/dfs_pricing.py` decides whether a
+row is a two-way price, `src/ingestion/pickem_store.py` archives each snapshot,
+and `src/ingestion/pickem.py` runs the batch.
 
 **Not wired into the slate.** `pickem.pickem_prop_line_rows()` is the seam, and
-`main.ingest_prop_lines` does not call it yet: with every source unconfigured it
-would add a step that can only report nothing.
+`main.ingest_prop_lines` does not call it: a step that bills per line does not
+belong in an unattended slate run until somebody has watched it cost what they
+expect.
 
 ## Capture contract
 
@@ -89,6 +121,16 @@ Pick'em rows carry **lines + optional multipliers**, not verified two-way
 American odds. EV and CLV need a two-way price, which only a sportsbook feed
 posts — PropLine here. Do not mark pick'em rows as
 `MarketContext.status=VALID` for stake math.
+
+### Which rows are actually pick'em
+
+`src/ingestion/dfs_pricing.py` is the single reader. PrizePicks is a pick'em
+board however numeric its prices look; **Underdog at payout multiplier 1.0 is
+a genuine two-way price and is not flagged**; a multiplier away from 1.0 on
+either side is a boost or discount and makes the row incomparable; PrizePicks
+`goblin` and `demon` are different products from its `standard` line. The
+paragraph above applies to rows that rule calls pick'em — not to every row
+that happens to come from a DFS operator.
 
 ### Wave 4: pick'em vs book line-diff
 
