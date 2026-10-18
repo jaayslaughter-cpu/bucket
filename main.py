@@ -743,7 +743,21 @@ def ingest_prop_lines(guideline: dict[str, Any] | None, persist: bool = True) ->
         books = list(guideline["approved_prop_sources"])
         logger.info("Prop books from master guideline: %s", books)
 
-    snapshots = pull_nba_prop_lines(bookmakers=books)
+    # THE DOCSTRING ABOVE PROMISED THIS AND THE CODE DID NOT DO IT. Only the
+    # import was guarded; the pull itself was not, so any error that escaped
+    # `pull_nba_prop_lines` -- and a restructured payload did exactly that --
+    # propagated out of step [3] and ended the run. Every later stage, all of
+    # which abstain perfectly well on zero prop rows, never got to run.
+    try:
+        snapshots = pull_nba_prop_lines(bookmakers=books)
+    except Exception as exc:  # noqa: BLE001 — an optional source, isolated
+        logger.exception(
+            "PROP-LINE INGEST FAILED, and the slate continues without it: %s. "
+            "Downstream stages abstain on missing prop lines; they cannot "
+            "abstain on a pipeline that stopped at step [3].",
+            exc,
+        )
+        return pd.DataFrame()
     rows: list[dict[str, Any]] = []
     for snap in snapshots:
         if snap.status != "VALID":

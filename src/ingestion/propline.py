@@ -33,6 +33,8 @@ from typing import Any
 
 import requests
 
+from src.utils.http_retry import retry_after_seconds
+
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://api.prop-line.com/v1"
@@ -322,12 +324,17 @@ class PropLineClient:
 
     @staticmethod
     def _retry_after_seconds(response: requests.Response, fallback: float) -> float:
-        """Honour Retry-After when the provider sends it."""
-        raw = response.headers.get("Retry-After")
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return fallback
+        """
+        Honour Retry-After when the provider sends it -- under the one rule.
+
+        THIS WAS THE WEAKEST OF THREE COPIES and it decided what happened in
+        production. ``max(0.0, float(raw))`` accepted everything: measured,
+        ``inf`` reached `time.sleep` and raised OverflowError, ``86400`` would
+        have slept a slate job for a day with no timeout above it, and ``nan``
+        and ``-1`` both collapsed to 0.0 -- an instant retry against the very
+        limiter that asked for a pause.
+        """
+        return retry_after_seconds(response.headers, fallback)
 
     def _request(
         self,
@@ -987,7 +994,26 @@ def pull_nba_prop_lines(
             failures.append(f"event {event_id}: {exc}")
             continue
 
-        for row in normalize_event_props(payload, mapping):
+        # PARSED INSIDE THE LOOP'S GUARD, not after it. `normalize_event_props`
+        # reads with `.get` and `or []` throughout, so a RENAMED key is handled
+        # -- it yields no rows. A RESTRUCTURED one is not: measured, a payload
+        # whose `bookmakers` arrives as an object keyed by book name (or whose
+        # `markets`/`outcomes` do) iterates strings and raises AttributeError,
+        # which escaped this function, escaped `main.ingest_prop_lines`, and
+        # took down the entire slate -- features, scoring, notification -- over
+        # an optional source. One event's unreadable shape is one event's
+        # failure.
+        try:
+            parsed = normalize_event_props(payload, mapping)
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            failures.append(
+                f"event {event_id}: payload shape not understood "
+                f"({type(exc).__name__}: {exc}) — the provider may have "
+                f"restructured this response"
+            )
+            continue
+
+        for row in parsed:
             by_source.setdefault(row.source, []).append(row)
 
     snapshots: list[PropLineSnapshotResult] = []
