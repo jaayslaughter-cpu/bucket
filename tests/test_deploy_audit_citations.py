@@ -80,7 +80,7 @@ ANCHORS = [
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
     ("scheduler_worker.py", 1460, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
-    ("src/db/repository.py", 474, "def newest_team_game_date"),
+    ("src/db/repository.py", 492, "def newest_team_game_date"),
     ("main.py", 182, "Deliberately NOT read"),
 ]
 
