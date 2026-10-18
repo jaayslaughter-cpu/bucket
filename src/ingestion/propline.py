@@ -34,7 +34,7 @@ from typing import Any
 import requests
 
 from src.ingestion import dfs_pricing
-from src.utils.http_retry import retry_after_seconds
+from src.utils.http_retry import retry_after_seconds, sanitise_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +335,30 @@ class PropLineClient:
         and ``-1`` both collapsed to 0.0 -- an instant retry against the very
         limiter that asked for a pause.
         """
+        # THE BODY HINT WINS WHERE THERE IS ONE. PropLine answers a 429 with
+        # ``{"detail": {"error": ..., "retry_after_seconds": N}}`` -- its
+        # official SDK reads the backoff from there, not from the header (see
+        # `RateLimitError` in propline-python). We read only the header, so on
+        # a burst limit we ignored the provider's own number and substituted
+        # our local exponential backoff: either too eager, which spends the
+        # retry budget against a limiter that told us how long to wait, or too
+        # slow mid-slate.
+        #
+        # Both paths go through `sanitise_seconds`, so the body hint gets the
+        # same finite/positive/capped guard as the header. A body that is not
+        # JSON, or carries no hint, falls through to the header and then to the
+        # caller's backoff -- never to a crash, because this is the code that
+        # runs when the provider is already unhappy.
+        body_hint = None
+        try:
+            detail = (response.json() or {}).get("detail")
+            if isinstance(detail, dict):
+                body_hint = detail.get("retry_after_seconds")
+        except (ValueError, AttributeError, TypeError):
+            body_hint = None
+
+        if body_hint is not None:
+            return sanitise_seconds(body_hint, fallback)
         return retry_after_seconds(response.headers, fallback)
 
     def _request(

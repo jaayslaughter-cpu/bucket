@@ -572,6 +572,82 @@ def expand_row_to_candidates(
     return out
 
 
+#: How old the slate's market data may be before the board refuses outright.
+#: An hour, following the rule this came from. Overridable, and None disables
+#: the gate -- but see `build_decision_board` for why a filtered subset is the
+#: wrong alternative.
+DEFAULT_MAX_MARKET_AGE_MINUTES = 60
+ENV_MAX_MARKET_AGE = "PROPIQ_MAX_MARKET_AGE_MINUTES"
+
+
+def _recommended_key(cand: "BettingDecisionCandidate") -> tuple[str, str]:
+    """What counts as "the same opinion" for the one-pick rule."""
+    return (str(cand.player_id or cand.player_name or ""), str(cand.target_market))
+
+
+def one_recommendation_per_player_market(
+    cands: list["BettingDecisionCandidate"],
+) -> tuple[list["BettingDecisionCandidate"], int]:
+    """
+    Keep the best RECOMMENDED candidate per (player, market); abstain on the rest.
+
+    TWO FLAGGED SIDES ON ONE PLAYER AND MARKET IS TWO OPINIONS WHERE ONLY ONE
+    CAN BE RIGHT. Books post alternate ladders -- the same player can carry
+    Over 24.5 and Over 27.5, and `normalize_event_props` pairs on the point
+    precisely so both survive as distinct rows -- so a board could recommend
+    Over 24.5 AND Under 27.5 on one player: contradictory advice, presented
+    as two independent findings, and a reader taking both is hedged into the
+    hold.
+
+    The loser ABSTAINS, it is not deleted. Its numbers are still the honest
+    result for that line and belong on the board; what it loses is the flag.
+    `cands` must already be sorted, so the first of a pair is the better one
+    by the board's own ranking.
+
+    ABSTAIN rather than a new third status: `DecisionStatus` is
+    ``Literal["RECOMMENDED", "ABSTAIN"]`` and inventing a "CONSIDER" here
+    would put a value outside that type on the model -- which pydantic would
+    not catch without validate_assignment, and which every consumer
+    branching on the two legal values would then read as a surprise.
+    """
+    seen: set[tuple[str, str]] = set()
+    demoted = 0
+    for cand in cands:
+        if cand.decision_status != "RECOMMENDED":
+            continue
+        key = _recommended_key(cand)
+        if key in seen:
+            cand.decision_status = "ABSTAIN"
+            note = (
+                "ABSTAINED: another line on this player and market is already "
+                "recommended, and two flagged sides of one player/market are "
+                "two opinions where only one can be right."
+            )
+            cand.warnings = [*(cand.warnings or []), note]
+            demoted += 1
+            continue
+        seen.add(key)
+    return cands, demoted
+
+
+def market_age_minutes(market_as_of: Any, now: Any = None) -> float | None:
+    """Minutes between the slate's market observation and ``now``, or None."""
+    if market_as_of is None:
+        return None
+    try:
+        observed = pd.Timestamp(market_as_of)
+    except (TypeError, ValueError):
+        return None
+    if observed is pd.NaT:
+        return None
+    current = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    if observed.tzinfo is None and current.tzinfo is not None:
+        observed = observed.tz_localize("UTC")
+    elif observed.tzinfo is not None and current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    return float((current - observed).total_seconds()) / 60.0
+
+
 def build_decision_board(
     rows: Sequence[ResearchSlateRow],
     *,
@@ -580,6 +656,8 @@ def build_decision_board(
     require_valid_book: bool = False,
     consider_only: bool = False,
     top_n: int | None = None,
+    market_as_of: Any = None,
+    max_market_age_minutes: int | None = None,
 ) -> list[BettingDecisionCandidate]:
     """
     Rank Over/Under candidates, recommended ones first.
@@ -591,7 +669,48 @@ def build_decision_board(
     lean and a de-vigged EV on one numeric scale would imply the two numbers
     are comparable; they are not, because only one of them has a price
     behind it. A 0.49 lean must not outrank a 0.08 edge.
+
+    TWO REFUSALS, both of which can only shrink the board:
+
+    * A STALE SLATE YIELDS ZERO CANDIDATES, not a filtered subset. Pass
+      ``market_as_of`` (the slate's market observation time) and
+      ``max_market_age_minutes``. A stale row that still clears the bar is the
+      dangerous case: it looks actionable and is not. Filtering to the rows
+      that happen to look fresh is worse than refusing, because it leaves a
+      short, confident-looking board built on a market nobody can vouch for.
+      Omit either argument and the gate does not run -- it cannot invent an
+      observation time it was not given, and guessing `now()` would make every
+      slate look fresh.
+
+    * ONE RECOMMENDATION PER PLAYER AND MARKET. See
+      `one_recommendation_per_player_market`; the losers are demoted to
+      ABSTAIN, not dropped.
+
+    Both rules come from `Kevocado/NBA_Predictor`'s `odds/edge_gate.py`,
+    read 2026-10-18. Its third rule -- an edge must be same book, same point,
+    both sides -- this project already satisfies: `normalize_event_props`
+    pairs on ``(book, market, player, point)``.
     """
+    if max_market_age_minutes is not None:
+        age = market_age_minutes(market_as_of)
+        if age is None:
+            logger.warning(
+                "Market staleness NOT CHECKED: a limit of %s minute(s) was "
+                "set but no usable market_as_of was given, so the board is "
+                "built unguarded. This is not a pass.",
+                max_market_age_minutes,
+            )
+        elif age > float(max_market_age_minutes):
+            logger.error(
+                "STALE SLATE — ZERO CANDIDATES: the market data is %.0f "
+                "minute(s) old, over the %s-minute limit ($%s). Returning an "
+                "empty board rather than the subset that happens to look "
+                "fresh: a stale row clearing the bar looks actionable and is "
+                "not.",
+                age, max_market_age_minutes, ENV_MAX_MARKET_AGE,
+            )
+            return []
+
     cands: list[BettingDecisionCandidate] = []
     for row in rows:
         cands.extend(expand_row_to_candidates(
@@ -613,6 +732,16 @@ def build_decision_board(
         )
 
     cands.sort(key=_sort_key)
+
+    # AFTER the sort, so "the first of a pair" means "the better one" by the
+    # board's own ranking rather than by input order.
+    cands, abstained = one_recommendation_per_player_market(cands)
+    if abstained:
+        logger.info(
+            "Abstained on %d candidate(s): another line on the same player "
+            "and market was already recommended.", abstained,
+        )
+
     if top_n is not None and top_n > 0:
         cands = cands[: int(top_n)]
     for i, c in enumerate(cands, start=1):

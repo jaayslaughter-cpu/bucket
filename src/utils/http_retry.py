@@ -68,6 +68,28 @@ def has_retry_after(source: Any) -> bool:
         return False
 
 
+def sanitise_seconds(value: Any, fallback: float) -> float:
+    """
+    One wait value, validated and capped, or ``fallback``.
+
+    Extracted so a hint that did NOT arrive in the header gets the identical
+    guard. PropLine signals its burst-limit backoff in the 429 BODY as
+    ``detail.retry_after_seconds`` -- its own SDK reads it there -- and a
+    second code path applying its own looser rule to that number is how the
+    three-readers defect this module was created to end would come straight
+    back.
+    """
+    if value is None:
+        return float(fallback)
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not math.isfinite(seconds) or seconds <= 0:
+        return float(fallback)
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
 def retry_after_seconds(source: Any, fallback: float) -> float:
     """The server's ``Retry-After`` in seconds, else ``fallback``, capped."""
     headers = _headers_of(source)
@@ -75,12 +97,4 @@ def retry_after_seconds(source: Any, fallback: float) -> float:
         raw = headers.get(HEADER)
     except (AttributeError, TypeError):
         return float(fallback)
-    if raw is None:
-        return float(fallback)
-    try:
-        seconds = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return float(fallback)
-    if not math.isfinite(seconds) or seconds <= 0:
-        return float(fallback)
-    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+    return sanitise_seconds(raw, fallback)
