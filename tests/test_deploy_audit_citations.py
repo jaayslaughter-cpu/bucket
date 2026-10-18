@@ -53,7 +53,7 @@ ANCHORS = [
     ("Dockerfile", 62, "python:3.11-slim"),
     ("Dockerfile", 77, "TZ=Etc/UTC"),
     ("docs/external_feature_harvest.md", 90, "ODDS_API_KEY"),
-    ("docs/pickem_props.md", 95, "ODDS_API_KEY"),
+    ("docs/pickem_props.md", 107, "ODDS_API_KEY"),
     ("src/models/xgb_adapter.py", 390, "_VERSIONS_KEY"),
     ("src/models/xgb_adapter.py", 417, "warn_on_mismatch"),
     # The 2026-10-11 candidate evaluation concluded "do not port, we already

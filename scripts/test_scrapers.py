@@ -59,37 +59,23 @@ SOURCES: dict[str, dict[str, Any]] = {
         "what": "licensed prop-line API; also carries underdog and prizepicks board lines",
     },
     "underdog": {
-        "module": None,
+        "module": "src/ingestion/underdog_props.py",
         "what": "pick'em board capture",
-        "note": (
-            "No client, and none has ever been committed. Underdog lines DO "
-            "reach this pipeline today -- as a book key inside PropLine's "
-            "payload (DFS_BOOKS, src/ingestion/propline.py), which is the "
-            "sanctioned path. A direct client is designed but not built: "
-            "docs/pickem_props.md."
-        ),
     },
     "prizepicks": {
         "module": None,
         "what": "pick'em board capture",
         "note": (
             "No client, and none has ever been committed. PrizePicks lines "
-            "reach this pipeline the same way Underdog's do, through "
-            "PropLine's DFS_BOOKS. A direct client is designed but not "
-            "built, and docs/pickem_props.md forbids getting past a bot wall "
-            "to build one."
+            "reach this pipeline through PropLine's DFS_BOOKS, which is the "
+            "sanctioned route. A direct client stays unwritten: its board was "
+            "expected behind a bot wall and docs/pickem_props.md bans getting "
+            "past one."
         ),
     },
     "sleeper": {
-        "module": None,
-        "what": "pick'em board capture",
-        "note": (
-            "No client, and none has ever been committed. Sleeper is not a "
-            "PropLine book either, so its lines reach this pipeline by no "
-            "route at all. config/dfs_payouts.yaml records why it is absent "
-            "from the payout matrix: it prices per-leg dynamic odds rather "
-            "than a fixed tiered one."
-        ),
+        "module": "src/ingestion/sleeper_props.py",
+        "what": "pick'em board capture, from operator-supplied JSON",
     },
 }
 
@@ -105,7 +91,12 @@ class SourceReport:
 
     @property
     def counts_against_us(self) -> bool:
-        """ABSENT is not a failure. Nothing is broken; nothing is there."""
+        """
+        ABSENT and UNCONFIGURED are not failures. Nothing is broken: for the
+        first nothing is there, and for the second this repository ships no
+        board paths on purpose. Only FAILED means something that should work
+        did not.
+        """
         return self.state == "FAILED"
 
 
@@ -160,6 +151,61 @@ def _check_propline(sample: int, offline: bool) -> SourceReport:
                         rows=len(rows), samples=samples)
 
 
+def _check_pickem(name: str, sample: int, offline: bool) -> SourceReport:
+    """
+    One pick'em board, through its own client.
+
+    NOT_CONFIGURED is reported as its own state and does NOT count against
+    us: this repository ships no board paths because nobody here has seen a
+    response, and calling that a failure would make a correct state look
+    broken every time the diagnostic runs.
+    """
+    from src.ingestion.pickem_schema import (
+        STATUS_EMPTY,
+        STATUS_NOT_CONFIGURED,
+        STATUS_VALID,
+        PickemConfigError,
+    )
+
+    puller = {
+        "underdog": "src.ingestion.underdog_props:pull_underdog_board",
+        "sleeper": "src.ingestion.sleeper_props:pull_sleeper_board",
+    }[name]
+    module_name, function_name = puller.split(":")
+    import importlib
+
+    pull = getattr(importlib.import_module(module_name), function_name)
+
+    try:
+        snapshot = pull()
+    except PickemConfigError as exc:
+        return SourceReport(name, "FAILED", str(exc))
+    except Exception as exc:  # noqa: BLE001 — a diagnostic reports, never raises
+        return SourceReport(name, "FAILED", f"{type(exc).__name__}: {exc}")
+
+    if snapshot.status == STATUS_NOT_CONFIGURED:
+        return SourceReport(name, "UNCONFIGURED", snapshot.message or "")
+    if offline:
+        return SourceReport(name, "OK", "configured; --offline, no request made")
+    if snapshot.status == STATUS_EMPTY:
+        return SourceReport(name, "EMPTY", snapshot.message or "")
+    if snapshot.status != STATUS_VALID:
+        return SourceReport(
+            name, "FAILED", snapshot.message or snapshot.status,
+            http_status=snapshot.http_status,
+        )
+
+    samples = [
+        f"{line.player_name:24} {line.market:4} {line.line:>6} "
+        f"mult={line.payout_multiplier} captured={line.captured_at_utc}"
+        for line in snapshot.lines[:sample]
+    ]
+    return SourceReport(
+        name, "OK", snapshot.message or "", http_status=snapshot.http_status,
+        rows=len(snapshot.lines), samples=samples,
+    )
+
+
 def _check_absent(name: str) -> SourceReport:
     return SourceReport(name, "ABSENT", SOURCES[name].get("note", ""))
 
@@ -197,16 +243,18 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if name == "propline":
             reports.append(_check_propline(args.sample, args.offline))
-        else:  # pragma: no cover - no other source has a client yet
+        elif name in ("underdog", "sleeper"):
+            reports.append(_check_pickem(name, args.sample, args.offline))
+        else:  # pragma: no cover - every source with a client has a probe
             reports.append(SourceReport(name, "FAILED", "no probe implemented"))
 
     width = max(len(r.name) for r in reports)
     print()
-    print(f"{'SOURCE'.ljust(width)}  STATE    ROWS  DETAIL")
+    print(f"{'SOURCE'.ljust(width)}  STATE          ROWS  DETAIL")
     print("-" * 100)
     for r in reports:
         status = f"[{r.http_status}] " if r.http_status else ""
-        print(f"{r.name.ljust(width)}  {r.state:<7}  {r.rows:>4}  {status}{r.detail}")
+        print(f"{r.name.ljust(width)}  {r.state:<13}  {r.rows:>4}  {status}{r.detail}")
     for r in reports:
         if r.samples:
             print(f"\n--- {r.name}: first {len(r.samples)} parsed line(s)")
@@ -215,9 +263,16 @@ def main(argv: list[str] | None = None) -> int:
 
     failed = [r.name for r in reports if r.counts_against_us]
     absent = [r.name for r in reports if r.state == "ABSENT"]
+    unconfigured = [r.name for r in reports if r.state == "UNCONFIGURED"]
     print()
     if absent:
         print(f"ABSENT (nothing to fix — no client was ever written): {', '.join(absent)}")
+    if unconfigured:
+        print(
+            f"UNCONFIGURED (client built, board paths not filled in): "
+            f"{', '.join(unconfigured)} — see the header of "
+            f"config/pickem_sources.yaml"
+        )
     if failed:
         print(f"FAILED: {', '.join(failed)}")
         return EXIT_SOURCE_FAILED

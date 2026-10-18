@@ -1,0 +1,116 @@
+# config/pickem_sources.yaml — where each pick'em board lives and how to read it.
+#
+# UNCONFIGURED ON PURPOSE. Every `board_url` below is null and every field
+# mapping is empty, because nobody working on this repository has seen a live
+# board response: the build container cannot reach either host (the
+# environment's network policy denies them). Filling these in with plausible
+# key names would be inventing an API payload, which `AGENTS.md` forbids
+# outright. Until an operator fills a source in, its client reports
+# NOT_CONFIGURED and names this file. It never reports an empty board, because
+# "we are not set up" and "the board posted nothing" send you to two different
+# places.
+#
+# HOW TO FILL ONE IN, without guessing:
+#
+#   1. From a machine that can reach the board, save one response:
+#        curl -sS '<board url>' > /tmp/underdog_board.json
+#   2. Print its real paths and sample values:
+#        python -m scripts.pull_pickem_props --describe /tmp/underdog_board.json
+#   3. Copy the paths you want into `rows` and `fields` below. `rows` is the
+#      path to the ARRAY of lines; every `fields` path is read RELATIVE to one
+#      row of that array.
+#   4. Check it against the same file before trusting it on the wire:
+#        python -m scripts.pull_pickem_props --source underdog --from-file /tmp/underdog_board.json
+#
+# Each field takes a LIST of candidate paths, tried in order. That is how a
+# shape change is rolled through: add the new path above the old one, deploy,
+# and remove the old one once the board has moved. A field whose candidates
+# all fail is reported as unresolved, by name, and its row is dropped.
+#
+# `lookups` handles a NORMALISED payload — entities in sibling arrays keyed by
+# id rather than nested inside each row. Declare the array and its id field,
+# then reference it from a field path as:
+#     lookup:<name>:<path to the id, relative to the row>:<path inside the entity>
+#
+# RESEARCH_ONLY. Lines and multipliers, captured with a timestamp. A pick'em
+# multiplier is not a two-way price and is never treated as one.
+
+as_of: null  # set to the date you verified the mapping against a real response
+verified_against: null  # e.g. "recorded board response 2026-10-20"
+
+sources:
+
+  underdog:
+    enabled: false
+    # The board endpoint. No credential: if a board needs one, it is not a
+    # public board and capturing it is not what was approved.
+    board_url: null
+    # Overridable per deployment without editing this file.
+    url_env: PROPIQ_UNDERDOG_BOARD_URL
+    # Only NBA rows are kept. The filter runs on whatever path `fields.sport`
+    # resolves to; with no mapping it keeps nothing rather than everything.
+    sport_filter:
+      field_paths: []
+      keep_values: ["NBA", "basketball_nba"]
+    rows: []
+    lookups: {}
+    fields:
+      player_name: []
+      market: []
+      line: []
+      payout_multiplier: []
+      captured_at_utc: []
+      team_abbr: []
+      opponent_abbr: []
+      game_time: []
+      board_id: []
+      player_id: []
+
+  sleeper:
+    enabled: false
+    # SLEEPER HAS NO PUBLIC PICK'EM BOARD. Recorded in docs/pickem_props.md
+    # from a logged-in check on 2026-09-15: sleeper.com/nba is scores and
+    # recap, sleeper.com/picks is marketing and an app install, and Player
+    # Picks appear app-gated. So the sanctioned path here is OPERATOR-SUPPLIED
+    # JSON, not a scrape and not a bot-wall bypass. Drop board responses in
+    # `local_dir` and the client reads the newest one.
+    board_url: null
+    url_env: PROPIQ_SLEEPER_BOARD_URL
+    local_dir: data/external/pickem/sleeper
+    rows: []
+    lookups: {}
+    fields:
+      player_name: []
+      market: []
+      line: []
+      payout_multiplier: []
+      captured_at_utc: []
+      team_abbr: []
+      opponent_abbr: []
+      game_time: []
+      board_id: []
+      player_id: []
+
+  # PrizePicks is deliberately absent. docs/pickem_props.md bans getting past
+  # a Cloudflare / Akamai / DataDome wall, and its board was expected to be
+  # behind one. Its lines already reach this pipeline through PropLine's
+  # DFS_BOOKS, which is the sanctioned route.
+
+# Board market name -> the stat this project models. A board market that maps
+# to none of these is reported as unmapped, never guessed into the nearest
+# one: attaching a real posted line to the wrong statistic is worse than
+# dropping it.
+#
+# THE KEYS ARE NOT A SECOND LIST OF STATS. They must all appear in
+# `propline.DEFAULT_MARKET_MAP`, which is where this project decides what it
+# models; `tests/test_pickem_capture.py` fails if one does not. The VALUES are
+# board spellings and are guesses about nothing -- a spelling that never
+# appears simply never matches.
+market_aliases:
+  PTS: ["points", "pts", "player_points"]
+  REB: ["rebounds", "reb", "player_rebounds", "total_rebounds"]
+  AST: ["assists", "ast", "player_assists"]
+  FG3M: ["three_points_made", "fg3m", "threes", "player_threes"]
+  STL: ["steals", "stl", "player_steals"]
+  BLK: ["blocks", "blk", "player_blocks"]
+  PRA: ["pts_rebs_asts", "pra", "points_rebounds_assists", "player_points_rebounds_assists"]

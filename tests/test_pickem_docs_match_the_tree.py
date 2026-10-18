@@ -103,28 +103,51 @@ def test_the_guard_actually_catches_an_unmarked_path(tmp_path):
     assert any(m in marked.lower() for m in PLANNED_MARKERS)
 
 
-def test_the_pickem_capture_modules_are_still_absent():
+def test_the_pickem_capture_modules_that_are_still_absent_stay_documented_as_such():
     """
-    A canary, not a wish. The moment somebody writes one of these, this test
-    fails and whoever wrote it updates `docs/pickem_props.md` from NOT BUILT
-    to what it actually does -- which is the direction this defect needs to be
-    caught in. Delete the entry here, not the test.
+    A canary, not a wish, and it has already fired once: on 2026-10-18 the
+    Underdog and Sleeper clients were built, this test failed listing all six
+    new modules, and `docs/pickem_props.md` was rewritten from NOT BUILT to
+    BUILT-BUT-UNCONFIGURED. That is the direction this defect needs catching
+    in. Delete the entry here when you write the module, not the test.
+
+    What remains unwritten, and why:
+      prizepicks_props  -- its board was expected behind a bot wall and
+                           getting past one is banned; its lines arrive via
+                           PropLine's DFS_BOOKS instead.
+      sleeper (metadata) -- player metadata and injuries. Injuries come from
+                           ESPN today (`src/ingestion/espn_availability.py`),
+                           so this has no caller waiting on it.
     """
     planned = [
-        "src/ingestion/underdog_props.py",
         "src/ingestion/prizepicks_props.py",
-        "src/ingestion/sleeper_props.py",
         "src/ingestion/sleeper.py",
-        "src/ingestion/pickem_schema.py",
-        "src/ingestion/pickem.py",
-        "src/ingestion/pickem_store.py",
-        "scripts/pull_pickem_props.py",
     ]
     built = [p for p in planned if (REPO_ROOT / p).exists()]
     assert not built, (
         f"{built} now exist(s). Good -- update docs/pickem_props.md to describe "
         f"what it really does and remove it from this list."
     )
+
+
+def test_the_capture_subsystem_that_was_built_is_all_present():
+    """
+    The other direction, which the original canary could not express: these
+    were written together and a half-deleted subsystem would leave the
+    document describing a client whose batch or store had gone.
+    """
+    built = [
+        "src/ingestion/pickem_schema.py",
+        "src/ingestion/pickem_board.py",
+        "src/ingestion/pickem_store.py",
+        "src/ingestion/pickem.py",
+        "src/ingestion/underdog_props.py",
+        "src/ingestion/sleeper_props.py",
+        "scripts/pull_pickem_props.py",
+        "config/pickem_sources.yaml",
+    ]
+    missing = [p for p in built if not (REPO_ROOT / p).exists()]
+    assert not missing, f"the pick'em capture subsystem is missing {missing}"
 
 
 def test_the_consumer_side_does_exist_and_has_nothing_to_read():

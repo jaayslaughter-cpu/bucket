@@ -318,7 +318,13 @@ import scripts.test_scrapers as diag  # noqa: E402
 
 
 def test_a_source_with_no_client_is_absent_not_failed(capsys):
-    code = diag.main(["--source", "underdog"])
+    """
+    PrizePicks, which stays unwritten on purpose. Underdog and Sleeper WERE
+    absent when this file was written and are not any more -- the clients
+    were built on 2026-10-18 -- which is why this now names the one platform
+    the claim is still true of.
+    """
+    code = diag.main(["--source", "prizepicks"])
     out = capsys.readouterr().out
     assert "ABSENT" in out
     assert code == diag.EXIT_OK, "a platform nobody wrote a client for was reported as a failure"
@@ -326,13 +332,31 @@ def test_a_source_with_no_client_is_absent_not_failed(capsys):
 
 def test_absent_says_how_those_lines_do_reach_the_pipeline(capsys):
     """
-    Underdog and PrizePicks lines are not missing -- they arrive as book keys
-    inside PropLine's payload. An operator told only "ABSENT" would go and
-    build a scraper this project does not need.
+    PrizePicks lines are not missing -- they arrive as a book key inside
+    PropLine's payload. An operator told only "ABSENT" would go and build a
+    scraper this project does not need, into a bot wall it must not bypass.
     """
-    diag.main(["--source", "underdog"])
+    diag.main(["--source", "prizepicks"])
     out = capsys.readouterr().out
     assert "DFS_BOOKS" in out
+
+
+@pytest.mark.parametrize("source", ["underdog", "sleeper"])
+def test_a_built_but_unconfigured_client_is_neither_absent_nor_failed(source, capsys):
+    """
+    Three distinct states, and conflating any two of them misleads: ABSENT is
+    "nobody wrote it", UNCONFIGURED is "it is written and ships with no board
+    paths, because nobody here has seen a response", FAILED is "something
+    that should work did not". Only the last is a non-zero exit.
+    """
+    code = diag.main(["--source", source])
+    out = capsys.readouterr().out
+    assert "UNCONFIGURED" in out
+    assert "ABSENT" not in out
+    assert code == diag.EXIT_OK
+    assert "config/pickem_sources.yaml" in out, (
+        "it says the source is unconfigured but not which file to edit"
+    )
 
 
 def test_a_missing_key_is_a_failure_with_a_nonzero_exit(monkeypatch, capsys):

@@ -106,3 +106,7 @@ Thumbs.db
 # https://github.com/shufinskiy/nba_data. Keep the directories, not the CSVs.
 data/external/shot_detail/*.csv
 data/external/matchups/*.csv
+
+# Operator-supplied pick'em board responses and the snapshot archive.
+# Third-party postings: captured for research, never committed.
+data/external/pickem/**/*.json
