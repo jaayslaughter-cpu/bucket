@@ -31,6 +31,11 @@ from src.db.models import (
     TeamGameStat,
 )
 from src.db.session import session_scope
+from src.utils.ids import (
+    GAME_ID_WIDTH,
+    REGULAR_SEASON_ID_DIGIT,
+    SEASON_TYPE_SQL_POSITION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -485,11 +490,58 @@ def newest_team_game_date() -> str | None:
     None rather than a raise when the table is empty: a first deploy with no
     ingest yet is not a broken one, and the caller treats an unknown date as an
     axis it cannot measure rather than as a pass.
+
+    REGULAR-SEASON GAMES ONLY, and that is the whole point of the filter. This
+    number is compared against an artifact's `train_end_date`, and training
+    DROPS non-regular-season rows on purpose (`scripts/ingest_training_pack`
+    decision 2: preseason rotations do not describe the same competition, and
+    the 2025-26 pack's preseason includes exhibitions against clubs that are
+    not NBA franchises). Comparing a train_end that can never pass April
+    against a workbook whose newest row is a June Finals game made the gate
+    STRUCTURALLY UNSATISFIABLE: measured on 2026-10-18 it read 151 days over a
+    21-day limit, and the smallest lag any retrain could reach was ~55 days.
+    Like against like, the same data runs to 2026-04-12 and a retrain through
+    it lands at zero.
+
+    `team_game_stats` has no season_type column and the workbook publishes
+    none, so the game id is the only signal -- see
+    `utils.ids.season_type_from_game_id`, whose mapping is measured against
+    this very workbook. An id the parser cannot read is EXCLUDED rather than
+    assumed regular: admitting one playoff row would reinstate the fault.
     """
+    total = 0
     with session_scope() as session:
-        newest = session.execute(select(func.max(TeamGameStat.game_date))).scalar()
+        # FILTERED IN SQL, and the aggregate is KEPT. This function's own
+        # argument against loading a frame to take one maximum still holds --
+        # the index has the number. The season-type digit and its position
+        # come from `utils.ids`, so the mapping is not restated here as SQL.
+        is_regular = and_(
+            func.length(TeamGameStat.nba_game_id) == GAME_ID_WIDTH,
+            func.substr(TeamGameStat.nba_game_id, SEASON_TYPE_SQL_POSITION, 1)
+            == REGULAR_SEASON_ID_DIGIT,
+        )
+        newest = session.execute(
+            select(func.max(TeamGameStat.game_date)).where(is_regular)
+        ).scalar()
+        if newest is None:
+            # "Nothing ingested" and "nothing REGULAR SEASON ingested" are
+            # different conditions -- the second is real in a playoff-only
+            # backfill -- and the second reads as the first unless asked.
+            total = session.execute(
+                select(func.count()).select_from(TeamGameStat)
+            ).scalar_one()
+
     if newest is None:
-        logger.info("No team-game rows, so there is no newest game date.")
+        if total:
+            logger.warning(
+                "%d team-game row(s) but NONE identifiable as regular season, "
+                "so training recency cannot be measured against them. Either "
+                "the ingest holds only playoff/preseason games, or the game "
+                "ids are in a format utils.ids does not read.",
+                total,
+            )
+        else:
+            logger.info("No team-game rows, so there is no newest game date.")
         return None
     return str(newest)[:10]
 

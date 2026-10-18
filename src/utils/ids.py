@@ -78,3 +78,70 @@ def normalise_one_game_id(value: object) -> str | None:
     remove, so it gets a scalar door into the same function.
     """
     return _one(value)
+
+
+# ---------------------------------------------------------------------------
+# season type, from the game id itself
+# ---------------------------------------------------------------------------
+#
+# An NBA game id encodes what KIND of game it is in its third character, and
+# nothing else in this project's data does. `team_game_stats` has no
+# season_type column and the BigDataBall workbook publishes none, so the id is
+# the only signal available -- and it is a reliable one.
+#
+# MEASURED against the 2025-26 workbook (2,644 rows) rather than taken from
+# documentation:
+#
+#     002  regular season   2025-10-21 .. 2026-04-12   2,460 rows
+#     005  play-in          2026-04-14 .. 2026-04-17       12
+#     004  playoffs         2026-04-18 .. 2026-06-13      170
+#     006  NBA Cup final    2025-12-16                      2
+#
+# The date ranges do not overlap and they fall in the real calendar order, which
+# is what makes the mapping trustworthy rather than a guess about a prefix.
+
+SEASON_TYPE_PRESEASON = "preseason"
+SEASON_TYPE_REGULAR = "regular"
+SEASON_TYPE_ALL_STAR = "all_star"
+SEASON_TYPE_PLAYOFFS = "playoffs"
+SEASON_TYPE_PLAY_IN = "play_in"
+SEASON_TYPE_CUP_FINAL = "cup_final"
+SEASON_TYPE_UNKNOWN = "unknown"
+
+#: Third character of a normalised 10-character game id -> what kind of game.
+_SEASON_TYPE_BY_DIGIT = {
+    "1": SEASON_TYPE_PRESEASON,
+    "2": SEASON_TYPE_REGULAR,
+    "3": SEASON_TYPE_ALL_STAR,
+    "4": SEASON_TYPE_PLAYOFFS,
+    "5": SEASON_TYPE_PLAY_IN,
+    "6": SEASON_TYPE_CUP_FINAL,
+}
+
+
+#: Where the season-type digit sits, 1-BASED, for a SQL ``substr``. A caller
+#: that filters in the database must not restate the mapping above in SQL --
+#: it reads this and `REGULAR_SEASON_ID_DIGIT` instead, so there is still one
+#: definition of which character means what.
+SEASON_TYPE_SQL_POSITION = 3
+REGULAR_SEASON_ID_DIGIT = "2"
+
+
+def season_type_from_game_id(value: object) -> str:
+    """
+    What kind of game this id belongs to, or ``SEASON_TYPE_UNKNOWN``.
+
+    Returns UNKNOWN rather than guessing REGULAR for an id it cannot read. A
+    caller filtering to regular-season games must drop what it cannot
+    identify: defaulting an unreadable id to "regular" would quietly admit
+    playoff rows to a comparison that exists to exclude them.
+    """
+    normalised = normalise_one_game_id(value)
+    if normalised is None or len(normalised) < 3:
+        return SEASON_TYPE_UNKNOWN
+    return _SEASON_TYPE_BY_DIGIT.get(normalised[2], SEASON_TYPE_UNKNOWN)
+
+
+def is_regular_season_game_id(value: object) -> bool:
+    """Whether this id is a regular-season game. Unreadable ids are not."""
+    return season_type_from_game_id(value) == SEASON_TYPE_REGULAR
