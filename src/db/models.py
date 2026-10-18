@@ -206,6 +206,15 @@ class PlayerGameLog(Base):
     reb: Mapped[int | None] = mapped_column(Integer)
     ast: Mapped[int | None] = mapped_column(Integer)
     fg3m: Mapped[int | None] = mapped_column(Integer)
+    # ATTEMPTS, not makes, and the PLAYER's not the team's. `features/
+    # scoring_efficiency` declares REQUIRED_COLS = ("PTS", "FGA", "FTA") and
+    # abstains without them, which is why the PTS model -- whose contract
+    # names TS_PCT_L10, TS_PCT_TREND and FT_RATE_L10 -- could not score a
+    # single row from this table. See migrations/009. NULL means the source
+    # did not report them: TS% divides by (2 * (FGA + 0.44 * FTA)), so a
+    # defaulted 0 is a division by zero rather than a convenience.
+    fga: Mapped[int | None] = mapped_column(Integer)
+    fta: Mapped[int | None] = mapped_column(Integer)
     stl: Mapped[int | None] = mapped_column(Integer)
     blk: Mapped[int | None] = mapped_column(Integer)
     tov: Mapped[int | None] = mapped_column(Integer)
