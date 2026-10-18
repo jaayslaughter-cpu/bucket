@@ -12,7 +12,8 @@ POLICY, and why each part is deliberate:
     second identical one wastes a call and hides the cause behind a
     timeout-shaped error. 429 is the exemption and IS retried, because there
     the request is fine and there have merely been too many of them; an
-    integer Retry-After is honoured and capped at MAX_RETRY_AFTER_SECONDS.
+    integer Retry-After is honoured and capped at MAX_RETRY_AFTER_SECONDS,
+    whose rule lives in ``utils.http_retry``.
   - a failed fetch RAISES. It never returns an empty dict, because a caller
     must be able to tell "no games tonight" from "the fetch failed".
   - the base host is overridable by env var so a test or mirror needs no code
@@ -28,6 +29,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+
+# THE RETRY-AFTER RULE IS NOT THIS MODULE'S. It was, and this module's copy
+# returned `nan` for ``Retry-After: nan`` -- `min(nan, 60.0)` is nan -- and
+# `time.sleep(nan)` raises ValueError, so a garbled header crashed the fetch it
+# was meant to pace. Three clients parsed that header and disagreed; one reader
+# is the fix. The cap is re-exported under its old name because this module's
+# docstring and `tests/test_espn_schedule.py` both refer to it here.
+from src.utils.http_retry import MAX_RETRY_AFTER_SECONDS as MAX_RETRY_AFTER_SECONDS
+from src.utils.http_retry import has_retry_after as _has_retry_after
+from src.utils.http_retry import retry_after_seconds as _retry_after_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -51,43 +62,6 @@ def site_url(path: str, config: "EspnConfig | None" = None) -> str:
 
 
 TOO_MANY_REQUESTS = 429
-
-
-def _has_retry_after(response: Any) -> bool:
-    headers = getattr(response, "headers", None) or {}
-    try:
-        return "Retry-After" in headers
-    except TypeError:
-        return False
-
-
-def _retry_after_seconds(response: Any, fallback: float) -> float:
-    """
-    The server's Retry-After in seconds, else ``fallback``.
-
-    Only a plain integer-seconds form is honoured; the HTTP-date form is
-    ignored rather than parsed approximately, because a wrong date parse would
-    sleep for either no time or a very long one.
-    """
-    headers = getattr(response, "headers", None) or {}
-    try:
-        raw = headers.get("Retry-After")
-    except (AttributeError, TypeError):
-        return float(fallback)
-    if raw is None:
-        return float(fallback)
-    try:
-        seconds = float(str(raw).strip())
-    except ValueError:
-        return float(fallback)
-    if seconds <= 0:
-        return float(fallback)
-    return min(seconds, MAX_RETRY_AFTER_SECONDS)
-
-
-# A server asking us to wait an hour is not something to obey inside a slate
-# job; cap it and let the caller fail rather than hang.
-MAX_RETRY_AFTER_SECONDS = 60.0
 
 
 class EspnError(RuntimeError):

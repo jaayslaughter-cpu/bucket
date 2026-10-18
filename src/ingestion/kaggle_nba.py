@@ -258,9 +258,31 @@ def _coerce_is_home(series: pd.Series) -> pd.Series:
         if pd.isna(value):
             return pd.NA
         text = str(value).strip().lower()
-        if text in ("1", "true", "t", "yes", "y", "home", "h"):
+
+        # NUMERIC FIRST, and this is the case the docstring promised and the
+        # code did not deliver. The Kaggle export's `home` column is float64,
+        # so `str(1.0)` is "1.0" -- which matched neither list below, and
+        # EVERY ROW of a fully populated column became NA. Measured on
+        # 261,689 regular-season rows: 100% null, while the source held
+        # 131,386 ones and 130,303 zeros.
+        #
+        # Only exactly 1 and 0 are a home flag. 2, -1 and 0.5 fall through to
+        # NA rather than being rounded into a side: a wrong home/away label
+        # is a wrong feature, which is worse than a missing one.
+        try:
+            number = float(text)
+        except ValueError:
+            number = None
+        if number is not None:
+            if number == 1.0:
+                return True
+            if number == 0.0:
+                return False
+            return pd.NA
+
+        if text in ("true", "t", "yes", "y", "home", "h"):
             return True
-        if text in ("0", "false", "f", "no", "n", "away", "a", "visitor", "v"):
+        if text in ("false", "f", "no", "n", "away", "a", "visitor", "v"):
             return False
         return pd.NA
 

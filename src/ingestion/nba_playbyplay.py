@@ -44,8 +44,8 @@ from src.settlement.boxscore_fetcher import (
     RETRY_BACKOFF,
     TOO_MANY_REQUESTS,
     normalize_game_id,
-    retry_after_seconds,
 )
+from src.utils.http_retry import retry_after_seconds
 
 logger = logging.getLogger(__name__)
 

@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from urllib.parse import urlparse, urlunparse
 
 from sqlalchemy import Engine, create_engine
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.db.models import Base
@@ -85,6 +85,50 @@ def get_database_url() -> str:
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     return _ensure_sslmode(url)
+
+
+#: Query-string parameters that carry a secret. libpq reads ``password`` from
+#: the URL's query as readily as from its userinfo, so a target rendered for a
+#: human has to mask both.
+SECRET_QUERY_KEYS = frozenset({"password", "sslpassword"})
+
+
+def database_target(url: str | None = None) -> str:
+    """
+    Which database a run is about to write to, WITHOUT its password.
+
+    Any one-off against a production URL has to say what it is pointing at --
+    an operator with two shells open is exactly who ingests a season into the
+    wrong database -- and the only string that identifies it is the one that
+    also carries the credential. So the rendering lives here, next to
+    `get_database_url`, rather than being open-coded at each place that wants
+    to print a target: one reader of one fact, and no second copy to forget
+    the masking.
+
+    SQLAlchemy's own renderer masks the userinfo password; it does NOT mask
+    the query-string one, and both are things this function is given.
+    """
+    raw = get_database_url() if url is None else url
+    try:
+        parsed = make_url(raw)
+        # MEASURED, not assumed: `make_url(...).render_as_string(
+        # hide_password=True)` leaves ``?password=hunter2`` fully legible --
+        # it masks only the ``user:pass@`` form. libpq accepts both, so a URL
+        # written the second way would have been printed in the clear by the
+        # very function whose job is to prevent that.
+        masked = {
+            key: ("REDACTED" if key.lower() in SECRET_QUERY_KEYS else value)
+            for key, value in parsed.query.items()
+        }
+        if masked != dict(parsed.query):
+            parsed = parsed.set(query=masked)
+        return parsed.render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001 -- see below
+        # A URL SQLAlchemy cannot parse is NOT echoed back. The obvious
+        # fallback -- return the raw string so the operator can see what is
+        # wrong with it -- prints the password of every URL that merely has a
+        # typo, into a log an operator pastes into a chat window.
+        return "<unparseable database URL>"
 
 
 #: Recycle a pooled connection after this many seconds. SQLAlchemy's default is

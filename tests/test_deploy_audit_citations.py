@@ -53,7 +53,7 @@ ANCHORS = [
     ("Dockerfile", 62, "python:3.11-slim"),
     ("Dockerfile", 77, "TZ=Etc/UTC"),
     ("docs/external_feature_harvest.md", 90, "ODDS_API_KEY"),
-    ("docs/pickem_props.md", 61, "ODDS_API_KEY"),
+    ("docs/pickem_props.md", 149, "ODDS_API_KEY"),
     ("src/models/xgb_adapter.py", 390, "_VERSIONS_KEY"),
     ("src/models/xgb_adapter.py", 417, "warn_on_mismatch"),
     # The 2026-10-11 candidate evaluation concluded "do not port, we already
@@ -80,7 +80,7 @@ ANCHORS = [
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
     ("scheduler_worker.py", 1460, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
-    ("src/db/repository.py", 469, "def newest_team_game_date"),
+    ("src/db/repository.py", 492, "def newest_team_game_date"),
     ("main.py", 182, "Deliberately NOT read"),
 ]
 

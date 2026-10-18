@@ -564,9 +564,13 @@ def _sqlite_session_scope(rows: list[str]):
     Base.metadata.create_all(bind=engine, tables=[TeamGameStat.__table__])
     factory = sessionmaker(bind=engine)
     with factory() as seed:
-        for i, day in enumerate(rows):
+        for i, row in enumerate(rows):
+            # A bare date keeps the regular-season default every existing
+            # caller relied on; a (date, game_id) pair is how the season-type
+            # filter is exercised.
+            day, game_id = row if isinstance(row, tuple) else (row, f"00226000{i:02d}")
             seed.add(TeamGameStat(
-                nba_game_id=f"00226000{i:02d}",
+                nba_game_id=game_id,
                 game_date=_date.fromisoformat(day),
                 team_abbr="LAL",
                 opponent_abbr="BOS",
@@ -625,3 +629,217 @@ def test_an_empty_table_has_no_newest_game_date(monkeypatch):
     )
     assert fresh["training_lag_days"] is None
     assert "training_recency" not in fresh["checks"]
+
+
+# --- the training-lag comparison must be LIKE AGAINST LIKE -----------------
+#
+# FOUND 2026-10-18, two days before opening night. The gate read:
+#
+#   [FAIL] artifact_freshness[PTS]: trained through 2026-01-13, we hold games
+#          through 2026-06-13 — 151 day(s), over the 21-day limit
+#
+# and no retrain could clear it. `scripts/ingest_training_pack` decision 2
+# DROPS non-regular-season rows, so `train_end_date` can never pass the end of
+# the regular season — while the comparison date came from a table whose newest
+# row was a June FINALS game. Measured on the 2025-26 workbook: the regular
+# season ends 2026-04-12 and the newest game of any kind is 2026-06-13, so the
+# smallest lag any honest retrain could reach was 62 days against a limit of
+# 21. The gate was not failing; it was unsatisfiable.
+#
+# A gate nobody can satisfy gets its limit raised or its result ignored, and
+# both of those are worse than the gate not existing. Like against like: the
+# same retrain lands at 0.
+
+
+def test_the_newest_game_date_excludes_playoff_games(monkeypatch):
+    """
+    THE FIX. The playoff row is newer and must not be the one the comparison
+    uses, because training never sees its kind.
+    """
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([
+            ("2026-04-12", "0022501230"),   # last regular-season game
+            ("2026-04-16", "0052500101"),   # play-in
+            ("2026-06-13", "0042500406"),   # Finals
+        ]),
+    )
+    assert repository.newest_team_game_date() == "2026-04-12", (
+        "the comparison date is a non-regular-season game, so no artifact "
+        "trained on regular-season rows can ever be current against it"
+    )
+
+
+@pytest.mark.parametrize(
+    "game_id,kind",
+    [
+        ("0012500001", "preseason"),
+        ("0032500001", "all-star"),
+        ("0042500406", "playoffs"),
+        ("0052500101", "play-in"),
+        ("0062500001", "NBA Cup final"),
+    ],
+)
+def test_no_non_regular_season_kind_sets_the_comparison_date(monkeypatch, game_id, kind):
+    """Each kind separately: one of them slipping through reinstates the fault
+    on its own, and they arrive at different times of year."""
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([
+            ("2026-04-12", "0022501230"),
+            ("2026-06-13", game_id),
+        ]),
+    )
+    assert repository.newest_team_game_date() == "2026-04-12", (
+        f"a {kind} game set the training-lag comparison date"
+    )
+
+
+def test_an_unreadable_game_id_is_excluded_rather_than_assumed_regular(monkeypatch):
+    """
+    Defaulting an id the parser cannot read to "regular" would quietly admit
+    exactly the rows the filter exists to drop.
+    """
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([
+            ("2026-04-12", "0022501230"),
+            ("2026-06-13", "not-an-id"),
+        ]),
+    )
+    assert repository.newest_team_game_date() == "2026-04-12"
+
+
+def test_a_playoff_only_table_is_not_measured_rather_than_measured_wrongly(monkeypatch):
+    """
+    A backfill holding only playoff rows has no regular-season date to compare
+    against. None means "this axis is not measured" — never a pass, and never
+    the June date.
+    """
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([("2026-06-13", "0042500406")]),
+    )
+    assert repository.newest_team_game_date() is None
+
+
+def test_a_playoff_only_table_says_why_it_cannot_measure(monkeypatch, caplog):
+    """"No rows" and "no REGULAR-SEASON rows" are different conditions, and the
+    second reads as the first unless it is said."""
+    import logging
+
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([("2026-06-13", "0042500406")]),
+    )
+    with caplog.at_level(logging.WARNING):
+        repository.newest_team_game_date()
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "NONE identifiable as regular season" in text
+
+
+def test_the_season_type_rule_is_not_restated_as_sql():
+    """
+    One reader. The filter runs in the database -- this function's own
+    docstring argues against loading a frame to take one maximum -- so the
+    digit and its position have to come from `utils.ids`, not be written out
+    again as a SQL literal here.
+    """
+    import ast
+    import inspect
+
+    from src.db import repository
+
+    src = inspect.getsource(repository.newest_team_game_date)
+    tree = ast.parse(src.lstrip())
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert "REGULAR_SEASON_ID_DIGIT" in names, (
+        "the regular-season digit is hardcoded here instead of read from "
+        "utils.ids, so the two definitions can drift"
+    )
+    assert "SEASON_TYPE_SQL_POSITION" in names
+    # the literal itself must not appear
+    assert '"2"' not in src and "'2'" not in src
+
+
+def test_the_gate_is_satisfiable_by_a_retrain_on_the_data_we_hold():
+    """
+    THE CONSEQUENCE, with the real workbook rather than fixtures: a retrain
+    through the last regular-season game must PASS. Before the fix the same
+    retrain read 62 days and failed, and there was nothing a retrain could do
+    about it.
+    """
+    import pandas as pd
+
+    from src.ingestion.bigdataball import load_bigdataball_workbook
+    from src.utils.ids import is_regular_season_game_id
+
+    book = "data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx"
+    if not Path(book).is_file():  # pragma: no cover - licensed export
+        pytest.skip("licensed workbook not present")
+
+    stats, _ = load_bigdataball_workbook(book)
+    dates = pd.to_datetime(stats["game_date"])
+    regular = stats["nba_game_id"].map(is_regular_season_game_id)
+    newest_regular = dates[regular].max().date()
+    newest_any = dates.max().date()
+
+    assert newest_any > newest_regular, (
+        "this workbook holds no post-season games, so it cannot demonstrate "
+        "the defect — the assertions below would pass trivially"
+    )
+
+    fresh = af.artifact_freshness(
+        sidecar(train_end=str(newest_regular)),
+        now=NOW,
+        newest_game_date=str(newest_regular),
+    )
+    assert fresh["training_lag_days"] == 0
+    # `checks` names the axes that WERE measured; `status` is the verdict.
+    assert "training_recency" in fresh["checks"]
+    assert fresh["status"] == af.OK
+
+    # and the comparison it replaced, for the record
+    stale = af.artifact_freshness(
+        sidecar(train_end=str(newest_regular)),
+        now=NOW,
+        newest_game_date=str(newest_any),
+    )
+    assert stale["training_lag_days"] == (newest_any - newest_regular).days
+    assert stale["status"] != af.OK, (
+        "the comparison that made the gate unsatisfiable now reads as healthy"
+    )
+
+
+def test_a_truncated_game_id_cannot_pass_the_filter(monkeypatch):
+    """
+    The length check earns its place: `substr('002', 3, 1)` is '2', so a
+    truncated or malformed id would match the digit test alone and set the
+    comparison date to whatever date it carried.
+    """
+    from src.db import repository
+
+    monkeypatch.setattr(
+        repository,
+        "session_scope",
+        _sqlite_session_scope([
+            ("2026-04-12", "0022501230"),
+            ("2026-06-13", "002"),
+        ]),
+    )
+    assert repository.newest_team_game_date() == "2026-04-12"

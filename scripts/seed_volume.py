@@ -54,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from main import resolve_model_artifact
 from src.utils.volume import (  # noqa: E402
     ENV_RAILWAY_VOLUME,
     ENV_STATE_DIR,
@@ -227,6 +228,63 @@ def seed(
 
     if not apply:
         lines.append("Nothing was written. Pass --apply to copy.")
+        return (1 if refused else 0), lines
+
+    # DID THE RESOLVER ACTUALLY GET WHAT WE WROTE. Found by measurement
+    # 2026-10-16: this script's destination is `artifact_dir_on(state_root)`,
+    # while `main.resolve_model_artifact` reads `artifacts_dir` from
+    # config/model_comparison.yaml -- which ships RELATIVE and is resolved
+    # against the WORKING DIRECTORY. They agree only when the state root is
+    # <cwd>/data, i.e. the documented /app/data mount under WORKDIR=/app.
+    # Seeding a volume mounted anywhere else printed "copy" for every market
+    # and left the resolver finding nothing.
+    #
+    # The docstring above already promised this could not happen -- "a seeding
+    # tool that wrote to a directory of its own choosing would report success
+    # and leave the resolver finding nothing" -- and the script guarded its
+    # DESTINATION without ever checking the OUTCOME. This asks.
+    #
+    # NOT "did something resolve": with a repo copy of the artifacts on the
+    # container layer the resolver answers happily, with a file a redeploy
+    # destroys. The resolved path must be UNDER THE STATE ROOT, which is the
+    # only thing seeding was for.
+    unusable: list[str] = []
+    for market, _family in planned:
+        resolved, how = resolve_model_artifact(market=market)
+        if resolved is None:
+            unusable.append(
+                f"  {market}: SEEDED BUT WILL NOT BE USED -- the resolver finds "
+                f"no artifact at all ({how})."
+            )
+            continue
+        try:
+            under_root = resolved.resolve().is_relative_to(root.resolve())
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            under_root = False
+        if not under_root:
+            unusable.append(
+                f"  {market}: SEEDED BUT WILL NOT BE USED -- the resolver will "
+                f"score with {resolved} ({how}), which is NOT under the state "
+                f"root {root}. A redeploy destroys that file; the copy on the "
+                f"volume is invisible to it."
+            )
+        else:
+            lines.append(f"  {market}: verified -- the resolver will use "
+                         f"{resolved} ({how}).")
+
+    if unusable:
+        lines.extend(unusable)
+        lines.append(
+            f"SEEDING DID NOT TAKE EFFECT. The files are on the volume at "
+            f"{dest}, but that is not where scoring looks: `artifacts_dir` in "
+            f"config/model_comparison.yaml is relative, so it resolves against "
+            f"the working directory. Mount the volume at /app/data (what the "
+            f"Dockerfile documents, and what makes the two agree under "
+            f"WORKDIR=/app), or point $PROPIQ_MODEL at a file on the volume. "
+            f"Until one of those is true every row abstains while the slate "
+            f"still exits 0."
+        )
+        return 2, lines
     return (1 if refused else 0), lines
 
 
