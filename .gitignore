@@ -43,6 +43,12 @@ data/external/bigdataball/*.xlsx
 data/external/basketball_reference/*.csv
 !data/external/nba_archive/
 !data/external/nba_archive/README.md
+!data/external/pickem/
+!data/external/pickem/sleeper/
+!data/external/pickem/sleeper/README.md
+# Board responses and the snapshot archive are third-party postings captured
+# for research: kept locally and on the volume, never committed.
+data/external/pickem/**/*.json
 # Kaggle archive exports are large third-party data - local only.
 data/external/nba_archive/**/*.csv
 data/external/nba_archive/**/*.parquet
@@ -106,7 +112,3 @@ Thumbs.db
 # https://github.com/shufinskiy/nba_data. Keep the directories, not the CSVs.
 data/external/shot_detail/*.csv
 data/external/matchups/*.csv
-
-# Operator-supplied pick'em board responses and the snapshot archive.
-# Third-party postings: captured for research, never committed.
-data/external/pickem/**/*.json
