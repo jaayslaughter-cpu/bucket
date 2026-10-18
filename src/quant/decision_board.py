@@ -62,6 +62,7 @@ half-line.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -580,6 +581,37 @@ DEFAULT_MAX_MARKET_AGE_MINUTES = 60
 ENV_MAX_MARKET_AGE = "PROPIQ_MAX_MARKET_AGE_MINUTES"
 
 
+def market_age_limit_minutes(explicit: int | None = None) -> int | None:
+    """
+    The staleness limit: the caller's, else ``$PROPIQ_MAX_MARKET_AGE_MINUTES``,
+    else an hour. ``None`` means no gate.
+
+    The env var is read HERE rather than existing only as a name in a log
+    line. `tests/test_scheduler_worker` caught that: a documented variable
+    nothing reads is a knob that does nothing, which is worse than no knob --
+    an operator sets it, sees no change, and concludes the gate is broken.
+
+    Set it to ``0`` or ``off`` to disable the gate deliberately.
+    """
+    if explicit is not None:
+        return explicit
+    raw = (os.environ.get(ENV_MAX_MARKET_AGE) or "").strip().lower()
+    if not raw:
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    if raw in ("0", "off", "none", "disabled"):
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "$%s is %r, which is not a number of minutes — using the %d-minute "
+            "default rather than guessing.",
+            ENV_MAX_MARKET_AGE, raw, DEFAULT_MAX_MARKET_AGE_MINUTES,
+        )
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    return value if value > 0 else None
+
+
 def _recommended_key(cand: "BettingDecisionCandidate") -> tuple[str, str]:
     """What counts as "the same opinion" for the one-pick rule."""
     return (str(cand.player_id or cand.player_name or ""), str(cand.target_market))
@@ -691,23 +723,39 @@ def build_decision_board(
     both sides -- this project already satisfies: `normalize_event_props`
     pairs on ``(book, market, player, point)``.
     """
-    if max_market_age_minutes is not None:
+    # THE GATE NEEDS BOTH A LIMIT AND AN OBSERVATION TIME. The limit has a
+    # default; the timestamp cannot, so a caller that passes no
+    # `market_as_of` is unaffected -- which is every caller today, so this
+    # changes nothing until one is wired.
+    age_limit = market_age_limit_minutes(max_market_age_minutes)
+    if max_market_age_minutes is not None and market_as_of is None:
+        # The caller asked for a check and gave nothing to check against.
+        # Worth saying, where the same situation under the ENV DEFAULT is
+        # just "not wired yet" and warning on it would be noise on every
+        # call.
+        logger.warning(
+            "Market staleness NOT CHECKED: a limit of %s minute(s) was "
+            "passed but no market_as_of came with it, so the board is built "
+            "unguarded. This is not a pass.",
+            max_market_age_minutes,
+        )
+    if age_limit is not None and market_as_of is not None:
         age = market_age_minutes(market_as_of)
         if age is None:
             logger.warning(
                 "Market staleness NOT CHECKED: a limit of %s minute(s) was "
                 "set but no usable market_as_of was given, so the board is "
                 "built unguarded. This is not a pass.",
-                max_market_age_minutes,
+                age_limit,
             )
-        elif age > float(max_market_age_minutes):
+        elif age > float(age_limit):
             logger.error(
                 "STALE SLATE — ZERO CANDIDATES: the market data is %.0f "
                 "minute(s) old, over the %s-minute limit ($%s). Returning an "
                 "empty board rather than the subset that happens to look "
                 "fresh: a stale row clearing the bar looks actionable and is "
                 "not.",
-                age, max_market_age_minutes, ENV_MAX_MARKET_AGE,
+                age, age_limit, ENV_MAX_MARKET_AGE,
             )
             return []
 

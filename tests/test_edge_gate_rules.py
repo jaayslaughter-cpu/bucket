@@ -225,24 +225,50 @@ def test_a_fresh_slate_is_not_gated():
     assert out != [], "a 5-minute-old market was gated as stale"
 
 
-def test_no_limit_means_no_gate():
-    """A caller that does not set a limit gets the previous behaviour. The
-    gate cannot invent a policy it was not given."""
-    out = db.build_decision_board([_row()], market_as_of=_minutes_ago(43200))
-    assert out != [], "a 30-day-old market was gated with no limit set"
-
-
-def test_a_limit_with_no_observation_time_warns_and_does_not_pass_silently(caplog):
+def test_an_unset_limit_falls_back_to_the_env_default():
     """
-    The dangerous middle: a limit is set, the timestamp is missing, and
-    nothing is checked. Guessing `now()` would make every slate look fresh,
-    so the board is built unguarded AND says so.
+    The limit HAS a default (an hour); only the observation time has none.
+    A caller that supplies `market_as_of` and no limit therefore gets the
+    gate -- which is the point, so a future caller does not have to know to
+    ask for it.
+    """
+    out = db.build_decision_board([_row()], market_as_of=_minutes_ago(43200))
+    assert out == [], "a 30-day-old market was published under the default limit"
+
+
+def test_the_gate_can_be_disabled_deliberately():
+    import os
+
+    try:
+        os.environ[db.ENV_MAX_MARKET_AGE] = "off"
+        out = db.build_decision_board([_row()], market_as_of=_minutes_ago(43200))
+        assert out != [], "'off' did not disable the gate"
+    finally:
+        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+
+
+def test_an_explicit_limit_with_no_observation_time_warns(caplog):
+    """
+    The dangerous middle: the caller ASKED for a check and gave nothing to
+    check against. Guessing `now()` would make every slate look fresh, so the
+    board is built unguarded AND says so.
     """
     with caplog.at_level(logging.WARNING):
-        db.build_decision_board([], market_as_of=None, max_market_age_minutes=60)
+        db.build_decision_board([_row()], market_as_of=None, max_market_age_minutes=60)
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "NOT CHECKED" in text
     assert "This is not a pass." in text
+
+
+def test_the_env_default_with_no_observation_time_is_silent(caplog):
+    """
+    Not the same situation: nobody asked for a check here, the limit merely
+    has a default. Warning on it would fire on every call from every caller
+    that has not been wired yet, which is all of them.
+    """
+    with caplog.at_level(logging.WARNING):
+        db.build_decision_board([_row()])
+    assert "NOT CHECKED" not in " ".join(r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize("bad", ["not a date", "", object()])
@@ -282,3 +308,46 @@ def test_pairing_is_same_book_same_point_both_sides():
 
     src = inspect.getsource(propline.normalize_event_props)
     assert "(book_key, stat, player, point_value)" in src
+
+
+def test_the_env_var_is_actually_read():
+    """
+    `tests/test_scheduler_worker` caught this: the limit's env var existed
+    only as a name in a log line, so an operator could set it, see no change,
+    and conclude the gate was broken. A documented knob that does nothing is
+    worse than no knob.
+    """
+    import os
+
+    os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+    assert db.market_age_limit_minutes() == db.DEFAULT_MAX_MARKET_AGE_MINUTES
+    try:
+        os.environ[db.ENV_MAX_MARKET_AGE] = "90"
+        assert db.market_age_limit_minutes() == 90
+        assert db.market_age_limit_minutes(15) == 15, "an explicit limit must win"
+        for off in ("0", "off", "none", "disabled"):
+            os.environ[db.ENV_MAX_MARKET_AGE] = off
+            assert db.market_age_limit_minutes() is None, f"{off!r} did not disable"
+    finally:
+        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+
+
+def test_an_unparseable_limit_falls_back_rather_than_guessing(caplog):
+    import os
+
+    try:
+        os.environ[db.ENV_MAX_MARKET_AGE] = "soon"
+        with caplog.at_level(logging.WARNING):
+            assert db.market_age_limit_minutes() == db.DEFAULT_MAX_MARKET_AGE_MINUTES
+        assert "not a number of minutes" in " ".join(
+            r.getMessage() for r in caplog.records
+        )
+    finally:
+        os.environ.pop(db.ENV_MAX_MARKET_AGE, None)
+
+
+def test_a_caller_passing_no_observation_time_is_unaffected():
+    """Every caller today passes none, so this change is inert until one is
+    wired — stated as a test so that stays true by accident of nobody, not by
+    luck."""
+    assert db.build_decision_board([_row()]) != []
