@@ -153,6 +153,12 @@ def _normalised_start_positions(values: Any) -> pd.Series | None:
     )
 
 
+#: Where a player-log row came from when the writer does not say. The live
+#: path is `ingestion/boxscores`, which reads stats.nba.com's league game log;
+#: `ingestion/kaggle_nba` sets its own `SOURCE` and that is honoured instead.
+DEFAULT_PLAYER_LOG_SOURCE = "nba_stats_leaguegamelog"
+
+
 def upsert_player_game_logs(df: pd.DataFrame) -> int:
     """
     Write the player panel to Postgres, keyed on (game, player).
@@ -211,7 +217,19 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         # column would change what POS_BUCKET means downstream, and
         # migration 008's CHECK only admits G, F and C.
         "starting_position": _normalised_start_positions(df.get("STARTING_POSITION")),
-        "source": "nba_stats_leaguegamelog",
+        # THE WRITER'S OWN PROVENANCE, when it states one. This was hardcoded
+        # to the league-game-log value, two lines below a comment that already
+        # acknowledged "a panel rebuilt from the Kaggle archive" reaches here
+        # -- so 214,381 rows ingested from a Kaggle export claimed to have
+        # come from stats.nba.com. Nothing downstream could then tell the two
+        # apart, which is the question provenance exists to answer, and a
+        # later real league-game-log write would have been indistinguishable
+        # from them.
+        "source": (
+            df["SOURCE"].astype(str)
+            if "SOURCE" in df.columns
+            else DEFAULT_PLAYER_LOG_SOURCE
+        ),
     })
 
     undated = int(work["game_date"].isna().sum())
