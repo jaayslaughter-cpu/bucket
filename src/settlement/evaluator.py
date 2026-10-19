@@ -50,6 +50,7 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from typing import Any
 
 from src.quant.composite_markets import (
     FPTS,
@@ -57,7 +58,6 @@ from src.quant.composite_markets import (
     CompositeMarketError,
     fantasy_weights,
 )
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
