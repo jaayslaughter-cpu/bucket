@@ -538,3 +538,131 @@ def test_the_body_hint_goes_through_the_same_guard_as_the_header(hint, expected)
     three-readers defect this module exists to end would come straight back.
     """
     assert _propline_wait(_Body(body={"detail": {"retry_after_seconds": hint}})) == expected
+
+
+# --- the team suffix that stopped the board joining the panel ---------------
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("De'Aaron Fox (SAS)", "De'Aaron Fox"),
+    ("Nikola Jokić (DEN)", "Nikola Jokić"),
+    ("Chet Holmgren (OKC)", "Chet Holmgren"),
+    ("Shai Gilgeous-Alexander (OKC)", "Shai Gilgeous-Alexander"),
+    ("A.J. Lawson (TOR)", "A.J. Lawson"),
+    # No suffix: unchanged.
+    ("Aaron Gordon", "Aaron Gordon"),
+    ("", ""),
+    (None, ""),
+])
+def test_the_propline_team_suffix_is_stripped_at_ingestion(raw, expected):
+    """
+    THE BLOCKER UNDER EVERY OTHER BLOCKER, and a one-line format difference.
+
+    The panel's PLAYER_NAME is bare ("Aaron Gordon"); PropLine's carries the
+    team. `id_crosswalk.resolve_board_names` compares them on an exact
+    NORMALISED match and refuses to fuzzy-match — for a reason it states
+    itself: a score high enough to catch Jokic/Jokić also catches
+    Jalen/Jaylen Williams, which in a settlement ledger is a wrong record
+    rather than a near miss.
+
+    So "deaaron fox sas" never equalled "deaaron fox", the name map came back
+    empty, every projection carried a null LINE, the recorder skipped every
+    row with "no posted line", and `prop_results` stayed empty — no ledger,
+    no calibration report, no publishable model figure, ever.
+    """
+    from src.ingestion.propline import strip_team_suffix
+
+    assert strip_team_suffix(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "Player (Questionable)",     # a word, not a team code
+    "Player (A)",                # one letter
+    "Player (TOOLONG)",          # five+
+    "Player (sas)",              # lowercase
+    "Player (SAS) Jr",           # not anchored at the end
+])
+def test_only_a_trailing_uppercase_team_code_is_stripped(raw):
+    """
+    Narrow on purpose. The pattern is two-to-four CAPITALS in parentheses at
+    the END, so a parenthetical carrying any other information survives
+    rather than being silently eaten out of a player's identity.
+    """
+    from src.ingestion.propline import strip_team_suffix
+
+    assert strip_team_suffix(raw) == raw.strip()
+
+
+def test_the_raw_payload_keeps_the_name_as_the_source_sent_it():
+    """Normalising a source's format must not destroy what it actually said."""
+    from src.ingestion.propline import normalize_event_props
+
+    payload = {
+        "id": "129636",
+        "commence_time": "2026-10-21T01:30:00Z",
+        "bookmakers": [{
+            "key": "bovada",
+            "markets": [{
+                "key": "player_points",
+                "outcomes": [
+                    {"name": "Over", "description": "De'Aaron Fox (SAS)",
+                     "point": 14.5, "price": -115},
+                    {"name": "Under", "description": "De'Aaron Fox (SAS)",
+                     "point": 14.5, "price": -115},
+                ],
+            }],
+        }],
+    }
+    rows = normalize_event_props(payload)
+    assert len(rows) == 1
+    assert rows[0].player_name == "De'Aaron Fox", "the suffix reached the panel join"
+    # AND THE NAME THIS TEST IS ACTUALLY ABOUT. It asserted only the stripped
+    # value, so it passed while `raw` kept no description at all and
+    # `strip_team_suffix`'s promise that "the unmodified string stays in raw"
+    # was simply untrue. The team tag is the one disambiguator the provider
+    # sends about which Williams a row is, and it was being dropped silently.
+    for side in ("over", "under"):
+        assert rows[0].raw[side]["description"] == "De'Aaron Fox (SAS)", (
+            f"raw[{side!r}] lost the name as the source sent it"
+        )
+
+
+@pytest.mark.parametrize("description", [
+    None,
+    float("nan"),
+    {"full_name": "De'Aaron Fox"},
+    ["De'Aaron Fox"],
+    12345,
+])
+def test_a_description_that_is_not_a_string_is_not_a_player(description):
+    """
+    `str(description or "")` MADE A PLAYER OUT OF A PAYLOAD SURPRISE. A float
+    NaN became the player "nan" and a dict became "{'full_name': ...}" --
+    both truthy, so both passed the caller's emptiness check and would be
+    recorded, projected and settled against a box score that cannot contain
+    them. The only safe reading of a non-string name is that there is no name.
+    """
+    from src.ingestion.propline import normalize_event_props, strip_team_suffix
+
+    assert strip_team_suffix(description) == ""
+
+    payload = {
+        "id": "129636",
+        "commence_time": "2026-10-21T01:30:00Z",
+        "bookmakers": [{
+            "key": "bovada",
+            "markets": [{
+                "key": "player_points",
+                "outcomes": [
+                    {"name": "Over", "description": description,
+                     "point": 14.5, "price": -115},
+                    {"name": "Under", "description": description,
+                     "point": 14.5, "price": -115},
+                ],
+            }],
+        }],
+    }
+    assert normalize_event_props(payload) == [], (
+        "a row with no readable player name must be dropped, not named after "
+        "whatever str() made of the payload"
+    )

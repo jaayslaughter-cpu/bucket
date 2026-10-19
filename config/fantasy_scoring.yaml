@@ -1,0 +1,39 @@
+# NBA DFS fantasy-point scoring matrices.
+#
+# PROVENANCE: user-supplied on 2026-10-19 and described by them as the exact
+# weights BOTH PrizePicks and Underdog use. NOT independently verified by this
+# repo — the environment's network policy denies the operator hosts, so no run
+# here has read a live scoring page. Treat these as the operator's terms AS
+# RECORDED ON THAT DATE, exactly as `dfs_payouts.yaml` treats its multiples.
+#
+# WHY THIS IS CONFIG AND NOT A CONSTANT. A fantasy multiplier is an operator
+# term, not a fact about basketball. Operators differ from each other and
+# change their own weights by sport, contest type and season, and a stale
+# weight misprices EVERY FPTS line built on it — silently, because the output
+# is still a plausible number. One file, dated, so a correction is one edit.
+#
+# ONE OPERATOR PER BLOCK EVEN WHERE THEY AGREE TODAY. They were supplied as
+# identical; writing them once and sharing it would turn "they happen to match"
+# into "they cannot differ", and the first divergence would be invisible.
+
+as_of: "2026-10-19"
+source: "user-supplied 2026-10-19; not verified against a live operator page from this environment"
+
+platforms:
+  prizepicks:
+    # Fantasy Score = 1.0*PTS + 1.2*REB + 1.5*AST + 3.0*STL + 3.0*BLK - 1.0*TOV
+    fpts:
+      PTS: 1.0
+      REB: 1.2
+      AST: 1.5
+      STL: 3.0
+      BLK: 3.0
+      TOV: -1.0
+  underdog:
+    fpts:
+      PTS: 1.0
+      REB: 1.2
+      AST: 1.5
+      STL: 3.0
+      BLK: 3.0
+      TOV: -1.0

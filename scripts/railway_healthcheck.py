@@ -590,11 +590,14 @@ def _check_calibration_report() -> list[Check]:
     03:30 and a redeploy before 09:00 leaves the gate with no evidence — so
     every card is withheld for a reason that is not the real one.
     """
-    from scheduler_worker import DEFAULT_CALIBRATION_REPORT, ENV_CALIBRATION_REPORT
+    from scheduler_worker import ENV_CALIBRATION_REPORT, calibration_report_path
     from src.utils.volume import resolve_state_root
 
-    configured = (os.environ.get(ENV_CALIBRATION_REPORT) or "").strip()
-    path = Path(configured or DEFAULT_CALIBRATION_REPORT)
+    # THE SAME RESOLVER SETTLEMENT WRITES THROUGH. Reading the env var again
+    # here would be a second copy of the precedence, and a healthcheck that
+    # certifies a different file from the one the job writes is worse than no
+    # healthcheck.
+    path = calibration_report_path()
     root = resolve_state_root()[0].resolve()
     out: list[Check] = []
 

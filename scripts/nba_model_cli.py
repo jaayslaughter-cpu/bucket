@@ -1635,9 +1635,11 @@ def paper_calibration_cmd(
 @app.command("prop-calibration")
 def prop_calibration_cmd(
     out: Path = typer.Option(
-        Path("outputs/calibration.json"), "--out",
-        help="Where to write the report. This file is what the dispatch "
-             "commands read via --calibration-report.",
+        None, "--out",
+        help="Where to write the report. Defaults to the same path the "
+             "scheduler reads (under the durable state root, or "
+             "$PROPIQ_CALIBRATION_REPORT), so a manual run lands where the "
+             "slate will look for it.",
     ),
     lookback_days: int = typer.Option(
         180, "--lookback-days",
@@ -1676,7 +1678,16 @@ def prop_calibration_cmd(
     Every exclusion is counted by reason in the report.
     """
     _setup_logging(verbose)
+    from scheduler_worker import calibration_report_path
     from src.settlement.calibration import prop_result_calibration_report, summarise
+
+    # THE SAME PATH THE SLATE READS. These two defaults had drifted apart the
+    # moment the worker's moved onto the durable volume: a manual
+    # `prop-calibration` wrote `outputs/calibration.json` while the 09:00 PT
+    # slate looked under the state root, so hand-generated evidence was
+    # ignored and every card stayed withheld — with both sides believing they
+    # were pointed at the same file. An explicit --out still wins.
+    out = calibration_report_path(out)
 
     try:
         report = prop_result_calibration_report(

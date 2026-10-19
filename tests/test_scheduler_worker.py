@@ -8,6 +8,8 @@ the part worth asserting.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import scheduler_worker as worker
@@ -1433,3 +1435,68 @@ def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
     assert out["status"] == "OK", "a written board must not be reported as failed"
     assert out["written_rows"] == 3
     assert "board above STANDS" in caplog.text
+
+
+# --- the publication gate's evidence lives on the durable volume ------------
+
+
+def test_the_calibration_report_defaults_under_the_durable_state_root(monkeypatch):
+    """
+    THE DEFAULT WAS EPHEMERAL, AND THE SYMPTOM BLAMED THE WRONG THING.
+    `outputs/calibration.json` is relative to the working directory, so on
+    Railway the settlement job wrote the report at 03:30 PT, a redeploy before
+    09:00 PT took it with it, and the slate then withheld every card for "no
+    calibration evidence" — true, and not the real reason, so an operator
+    debugs the gate instead of the volume.
+
+    `railway_healthcheck` warned about it, but a warning somebody has to
+    notice and act on is worse than a default that is simply right.
+    """
+    from src.utils.volume import resolve_state_root
+
+    monkeypatch.delenv(worker.ENV_CALIBRATION_REPORT, raising=False)
+    root = resolve_state_root()[0].resolve()
+    assert worker.calibration_report_path().resolve().is_relative_to(root)
+
+
+def test_an_operator_who_names_a_path_still_wins(monkeypatch):
+    """The default moved; it did not become a policy."""
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, "/tmp/operator/choice.json")
+    assert worker.calibration_report_path() == Path("/tmp/operator/choice.json")
+    # An explicit argument outranks even the variable.
+    assert worker.calibration_report_path("/tmp/explicit.json") == Path(
+        "/tmp/explicit.json"
+    )
+
+
+def test_the_healthcheck_certifies_the_file_settlement_actually_writes():
+    """
+    ONE RESOLVER, OR THE HEALTHCHECK IS WORSE THAN NOTHING. Four readers each
+    had their own `env or default`: the boot probe, the dispatcher, the report
+    writer and `railway_healthcheck`. Copies agree until one is changed, and a
+    healthcheck that certifies a different path from the one settlement writes
+    certifies nothing.
+    """
+    import ast
+
+    source = (Path(__file__).resolve().parents[1]
+              / "scripts" / "railway_healthcheck.py").read_text(encoding="utf-8")
+
+    # THE CALL, NOT THE SUBSTRING. Grepping the whole file for
+    # "calibration_report_path()" passed on a mention in a comment or a
+    # docstring, so the check survived the implementation regressing — which
+    # is the same assertion-that-cannot-fail shape this suite keeps finding.
+    tree = ast.parse(source)
+    function = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_check_calibration_report"),
+        None,
+    )
+    assert function is not None, "_check_calibration_report was renamed or removed"
+    assert any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "calibration_report_path"
+        for n in ast.walk(function)
+    ), "the healthcheck stopped CALLING the shared resolver"
+    assert "DEFAULT_CALIBRATION_REPORT" not in source, (
+        "the healthcheck grew its own copy of the default back"
+    )

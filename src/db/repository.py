@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -455,6 +456,33 @@ def insert_prop_snapshots(df: pd.DataFrame) -> int:
             session.execute(pg_insert(PropLineSnapshot).values(batch))
     logger.info("Inserted %d prop line snapshots", len(rows))
     return len(rows)
+
+
+def propline_event_ids_for_dates(game_dates: Sequence[Any]) -> list[str]:
+    """
+    Distinct PropLine EVENT ids for these slate dates, from the snapshots.
+
+    READ FROM prop_line_snapshots, NOT prop_results, and the distinction is
+    load-bearing. `normalize_event_props` always writes PropLine's own event
+    id into the snapshot's ``nba_game_id`` column, so a snapshot's value is
+    reliably an event id. `prop_results.nba_game_id` is MIXED: the recorder
+    takes the panel's GAME_ID when it has one and falls back to the posted
+    line's event id when it does not (`recorder.py`, ``game_id or
+    posted.get("nba_game_id")``), so the same column holds NBA game ids for
+    some rows and PropLine event ids for others. Calling the closing-odds
+    endpoint with an NBA game id would 404 for half a slate and look like an
+    outage.
+    """
+    if not game_dates:
+        return []
+    with session_scope() as session:
+        rows = session.execute(
+            select(PropLineSnapshot.nba_game_id)
+            .where(PropLineSnapshot.game_date.in_(list(game_dates)))
+            .where(PropLineSnapshot.nba_game_id.is_not(None))
+            .distinct()
+        ).scalars().all()
+    return [str(r) for r in rows if r]
 
 
 def _window(slate_date: str | None, lookback_days: int) -> tuple[Any, Any]:

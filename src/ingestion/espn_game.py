@@ -31,6 +31,7 @@ scoring runs, period structure, and event ordering.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -154,13 +155,32 @@ def _number(text: Any) -> float | None:
 
 
 def _split_made_attempted(text: Any) -> tuple[float | None, float | None]:
-    """'12-24' -> (12.0, 24.0). Anything else -> (None, None), never a guess."""
+    """
+    '12-24' -> (12.0, 24.0). Anything else -> (None, None), never a guess.
+
+    BOTH HALVES OR NEITHER. This said "never a guess" while returning
+    ``(3.0, None)`` for ``"3-x"``: one readable half and one unreadable one
+    yielded a made count with no attempts beside it. A shooting split with a
+    numerator and no denominator is not a partial reading, it is a wrong one
+    -- FG% computed from it is infinite, and a prop graded on attempts would
+    be graded against a missing number. Found by cubic on PR #16.
+    """
     if text is None:
         return None, None
     parts = str(text).strip().split("-")
     if len(parts) != 2:
         return None, None
-    return _number(parts[0]), _number(parts[1])
+    made, attempted = _number(parts[0]), _number(parts[1])
+    if made is None or attempted is None:
+        return None, None
+    # AND BOTH HALVES MUST BE FINITE. `_number` happily returns inf for
+    # ``"inf-5"``, which survived the None check above and then raised
+    # OverflowError the moment a caller converted it to an int -- taking the
+    # whole ESPN event down with it and leaving every prop on that game
+    # PENDING. Refusing the pair costs one stat; raising costs a game.
+    if not (math.isfinite(made) and math.isfinite(attempted)):
+        return None, None
+    return made, attempted
 
 
 def _stats_from_block(names: list[Any], values: list[Any]) -> dict[str, float | None]:

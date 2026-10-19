@@ -30,12 +30,14 @@ from src.settlement.boxscore_fetcher import (
     GameNotFinalError,
     fetch_player_stats_for_game,
 )
+from src.settlement.closing_lines import capture_for_dates, closing_for_prop
 from src.settlement.evaluator import (
     Outcome,
     SettlementError,
     compute_clv,
     settle_prop,
 )
+from src.settlement.names import normalise_player_name
 from src.utils.timezones import pacific_calendar_date
 
 logger = logging.getLogger(__name__)
@@ -91,10 +93,8 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
             return None
         return candidate
 
-    def norm(s: str) -> str:
-        return "".join(ch for ch in s.casefold() if ch.isalnum())
-
-    target = norm(player_name)
+    target = normalise_player_name(player_name)
+    norm = normalise_player_name
     for name, stats in stats_by_name.items():
         if norm(name) == target:
             if stats.get("ambiguous_name"):
@@ -106,6 +106,18 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
                 return None
             return stats
     return None
+
+
+#: What `extract_player_stats` has always implied without saying: a row with
+#: no explicit source came from the NBA CDN, because until the ESPN fallback
+#: existed that was the only producer.
+CDN_RESULT_SOURCE = "nba_cdn_liveData"
+ESPN_RESULT_SOURCE = "espn_site_api_summary"
+
+
+def _result_source(player_stats: dict) -> str:
+    """The source that actually produced this stat line."""
+    return ESPN_RESULT_SOURCE if player_stats.get("source") == "espn" else CDN_RESULT_SOURCE
 
 
 def stake_or_default(stake: Decimal | None) -> Decimal:
@@ -135,6 +147,11 @@ def settle_pending_props(
     # UTC-dated cutoff would drop the most recent night's props.
     cutoff = pacific_calendar_date() - timedelta(days=max_game_age_days)
     http = session_http or requests.Session()
+    # ONE SLATE FETCH PER RUN, not per game. Without this the ESPN fallback
+    # re-fetched the whole slate for every game: a twelve-game CDN outage made
+    # about 156 requests instead of thirteen, against a host whose 429 would
+    # then strand the grading the fallback exists to rescue.
+    espn_cache: dict[str, Any] = {}
 
     with session_scope() as db:
         pending = db.execute(
@@ -152,12 +169,45 @@ def settle_pending_props(
         for row in pending:
             by_game.setdefault(row.nba_game_id, []).append(row)
 
+        # CLOSING LINES, ONCE PER RUN. CLV is the only validator that needs no
+        # history: it compares the line taken against THAT SAME GAME's close,
+        # so it reads on the first game of a season while win/loss needs
+        # thousands of settled props. The machinery was complete and inert --
+        # `compute_clv`, the columns and the results card all existed and
+        # nothing populated `closing_line`.
+        #
+        # A FAILURE HERE MUST NOT COST THE GRADING RUN. A closing line is a
+        # market-quality measure, not a settlement input: a prop with no quote
+        # still grades to WIN/LOSS/PUSH and simply carries no CLV.
+        closing_lookup: dict = {}
+        try:
+            closing_lookup = capture_for_dates(
+                {row.game_date for row in pending if row.game_date},
+                session=http,
+            )
+        except Exception as exc:  # noqa: BLE001 — see above
+            logger.warning(
+                "Closing-line capture failed (%s); every prop grades without "
+                "CLV. Grading itself is unaffected.", exc,
+            )
+
         logger.info("Settling %d pending props across %d games", len(pending), len(by_game))
 
         for game_id, props in by_game.items():
             report.games_attempted += 1
             try:
-                stats_by_name, raw_payload = fetch_player_stats_for_game(game_id, session=http)
+                # THE FALLBACK'S TWO INPUTS, both already in hand. ESPN's
+                # payload carries no NBA game id, so `espn_boxscore` identifies
+                # the event from the players being graded; without these it
+                # declines rather than guess which game it is reading. The CDN
+                # path ignores both.
+                stats_by_name, raw_payload = fetch_player_stats_for_game(
+                    game_id,
+                    session=http,
+                    game_date=props[0].game_date,
+                    expected_players={p.player_name for p in props if p.player_name},
+                    espn_cache=espn_cache,
+                )
             except GameNotFinalError as exc:
                 report.games_not_final += 1
                 logger.info("Game %s not final — leaving %d props PENDING. %s",
@@ -190,11 +240,60 @@ def settle_pending_props(
                         did_not_play=player_stats.get("did_not_play", False),
                         minutes_played=player_stats.get("minutes_played"),
                         stake_units=stake_or_default(prop.stake_units),
+                        # THE OPERATOR, FOR FPTS ONLY. A fantasy score is
+                        # scored on the book's own multipliers, so the row's
+                        # source IS the scoring matrix; every other market
+                        # ignores this. An operator with no configured matrix
+                        # raises and the prop stays PENDING with a named
+                        # reason, rather than being graded on whichever
+                        # operator's terms happened to be the default.
+                        platform=prop.source,
                     )
                 except (SettlementError, ValueError, TypeError, AttributeError) as exc:
                     report.errors.append(f"{game_id}/{prop.player_name}/{prop.market}: {exc}")
                     logger.warning("Could not grade %s %s: %s", prop.player_name, prop.market, exc)
                     continue
+
+                # FILL THE CLOSE BEFORE MEASURING AGAINST IT. These two
+                # columns existed and nothing ever wrote them, so `compute_clv`
+                # returned {None, None} on every row ever graded.
+                #
+                # The LINE is the main close; the ODDS are the price of the SAME
+                # POINT that was taken. `compute_clv` keeps the line move and
+                # the price move separate because "reporting one as the other is
+                # the most common CLV error", and handing it the main line's
+                # price would let a line move leak into clv_prob_points and read
+                # as a price edge.
+                #
+                # RESOLVED INTO LOCALS, NOT ONTO THE ROW. `dry_run` must write
+                # nothing, and these two assignments sat ABOVE the only
+                # `if not dry_run` guard: `session_scope()` commits on a clean
+                # exit and does not care that the caller asked for a rehearsal,
+                # so a dry run persisted every close it captured.
+                closing_line = prop.closing_line
+                closing_odds = prop.closing_odds
+                # EITHER ONE MISSING IS A REASON TO LOOK. The two numbers come
+                # from different rungs -- the main line, and the price of the
+                # point actually taken -- so a row can carry a close and still
+                # have no same-point price. Gating on the line alone left those
+                # rows permanently without one, and the price measure is the
+                # half that abstains without it.
+                if closing_line is None or closing_odds is None:
+                    main_line, same_point_odds = closing_for_prop(
+                        closing_lookup,
+                        source=prop.source,
+                        market=prop.market,
+                        player_name=prop.player_name,
+                        taken_line=prop.predicted_line,
+                        taken_side=prop.predicted_side,
+                    )
+                    # Only ever ADDS a close: whichever field already holds a
+                    # number keeps it, so a re-run cannot overwrite what was
+                    # true at the time with a later capture.
+                    if closing_line is None:
+                        closing_line = main_line
+                    if closing_odds is None:
+                        closing_odds = same_point_odds
 
                 # CLV is a market-quality signal, not part of grading. A bad
                 # closing price must not abort the surrounding transaction and
@@ -203,9 +302,9 @@ def settle_pending_props(
                     clv = compute_clv(
                         predicted_line=prop.predicted_line,
                         predicted_side=prop.predicted_side,
-                        closing_line=prop.closing_line,
+                        closing_line=closing_line,
                         bet_odds=prop.odds,
-                        closing_odds=prop.closing_odds,
+                        closing_odds=closing_odds,
                     )
                 except SettlementError as exc:
                     report.errors.append(
@@ -218,6 +317,8 @@ def settle_pending_props(
                     clv = {"clv_line_points": None, "clv_prob_points": None}
 
                 if not dry_run:
+                    prop.closing_line = closing_line
+                    prop.closing_odds = closing_odds
                     prop.outcome_status = str(result.outcome)
                     prop.actual_result = result.actual_result
                     prop.stake_units = result.stake_units
@@ -227,7 +328,14 @@ def settle_pending_props(
                     prop.clv_line_points = clv["clv_line_points"]
                     prop.clv_prob_points = clv["clv_prob_points"]
                     prop.settlement_note = result.note
-                    prop.result_source = "nba_cdn_liveData"
+                    # PROVENANCE IS NOT DECORATION. This was hardcoded, so
+                    # every ESPN-graded row claimed the NBA CDN as its source.
+                    # The settlement audit's whole value is being able to ask
+                    # "where did this number come from" and get a true answer;
+                    # a row that lies about its source cannot be re-checked
+                    # against the feed it names. The fetched row says which
+                    # source produced it, and the CDN value stands otherwise.
+                    prop.result_source = _result_source(player_stats)
                     prop.settled_at_utc = datetime.now(timezone.utc)
                     prop.raw_boxscore_json = {
                         "gameId": game_id,

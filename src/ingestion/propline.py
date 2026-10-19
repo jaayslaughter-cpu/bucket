@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -793,6 +794,52 @@ def _pricing_for_row(book_key: str, data: dict[str, Any]) -> dfs_pricing.DfsPric
     )
 
 
+#: PropLine writes the player as ``"De'Aaron Fox (SAS)"`` -- name then team
+#: code in parentheses. Two to four capitals only, anchored at the end, so a
+#: parenthetical that is part of a name could never be eaten.
+_TEAM_SUFFIX = re.compile(r"\s*\([A-Z]{2,4}\)\s*$")
+
+
+def strip_team_suffix(description: Any) -> str:
+    """
+    ``"De'Aaron Fox (SAS)"`` -> ``"De'Aaron Fox"``.
+
+    THIS WAS THE BLOCKER UNDER EVERY OTHER BLOCKER, and it is a one-line
+    format difference. The panel's PLAYER_NAME is bare ("Aaron Gordon");
+    PropLine's carries the team. `id_crosswalk.resolve_board_names` compares
+    them on an exact normalised match and REFUSES to fuzzy-match, for a good
+    reason it states itself: a score high enough to catch Jokic/Jokić also
+    catches Jalen/Jaylen Williams, and in a settlement ledger that is a wrong
+    record rather than a near miss.
+
+    So "deaaron fox sas" never equalled "deaaron fox", the name map came back
+    EMPTY, every projection carried a null LINE, the recorder skipped every
+    row with "no posted line", `prop_results` stayed empty -- and with no
+    graded rows there was no ledger, no calibration report, and therefore no
+    publishable model figure, ever. Measured on the live board: all three of
+    Fox, Jokić and Holmgren came back DATA_NOT_AVAILABLE.
+
+    The diagnostic made it worse. `main._attach_prop_lines` logs "even after
+    the name crosswalk ... not a name-format problem" on a total miss, which
+    is precisely what this was.
+
+    Stripped HERE, at the ingestion boundary, because normalising a source's
+    own formatting is this adapter's job -- and the unmodified string stays in
+    ``raw["<side>"]["description"]`` so nothing is lost.
+
+    STRINGS ONLY, AND DELIBERATELY NOT ``str()`` OF WHATEVER ARRIVED. That
+    coercion turned a float NaN into a player called "nan" and a dict into a
+    player called "{'name': ...}" -- both truthy, so both survived the
+    caller's emptiness check and reached `prop_results` as a player name, to
+    be settled against a box score that can never contain them. A non-string
+    description is a payload surprise, not a name, and returning "" routes it
+    straight into the ``if not player: continue`` the caller already has.
+    """
+    if not isinstance(description, str):
+        return ""
+    return _TEAM_SUFFIX.sub("", description.strip()).strip()
+
+
 def normalize_event_props(
     payload: dict[str, Any],
     market_map: dict[str, str] | None = None,
@@ -853,7 +900,7 @@ def normalize_event_props(
                     logger.debug("Skipping %s row: %s", book_key, why)
                     continue
 
-                player = (outcome.get("description") or "").strip()
+                player = strip_team_suffix(outcome.get("description"))
                 if not player:
                     continue
                 side = (outcome.get("name") or "").strip().lower()
@@ -900,6 +947,13 @@ def normalize_event_props(
                         row["captured_source"] = observed_source
 
                 row["raw"][side] = {
+                    # THE UNSTRIPPED NAME, because `strip_team_suffix` claims
+                    # in its own docstring that nothing is lost and this is
+                    # the only place that can keep that true. Without it the
+                    # team tag -- the one piece of disambiguating information
+                    # the provider sends about which Williams this is -- was
+                    # discarded at the boundary with no record anywhere.
+                    "description": outcome.get("description"),
                     "price": outcome.get("price"),
                     "point": point,
                     "book_outcome_id": outcome.get("book_outcome_id"),

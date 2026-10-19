@@ -303,9 +303,102 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+#: Why `select_event_by_players` declined, when the reason is "our game is
+#: not among the final ones yet" rather than "ESPN is broken". Matched on the
+#: refusal's own wording because the selector raises one exception type for
+#: several distinguishable situations, and widening its type hierarchy to say
+#: so would spread this distinction across two modules.
+_UNFINISHED_MARKERS = (
+    "appear in any",          # none of our players reached a box score yet
+    "split across events",    # some have, some have not: the game is mid-flight
+)
+
+
+def _looks_unfinished(exc: Exception) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _UNFINISHED_MARKERS)
+
+
 def fetch_player_stats_for_game(
-    game_id: str | int, session: requests.Session | None = None
+    game_id: str | int,
+    session: requests.Session | None = None,
+    *,
+    game_date: Any = None,
+    expected_players: set[str] | None = None,
+    espn_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Convenience: final box score -> (player stats by name, raw payload)."""
-    payload = fetch_final_boxscore(game_id, session=session)
-    return extract_player_stats(payload), payload
+    """
+    Final box score -> (player stats by name, raw payload), CDN first.
+
+    THE CDN IS PREFERRED AND UNCHANGED: it is addressed by NBA game id, so it
+    is exact, and it carries the NBA personId that the duplicate-name branch
+    of `extract_player_stats` needs. It is only not reachable.
+
+    Measured 2026-10-19: cdn.nba.com answers 403 in 0.47s with the real
+    headers above, and stats.nba.com never completes a connection. A control
+    host through the same proxy answered, so the refusal is NBA's. With no box
+    score the settlement loop cannot close, and the publication gate then
+    withholds every card for want of calibration evidence that grading is the
+    only source of — so an unreachable CDN silences the whole pipeline.
+
+    `settlement.espn_boxscore` is the fallback, and it needs what it cannot
+    derive: ESPN carries no NBA game id, so the event is identified from the
+    PLAYERS being graded. Omit either `game_date` or `expected_players` and
+    the fallback is not attempted — it refuses to guess which game it is
+    looking at, exactly as the stale-market gate refuses to invent an
+    observation time.
+
+    A GameNotFinalError from the CDN is AUTHORITATIVE and is re-raised
+    untouched. The game genuinely has not finished; asking a second source
+    for a verdict we already have would only find a disagreement to act on.
+    """
+    try:
+        payload = fetch_final_boxscore(game_id, session=session)
+        return extract_player_stats(payload), payload
+    except GameNotFinalError:
+        raise
+    except BoxScoreError as cdn_exc:
+        if game_date is None or not expected_players:
+            raise
+        from src.settlement.espn_boxscore import (
+            EspnBoxScoreError,
+            EspnGameNotFinalError,
+            fetch_espn_player_stats_for_game,
+        )
+
+        logger.warning(
+            "CDN box score unavailable for %s (%s) — falling back to ESPN.",
+            normalize_game_id(game_id), cdn_exc,
+        )
+        try:
+            return fetch_espn_player_stats_for_game(
+                game_date, set(expected_players), session=session,
+                cache=espn_cache,
+            )
+        except EspnGameNotFinalError as exc:
+            raise GameNotFinalError(
+                f"ESPN has no final box score for {normalize_game_id(game_id)} "
+                f"on {game_date}: {exc}"
+            ) from exc
+        except EspnBoxScoreError as exc:
+            # A GAME THAT HAS NOT FINISHED MUST NOT READ AS A FETCH FAILURE.
+            # `select_event_by_players` cannot find our event while it is
+            # still being played, and it says so by declining -- but on a
+            # night where OTHER games are already final the slate is
+            # non-empty, so that decline arrives as an ordinary
+            # EspnBoxScoreError. Counted as a failure it inflates
+            # games_failed and fills `report.errors` with games that are
+            # merely in progress, which is how a healthy night starts looking
+            # like an outage. The props stay PENDING either way; only the
+            # label differs, and the label is what an operator reads.
+            if _looks_unfinished(exc):
+                raise GameNotFinalError(
+                    f"No final ESPN event matches {normalize_game_id(game_id)} "
+                    f"on {game_date} yet: {exc}"
+                ) from exc
+            # BOTH sources named, because "box score fetch failed" with one
+            # cause hides which half of the fallback is actually broken.
+            raise BoxScoreError(
+                f"Both box score sources failed for "
+                f"{normalize_game_id(game_id)}. CDN: {cdn_exc} | ESPN: {exc}"
+            ) from exc

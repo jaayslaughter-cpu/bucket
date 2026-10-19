@@ -55,6 +55,7 @@ import signal
 import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # the annotation only; importing it at runtime would make
@@ -86,8 +87,39 @@ ENV_RESULTS_CARD = "PROPIQ_RESULTS_CARD"
 ENV_PRELOCK = "PROPIQ_PRELOCK"
 ENV_PRELOCK_LEAD = "PROPIQ_PRELOCK_LEAD_MINUTES"
 
-DEFAULT_CALIBRATION_REPORT = "outputs/calibration.json"
+#: Relative to the DURABLE STATE ROOT, not the working directory. The old value
+#: was a bare "outputs/calibration.json", which on Railway is ephemeral: the
+#: settlement job writes the report at 03:30 PT, the slate reads it at 09:00 PT,
+#: and a redeploy in between left the publication gate with no evidence. Every
+#: card was then withheld for "no calibration evidence" -- which is true, and is
+#: NOT the real reason, so the operator debugs the gate instead of the volume.
+#: `railway_healthcheck` warned about this, and a warning an operator has to act
+#: on is worse than a default that is simply right.
+CALIBRATION_REPORT_RELPATH = "outputs/calibration.json"
 DEFAULT_BOARD_CSV = "outputs/decision_board.csv"
+
+
+def calibration_report_path(explicit: str | Path | None = None) -> Path:
+    """
+    The one answer to "where does the publication gate's evidence live".
+
+    FOUR READERS HAD THEIR OWN COPY of ``env or default`` -- the boot probe, the
+    dispatcher, the report writer and `railway_healthcheck` -- which is the
+    defect this tree keeps finding: the copies agree until one of them is
+    changed. The healthcheck checking a different path from the one settlement
+    writes would make it certify the wrong file.
+
+    Precedence: an explicit argument, then ``$PROPIQ_CALIBRATION_REPORT``, then
+    the state root. An operator who sets the variable still wins.
+    """
+    if explicit:
+        return Path(explicit)
+    configured = (os.environ.get(ENV_CALIBRATION_REPORT) or "").strip()
+    if configured:
+        return Path(configured)
+    from src.utils.volume import resolve_state_root
+
+    return resolve_state_root()[0] / CALIBRATION_REPORT_RELPATH
 
 # 09:00 PT: before any NBA tip (the earliest are late morning PT) and after the
 # night's box scores have settled into the sources.
@@ -667,9 +699,7 @@ def check_state_dir(path: str | None = None) -> dict[str, Any]:
     else:
         root, how = resolve_state_root()
         targets = [(root, "STATE ROOT", state_root_contents, (how, True))]
-        report_dir = Path(
-            os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
-        ).parent
+        report_dir = calibration_report_path().parent
         # Compare resolved paths: "outputs" and "/app/outputs" are the same
         # directory and probing it twice would log a duplicate.
         if report_dir.resolve() != root.resolve():
@@ -1421,9 +1451,7 @@ def run_dispatch() -> dict[str, Any]:
         return {"status": "SKIPPED", "reason": "dispatch disabled"}
 
     board_csv = Path(os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV)
-    report_path = Path(
-        os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT
-    )
+    report_path = calibration_report_path()
 
     # Imported BEFORE the try, because the except clause below names
     # DiscordDispatchError: an ImportError inside the try would leave that name
@@ -1981,9 +2009,8 @@ def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
     behind it aged out.
     """
     import json
-    from pathlib import Path
 
-    target = Path(path or os.environ.get(ENV_CALIBRATION_REPORT) or DEFAULT_CALIBRATION_REPORT)
+    target = calibration_report_path(path)
     try:
         from src.settlement.calibration import (
             prop_result_calibration_report,

@@ -920,19 +920,80 @@ def section_5(report: Report) -> None:
     g = guard(report, "a failing job does not take the worker down")
 
     def _safety() -> None:
+        """
+        A job is safe if IT catches, or if the helper it delegates to does.
+
+        THIS CHECK USED TO CRY WOLF. It required a `try` lexically inside each
+        top-level ``run_*``, and `run_slate` has none: it takes the
+        cross-process write lock and hands off to `_run_slate_locked`, which
+        carries the real guard (and a separate `except SystemExit`, which is
+        the branch that actually fired on Railway on 2026-10-11). So the one
+        FAIL in this whole suite was a false positive, two days before a
+        season opener -- and a verifier that reports a healthy tree as broken
+        gets ignored, which costs more than the check was ever worth.
+
+        Delegation is resolved ONE level, by name, among this module's own
+        functions. Not arbitrarily deep: "something somewhere down the call
+        graph catches" is not a property worth asserting, because it passes
+        for a guard three hops away that no longer covers the caller.
+        """
         src = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
-        wrapped, unwrapped = [], []
+
+        catches = {
+            n.name: any(isinstance(x, ast.Try) for x in ast.walk(n))
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+        }
+
+        def _own_calls(node: ast.FunctionDef):
+            """
+            Calls this function makes ITSELF, not ones a nested def makes.
+
+            `ast.walk` descends into nested function bodies, so a `run_*` job
+            containing an inner helper that happens to be guarded read as safe
+            even when the job's own body was not. That is the direction that
+            matters: it would let a later unguarded job pass this gate
+            silently, which is the whole failure this check exists to catch.
+            """
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda, ast.ClassDef)):
+                    continue
+                for inner in ast.walk(child):
+                    if isinstance(inner, ast.Call):
+                        yield inner
+
+        def _delegates_to_a_guard(node: ast.FunctionDef) -> str | None:
+            for call in _own_calls(node):
+                name = getattr(call.func, "id", None)
+                if name and name != node.name and catches.get(name):
+                    return name
+            return None
+
+        wrapped, via, unwrapped = [], [], []
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("run_"):
-                has = any(isinstance(n, ast.Try) for n in ast.walk(node))
-                (wrapped if has else unwrapped).append(node.name)
+            if not (isinstance(node, ast.FunctionDef)
+                    and node.name.startswith("run_")):
+                continue
+            if catches.get(node.name):
+                wrapped.append(node.name)
+                continue
+            helper = _delegates_to_a_guard(node)
+            if helper:
+                via.append(f"{node.name} -> {helper}")
+            else:
+                unwrapped.append(node.name)
+
         if unwrapped:
             report.bad("a failing job does not take the worker down",
-                       f"no try/except in {unwrapped}")
+                       f"no try/except in {unwrapped}, and nothing they call "
+                       f"catches either")
         else:
-            report.ok("a failing job does not take the worker down",
-                      f"{', '.join(wrapped)} each catch and log")
+            detail = f"{', '.join(wrapped)} each catch and log"
+            if via:
+                detail += f"; {', '.join(via)} delegates to a guarded helper"
+            report.ok("a failing job does not take the worker down", detail)
     g(_safety)
 
     g = guard(report, "the scheduled slate passes the arguments it needs")
