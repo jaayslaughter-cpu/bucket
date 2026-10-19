@@ -296,16 +296,27 @@ def composite_variance(
     # tree keeps removing.
     _require_consistent(correlations, names, market=spec.market)
 
-    total = 0.0
-    for name in names:
-        total += (spec.weights[name] ** 2) * (sds[name] ** 2)
+    # OVERFLOW RAISES HERE, IT DOES NOT ONLY RETURN inf. `(1e200) ** 2` is an
+    # OverflowError while `1e200 * 1e200` is inf, so the accumulation can fail
+    # either way from inputs `_finite` has already accepted -- and an
+    # uncaught OverflowError out of a projection helper is a crash where the
+    # answer is "no usable spread".
+    try:
+        total = 0.0
+        for name in names:
+            total += (spec.weights[name] ** 2) * (sds[name] ** 2)
 
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            rho = _correlation(correlations, a, b, market=spec.market)
-            total += (
-                2.0 * spec.weights[a] * spec.weights[b] * rho * sds[a] * sds[b]
-            )
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                rho = _correlation(correlations, a, b, market=spec.market)
+                total += (
+                    2.0 * spec.weights[a] * spec.weights[b] * rho * sds[a] * sds[b]
+                )
+    except OverflowError as exc:
+        raise CompositeMarketError(
+            f"DATA_NOT_AVAILABLE: {spec.market} variance overflowed from "
+            f"finite inputs ({exc}), so the spread is not usable"
+        ) from exc
 
     if total < 0:
         # Belt to the braces: a PSD correlation matrix cannot produce this,
@@ -315,6 +326,17 @@ def composite_variance(
             f"{spec.market}: the supplied correlations imply a NEGATIVE variance "
             f"({total:.4f}), so they are not a consistent (PSD) matrix. Repair "
             f"them with quant.psd_repair rather than taking a root of this."
+        )
+    # FINITE INPUTS CAN STILL SUM TO AN INFINITE VARIANCE. `_finite` guards
+    # each sd, but squaring and weighting six of them near the float ceiling
+    # overflows, and `inf` here reads downstream as "infinitely uncertain"
+    # rather than "unusable" -- an sd of inf makes every Over and Under
+    # equally likely and the row looks priced instead of absent.
+    # `composite_mean` abstains on exactly this; so does this now.
+    if not math.isfinite(total):
+        raise CompositeMarketError(
+            f"DATA_NOT_AVAILABLE: {spec.market} variance totals {total} from "
+            f"finite inputs, so the spread is not usable"
         )
     return total
 

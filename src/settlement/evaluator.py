@@ -154,6 +154,36 @@ def is_whole_number_line(line: Decimal) -> bool:
     return line == line.to_integral_value()
 
 
+def fractional_values_possible(market: str, *, platform: Any = None) -> bool:
+    """
+    Whether this market's realised value can land off a whole number.
+
+    THE PUSH GUARD'S REAL QUESTION, and it had the wrong answer for FPTS.
+    Every counting stat is an integer and every SUM of them is too, so a tie
+    against a .5 line cannot happen and almost certainly means something
+    upstream mis-parsed -- worth refusing loudly, which is what the guard is
+    for.
+
+    A FANTASY SCORE IS NOT INTEGER-VALUED. 1.2*REB and 1.5*AST put x.5 well
+    within reach of entirely ordinary numbers -- 20 PTS, 5 REB, 1 AST is
+    27.5 exactly -- so on FPTS that same tie is a REAL PUSH. Refusing it
+    raised "arithmetically impossible for an integer stat", left the row
+    PENDING on every later run, and blamed a parsing bug that did not exist.
+
+    DERIVED FROM THE WEIGHTS, not from the market's name: an operator whose
+    matrix happened to be all integers would be integer-valued too and should
+    keep the guard, so this reads the one weight table rather than assuming
+    what FPTS looks like.
+    """
+    if market.upper().strip() != FPTS:
+        return False
+    weights = fantasy_weights(str(platform)) if str(platform or "").strip() else {}
+    return any(
+        _to_decimal(w, "FPTS weight") != _to_decimal(w, "FPTS weight").to_integral_value()
+        for w in weights.values()
+    )
+
+
 def _component(player_stats: dict[str, Any], field: str, market_key: str) -> Decimal:
     """One box-score component, or a refusal. A missing stat is not a zero."""
     if field not in player_stats or player_stats[field] is None:
@@ -316,7 +346,13 @@ def settle_prop(
 
     # --- PUSH: exact tie. Only reachable on a whole-number line. --------
     if actual == line:
-        if not is_whole_number_line(line):
+        # MARKET-AWARE, because the guard's premise only holds for integers.
+        # A fractional tie is impossible for a counting stat and real for a
+        # fantasy score, and treating the second as the first refused a
+        # legitimate PUSH and left the row PENDING for good.
+        if not is_whole_number_line(line) and not fractional_values_possible(
+            market, platform=platform
+        ):
             raise SettlementError(
                 f"Computed a PUSH on fractional line {line} (actual={actual}). "
                 f"This is arithmetically impossible for an integer stat and "

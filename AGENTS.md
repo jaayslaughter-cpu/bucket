@@ -199,8 +199,8 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   yet and the board cannot offer them. `src/quant/streaks.py` computes
   Underdog Streak valuations by backward induction, and every multiple it
   reads from `config/streaks.yaml` is **user-supplied and has never been read
-  from a live operator page from this environment**, which the file says on
-  its own first line. Nothing trades any of it: the user's sequencing is
+  from a live operator page from this environment**, as that file's own
+  provenance comments state. Nothing trades any of it: the user's sequencing is
   singles only until per-leg calibration is measured on real lines.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
