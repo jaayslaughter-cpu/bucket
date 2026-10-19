@@ -616,3 +616,53 @@ def test_the_raw_payload_keeps_the_name_as_the_source_sent_it():
     rows = normalize_event_props(payload)
     assert len(rows) == 1
     assert rows[0].player_name == "De'Aaron Fox", "the suffix reached the panel join"
+    # AND THE NAME THIS TEST IS ACTUALLY ABOUT. It asserted only the stripped
+    # value, so it passed while `raw` kept no description at all and
+    # `strip_team_suffix`'s promise that "the unmodified string stays in raw"
+    # was simply untrue. The team tag is the one disambiguator the provider
+    # sends about which Williams a row is, and it was being dropped silently.
+    for side in ("over", "under"):
+        assert rows[0].raw[side]["description"] == "De'Aaron Fox (SAS)", (
+            f"raw[{side!r}] lost the name as the source sent it"
+        )
+
+
+@pytest.mark.parametrize("description", [
+    None,
+    float("nan"),
+    {"full_name": "De'Aaron Fox"},
+    ["De'Aaron Fox"],
+    12345,
+])
+def test_a_description_that_is_not_a_string_is_not_a_player(description):
+    """
+    `str(description or "")` MADE A PLAYER OUT OF A PAYLOAD SURPRISE. A float
+    NaN became the player "nan" and a dict became "{'full_name': ...}" --
+    both truthy, so both passed the caller's emptiness check and would be
+    recorded, projected and settled against a box score that cannot contain
+    them. The only safe reading of a non-string name is that there is no name.
+    """
+    from src.ingestion.propline import normalize_event_props, strip_team_suffix
+
+    assert strip_team_suffix(description) == ""
+
+    payload = {
+        "id": "129636",
+        "commence_time": "2026-10-21T01:30:00Z",
+        "bookmakers": [{
+            "key": "bovada",
+            "markets": [{
+                "key": "player_points",
+                "outcomes": [
+                    {"name": "Over", "description": description,
+                     "point": 14.5, "price": -115},
+                    {"name": "Under", "description": description,
+                     "point": 14.5, "price": -115},
+                ],
+            }],
+        }],
+    }
+    assert normalize_event_props(payload) == [], (
+        "a row with no readable player name must be dropped, not named after "
+        "whatever str() made of the payload"
+    )

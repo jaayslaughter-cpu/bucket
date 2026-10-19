@@ -58,21 +58,20 @@ import requests
 
 from src.ingestion.espn_game import fetch_summary
 from src.ingestion.espn_schedule import STATE_FINAL, fetch_scoreboard, parse_scoreboard
+from src.settlement.evaluator import PANEL_TO_BOXSCORE
 from src.settlement.names import normalise_player_name
 
 logger = logging.getLogger(__name__)
 
 #: `espn_game` emits the PANEL's stat names. Settlement reads the CDN's field
 #: names verbatim (see `extract_player_stats`), so the translation happens
-#: here, once. A stat ESPN omitted stays absent rather than becoming a zero.
+#: once -- in `evaluator.PANEL_TO_BOXSCORE`, which is where the box-score
+#: vocabulary is defined and graded from. This EXTENDS it with the shot-volume
+#: columns migration 009 added, rather than restating the seven pairs it
+#: already has: two copies of this table is how a renamed field grades one way
+#: and projects another. A stat ESPN omitted stays absent, never a zero.
 PANEL_TO_CDN = {
-    "PTS": "points",
-    "REB": "reboundsTotal",
-    "AST": "assists",
-    "FG3M": "threePointersMade",
-    "STL": "steals",
-    "BLK": "blocks",
-    "TOV": "turnovers",
+    **PANEL_TO_BOXSCORE,
     # Shot volume, for the fga/fta columns migration 009 added.
     "FGM": "fieldGoalsMade",
     "FGA": "fieldGoalsAttempted",

@@ -57,8 +57,11 @@ RESEARCH_ONLY.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,12 @@ logger = logging.getLogger(__name__)
 STREAK_CONFIG = Path("config/streaks.yaml")
 
 GATEKEEPER_PICKS = 2
+
+#: THE FIRST TIER THAT CAN BE CASHED. The operator's terms as supplied: "after
+#: every correct pick FROM LEG 3 ONWARDS, Underdog presents a 'Win Now'
+#: cash-out offer". Two correct picks is a live streak, not a cashable
+#: position -- there is no offer there to accept or decline.
+FIRST_CASHOUT_PICKS = GATEKEEPER_PICKS + 1
 
 
 class StreakError(ValueError):
@@ -76,9 +85,19 @@ class StreakError(ValueError):
 class StreakCurve:
     """Picks -> gross multiple returned per 1 staked. Sorted, contiguous."""
 
-    multipliers: dict[int, float]
+    multipliers: Mapping[int, float]
     as_of: str | None = None
     source: str | None = None
+
+    def __post_init__(self) -> None:
+        # FROZEN STOPS REBINDING, NOT MUTATION. `curve.multipliers[11] = 1e9`
+        # silently repriced every valuation taken from this curve, and the
+        # loader is the kind of thing a caller holds for a whole run, so the
+        # edit outlives whatever made it. Read-only, and `load_streak_curve`
+        # is the one door that validates what goes in.
+        object.__setattr__(
+            self, "multipliers", MappingProxyType(dict(self.multipliers))
+        )
 
     @property
     def max_picks(self) -> int:
@@ -97,10 +116,19 @@ class StreakVerdict:
     """What to do at one tier, and the arithmetic behind it."""
 
     picks: int
-    cashout_value: float
+    #: None where the operator offers no cash-out at this tier.
+    cashout_value: float | None
     hold_value: float
     recommendation: str          # "HOLD" or "CASH_OUT"
     break_even_probability: float
+    #: WHICH QUESTION `break_even_probability` ANSWERS, because there are two
+    #: and they are different numbers. "next_leg" is the threshold for THIS
+    #: leg holding the continuation assumption fixed -- exact, and the right
+    #: reading when `continuation_probability` was supplied. "flat_all_legs"
+    #: is the self-consistent fixed point for a player who assumes the same p
+    #: for every remaining leg, which is the only one a flat p can be
+    #: compared against. "no_offer" means there is nothing to decline.
+    break_even_basis: str
     reason: str
 
 
@@ -131,7 +159,55 @@ def load_streak_curve(
             f"DATA_NOT_AVAILABLE: {config_path} has no `streaks` curve for "
             f"{platform!r}."
         )
-    multipliers = {int(k): float(v) for k, v in streaks.items()}
+    # EVERY VALUE CHECKED HERE, BECAUSE NOTHING DOWNSTREAM CAN. `{int(k):
+    # float(v)}` raised a bare ValueError on a typo, and accepted `.nan`,
+    # `.inf`, zero and negatives without comment -- a NaN tier makes every
+    # comparison in `streak_values` False so the induction silently prefers
+    # whichever branch NaN loses to, and a zero tier values a live streak at
+    # nothing. This is the only door into a StreakCurve, so it is the only
+    # place the curve can be made trustworthy.
+    if not isinstance(streaks, Mapping):
+        raise StreakError(
+            f"{config_path}: {platform!r} `streaks` must be a mapping of "
+            f"correct picks -> multiple, got {type(streaks).__name__}"
+        )
+
+    multipliers: dict[int, float] = {}
+    for key, value in streaks.items():
+        try:
+            picks = int(str(key).strip())
+        except (TypeError, ValueError) as exc:
+            raise StreakError(
+                f"{config_path}: {platform!r} has a tier keyed {key!r}, which "
+                f"is not a number of correct picks"
+            ) from exc
+        try:
+            multiple = float(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise StreakError(
+                f"{config_path}: {platform!r} tier {picks} pays {value!r}, "
+                f"which is not a multiple"
+            ) from exc
+        if picks < 1:
+            raise StreakError(
+                f"{config_path}: {platform!r} has a tier at {picks} pick(s); a "
+                f"streak starts at one."
+            )
+        if not math.isfinite(multiple) or multiple <= 0:
+            raise StreakError(
+                f"{config_path}: {platform!r} tier {picks} pays {value!r}. A "
+                f"tier returns a positive, finite multiple of the stake; a "
+                f"non-finite one makes every comparison in the valuation "
+                f"meaningless and a zero one values a live streak at nothing."
+            )
+        if picks in multipliers:
+            raise StreakError(
+                f"{config_path}: {platform!r} gives tier {picks} twice "
+                f"({multipliers[picks]} and {multiple}); which one is the "
+                f"operator's term is not something this can guess."
+            )
+        multipliers[picks] = multiple
+
     if GATEKEEPER_PICKS not in multipliers:
         raise StreakError(
             f"{platform!r} streak curve has no {GATEKEEPER_PICKS}-pick tier, "
@@ -144,6 +220,19 @@ def load_streak_curve(
             f"one pick at a time, so a gap means a tier is missing rather than "
             f"unreachable."
         )
+    # STRICTLY INCREASING, because each tier is the one before it plus a leg
+    # that could have lost everything. A tier paying no more than its
+    # predecessor is a transposed digit in config (2.0 for 20.0), and the
+    # induction would read it as a position worth cashing immediately and
+    # always -- a real recommendation built on a typo.
+    for earlier, later in zip(tiers, tiers[1:]):
+        if multipliers[later] <= multipliers[earlier]:
+            raise StreakError(
+                f"{platform!r} tier {later} pays {multipliers[later]}, which is "
+                f"no more than tier {earlier}'s {multipliers[earlier]}. Adding a "
+                f"leg risks the whole streak, so a tier that does not pay more "
+                f"is a config error rather than a bad bet."
+            )
     return StreakCurve(multipliers, raw.get("as_of"), raw.get("source"))
 
 
@@ -163,7 +252,24 @@ def streak_values(
     p_next * V_next_tier" is that one-step form.
 
         V(max)  = the top tier's multiple -- the streak is complete and paid
-        V(k)    = max( cashout(k), p * V(k+1) )
+        V(k)    = max( cashout(k), p * V(k+1) )   for k >= FIRST_CASHOUT_PICKS
+        V(k)    = p * V(k+1)                      below it
+
+    THE GATEKEEPER IS NOT A CASHABLE POSITION, and the first version of this
+    took the max at every tier including 2. The operator's terms say "Win Now"
+    is offered from LEG 3; at two correct picks there is no offer, so there is
+    no alternative to compare holding against. Taking the max there floors the
+    value of a live 2-pick streak at the 3x tier it cannot actually collect,
+    which overstates entry EV and -- the live consequence -- lets
+    `extension_verdict` return CASH_OUT at a tier where cashing out is not a
+    thing the operator lets you do.
+
+    MEASURED, so the size of it is on the record rather than assumed: on the
+    supplied curve the floor only binds below about p = 0.52, because above
+    that the hold value at two picks already exceeds 3x. The entry EVs in this
+    module's header (p = 0.60 -> +2.63, break-even 0.534) are unchanged by the
+    correction. At p = 0.45 it was +0.06 units of pure fiction, at p = 0.40
+    +0.10, at p = 0.30 +0.11.
 
     ``cashout_fraction`` is what the operator actually offers as a fraction of
     the tier value. It defaults to 1.0 to reproduce the brief's assumption,
@@ -179,9 +285,13 @@ def streak_values(
     top = curve.max_picks
     values: dict[int, float] = {top: curve.multiple(top)}
     for picks in range(top - 1, GATEKEEPER_PICKS - 1, -1):
-        cash = curve.multiple(picks) * cashout_fraction
         hold = per_leg_probability * values[picks + 1]
-        values[picks] = max(cash, hold)
+        if picks < FIRST_CASHOUT_PICKS:
+            # No offer exists at this tier, so holding is not a choice that
+            # beat something -- it is the only thing the position can do.
+            values[picks] = hold
+            continue
+        values[picks] = max(curve.multiple(picks) * cashout_fraction, hold)
     return values
 
 
@@ -237,26 +347,70 @@ def extension_verdict(
     if not 0.0 < next_leg_probability < 1.0:
         raise StreakError("next_leg_probability must be in (0, 1)")
 
+    assumed_continuation = continuation_probability is None
     later = (
-        next_leg_probability if continuation_probability is None
+        next_leg_probability if assumed_continuation
         else continuation_probability
     )
     values = streak_values(
         curve, per_leg_probability=later, cashout_fraction=cashout_fraction,
     )
-    cashout_value = curve.multiple(picks_so_far) * cashout_fraction
     next_tier_value = values[picks_so_far + 1]
     hold_value = next_leg_probability * next_tier_value
 
-    break_even = cashout_value / next_tier_value if next_tier_value else 1.0
+    if picks_so_far < FIRST_CASHOUT_PICKS:
+        # NOTHING TO DECLINE, SO NOTHING TO DECIDE. "Win Now" starts at leg
+        # 3; a 2-pick streak cannot be collected, so the only thing this
+        # position can do is continue. Reporting it as a HOLD that beat a
+        # cash-out worth 3x would be inventing the alternative -- and the
+        # earlier version did exactly that, returning CASH_OUT below p = 0.52
+        # and advising an action the operator does not offer.
+        return StreakVerdict(
+            picks=picks_so_far,
+            cashout_value=None,
+            hold_value=hold_value,
+            recommendation="HOLD",
+            break_even_probability=0.0,
+            break_even_basis="no_offer",
+            reason=(
+                f"At {picks_so_far} pick(s) there is no cash-out: the "
+                f"operator offers 'Win Now' from {FIRST_CASHOUT_PICKS} picks "
+                f"onwards. The position continues or it is forfeited, so any "
+                f"p above zero is better than the alternative and there is no "
+                f"decision to take. Continuing is worth {hold_value:.2f}x "
+                f"({next_leg_probability:.3f} x {next_tier_value:.2f}x)."
+            ),
+        )
+
+    cashout_value = curve.multiple(picks_so_far) * cashout_fraction
     hold = hold_value > cashout_value
+
+    # TWO DIFFERENT BREAK-EVENS, AND THE RATIO IS ONLY ONE OF THEM.
+    # `cashout / V(k+1)` is exact for THIS leg while the continuation stays
+    # fixed -- correct when the caller supplied `continuation_probability`,
+    # because then V(k+1) does not move when p does. When the continuation
+    # DEFAULTS to the same p it does move, so the ratio is a function of the
+    # very number it is meant to be a threshold for: feed p = 0.55 and get
+    # back a "break-even" computed at a continuation of 0.55, feed 0.60 and
+    # get a different one. Nobody can compare a flat p against that. For the
+    # flat case this solves the fixed point instead, so the answer is the p
+    # at which a player assuming p throughout is genuinely indifferent.
+    if assumed_continuation:
+        break_even = _flat_break_even(
+            curve, picks_so_far, cashout_fraction=cashout_fraction
+        )
+        basis = "flat_all_legs"
+    else:
+        break_even = cashout_value / next_tier_value if next_tier_value else 1.0
+        basis = "next_leg"
+
     reason = (
         f"At {picks_so_far} pick(s) the streak is worth "
         f"{cashout_value:.2f}x if cashed. Adding a leg at p="
         f"{next_leg_probability:.3f} is worth {hold_value:.2f}x "
         f"({next_leg_probability:.3f} x {next_tier_value:.2f}x), because a miss "
         f"forfeits the whole streak rather than one unit. Break-even p is "
-        f"{break_even:.3f}."
+        f"{break_even:.3f} ({basis})."
     )
     return StreakVerdict(
         picks=picks_so_far,
@@ -264,8 +418,49 @@ def extension_verdict(
         hold_value=hold_value,
         recommendation="HOLD" if hold else "CASH_OUT",
         break_even_probability=break_even,
+        break_even_basis=basis,
         reason=reason,
     )
+
+
+def _flat_break_even(
+    curve: StreakCurve, picks: int, *, cashout_fraction: float,
+) -> float:
+    """
+    The flat per-leg p at which holding at ``picks`` exactly ties cashing out.
+
+    THE FIXED POINT, NOT A RATIO. Solves ``p * V_p(picks+1) = cashout(picks)``
+    where V_p is the whole backward induction run at that same p, so the
+    answer does not depend on a continuation assumption the caller has to
+    make up. ``p * V_p(k+1)`` is strictly increasing in p -- every tier of the
+    induction is -- so the root is unique and bisection finds it.
+
+    Returns 0.0 when the operator offers nothing to cash (``cashout_fraction``
+    of zero): holding then wins at any p above zero, so the threshold is zero.
+    """
+    cashout = curve.multiple(picks) * cashout_fraction
+    if cashout <= 0:
+        return 0.0
+
+    def excess(probability: float) -> float:
+        values = streak_values(
+            curve, per_leg_probability=probability,
+            cashout_fraction=cashout_fraction,
+        )
+        return probability * values[picks + 1] - cashout
+
+    # At p -> 1 the continuation is worth at least the next tier, which pays
+    # strictly more than this one, so the root is bracketed.
+    low, high = 1e-12, 1.0 - 1e-12
+    if excess(high) <= 0:
+        return 1.0
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        if excess(mid) > 0:
+            high = mid
+        else:
+            low = mid
+    return (low + high) / 2.0
 
 
 def break_even_for_full_ride(curve: StreakCurve, picks: int | None = None) -> float:

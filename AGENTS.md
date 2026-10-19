@@ -189,6 +189,19 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   properties are now asserted directly rather than through the driver
   (`tests/test_postgres_only_defects.py`), but **there is still no Postgres in
   CI**, which is what would have caught them.
+- **The composite markets are graded but not yet projected, and the streak
+  curve is an unverified operator term.** `src/quant/composite_markets.py`
+  holds one decomposition for PA/PR/RA/PRA/FPTS and
+  `src/settlement/evaluator.py` now derives its grading table from it, so an
+  FPTS prop can be settled where it previously raised "Unknown market". What
+  is **not** built: feature rollups for PA/PR/RA/FPTS, ingestion market-map
+  entries, and composite model artifacts — so nothing projects these markets
+  yet and the board cannot offer them. `src/quant/streaks.py` computes
+  Underdog Streak valuations by backward induction, and every multiple it
+  reads from `config/streaks.yaml` is **user-supplied and has never been read
+  from a live operator page from this environment**, which the file says on
+  its own first line. Nothing trades any of it: the user's sequencing is
+  singles only until per-leg calibration is measured on real lines.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

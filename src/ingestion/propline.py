@@ -825,9 +825,19 @@ def strip_team_suffix(description: Any) -> str:
 
     Stripped HERE, at the ingestion boundary, because normalising a source's
     own formatting is this adapter's job -- and the unmodified string stays in
-    ``raw`` so nothing is lost.
+    ``raw["<side>"]["description"]`` so nothing is lost.
+
+    STRINGS ONLY, AND DELIBERATELY NOT ``str()`` OF WHATEVER ARRIVED. That
+    coercion turned a float NaN into a player called "nan" and a dict into a
+    player called "{'name': ...}" -- both truthy, so both survived the
+    caller's emptiness check and reached `prop_results` as a player name, to
+    be settled against a box score that can never contain them. A non-string
+    description is a payload surprise, not a name, and returning "" routes it
+    straight into the ``if not player: continue`` the caller already has.
     """
-    return _TEAM_SUFFIX.sub("", str(description or "").strip()).strip()
+    if not isinstance(description, str):
+        return ""
+    return _TEAM_SUFFIX.sub("", description.strip()).strip()
 
 
 def normalize_event_props(
@@ -937,6 +947,13 @@ def normalize_event_props(
                         row["captured_source"] = observed_source
 
                 row["raw"][side] = {
+                    # THE UNSTRIPPED NAME, because `strip_team_suffix` claims
+                    # in its own docstring that nothing is lost and this is
+                    # the only place that can keep that true. Without it the
+                    # team tag -- the one piece of disambiguating information
+                    # the provider sends about which Williams this is -- was
+                    # discarded at the boundary with no record anywhere.
+                    "description": outcome.get("description"),
                     "price": outcome.get("price"),
                     "point": point,
                     "book_outcome_id": outcome.get("book_outcome_id"),

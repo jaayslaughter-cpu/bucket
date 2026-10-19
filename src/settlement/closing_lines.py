@@ -44,6 +44,7 @@ RESEARCH_ONLY. This measures market agreement. It is not profit, and
 from __future__ import annotations
 
 import logging
+import statistics
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,6 +92,50 @@ def price_imbalance(over_odds: Any, under_odds: Any) -> float | None:
     return abs(float(over) - float(under))
 
 
+def price_overround(over_odds: Any, under_odds: Any) -> float | None:
+    """
+    The two-way overround: implied over + implied under, minus 1.
+
+    The book's margin on this rung. None on a one-way quote, for the same
+    reason `price_imbalance` abstains there.
+    """
+    if over_odds is None or under_odds is None:
+        return None
+    try:
+        over = american_to_implied_probability(int(over_odds))
+        under = american_to_implied_probability(int(under_odds))
+    except (TypeError, ValueError):
+        return None
+    return float(over) + float(under) - 1.0
+
+
+def _main_line_sort_key(row: Any, imbalance: float, ladder_mid: float) -> tuple:
+    """
+    Rank one rung's claim to be the main line. Lower is more main.
+
+    TIES MUST BE BROKEN BY A RULE, NOT BY PAYLOAD ORDER. Two rungs can be
+    EXACTLY as balanced as each other -- a ladder quoting -115/-115 at 14.5
+    and -200/-200 at 16.5 both sit at zero imbalance -- and a plain `min`
+    then returns whichever the provider happened to serialise first, so the
+    same close resolves to a different main line depending on dict ordering
+    upstream. That is a silent, irreproducible CLV baseline.
+
+    The second key is the OVERROUND, and it is not a tiebreak of convenience:
+    at equal balance the TIGHTER two-way price is the one the book is making
+    a market on. -200/-200 carries about 19 points of vig and is a rung the
+    book does not want traded, however symmetrical it looks. The last two
+    keys only make the answer total: nearest the middle of the posted ladder,
+    then the lower point.
+    """
+    overround = price_overround(row.over_odds_american, row.under_odds_american)
+    return (
+        imbalance,
+        float("inf") if overround is None else overround,
+        abs(float(row.line) - ladder_mid),
+        float(row.line),
+    )
+
+
 def build_closing_lookup(rows: Any) -> dict[ClosingKey, ClosingQuote]:
     """
     Closing rows (as `normalize_event_props` returns them) -> quote per key.
@@ -129,7 +174,13 @@ def build_closing_lookup(rows: Any) -> dict[ClosingKey, ClosingQuote]:
             if imbalance is not None
         ]
         if two_way:
-            _, main = min(two_way, key=lambda pair: pair[0])
+            ladder_mid = statistics.median(by_point) if by_point else 0.0
+            _, main = min(
+                two_way,
+                key=lambda pair: _main_line_sort_key(
+                    pair[1], pair[0], ladder_mid
+                ),
+            )
             out[key] = ClosingQuote(
                 main_line=float(main.line),
                 main_over_odds=main.over_odds_american,
@@ -176,7 +227,13 @@ def capture_for_dates(
         normalize_event_props,
     )
 
-    api = client or PropLineClient()
+    # THE RUNNER'S OWN SESSION, not a fresh one. `settle_pending_props`
+    # builds one `requests.Session` per run and threads it through the CDN and
+    # ESPN fetches; a client constructed bare here would keep its own pool and
+    # ignore every adapter, proxy and retry policy configured on that one --
+    # and in a test it would reach the real host instead of the injected
+    # transport, which is how a unit test becomes a network call.
+    api = client or PropLineClient(session=session)
     market_keys = list(markets or DEFAULT_MARKET_MAP)
     event_ids = propline_event_ids_for_dates(list(game_dates))
     if not event_ids:

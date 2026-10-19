@@ -14,6 +14,7 @@ RESEARCH_ONLY. Projections and figures, no wagers.
 from __future__ import annotations
 
 import math
+from datetime import date as _d
 from pathlib import Path
 
 import pytest
@@ -24,25 +25,154 @@ from src.quant import streaks as st
 # --- the decomposition, and that nothing else disagrees with it -------------
 
 
-def test_the_sum_composites_match_the_settlement_grader():
+def test_the_settlement_grader_reads_this_decomposition():
     """
-    ONE DEFINITION OR THE LEDGER AND THE PROJECTION DIVERGE. `evaluator.
-    MARKET_COMPONENTS` decides what a graded PA actually totals; this module
-    decides what the projection totals. If they ever disagree, every PA row is
-    projected on one definition and settled on another, and both look fine.
+    ONE DEFINITION OR THE LEDGER AND THE PROJECTION DIVERGE. This used to
+    assert that two hand-written tables agreed. They now agree BY
+    CONSTRUCTION -- `evaluator.MARKET_COMPONENTS` is built from
+    `SUM_COMPOSITES` through `PANEL_TO_BOXSCORE` -- so what is left to pin is
+    the part that can still break: that the derivation happened at all, and
+    that every component has a box-score field to be read from.
     """
-    from src.settlement.evaluator import MARKET_COMPONENTS
+    from src.settlement.evaluator import MARKET_COMPONENTS, PANEL_TO_BOXSCORE
 
-    cdn_to_panel = {
-        "points": "PTS", "reboundsTotal": "REB", "assists": "AST",
-        "steals": "STL", "blocks": "BLK", "turnovers": "TOV",
-    }
     for market, components in cm.SUM_COMPOSITES.items():
         graded = MARKET_COMPONENTS.get(market)
         assert graded is not None, f"{market} projects but settlement cannot grade it"
-        assert tuple(cdn_to_panel[c] for c in graded) == components, (
-            f"{market}: settlement totals {graded}, this module totals {components}"
+        assert graded == tuple(PANEL_TO_BOXSCORE[c] for c in components)
+
+    # And every component of every composite, FPTS included, is translatable.
+    for name in cm.COMPONENTS:
+        assert name in PANEL_TO_BOXSCORE, (
+            f"{name} is a composite component with no box-score field"
         )
+
+
+def test_an_fpts_prop_can_actually_be_settled():
+    """
+    IT COULD NOT BE, AND THAT WAS THE WHOLE POINT OF THE FINDING. A fantasy
+    score is not a SUM, so an FPTS prop reached `combine_stat`, found no entry
+    in a table of markets-that-sum, and raised "Unknown market". The
+    projection side was built and the ledger could never close the loop on it
+    — which also means no FPTS calibration could ever be measured, so the
+    user's own "singles until calibration is measured" gate was unreachable
+    for this market.
+    """
+    from decimal import Decimal
+
+    from src.settlement.evaluator import combine_stat, settle_prop
+
+    box = {"points": 30, "reboundsTotal": 8, "assists": 9,
+           "steals": 2, "blocks": 1, "turnovers": 4}
+    # 30 + 1.2*8 + 1.5*9 + 3*2 + 3*1 - 1*4
+    assert combine_stat(box, "FPTS", platform="underdog") == Decimal("58.1")
+
+    graded = settle_prop(
+        market="FPTS", predicted_line=55.5, predicted_side="OVER",
+        player_stats=box, odds=-110, platform="underdog",
+    )
+    assert str(graded.outcome) == "WIN"
+    assert graded.actual_result == Decimal("58.1")
+
+
+def test_fpts_grades_in_decimal_but_on_the_same_weights_as_the_projection():
+    """
+    TWO NUMERIC REPRESENTATIONS, ONE WEIGHT TABLE. The grader is Decimal
+    throughout because the P/L ledger must not drift; this module projects in
+    float. That is two arithmetics, which is exactly the shape of the
+    two-definitions defect — so the weights come from one place and the two
+    results are pinned equal here.
+    """
+    from decimal import Decimal
+
+    from src.settlement.evaluator import fantasy_points
+
+    box = {"PTS": 30.0, "REB": 8.0, "AST": 9.0, "STL": 2.0, "BLK": 1.0, "TOV": 4.0}
+    cdn = {"points": 30, "reboundsTotal": 8, "assists": 9,
+           "steals": 2, "blocks": 1, "turnovers": 4}
+    projected = cm.realised_composite(cm.composite("FPTS", platform="underdog"), box)
+    assert fantasy_points(cdn, platform="underdog") == pytest.approx(
+        Decimal(str(projected))
+    )
+
+
+def test_fpts_is_never_graded_on_a_guessed_operators_terms():
+    """
+    The multipliers are an operator's term. Grading a PrizePicks entry on
+    Underdog's matrix returns an entirely plausible wrong number, and the two
+    are configured separately precisely so the first divergence is visible.
+    """
+    from src.settlement.evaluator import SettlementError, combine_stat
+
+    box = {"points": 30, "reboundsTotal": 8, "assists": 9,
+           "steals": 2, "blocks": 1, "turnovers": 4}
+    with pytest.raises(SettlementError, match="without a platform"):
+        combine_stat(box, "FPTS")
+    with pytest.raises(SettlementError, match="weights unavailable"):
+        combine_stat(box, "FPTS", platform="not_an_operator")
+
+
+def test_a_missing_component_still_refuses_to_grade_fpts():
+    """A missing stat is not a zero — the rule the sum markets already keep."""
+    from src.settlement.evaluator import SettlementError, combine_stat
+
+    incomplete = {"points": 30, "reboundsTotal": 8, "assists": 9,
+                  "steals": 2, "blocks": 1}   # no turnovers
+    with pytest.raises(SettlementError, match="missing component"):
+        combine_stat(incomplete, "FPTS", platform="underdog")
+
+
+def test_the_runner_grades_fpts_on_the_rows_own_source(monkeypatch, run_settlement):
+    """
+    The source column IS the scoring matrix for an FPTS row. Hardcoding one
+    operator would grade every book's fantasy line on that operator's terms,
+    and asserting the substring "platform=prop.source" appears in runner.py
+    would be satisfied by a comment — so this grades two real rows and reads
+    the answer off the ledger.
+
+    The second row's operator has no configured matrix, which is the refusal
+    that proves the source is being read rather than defaulted: it stays
+    PENDING with a named reason instead of being scored on Underdog's terms.
+    """
+    from decimal import Decimal
+
+    class _Row:
+        def __init__(self, source):
+            self.nba_game_id = "0022600001"
+            self.game_date = _d(2026, 10, 21)
+            self.player_name = "De'Aaron Fox"
+            self.market = "FPTS"
+            self.predicted_line = 55.5
+            self.predicted_side = "OVER"
+            self.odds = -110
+            self.source = source
+            self.stake_units = None
+            self.closing_line = None
+            self.closing_odds = None
+            self.outcome_status = "PENDING"
+            for field in ("actual_result", "profit_units", "minutes_played",
+                          "did_not_play", "clv_line_points", "clv_prob_points",
+                          "settlement_note", "result_source", "settled_at_utc",
+                          "raw_boxscore_json"):
+                setattr(self, field, None)
+
+    known, unknown = _Row("underdog"), _Row("a_book_with_no_matrix")
+    report = run_settlement(
+        monkeypatch, [known, unknown],
+        player_stats={"De'Aaron Fox": {
+            "points": 30, "reboundsTotal": 8, "assists": 9, "steals": 2,
+            "blocks": 1, "turnovers": 4, "minutes_played": 36.0,
+            "did_not_play": False,
+        }},
+    )
+
+    assert known.outcome_status == "WIN"
+    assert known.actual_result == Decimal("58.1")
+
+    assert unknown.outcome_status == "PENDING", (
+        "an FPTS row was graded on an operator's terms that were never configured"
+    )
+    assert any("FPTS weights unavailable" in e for e in report.errors), report.errors
 
 
 def test_every_component_is_a_real_panel_column():
@@ -170,15 +300,123 @@ def test_an_impossible_correlation_is_refused(rho):
 
 def test_a_non_psd_correlation_set_is_named_not_square_rooted():
     """
-    A negative variance means the supplied correlations are not a consistent
-    matrix. Returning it would hand the caller an imaginary standard
-    deviation; `quant.psd_repair` exists for exactly this.
+    An inconsistent correlation set is not a matrix any three variables could
+    produce. Computing a variance from it would hand the caller a confident
+    number about an impossible world; `quant.psd_repair` exists for this.
     """
     spec = cm.composite("PRA")
     sds = {"PTS": 5.0, "REB": 5.0, "AST": 5.0}
     impossible = {("PTS", "REB"): -1.0, ("PTS", "AST"): -1.0, ("REB", "AST"): -1.0}
-    with pytest.raises(cm.CompositeMarketError, match="NEGATIVE variance"):
+    with pytest.raises(cm.CompositeMarketError, match="not a consistent"):
         cm.composite_variance(spec, sds, impossible)
+
+
+def test_an_impossible_set_is_refused_even_when_the_variance_comes_out_POSITIVE():
+    """
+    THE CHECK THAT WAS ONLY HALF A CHECK. Testing `total < 0` catches
+    inconsistency only when it happens to show up in THIS composite's scalar.
+    PTSxREB = +0.9, PTSxAST = +0.9, REBxAST = -0.9 cannot be realised by any
+    three random variables — its smallest eigenvalue is about -0.72 — yet at
+    equal sds it yields a comfortably POSITIVE variance, so the old guard
+    passed it and the projection inherited the confidence.
+
+    Pairs are fitted ONE BUCKET AT A TIME by `leg_correlation`, so nothing
+    upstream makes the three agree with each other. This is reachable from
+    real fitted inputs, not only from a hand-written matrix.
+    """
+    spec = cm.composite("PRA")
+    sds = {"PTS": 5.0, "REB": 5.0, "AST": 5.0}
+    impossible = {("PTS", "REB"): 0.9, ("PTS", "AST"): 0.9, ("REB", "AST"): -0.9}
+
+    # The arithmetic itself is positive — this is why `total < 0` missed it.
+    weighted = sum(25.0 for _ in range(3)) + 2.0 * 25.0 * (0.9 + 0.9 - 0.9)
+    assert weighted > 0
+
+    with pytest.raises(cm.CompositeMarketError, match="not a consistent"):
+        cm.composite_variance(spec, sds, impossible)
+
+
+def test_the_fitted_priors_this_project_measured_are_accepted():
+    """
+    The guard must refuse impossible sets WITHOUT refusing the real ones.
+    These are the priors fitted from the 2018-2026 panel (214,381 rows,
+    as_of 2026-03-28): PTSxREB 0.385, ASTxREB 0.279, ASTxPTS 0.253.
+    """
+    spec = cm.composite("PRA")
+    sds = {"PTS": 6.5, "REB": 2.8, "AST": 2.1}
+    fitted = {("PTS", "REB"): 0.385, ("REB", "AST"): 0.279, ("PTS", "AST"): 0.253}
+    assert cm.composite_variance(spec, sds, fitted) > 0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_projection_abstains_instead_of_propagating(bad):
+    """
+    A NaN composite is worse than a missing one: it compares False against
+    every line, so the Under grades as a confident win and nothing says the
+    projection was absent. inf makes every Over certain the same way.
+    """
+    spec = cm.composite("PRA")
+    with pytest.raises(cm.CompositeMarketError, match="not finite"):
+        cm.composite_mean(spec, {"PTS": bad, "REB": 6.0, "AST": 5.0})
+    with pytest.raises(cm.CompositeMarketError, match="not finite"):
+        cm.composite_variance(
+            spec, {"PTS": bad, "REB": 2.0, "AST": 2.0},
+            {("PTS", "REB"): 0.3, ("PTS", "AST"): 0.2, ("REB", "AST"): 0.2},
+        )
+
+
+def test_a_spec_cannot_be_repriced_in_place():
+    """
+    `frozen=True` STOPS REBINDING, NOT MUTATION. The specs come from a
+    module-level table and a config read, so an in-place edit outlives the
+    caller that made it and reprices every later projection in the process.
+    """
+    spec = cm.composite("PRA")
+    with pytest.raises(TypeError):
+        spec.weights["REB"] = 99.0
+    assert cm.composite("PRA").weights == {"PTS": 1.0, "REB": 1.0, "AST": 1.0}
+
+
+def test_an_fpts_matrix_missing_a_component_is_refused(tmp_path):
+    """
+    A MISSING TOV DOES NOT MEAN TURNOVERS ARE FREE. It means nobody said what
+    they cost, and scoring a six-component product on five returns an
+    entirely plausible number for it. An operator who truly does not score a
+    component writes 0.0 — that is the difference between zero and forgotten.
+    """
+    config = tmp_path / "fantasy.yaml"
+    config.write_text(
+        "platforms:\n  underdog:\n    fpts:\n      PTS: 1.0\n      REB: 1.2\n"
+        "      AST: 1.5\n      STL: 3.0\n      BLK: 3.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(cm.CompositeMarketError, match="no FPTS weight for"):
+        cm.fantasy_weights("underdog", path=config)
+
+    # Stated as zero is a term, and is accepted.
+    config.write_text(
+        "platforms:\n  underdog:\n    fpts:\n      PTS: 1.0\n      REB: 1.2\n"
+        "      AST: 1.5\n      STL: 3.0\n      BLK: 3.0\n      TOV: 0.0\n",
+        encoding="utf-8",
+    )
+    assert cm.fantasy_weights("underdog", path=config)["TOV"] == 0.0
+
+
+@pytest.mark.parametrize("value", [".nan", ".inf", "not_a_number"])
+def test_an_unusable_fpts_weight_is_refused(tmp_path, value):
+    """
+    `inf * PTS` makes every FPTS line infinitely over and `nan` makes every
+    comparison False, which grades as a confident Under. Both look like
+    arithmetic rather than a config error everywhere downstream.
+    """
+    config = tmp_path / "fantasy.yaml"
+    config.write_text(
+        "platforms:\n  underdog:\n    fpts:\n      PTS: 1.0\n      REB: 1.2\n"
+        f"      AST: 1.5\n      STL: 3.0\n      BLK: 3.0\n      TOV: {value}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(cm.CompositeMarketError, match="not finite|not a number"):
+        cm.fantasy_weights("underdog", path=config)
 
 
 def test_grading_uses_the_same_arithmetic_as_projecting():
@@ -339,3 +577,178 @@ def test_the_streak_curve_is_not_in_the_pickem_payout_catalogue():
     assert streaks["platforms"]["underdog"]["streaks"]["11"
            if "11" in streaks["platforms"]["underdog"]["streaks"] else 11] == 1000.0
     assert streaks.get("as_of"), "an operator term with no date cannot be audited"
+
+
+# --- the gatekeeper is not a cashable position -----------------------------
+
+
+def test_there_is_no_cash_out_at_the_gatekeeper():
+    """
+    "WIN NOW" STARTS AT LEG 3. The operator's terms as supplied say the
+    cash-out is offered after every correct pick FROM LEG 3 ONWARDS, so a
+    2-pick streak cannot be collected. The first version took
+    ``max(cashout, hold)`` at every tier including 2, and below p = 0.52 the
+    3x floor won — so it returned CASH_OUT and recommended an action the
+    operator does not offer.
+    """
+    curve = st.load_streak_curve("underdog")
+    v = st.extension_verdict(curve, picks_so_far=2, next_leg_probability=0.45)
+
+    assert v.cashout_value is None, "a 2-pick streak cannot be cashed"
+    assert v.recommendation == "HOLD", "it recommended cashing out a position"
+    assert v.break_even_basis == "no_offer"
+    assert v.break_even_probability == 0.0
+    assert "no cash-out" in v.reason
+
+
+@pytest.mark.parametrize("p", [0.10, 0.30, 0.40, 0.45, 0.50])
+def test_a_live_gatekeeper_is_not_floored_at_a_tier_it_cannot_collect(p):
+    """
+    V(2) = p * V(3), with no max. Flooring it at the 3x tier values the
+    position at a payout that cannot be taken, and the error lands straight in
+    the entry EV because the entry is p^2 * V(2).
+    """
+    curve = st.load_streak_curve("underdog")
+    values = st.streak_values(curve, per_leg_probability=p)
+
+    assert values[2] == pytest.approx(p * values[3])
+    # `<=` rather than `<` for one real coincidence: at exactly p = 0.50 every
+    # tier cashes, so V(3) = 6.0 and p*V(3) = 3.0 — the same number the floor
+    # would have supplied. The two agree there and nowhere below it.
+    assert values[2] <= curve.multiple(2), (
+        "the gatekeeper is valued above a 3x it cannot collect"
+    )
+    if p < 0.50:
+        assert values[2] < curve.multiple(2)
+
+    # And the fiction is bounded: entry EV is no higher than the floored
+    # version would report, and strictly lower wherever the floor bound.
+    floored = p * p * max(curve.multiple(2), p * values[3]) - 1.0
+    assert st.entry_expected_value(curve, per_leg_probability=p) <= floored
+
+
+def test_the_correction_does_not_move_the_quoted_entry_evs():
+    """
+    MEASURED, NOT ASSUMED. Above about p = 0.52 the hold value at two picks
+    already exceeds 3x, so the floor never bound there and this module's
+    header figures stand. Pinned so a later change to the valuation cannot
+    quietly rewrite the numbers that were reported.
+    """
+    curve = st.load_streak_curve("underdog")
+    for p, expected in ((0.60, 2.628), (0.58, 1.499), (0.55, 0.393),
+                        (0.534, 0.007), (0.53, -0.073)):
+        got = st.entry_expected_value(curve, per_leg_probability=p)
+        assert got == pytest.approx(expected, abs=1e-3), f"p={p} gave {got:+.4f}"
+
+
+# --- the break-even has to be a threshold, not an echo ---------------------
+
+
+def test_the_flat_break_even_does_not_move_with_the_p_it_is_given():
+    """
+    `cashout / V(k+1)` IS A FUNCTION OF ITS OWN INPUT when the continuation
+    defaults to the same p: V(k+1) is computed at that p, so feeding 0.55 and
+    0.60 returned two different "break-evens" and a flat p could not be
+    compared against either. The fixed point is one number.
+    """
+    curve = st.load_streak_curve("underdog")
+    reported = {
+        st.extension_verdict(
+            curve, picks_so_far=3, next_leg_probability=p
+        ).break_even_probability
+        for p in (0.30, 0.45, 0.52, 0.55, 0.60, 0.90)
+    }
+    assert len(reported) == 1, f"the break-even moved with its input: {reported}"
+
+
+def test_at_the_reported_break_even_holding_and_cashing_are_equal():
+    """
+    The definition, checked rather than asserted: at p* a player assuming p*
+    for every remaining leg is exactly indifferent.
+    """
+    curve = st.load_streak_curve("underdog")
+    for picks in range(st.FIRST_CASHOUT_PICKS, curve.max_picks):
+        star = st.extension_verdict(
+            curve, picks_so_far=picks, next_leg_probability=0.5,
+        ).break_even_probability
+        at_star = st.extension_verdict(
+            curve, picks_so_far=picks, next_leg_probability=star,
+        )
+        assert at_star.hold_value == pytest.approx(at_star.cashout_value, rel=1e-6), (
+            f"{picks} picks: p*={star:.6f} is not the indifference point"
+        )
+
+
+def test_an_explicit_continuation_gets_the_exact_ratio_and_says_so():
+    """
+    When the caller SUPPLIES the continuation, V(k+1) no longer moves with p,
+    so `cashout / V(k+1)` is exact and is the right answer for that leg. The
+    two readings are different numbers and the verdict names which it gave.
+    """
+    curve = st.load_streak_curve("underdog")
+    v = st.extension_verdict(
+        curve, picks_so_far=3, next_leg_probability=0.60,
+        continuation_probability=0.52,
+    )
+    values = st.streak_values(curve, per_leg_probability=0.52)
+    assert v.break_even_basis == "next_leg"
+    assert v.break_even_probability == pytest.approx(6.0 / values[4])
+
+    flat = st.extension_verdict(curve, picks_so_far=3, next_leg_probability=0.60)
+    assert flat.break_even_basis == "flat_all_legs"
+    assert flat.break_even_probability != pytest.approx(v.break_even_probability)
+
+
+# --- the curve reader is the only door, so it is the only guard ------------
+
+
+@pytest.mark.parametrize("value,pattern", [
+    (".nan", "positive, finite"),
+    (".inf", "positive, finite"),
+    ("0", "positive, finite"),
+    ("-10.0", "positive, finite"),
+    ("not_a_number", "not a multiple"),
+])
+def test_a_tier_that_is_not_a_multiple_is_refused(tmp_path, value, pattern):
+    """
+    `{int(k): float(v)}` RAISED A BARE ValueError ON A TYPO and accepted NaN,
+    inf, zero and negatives without comment. A NaN tier makes every comparison
+    in the induction False, so it silently takes whichever branch NaN loses
+    to; a zero tier values a live streak at nothing.
+    """
+    bad = tmp_path / "s.yaml"
+    bad.write_text(
+        f"platforms:\n  underdog:\n    streaks:\n      2: 3.0\n      3: {value}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(st.StreakError, match=pattern):
+        st.load_streak_curve("underdog", path=bad)
+
+
+def test_a_tier_that_pays_no_more_than_its_predecessor_is_refused(tmp_path):
+    """
+    Each tier is the one before it plus a leg that could have lost everything,
+    so a tier paying less is a transposed digit (2.0 for 20.0) — and the
+    induction would read it as a position to cash immediately and always,
+    making a real recommendation out of a typo.
+    """
+    bad = tmp_path / "s.yaml"
+    bad.write_text(
+        "platforms:\n  underdog:\n    streaks:\n      2: 3.0\n      3: 6.0\n"
+        "      4: 2.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(st.StreakError, match="no more than tier"):
+        st.load_streak_curve("underdog", path=bad)
+
+
+def test_a_loaded_curve_cannot_be_repriced_in_place():
+    """
+    `frozen=True` stops rebinding, not mutation. A curve is held for a whole
+    run, so `curve.multipliers[11] = 1e9` repriced every valuation taken from
+    it and outlived whatever made the edit.
+    """
+    curve = st.load_streak_curve("underdog")
+    with pytest.raises(TypeError):
+        curve.multipliers[11] = 1e9
+    assert st.load_streak_curve("underdog").multipliers[11] == 1000.0

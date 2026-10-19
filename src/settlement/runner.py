@@ -240,6 +240,14 @@ def settle_pending_props(
                         did_not_play=player_stats.get("did_not_play", False),
                         minutes_played=player_stats.get("minutes_played"),
                         stake_units=stake_or_default(prop.stake_units),
+                        # THE OPERATOR, FOR FPTS ONLY. A fantasy score is
+                        # scored on the book's own multipliers, so the row's
+                        # source IS the scoring matrix; every other market
+                        # ignores this. An operator with no configured matrix
+                        # raises and the prop stays PENDING with a named
+                        # reason, rather than being graded on whichever
+                        # operator's terms happened to be the default.
+                        platform=prop.source,
                     )
                 except (SettlementError, ValueError, TypeError, AttributeError) as exc:
                     report.errors.append(f"{game_id}/{prop.player_name}/{prop.market}: {exc}")
@@ -257,10 +265,20 @@ def settle_pending_props(
                 # price would let a line move leak into clv_prob_points and read
                 # as a price edge.
                 #
-                # Only ever ADDS a close: a row that already carries one keeps
-                # it, so a re-run cannot overwrite the number that was true at
-                # the time with a later one.
-                if prop.closing_line is None:
+                # RESOLVED INTO LOCALS, NOT ONTO THE ROW. `dry_run` must write
+                # nothing, and these two assignments sat ABOVE the only
+                # `if not dry_run` guard: `session_scope()` commits on a clean
+                # exit and does not care that the caller asked for a rehearsal,
+                # so a dry run persisted every close it captured.
+                closing_line = prop.closing_line
+                closing_odds = prop.closing_odds
+                # EITHER ONE MISSING IS A REASON TO LOOK. The two numbers come
+                # from different rungs -- the main line, and the price of the
+                # point actually taken -- so a row can carry a close and still
+                # have no same-point price. Gating on the line alone left those
+                # rows permanently without one, and the price measure is the
+                # half that abstains without it.
+                if closing_line is None or closing_odds is None:
                     main_line, same_point_odds = closing_for_prop(
                         closing_lookup,
                         source=prop.source,
@@ -269,10 +287,13 @@ def settle_pending_props(
                         taken_line=prop.predicted_line,
                         taken_side=prop.predicted_side,
                     )
-                    if main_line is not None:
-                        prop.closing_line = main_line
-                    if same_point_odds is not None and prop.closing_odds is None:
-                        prop.closing_odds = same_point_odds
+                    # Only ever ADDS a close: whichever field already holds a
+                    # number keeps it, so a re-run cannot overwrite what was
+                    # true at the time with a later capture.
+                    if closing_line is None:
+                        closing_line = main_line
+                    if closing_odds is None:
+                        closing_odds = same_point_odds
 
                 # CLV is a market-quality signal, not part of grading. A bad
                 # closing price must not abort the surrounding transaction and
@@ -281,9 +302,9 @@ def settle_pending_props(
                     clv = compute_clv(
                         predicted_line=prop.predicted_line,
                         predicted_side=prop.predicted_side,
-                        closing_line=prop.closing_line,
+                        closing_line=closing_line,
                         bet_odds=prop.odds,
-                        closing_odds=prop.closing_odds,
+                        closing_odds=closing_odds,
                     )
                 except SettlementError as exc:
                     report.errors.append(
@@ -296,6 +317,8 @@ def settle_pending_props(
                     clv = {"clv_line_points": None, "clv_prob_points": None}
 
                 if not dry_run:
+                    prop.closing_line = closing_line
+                    prop.closing_odds = closing_odds
                     prop.outcome_status = str(result.outcome)
                     prop.actual_result = result.actual_result
                     prop.stake_units = result.stake_units
