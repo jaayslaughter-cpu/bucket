@@ -157,7 +157,17 @@ def settle_pending_props(
         for game_id, props in by_game.items():
             report.games_attempted += 1
             try:
-                stats_by_name, raw_payload = fetch_player_stats_for_game(game_id, session=http)
+                # THE FALLBACK'S TWO INPUTS, both already in hand. ESPN's
+                # payload carries no NBA game id, so `espn_boxscore` identifies
+                # the event from the players being graded; without these it
+                # declines rather than guess which game it is reading. The CDN
+                # path ignores both.
+                stats_by_name, raw_payload = fetch_player_stats_for_game(
+                    game_id,
+                    session=http,
+                    game_date=props[0].game_date,
+                    expected_players={p.player_name for p in props if p.player_name},
+                )
             except GameNotFinalError as exc:
                 report.games_not_final += 1
                 logger.info("Game %s not final — leaving %d props PENDING. %s",

@@ -304,8 +304,68 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def fetch_player_stats_for_game(
-    game_id: str | int, session: requests.Session | None = None
+    game_id: str | int,
+    session: requests.Session | None = None,
+    *,
+    game_date: Any = None,
+    expected_players: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Convenience: final box score -> (player stats by name, raw payload)."""
-    payload = fetch_final_boxscore(game_id, session=session)
-    return extract_player_stats(payload), payload
+    """
+    Final box score -> (player stats by name, raw payload), CDN first.
+
+    THE CDN IS PREFERRED AND UNCHANGED: it is addressed by NBA game id, so it
+    is exact, and it carries the NBA personId that the duplicate-name branch
+    of `extract_player_stats` needs. It is only not reachable.
+
+    Measured 2026-10-19: cdn.nba.com answers 403 in 0.47s with the real
+    headers above, and stats.nba.com never completes a connection. A control
+    host through the same proxy answered, so the refusal is NBA's. With no box
+    score the settlement loop cannot close, and the publication gate then
+    withholds every card for want of calibration evidence that grading is the
+    only source of — so an unreachable CDN silences the whole pipeline.
+
+    `settlement.espn_boxscore` is the fallback, and it needs what it cannot
+    derive: ESPN carries no NBA game id, so the event is identified from the
+    PLAYERS being graded. Omit either `game_date` or `expected_players` and
+    the fallback is not attempted — it refuses to guess which game it is
+    looking at, exactly as the stale-market gate refuses to invent an
+    observation time.
+
+    A GameNotFinalError from the CDN is AUTHORITATIVE and is re-raised
+    untouched. The game genuinely has not finished; asking a second source
+    for a verdict we already have would only find a disagreement to act on.
+    """
+    try:
+        payload = fetch_final_boxscore(game_id, session=session)
+        return extract_player_stats(payload), payload
+    except GameNotFinalError:
+        raise
+    except BoxScoreError as cdn_exc:
+        if game_date is None or not expected_players:
+            raise
+        from src.settlement.espn_boxscore import (
+            EspnBoxScoreError,
+            EspnGameNotFinalError,
+            fetch_espn_player_stats_for_game,
+        )
+
+        logger.warning(
+            "CDN box score unavailable for %s (%s) — falling back to ESPN.",
+            normalize_game_id(game_id), cdn_exc,
+        )
+        try:
+            return fetch_espn_player_stats_for_game(
+                game_date, set(expected_players), session=session,
+            )
+        except EspnGameNotFinalError as exc:
+            raise GameNotFinalError(
+                f"ESPN has no final box score for {normalize_game_id(game_id)} "
+                f"on {game_date}: {exc}"
+            ) from exc
+        except EspnBoxScoreError as exc:
+            # BOTH sources named, because "box score fetch failed" with one
+            # cause hides which half of the fallback is actually broken.
+            raise BoxScoreError(
+                f"Both box score sources failed for "
+                f"{normalize_game_id(game_id)}. CDN: {cdn_exc} | ESPN: {exc}"
+            ) from exc
