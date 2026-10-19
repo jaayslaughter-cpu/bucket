@@ -1,0 +1,42 @@
+# Underdog Streaks tier curve.
+#
+# PROVENANCE: user-supplied on 2026-10-19 as Underdog's published curve. NOT
+# independently verified by this repo — the environment's network policy denies
+# the operator hosts, so no run here has read a live page. Same standing as
+# every multiple in `dfs_payouts.yaml`: the operator's terms AS RECORDED ON
+# THAT DATE, and they change.
+#
+# WHY THIS IS NOT IN dfs_payouts.yaml. That file's invariant is that every
+# variant is a HITS -> MULTIPLE matrix for an entry bought at a fixed size, and
+# its loader and tests enforce it. A streak is a different product: a 2-pick
+# gatekeeper, then legs added ONE AT A TIME up to 11, with a cash-out offered
+# from leg 3 and total forfeiture on a single miss. Forcing it into that shape
+# would also make streaks appear as a selectable pick'em variant to the entry
+# builder, which prices static matrices and has no notion of a sequential
+# position. The attempt broke two of that file's own tests, correctly.
+#
+# `streaks` maps CORRECT PICKS -> gross multiple returned per 1 staked. Tiers
+# must be contiguous: a streak advances one pick at a time, so a gap means a
+# missing tier rather than an unreachable one.
+#
+# NOTE 2-6 COINCIDE WITH `underdog.power` in dfs_payouts.yaml as recorded on
+# 2026-09-28. Recorded here separately anyway: two products agreeing today is
+# not the same as one product, and sharing the numbers would hide the first
+# divergence.
+
+as_of: "2026-10-19"
+source: "user-supplied 2026-10-19; not verified against a live operator page from this environment"
+
+platforms:
+  underdog:
+    streaks:
+      2: 3.0
+      3: 6.0
+      4: 10.0
+      5: 20.0
+      6: 35.0
+      7: 65.0
+      8: 120.0
+      9: 225.0
+      10: 425.0
+      11: 1000.0
