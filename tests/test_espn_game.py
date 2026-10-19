@@ -343,3 +343,14 @@ def test_a_well_formed_pair_still_splits():
     """The control: the fix must not have made the parser refuse everything."""
     assert _split_made_attempted("12-24") == (12.0, 24.0)
     assert _split_made_attempted("0-0") == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("raw", ["inf-5", "5-inf", "nan-5", "5-nan", "-inf-5"])
+def test_a_non_finite_half_is_refused(raw):
+    """
+    `_number` returns inf for "inf", which survived the both-halves-present
+    check and then raised OverflowError the moment a caller converted it to an
+    int — taking the whole ESPN event down and leaving every prop on that game
+    PENDING. Refusing the pair costs one stat; raising costs a game.
+    """
+    assert _split_made_attempted(raw) == (None, None)

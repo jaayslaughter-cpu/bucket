@@ -50,6 +50,7 @@ RESEARCH_ONLY. This reads results that already happened.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date, datetime
 from typing import Any
 
@@ -104,13 +105,37 @@ def _as_date(value: str | date | datetime) -> date:
 
 
 def _int_or_none(value: Any) -> int | None:
-    """`espn_game` yields floats; the CDN contract is integer counting stats."""
+    """
+    `espn_game` yields floats; the CDN contract is integer counting stats.
+
+    REFUSES A FRACTION, DOES NOT ROUND IT. This was `int(round(...))`, so a
+    malformed ``3.5`` points became a confident ``4`` — and on a 3.5 line that
+    is the difference between a WIN and a LOSS, decided by a rounding mode. A
+    player cannot score half a point: a fractional counting stat is corrupt
+    input, and the only honest reading of corrupt input is none.
+    """
     if value is None:
         return None
     try:
-        return int(round(float(value)))
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(number) or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _minutes_or_none(value: Any) -> float | None:
+    """Minutes as a finite, non-negative float, else None for "unknown"."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
 
 
 def final_events_for_date(
@@ -156,8 +181,12 @@ def settlement_rows(summary: Any, slate_game: Any = None) -> dict[str, dict[str,
             cdn: _int_or_none(row.stats.get(panel))
             for panel, cdn in PANEL_TO_CDN.items()
         }
-        minutes = row.stats.get("MIN")
-        minutes = float(minutes) if minutes is not None else None
+        # FINITE AND NON-NEGATIVE, OR UNKNOWN. A bare float() let ``-5`` and
+        # ``inf`` through as "parsed", so malformed availability data read as a
+        # row that played. Anything unusable becomes None and takes the
+        # unavailable-minutes path below, which is already written for exactly
+        # this uncertainty.
+        minutes = _minutes_or_none(row.stats.get("MIN"))
         played_signal = any(
             values.get(field) is not None and values[field] > 0
             for field in MARKET_COMPONENTS
@@ -182,12 +211,23 @@ def settlement_rows(summary: Any, slate_game: Any = None) -> dict[str, dict[str,
                 "stats — grading from the stat line, not voiding.", name,
             )
 
-        if name in out:
-            out[name]["ambiguous_name"] = True
+        # THE GUARD HAS TO USE THE MATCHER'S OWN RULE. Keyed on the raw name,
+        # "P.J. Washington" and "PJ Washington" were two separate entries --
+        # and `_match_player` normalises, so it would have matched whichever
+        # it reached first and graded one player against the other's line. The
+        # collision the guard exists to catch was invisible to it.
+        clash = [
+            existing for existing in out
+            if normalise_player_name(existing) == normalise_player_name(name)
+        ]
+        if clash:
+            for existing in clash:
+                out[existing]["ambiguous_name"] = True
             logger.warning(
-                "ESPN: duplicate player name %r in event %s — marked ambiguous. "
-                "This path has no NBA personId to settle by, so the matcher "
-                "must refuse rather than pick.", name, row.espn_event_id,
+                "ESPN: %r collides with %s in event %s once normalised — all "
+                "marked ambiguous. This path has no NBA personId to settle by, "
+                "so the matcher must refuse rather than pick.",
+                name, ", ".join(repr(c) for c in clash), row.espn_event_id,
             )
             continue
 

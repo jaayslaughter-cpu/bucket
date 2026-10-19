@@ -107,8 +107,81 @@ def test_duplicate_names_are_marked_ambiguous():
 
 
 def test_a_stat_espn_omitted_stays_absent_rather_than_becoming_zero():
-    h = espn.settlement_rows(_Summary([_row("Partial", PTS=None)]))["Partial"]
+    """
+    `PTS=None` is a PRESENT key with a null value, which is not the case this
+    claims to cover: a regression that mishandles a MISSING key would pass.
+    The key is removed.
+    """
+    row = _row("Partial")
+    del row.stats["PTS"]
+    h = espn.settlement_rows(_Summary([row]))["Partial"]
     assert h["points"] is None, "an omitted stat was invented as a zero"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (8.0, 8), (0.0, 0), (24.0, 24),
+    (3.5, None), (0.5, None), (float("inf"), None), (float("nan"), None),
+    ("x", None), (None, None),
+])
+def test_a_fractional_counting_stat_is_refused_not_rounded(raw, expected):
+    """
+    THE ROUNDING MODE DECIDED A W/L. This was `int(round(...))`, so a
+    malformed 3.5 points became a confident 4 — and on a 3.5 line that is the
+    difference between WIN and LOSS. A player cannot score half a point, so a
+    fractional counting stat is corrupt input, and the only honest reading of
+    corrupt input is none.
+    """
+    assert espn._int_or_none(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (25.0, 25.0), (0.0, 0.0),
+    (-5.0, None), (float("inf"), None), (float("nan"), None), ("??", None),
+])
+def test_minutes_must_be_finite_and_non_negative(raw, expected):
+    """
+    A bare `float()` let -5 and inf through as "parsed", so malformed
+    availability data read as a row that played. Anything unusable takes the
+    unavailable-minutes path, which is already written for this uncertainty.
+    """
+    assert espn._minutes_or_none(raw) == expected
+
+
+def test_negative_minutes_do_not_read_as_a_played_row():
+    """The whole point of the guard above, at the level that matters."""
+    h = espn.settlement_rows(_Summary([_row("Odd", MIN=-5.0)]))["Odd"]
+    assert h["minutes_played"] is None
+    assert h["minutes_status"] == "UNAVAILABLE"
+
+
+def test_names_differing_only_by_punctuation_are_still_ambiguous():
+    """
+    THE GUARD WAS BLIND TO THE COLLISION IT EXISTS TO CATCH. Keyed on the raw
+    name, "P.J. Washington" and "PJ Washington" were two entries — and
+    `_match_player` normalises, so it would have matched whichever it reached
+    first and graded one player against the other's line.
+    """
+    out = espn.settlement_rows(_Summary([
+        _row("P.J. Washington", athlete_id="1"),
+        _row("PJ Washington", athlete_id="2"),
+    ]))
+    assert any(v["ambiguous_name"] for v in out.values()), (
+        "a normalised-identical pair was not flagged"
+    )
+    assert all(v["ambiguous_name"] for v in out.values()), (
+        "only one side of the collision was flagged, so the matcher can still pick"
+    )
+
+
+def test_a_diacritic_only_difference_matches():
+    """
+    `Nikola Jokić` in an ESPN box score must reach a pending `Nikola Jokic`
+    prop. The settlement normaliser re-exports `id_crosswalk`'s rule, which
+    strips combining marks; a fourth hand-rolled rule did not, and this is the
+    case it exists for.
+    """
+    cands = _cands({"A": ["Nikola Jokić"], "B": ["Someone Else"]})
+    assert espn.select_event_by_players(cands, {"Nikola Jokic"}) == "A"
 
 
 # --- identifying which ESPN event is our game -------------------------------

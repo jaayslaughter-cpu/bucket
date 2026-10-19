@@ -31,6 +31,7 @@ scoring runs, period structure, and event ordering.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -171,6 +172,13 @@ def _split_made_attempted(text: Any) -> tuple[float | None, float | None]:
         return None, None
     made, attempted = _number(parts[0]), _number(parts[1])
     if made is None or attempted is None:
+        return None, None
+    # AND BOTH HALVES MUST BE FINITE. `_number` happily returns inf for
+    # ``"inf-5"``, which survived the None check above and then raised
+    # OverflowError the moment a caller converted it to an int -- taking the
+    # whole ESPN event down with it and leaving every prop on that game
+    # PENDING. Refusing the pair costs one stat; raising costs a game.
+    if not (math.isfinite(made) and math.isfinite(attempted)):
         return None, None
     return made, attempted
 
