@@ -30,6 +30,7 @@ from src.settlement.boxscore_fetcher import (
     GameNotFinalError,
     fetch_player_stats_for_game,
 )
+from src.settlement.closing_lines import capture_for_dates, closing_for_prop
 from src.settlement.evaluator import (
     Outcome,
     SettlementError,
@@ -168,6 +169,28 @@ def settle_pending_props(
         for row in pending:
             by_game.setdefault(row.nba_game_id, []).append(row)
 
+        # CLOSING LINES, ONCE PER RUN. CLV is the only validator that needs no
+        # history: it compares the line taken against THAT SAME GAME's close,
+        # so it reads on the first game of a season while win/loss needs
+        # thousands of settled props. The machinery was complete and inert --
+        # `compute_clv`, the columns and the results card all existed and
+        # nothing populated `closing_line`.
+        #
+        # A FAILURE HERE MUST NOT COST THE GRADING RUN. A closing line is a
+        # market-quality measure, not a settlement input: a prop with no quote
+        # still grades to WIN/LOSS/PUSH and simply carries no CLV.
+        closing_lookup: dict = {}
+        try:
+            closing_lookup = capture_for_dates(
+                {row.game_date for row in pending if row.game_date},
+                session=http,
+            )
+        except Exception as exc:  # noqa: BLE001 — see above
+            logger.warning(
+                "Closing-line capture failed (%s); every prop grades without "
+                "CLV. Grading itself is unaffected.", exc,
+            )
+
         logger.info("Settling %d pending props across %d games", len(pending), len(by_game))
 
         for game_id, props in by_game.items():
@@ -222,6 +245,34 @@ def settle_pending_props(
                     report.errors.append(f"{game_id}/{prop.player_name}/{prop.market}: {exc}")
                     logger.warning("Could not grade %s %s: %s", prop.player_name, prop.market, exc)
                     continue
+
+                # FILL THE CLOSE BEFORE MEASURING AGAINST IT. These two
+                # columns existed and nothing ever wrote them, so `compute_clv`
+                # returned {None, None} on every row ever graded.
+                #
+                # The LINE is the main close; the ODDS are the price of the SAME
+                # POINT that was taken. `compute_clv` keeps the line move and
+                # the price move separate because "reporting one as the other is
+                # the most common CLV error", and handing it the main line's
+                # price would let a line move leak into clv_prob_points and read
+                # as a price edge.
+                #
+                # Only ever ADDS a close: a row that already carries one keeps
+                # it, so a re-run cannot overwrite the number that was true at
+                # the time with a later one.
+                if prop.closing_line is None:
+                    main_line, same_point_odds = closing_for_prop(
+                        closing_lookup,
+                        source=prop.source,
+                        market=prop.market,
+                        player_name=prop.player_name,
+                        taken_line=prop.predicted_line,
+                        taken_side=prop.predicted_side,
+                    )
+                    if main_line is not None:
+                        prop.closing_line = main_line
+                    if same_point_odds is not None and prop.closing_odds is None:
+                        prop.closing_odds = same_point_odds
 
                 # CLV is a market-quality signal, not part of grading. A bad
                 # closing price must not abort the surrounding transaction and

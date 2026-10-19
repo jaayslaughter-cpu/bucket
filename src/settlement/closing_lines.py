@@ -148,6 +148,66 @@ def build_closing_lookup(rows: Any) -> dict[ClosingKey, ClosingQuote]:
     return out
 
 
+def capture_for_dates(
+    game_dates: Any,
+    *,
+    client: Any = None,
+    markets: Any = None,
+    session: Any = None,
+) -> dict[ClosingKey, ClosingQuote]:
+    """
+    Build the closing lookup for every PropLine event on these slate dates.
+
+    ONE CALL PER EVENT, ONCE PER SETTLEMENT RUN. The endpoint is per-event, so
+    a twelve-game slate is twelve calls; the runner builds this once and every
+    prop reads from it, the same discipline the ESPN box-score cache follows
+    after re-fetching a slate per game cost ~156 requests.
+
+    AN EVENT THAT FAILS DOES NOT TAKE THE SLATE DOWN. A closing line is a
+    market-quality measure, not a settlement input: a prop with no closing
+    quote still grades to WIN/LOSS/PUSH, it just carries no CLV. So a failed
+    event is logged and skipped rather than raised, because the alternative
+    trades a complete grading run for a complete CLV run.
+    """
+    from src.db.repository import propline_event_ids_for_dates
+    from src.ingestion.propline import (
+        DEFAULT_MARKET_MAP,
+        PropLineClient,
+        normalize_event_props,
+    )
+
+    api = client or PropLineClient()
+    market_keys = list(markets or DEFAULT_MARKET_MAP)
+    event_ids = propline_event_ids_for_dates(list(game_dates))
+    if not event_ids:
+        logger.info(
+            "No PropLine event ids in prop_line_snapshots for %s, so there is "
+            "no closing line to capture. CLV stays null and grading is "
+            "unaffected.", sorted(game_dates),
+        )
+        return {}
+
+    rows: list[Any] = []
+    failed = 0
+    for event_id in event_ids:
+        try:
+            rows.extend(normalize_event_props(
+                api.fetch_closing_odds(event_id, market_keys)
+            ))
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            failed += 1
+            logger.warning(
+                "Closing odds unavailable for PropLine event %s (%s); its props "
+                "grade without CLV.", event_id, exc,
+            )
+    lookup = build_closing_lookup(rows)
+    logger.info(
+        "Closing lines: %d event(s), %d failed, %d quote(s) across %d row(s)",
+        len(event_ids), failed, len(lookup), len(rows),
+    )
+    return lookup
+
+
 def closing_for_prop(
     lookup: dict[ClosingKey, ClosingQuote],
     *,
