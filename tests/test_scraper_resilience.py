@@ -428,3 +428,113 @@ def test_the_source_table_cannot_claim_a_client_that_is_not_there(capsys):
             f"the diagnostic claims {name} has a client at {module}, which is "
             f"not in the tree"
         )
+
+
+# --- the provider's own backoff hint, which lives in the 429 BODY -----------
+#
+# FOUND 2026-10-18 while reading the official SDK (`proplineapi/propline-python`).
+# PropLine answers a 429 with {"detail": {"error": ..., "retry_after_seconds":
+# N}} and its own client reads the backoff from THERE, not from the header.
+# We read only the header, so on a burst limit we discarded the provider's
+# number and substituted our local exponential backoff -- either too eager,
+# spending the retry budget against a limiter that had just said how long to
+# wait, or needlessly slow mid-slate.
+#
+# These were verified by hand first and the mutations survived, because a
+# measurement nobody pins is not coverage.
+
+
+class _Body:
+    """A 429 whose JSON body may or may not carry the hint."""
+
+    def __init__(self, body=None, header=None, raise_json=False):
+        self.status_code = 429
+        self.headers = {"Retry-After": header} if header else {}
+        self._body = body
+        self._raise = raise_json
+
+    def json(self):
+        if self._raise:
+            raise ValueError("not json")
+        return self._body
+
+
+def _propline_wait(response, fallback=2.0):
+    return propline.PropLineClient._retry_after_seconds(response, fallback)
+
+
+def test_the_body_hint_is_honoured():
+    assert _propline_wait(_Body(body={"detail": {"retry_after_seconds": 7}})) == 7.0
+
+
+def test_the_body_hint_beats_the_header():
+    """
+    Both can be present and disagree. The body is the provider's own
+    burst-limit field and its SDK treats it as authoritative, so it wins --
+    and the choice is pinned here rather than left to whichever branch ran
+    first.
+    """
+    wait = _propline_wait(
+        _Body(body={"detail": {"retry_after_seconds": 7}}, header="30")
+    )
+    assert wait == 7.0
+
+
+def test_the_header_still_works_when_the_body_carries_no_hint():
+    assert _propline_wait(_Body(body={"detail": {"error": "burst"}}, header="30")) == 30.0
+
+
+def test_a_non_json_body_falls_back_to_the_header():
+    """This code runs when the provider is already unhappy, so an unparseable
+    body must not become an exception on the retry path."""
+    assert _propline_wait(_Body(raise_json=True, header="30")) == 30.0
+
+
+def test_a_non_json_body_with_no_header_falls_back_to_the_caller():
+    assert _propline_wait(_Body(raise_json=True)) == 2.0
+
+
+def test_a_string_detail_is_not_mistaken_for_a_hint():
+    assert _propline_wait(_Body(body={"detail": "rate limited"}, header="12")) == 12.0
+
+
+@pytest.mark.parametrize("hint", ["not a number", "", 0, -1, float("nan"),
+                                  float("inf"), None, [], {}])
+def test_an_unusable_body_hint_falls_back_to_the_header(hint):
+    """
+    THE PRECEDENCE IS BODY, THEN HEADER, THEN THE CALLER -- which means every
+    step has to be able to decline. The first version asked
+    `sanitise_seconds` whether the hint was usable, but that function cannot
+    say: it folds "nothing usable here" into the caller's fallback. So a
+    junk hint next to a perfectly good `Retry-After: 30` discarded the 30 and
+    backed off locally, against a limiter that had just said how long to wait.
+    """
+    assert _propline_wait(
+        _Body(body={"detail": {"retry_after_seconds": hint}}, header="30")
+    ) == 30.0
+
+
+def test_an_unusable_body_hint_with_no_header_reaches_the_caller():
+    """And with nothing anywhere, the caller's own backoff -- never a crash."""
+    assert _propline_wait(
+        _Body(body={"detail": {"retry_after_seconds": "soon"}})
+    ) == 2.0
+
+
+@pytest.mark.parametrize(
+    "hint,expected",
+    [
+        (86400, MAX_RETRY_AFTER_SECONDS),   # capped, not obeyed
+        (float("nan"), 2.0),                # time.sleep(nan) raises ValueError
+        (float("inf"), 2.0),                # time.sleep(inf) raises OverflowError
+        (-1, 2.0),                          # an instant retry against a limiter
+        (0, 2.0),
+    ],
+)
+def test_the_body_hint_goes_through_the_same_guard_as_the_header(hint, expected):
+    """
+    The whole reason `sanitise_seconds` was extracted. A second code path
+    applying its own looser rule to the provider's number is how the
+    three-readers defect this module exists to end would come straight back.
+    """
+    assert _propline_wait(_Body(body={"detail": {"retry_after_seconds": hint}})) == expected

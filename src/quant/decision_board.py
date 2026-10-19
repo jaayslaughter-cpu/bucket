@@ -62,6 +62,7 @@ half-line.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -572,6 +573,169 @@ def expand_row_to_candidates(
     return out
 
 
+#: How old the slate's market data may be before the board refuses outright.
+#: An hour, following the rule this came from. Overridable, and None disables
+#: the gate -- but see `build_decision_board` for why a filtered subset is the
+#: wrong alternative.
+DEFAULT_MAX_MARKET_AGE_MINUTES = 60
+ENV_MAX_MARKET_AGE = "PROPIQ_MAX_MARKET_AGE_MINUTES"
+
+
+def market_age_limit_minutes(explicit: int | None = None) -> int | None:
+    """
+    The staleness limit: the caller's, else ``$PROPIQ_MAX_MARKET_AGE_MINUTES``,
+    else an hour. ``None`` means no gate.
+
+    The env var is read HERE rather than existing only as a name in a log
+    line. `tests/test_scheduler_worker` caught that: a documented variable
+    nothing reads is a knob that does nothing, which is worse than no knob --
+    an operator sets it, sees no change, and concludes the gate is broken.
+
+    Set it to ``0`` or ``off`` to disable the gate deliberately. Both sources
+    go through `_limit_from_value`, so an argument and an env var cannot come
+    to different conclusions about the same number.
+    """
+    if explicit is not None:
+        return _limit_from_value(explicit, f"max_market_age_minutes={explicit!r}")
+    raw = (os.environ.get(ENV_MAX_MARKET_AGE) or "").strip().lower()
+    if not raw:
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    if raw in ("off", "none", "disabled"):
+        return None
+    return _limit_from_value(raw, f"${ENV_MAX_MARKET_AGE} is {raw!r}")
+
+
+def _limit_from_value(raw: Any, origin: str) -> int | None:
+    """
+    One number to one limit: zero disables, a positive whole number of
+    minutes is the limit, anything else warns and takes the default.
+
+    EVERY BRANCH HERE IS A DEFECT THAT WAS REAL. An explicit ``0`` used to
+    return straight out as ``0``, which does not disable the gate -- it sets
+    the limit to zero minutes, so every market on earth reads as stale and
+    the board comes back EMPTY. The quiet failure mode of the gate is
+    supposed to be "not wired yet", never "no plays today".
+
+    A NEGATIVE limit used to disable the gate SILENTLY, which is backwards:
+    ``-60`` is a typo, and the direction a typo must never resolve in is
+    "stop checking". It warns and takes the default now.
+
+    ``inf`` used to CRASH the board. ``int(float("inf"))`` raises
+    OverflowError, not ValueError, so an operator's ``=inf`` took down
+    board construction instead of being refused like every other
+    unusable value. (``nan`` does raise ValueError -- the two are not
+    symmetric, which is exactly why guessing the exception was wrong.)
+    """
+    try:
+        value = int(float(str(raw).strip()))
+    except (OverflowError, TypeError, ValueError):
+        logger.warning(
+            "%s, which is not a number of minutes — using the %d-minute "
+            "default rather than guessing.",
+            origin, DEFAULT_MAX_MARKET_AGE_MINUTES,
+        )
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    if value == 0:
+        return None
+    if value < 0:
+        logger.warning(
+            "%s, which is not a number of minutes — using the %d-minute "
+            "default rather than silently switching the staleness gate off.",
+            origin, DEFAULT_MAX_MARKET_AGE_MINUTES,
+        )
+        return DEFAULT_MAX_MARKET_AGE_MINUTES
+    return value
+
+
+def _recommended_key(cand: "BettingDecisionCandidate") -> tuple[str, str, str]:
+    """
+    What counts as "the same opinion" for the one-pick rule.
+
+    BOTH THE ID AND THE NAME, not ``player_id or player_name``. That first
+    version trusted the id completely, so two DIFFERENT players sharing one
+    id -- a fuzzy name-to-id resolution mapping two Williamses onto one
+    player, or a placeholder id in a fixture -- collapsed into a single key
+    and one of them lost its flag. Found by exactly that: a board of
+    "Leaner" and "Priced" under one `player_id`, where the whole model-lean
+    side of the board was being suppressed and nothing noticed, because the
+    demoted candidate stayed on the board wearing an ABSTAIN.
+
+    Silently dropping a legitimate finding is the worse of the two errors
+    available here. The other -- one real player reaching the board twice
+    under two spellings of their name -- needs a duplicate slate row for one
+    (player, market), which is an upstream defect this gate is not the right
+    place to paper over.
+    """
+    return (
+        str(cand.player_id or "").strip().lower(),
+        str(cand.player_name or "").strip().lower(),
+        str(cand.target_market),
+    )
+
+
+def one_recommendation_per_player_market(
+    cands: list["BettingDecisionCandidate"],
+) -> tuple[list["BettingDecisionCandidate"], int]:
+    """
+    Keep the best RECOMMENDED candidate per (player, market); abstain on the rest.
+
+    TWO FLAGGED SIDES ON ONE PLAYER AND MARKET IS TWO OPINIONS WHERE ONLY ONE
+    CAN BE RIGHT. Books post alternate ladders -- the same player can carry
+    Over 24.5 and Over 27.5, and `normalize_event_props` pairs on the point
+    precisely so both survive as distinct rows -- so a board could recommend
+    Over 24.5 AND Under 27.5 on one player: contradictory advice, presented
+    as two independent findings, and a reader taking both is hedged into the
+    hold.
+
+    The loser ABSTAINS, it is not deleted. Its numbers are still the honest
+    result for that line and belong on the board; what it loses is the flag.
+    `cands` must already be sorted, so the first of a pair is the better one
+    by the board's own ranking.
+
+    ABSTAIN rather than a new third status: `DecisionStatus` is
+    ``Literal["RECOMMENDED", "ABSTAIN"]`` and inventing a "CONSIDER" here
+    would put a value outside that type on the model -- which pydantic would
+    not catch without validate_assignment, and which every consumer
+    branching on the two legal values would then read as a surprise.
+    """
+    seen: set[tuple[str, str]] = set()
+    demoted = 0
+    for cand in cands:
+        if cand.decision_status != "RECOMMENDED":
+            continue
+        key = _recommended_key(cand)
+        if key in seen:
+            cand.decision_status = "ABSTAIN"
+            note = (
+                "ABSTAINED: another line on this player and market is already "
+                "recommended, and two flagged sides of one player/market are "
+                "two opinions where only one can be right."
+            )
+            cand.warnings = [*(cand.warnings or []), note]
+            demoted += 1
+            continue
+        seen.add(key)
+    return cands, demoted
+
+
+def market_age_minutes(market_as_of: Any, now: Any = None) -> float | None:
+    """Minutes between the slate's market observation and ``now``, or None."""
+    if market_as_of is None:
+        return None
+    try:
+        observed = pd.Timestamp(market_as_of)
+    except (TypeError, ValueError):
+        return None
+    if observed is pd.NaT:
+        return None
+    current = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    if observed.tzinfo is None and current.tzinfo is not None:
+        observed = observed.tz_localize("UTC")
+    elif observed.tzinfo is not None and current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    return float((current - observed).total_seconds()) / 60.0
+
+
 def build_decision_board(
     rows: Sequence[ResearchSlateRow],
     *,
@@ -580,6 +744,8 @@ def build_decision_board(
     require_valid_book: bool = False,
     consider_only: bool = False,
     top_n: int | None = None,
+    market_as_of: Any = None,
+    max_market_age_minutes: int | None = None,
 ) -> list[BettingDecisionCandidate]:
     """
     Rank Over/Under candidates, recommended ones first.
@@ -591,7 +757,64 @@ def build_decision_board(
     lean and a de-vigged EV on one numeric scale would imply the two numbers
     are comparable; they are not, because only one of them has a price
     behind it. A 0.49 lean must not outrank a 0.08 edge.
+
+    TWO REFUSALS, both of which can only shrink the board:
+
+    * A STALE SLATE YIELDS ZERO CANDIDATES, not a filtered subset. Pass
+      ``market_as_of`` (the slate's market observation time) and
+      ``max_market_age_minutes``. A stale row that still clears the bar is the
+      dangerous case: it looks actionable and is not. Filtering to the rows
+      that happen to look fresh is worse than refusing, because it leaves a
+      short, confident-looking board built on a market nobody can vouch for.
+      Omit either argument and the gate does not run -- it cannot invent an
+      observation time it was not given, and guessing `now()` would make every
+      slate look fresh.
+
+    * ONE RECOMMENDATION PER PLAYER AND MARKET. See
+      `one_recommendation_per_player_market`; the losers are demoted to
+      ABSTAIN, not dropped.
+
+    Both rules come from `Kevocado/NBA_Predictor`'s `odds/edge_gate.py`,
+    read 2026-10-18. Its third rule -- an edge must be same book, same point,
+    both sides -- this project already satisfies: `normalize_event_props`
+    pairs on ``(book, market, player, point)``.
     """
+    # THE GATE NEEDS BOTH A LIMIT AND AN OBSERVATION TIME. The limit has a
+    # default; the timestamp cannot, so a caller that passes no
+    # `market_as_of` is unaffected -- which is every caller today, so this
+    # changes nothing until one is wired.
+    age_limit = market_age_limit_minutes(max_market_age_minutes)
+    if max_market_age_minutes is not None and market_as_of is None:
+        # The caller asked for a check and gave nothing to check against.
+        # Worth saying, where the same situation under the ENV DEFAULT is
+        # just "not wired yet" and warning on it would be noise on every
+        # call.
+        logger.warning(
+            "Market staleness NOT CHECKED: a limit of %s minute(s) was "
+            "passed but no market_as_of came with it, so the board is built "
+            "unguarded. This is not a pass.",
+            max_market_age_minutes,
+        )
+    if age_limit is not None and market_as_of is not None:
+        age = market_age_minutes(market_as_of)
+        if age is None:
+            logger.warning(
+                "Market staleness NOT CHECKED: a limit of %s minute(s) was "
+                "set but no usable market_as_of was given, so the board is "
+                "built unguarded. This is not a pass.",
+                age_limit,
+            )
+        elif age > float(age_limit):
+            logger.error(
+                "STALE SLATE — ZERO CANDIDATES: the market data is %.0f "
+                "minute(s) old, over the %s-minute limit ($%s). Returning an "
+                "empty board rather than the subset that happens to look "
+                "fresh: a stale row clearing the bar looks actionable and is "
+                "not.",
+                age, age_limit, ENV_MAX_MARKET_AGE,
+            )
+            return []
+
     cands: list[BettingDecisionCandidate] = []
     for row in rows:
         cands.extend(expand_row_to_candidates(
@@ -613,6 +836,26 @@ def build_decision_board(
         )
 
     cands.sort(key=_sort_key)
+
+    # AFTER the sort, so "the first of a pair" means "the better one" by the
+    # board's own ranking rather than by input order.
+    cands, abstained = one_recommendation_per_player_market(cands)
+    if abstained:
+        logger.info(
+            "Abstained on %d candidate(s): another line on the same player "
+            "and market was already recommended.", abstained,
+        )
+        # DEMOTION CHANGES THE FIRST SORT KEY, so the sort above is now stale
+        # and `consider_only` was applied before any of this happened. Left
+        # alone, a demoted ABSTAIN keeps the high position it held while it
+        # was still RECOMMENDED -- so `top_n=5` could spend a slot on it and
+        # cut a genuine recommendation ranked below it, and a
+        # `consider_only=True` caller, who asked for recommendations only,
+        # would be handed an ABSTAIN. Re-apply both.
+        cands.sort(key=_sort_key)
+        if consider_only:
+            cands = [c for c in cands if c.decision_status == "RECOMMENDED"]
+
     if top_n is not None and top_n > 0:
         cands = cands[: int(top_n)]
     for i, c in enumerate(cands, start=1):
