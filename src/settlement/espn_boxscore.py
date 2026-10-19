@@ -113,6 +113,14 @@ def _int_or_none(value: Any) -> int | None:
     is the difference between a WIN and a LOSS, decided by a rounding mode. A
     player cannot score half a point: a fractional counting stat is corrupt
     input, and the only honest reading of corrupt input is none.
+
+    AND REFUSES A NEGATIVE, for the same reason. Every field this feeds is a
+    COUNTING stat — points, rebounds, assists, steals, blocks, turnovers,
+    makes and attempts — and none of them can go below zero. ``PLUS_MINUS`` is
+    the one signed figure ESPN sends and it is deliberately not in
+    `PANEL_TO_CDN`, so nothing legitimately negative passes through here. A
+    ``-3`` is corrupt, and settling an Under on it would be a real-looking
+    result built on impossible input.
     """
     if value is None:
         return None
@@ -120,7 +128,7 @@ def _int_or_none(value: Any) -> int | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(number) or not number.is_integer():
+    if not math.isfinite(number) or not number.is_integer() or number < 0:
         return None
     return int(number)
 

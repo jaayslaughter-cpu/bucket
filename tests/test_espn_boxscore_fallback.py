@@ -122,6 +122,12 @@ def test_a_stat_espn_omitted_stays_absent_rather_than_becoming_zero():
     (8.0, 8), (0.0, 0), (24.0, 24),
     (3.5, None), (0.5, None), (float("inf"), None), (float("nan"), None),
     ("x", None), (None, None),
+    # Negative counting stats are impossible, not merely unusual. Every field
+    # this feeds is a count; PLUS_MINUS is the one signed figure ESPN sends
+    # and it is deliberately absent from PANEL_TO_CDN, so nothing legitimately
+    # negative reaches here. Settling an Under on a -3 would be a real-looking
+    # result built on impossible input.
+    (-1.0, None), (-3.0, None), (-0.0, 0),
 ])
 def test_a_fractional_counting_stat_is_refused_not_rounded(raw, expected):
     """
