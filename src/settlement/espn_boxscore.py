@@ -1,45 +1,48 @@
 """
-src/settlement/espn_boxscore.py — the box score we can actually reach.
+src/settlement/espn_boxscore.py — grade from a box score we can reach.
 
-WHY THIS EXISTS. `settlement/boxscore_fetcher` grades from
-``cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json``, and
+WHY THIS EXISTS. `settlement/boxscore_fetcher` grades from the NBA CDN, and
 measured on 2026-10-19, two days before the season opener:
 
     cdn.nba.com    403 in 0.47s  (actively rejected, with the real
                                   User-Agent/Referer/Origin headers sent)
     stats.nba.com  000 after 20s (connection never completed)
 
-A control host through the same proxy answered, so this is the NBA side
-refusing, not a local misconfiguration. With no reachable box score the
-settlement loop cannot close: props stay PENDING, the W/L ledger never
-fills, `prop_result_calibration_report` has nothing to read, and the
-publication gate withholds every card for want of evidence it can never
-acquire. The loop is self-reinforcing, which is why this is a blocker and
-not an inconvenience.
+A control host through the same proxy answered, so the refusal is NBA's. With
+no box score the settlement loop cannot close: props stay PENDING, the ledger
+never fills, `prop_result_calibration_report` has nothing to read, and
+`publication_gate` then withholds every card for want of evidence that grading
+is the only source of. The loop re-arms itself.
 
-``site.api.espn.com`` answers 200 and carries full player box scores —
-MIN, PTS, FG, 3PT, FT, REB, AST, TO, STL, BLK, OREB, DREB, PF, +/-, plus
-``didNotPlay`` and ``starter`` — and the project already reaches it for the
-schedule, so it needs no new host, no new key and no bot-wall circumvention.
+WHAT THIS MODULE IS: AN ADAPTER, AND NOTHING MORE. The first version of this
+file parsed ESPN itself -- and `src/ingestion/espn_game` already did, better.
+That module handles BOTH documented summary shapes
+(``boxscore.teams[].players[]`` and ``boxscore.players[]``), zips ESPN's own
+header names to that block's values with ``strict=True`` so a length mismatch
+RAISES instead of truncating to fit, and splits made-attempted pairs. Its
+docstring states the same lesson the duplicate had rediscovered: indexing the
+positional ``stats`` array puts rebounds in the assists column the moment ESPN
+reorders a column, and nothing looks wrong.
 
-WHAT THIS IS NOT. It is a FALLBACK, not a replacement. The CDN is addressed
-by NBA game id and is exact; ESPN is addressed by its own event id and has
-to be matched to ours. Where the CDN answers, it still wins.
+So transport goes through `espn_client.get_json` (which honours
+``PROPIQ_ESPN_SITE_BASE``, so a mirror or a test host is respected, and which
+does not retry a permanent 4xx), the scoreboard through
+`espn_schedule.fetch_scoreboard`, and the box score through
+`espn_game.fetch_summary`. What is left here is the only thing genuinely new:
+deciding WHICH ESPN event is the NBA game we are grading.
 
-THE TWO THINGS ESPN CANNOT GIVE US, recorded here rather than papered over:
-
-  * NO NBA PERSON ID. ESPN numbers athletes itself (Tobias Harris is 6440),
-    so ``nba_player_id`` comes back None on this path rather than carrying an
-    ESPN id in a field every reader will take for an NBA one. That is a real
-    loss: `extract_player_stats`'s duplicate-name branch says "settle by
-    personId, not name", and on this path there is no personId to settle by.
-    Duplicate names are still DETECTED and still marked ambiguous, so the
-    matcher refuses them instead of grading one player against another's line.
-
-  * NO NBA GAME ID anywhere in the payload (searched; absent). So the event
-    has to be identified, and `fetch_player_stats_for_game` does it by
-    EVIDENCE: the players we are grading must appear in the event's own box
-    score. See `select_event_by_players`, which declines rather than guesses.
+THAT DECISION IS MADE ON EVIDENCE. ESPN's payload carries no NBA game id
+(searched; absent), and `games` -- the one table holding both an nba_game_id
+and a team pair -- has no writer anywhere in this tree, so there is nothing to
+join on. What is available is what settlement already matches on: the players
+being graded. `select_event_by_players` requires the winning event to contain
+EVERY expected player that appears anywhere on the slate, and refuses
+otherwise. A unique PARTIAL overlap is not enough: if the game we want is not
+final yet and some other game that night happens to contain one same-named
+player, a partial rule would pick it and grade a whole game's props against a
+different game's box score. That is the exact catastrophe this module exists
+to avoid, so it declines and the props wait for the next run -- which is what
+settlement's six-hour misfire grace is for.
 
 RESEARCH_ONLY. This reads results that already happened.
 """
@@ -47,57 +50,41 @@ RESEARCH_ONLY. This reads results that already happened.
 from __future__ import annotations
 
 import logging
-import time
 from datetime import date, datetime
 from typing import Any
 
 import requests
 
-from src.utils.http_retry import retry_after_seconds
+from src.ingestion.espn_game import fetch_summary
+from src.ingestion.espn_schedule import STATE_FINAL, fetch_scoreboard, parse_scoreboard
+from src.settlement.names import normalise_player_name
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
-SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-
-#: ESPN's own name for a completed game. Anything else is refused, for the
-#: same reason the CDN path checks gameStatus: grading a live game settles
-#: props against a partial stat line.
-STATUS_FINAL = "STATUS_FINAL"
-
-REQUEST_TIMEOUT = 15
-RETRY_ATTEMPTS = 3
-RETRY_BACKOFF = 2.0
-TOO_MANY_REQUESTS = 429
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-}
-
-#: ESPN label -> the CDN field name the rest of settlement already reads.
-#: The CDN's names are used VERBATIM downstream so no renaming layer can
-#: drift (see `extract_player_stats`), which means the translation has to
-#: happen here, once.
-DIRECT_LABELS = {
+#: `espn_game` emits the PANEL's stat names. Settlement reads the CDN's field
+#: names verbatim (see `extract_player_stats`), so the translation happens
+#: here, once. A stat ESPN omitted stays absent rather than becoming a zero.
+PANEL_TO_CDN = {
     "PTS": "points",
     "REB": "reboundsTotal",
     "AST": "assists",
+    "FG3M": "threePointersMade",
     "STL": "steals",
     "BLK": "blocks",
-    "TO": "turnovers",
+    "TOV": "turnovers",
+    # Shot volume, for the fga/fta columns migration 009 added.
+    "FGM": "fieldGoalsMade",
+    "FGA": "fieldGoalsAttempted",
+    "FTM": "freeThrowsMade",
+    "FTA": "freeThrowsAttempted",
 }
 
-#: Labels whose value is "made-attempted" ("3-5"). 3PT feeds the market
-#: component; FG and FT feed the fga/fta columns migration 009 added.
-SPLIT_LABELS = {
-    "3PT": ("threePointersMade", "threePointersAttempted"),
-    "FG": ("fieldGoalsMade", "fieldGoalsAttempted"),
-    "FT": ("freeThrowsMade", "freeThrowsAttempted"),
-}
+#: The market components `evaluator` grades on. Used only to decide whether a
+#: row with unreadable minutes nevertheless shows evidence of having played.
+MARKET_COMPONENTS = (
+    "points", "reboundsTotal", "assists",
+    "threePointersMade", "steals", "blocks", "turnovers",
+)
 
 
 class EspnBoxScoreError(RuntimeError):
@@ -105,237 +92,125 @@ class EspnBoxScoreError(RuntimeError):
 
 
 class EspnGameNotFinalError(EspnBoxScoreError):
-    """The event exists but is not finished."""
+    """No ESPN event for this game has finished."""
+
+
+def _as_date(value: str | date | datetime) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return datetime.fromisoformat(str(value)[:10]).date()
 
 
 def _int_or_none(value: Any) -> int | None:
-    """ESPN sends every stat as a STRING, including '+2' and '--'."""
+    """`espn_game` yields floats; the CDN contract is integer counting stats."""
     if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in {"--", "-"}:
         return None
     try:
-        return int(float(text))
-    except ValueError:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
         return None
 
 
-def _split_made_attempted(value: Any) -> tuple[int | None, int | None]:
-    """'3-5' -> (3, 5). Anything else -> (None, None), never a guess."""
-    if value is None:
-        return None, None
-    parts = str(value).strip().split("-")
-    if len(parts) != 2:
-        return None, None
-    return _int_or_none(parts[0]), _int_or_none(parts[1])
-
-
-def _parse_minutes(value: Any) -> float | None:
-    """ESPN minutes are plain ('25'), but accept 'MM:SS' rather than assume."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text in {"--", "-"}:
-        return None
-    if ":" in text:
-        mm, _, ss = text.partition(":")
-        m, s = _int_or_none(mm), _int_or_none(ss)
-        if m is None:
-            return None
-        return float(m) + (float(s) / 60.0 if s is not None else 0.0)
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def _get(url: str, params: dict[str, Any], session: requests.Session | None) -> dict[str, Any]:
-    """One GET, with the project's single Retry-After rule."""
-    sess = session or requests.Session()
-    last: Exception | None = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            resp = sess.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == TOO_MANY_REQUESTS:
-                wait = retry_after_seconds(resp.headers, RETRY_BACKOFF ** attempt)
-                if attempt < RETRY_ATTEMPTS:
-                    logger.warning(
-                        "espn boxscore: 429 on %s, attempt %d/%d; waiting %.1fs",
-                        url, attempt, RETRY_ATTEMPTS, wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise EspnBoxScoreError(
-                    f"ESPN rate-limited {url} on all {RETRY_ATTEMPTS} attempts. "
-                    f"Settlement has a six-hour misfire grace, so this game is "
-                    f"graded on the next run rather than lost."
-                )
-            resp.raise_for_status()
-            return resp.json()
-        except EspnBoxScoreError:
-            raise
-        except (requests.exceptions.RequestException, ValueError) as exc:
-            last = exc
-            if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF ** attempt)
-    raise EspnBoxScoreError(f"ESPN request failed after {RETRY_ATTEMPTS} attempts: {url}") from last
-
-
-def _as_yyyymmdd(game_date: str | date | datetime) -> str:
-    if isinstance(game_date, datetime):
-        return game_date.date().strftime("%Y%m%d")
-    if isinstance(game_date, date):
-        return game_date.strftime("%Y%m%d")
-    text = str(game_date).strip()
-    if len(text) == 8 and text.isdigit():
-        return text
-    return datetime.fromisoformat(text[:10]).strftime("%Y%m%d")
-
-
-def final_event_ids_for_date(
+def final_events_for_date(
     game_date: str | date | datetime, session: requests.Session | None = None
-) -> list[str]:
-    """Event ids of the FINAL games on a date. Non-final games are left out."""
-    payload = _get(SCOREBOARD_URL, {"dates": _as_yyyymmdd(game_date)}, session)
-    out: list[str] = []
-    for event in payload.get("events") or []:
-        event_id = event.get("id")
-        if not event_id:
+) -> list[Any]:
+    """
+    The FINAL games on a date, as `espn_schedule.SlateGame`s.
+
+    Finality comes from the SCOREBOARD's own ``state == "post"``, which is the
+    convention `espn_schedule` already uses. It deliberately does not come from
+    `GameSummary.status`: that field reports whether the PARSE succeeded (``OK``
+    / ``DATA_NOT_AVAILABLE``), not whether the game finished, and reading it as
+    finality would settle props against a game still in progress.
+    """
+    payload = fetch_scoreboard(_as_date(game_date), session=session)
+    result = parse_scoreboard(payload)
+    return [g for g in result.games if g.state == STATE_FINAL]
+
+
+def settlement_rows(summary: Any, slate_game: Any = None) -> dict[str, dict[str, Any]]:
+    """
+    `espn_game`'s BoxScoreRows -> the dict `extract_player_stats` returns.
+
+    TWO THINGS ESPN CANNOT GIVE, recorded rather than papered over:
+
+      * NO NBA PERSON ID. ESPN numbers athletes itself, so ``nba_player_id``
+        is None here rather than carrying an ESPN id in a field every reader
+        will take for an NBA one -- a join against player_game_logs would then
+        match nothing, or the wrong person. It goes in ``espn_athlete_id``.
+      * Duplicate names therefore have no personId to settle by, so DETECTION
+        is the only protection left. Both entries are marked ambiguous and
+        `_match_player` refuses, rather than grading one player against the
+        other's line.
+    """
+    out: dict[str, dict[str, Any]] = {}
+
+    for row in getattr(summary, "box_score", None) or []:
+        name = (row.player_name or "").strip()
+        if not name:
             continue
-        competitions = event.get("competitions") or [{}]
-        status = (((competitions[0].get("status") or {}).get("type") or {})
-                  .get("name") or "")
-        if status == STATUS_FINAL:
-            out.append(str(event_id))
-    return out
 
-
-def fetch_event_summary(
-    event_id: str, session: requests.Session | None = None
-) -> dict[str, Any]:
-    return _get(SUMMARY_URL, {"event": str(event_id)}, session)
-
-
-def _event_status(summary: dict[str, Any]) -> str:
-    header = summary.get("header") or {}
-    competitions = header.get("competitions") or [{}]
-    return (((competitions[0].get("status") or {}).get("type") or {}).get("name") or "")
-
-
-def extract_espn_player_stats(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """
-    Flatten an ESPN summary into the SAME shape `extract_player_stats` returns.
-
-    STATS ARE READ BY LABEL, NEVER BY POSITION. ESPN ships a positional
-    ``stats`` array beside a ``labels`` array; indexing the array by a
-    hardcoded offset would silently read rebounds as assists the day ESPN
-    inserts a column. Zipping the two is the only form that cannot drift.
-    """
-    status = _event_status(summary)
-    if status != STATUS_FINAL:
-        raise EspnGameNotFinalError(
-            f"ESPN event status is {status or 'unknown'}, not {STATUS_FINAL}. "
-            f"Refusing to settle against a non-final box score."
+        values = {
+            cdn: _int_or_none(row.stats.get(panel))
+            for panel, cdn in PANEL_TO_CDN.items()
+        }
+        minutes = row.stats.get("MIN")
+        minutes = float(minutes) if minutes is not None else None
+        played_signal = any(
+            values.get(field) is not None and values[field] > 0
+            for field in MARKET_COMPONENTS
         )
 
-    boxscore = summary.get("boxscore") or {}
-    out: dict[str, dict[str, Any]] = {}
-    home_abbr = _home_abbreviation(summary)
+        # A failed minutes parse is NOT a DNP. The CDN path learned this the
+        # hard way: folding it in voided every player whose minutes format
+        # changed, against a box score showing they had played, and those rows
+        # left W-L entirely -- a parser break reading as a quiet sample shrink.
+        if row.did_not_play:
+            did_not_play, minutes_status = True, "DNP_DECLARED"
+        elif minutes == 0.0:
+            did_not_play, minutes_status = True, "PARSED"
+        elif minutes is None:
+            did_not_play, minutes_status = not played_signal, "UNAVAILABLE"
+        else:
+            did_not_play, minutes_status = False, "PARSED"
 
-    for team_block in boxscore.get("players") or []:
-        team = team_block.get("team") or {}
-        tricode = team.get("abbreviation")
-        for group in team_block.get("statistics") or []:
-            labels = [str(x) for x in (group.get("labels") or [])]
-            for athlete in group.get("athletes") or []:
-                info = athlete.get("athlete") or {}
-                name = (info.get("displayName") or "").strip()
-                if not name:
-                    continue
+        if minutes_status == "UNAVAILABLE" and played_signal:
+            logger.warning(
+                "ESPN: minutes unreadable for %r but the box score records "
+                "stats — grading from the stat line, not voiding.", name,
+            )
 
-                raw = dict(zip(labels, athlete.get("stats") or []))
-                values: dict[str, Any] = {
-                    field: _int_or_none(raw.get(label))
-                    for label, field in DIRECT_LABELS.items()
-                }
-                for label, (made_key, att_key) in SPLIT_LABELS.items():
-                    made, attempted = _split_made_attempted(raw.get(label))
-                    values[made_key] = made
-                    values[att_key] = attempted
+        if name in out:
+            out[name]["ambiguous_name"] = True
+            logger.warning(
+                "ESPN: duplicate player name %r in event %s — marked ambiguous. "
+                "This path has no NBA personId to settle by, so the matcher "
+                "must refuse rather than pick.", name, row.espn_event_id,
+            )
+            continue
 
-                minutes = _parse_minutes(raw.get("MIN"))
-                declared_dnp = bool(athlete.get("didNotPlay"))
-                played_signal = any(
-                    v is not None and v > 0
-                    for v in (values.get(f) for f in (
-                        "points", "reboundsTotal", "assists",
-                        "threePointersMade", "steals", "blocks", "turnovers",
-                    ))
-                )
-
-                # Mirrors the CDN path's reasoning exactly: a failed minutes
-                # parse is NOT a DNP, because voiding a player the box score
-                # shows playing removes them from W-L entirely and reads as a
-                # quiet sample shrink rather than an error.
-                if declared_dnp:
-                    did_not_play, minutes_status = True, "DNP_DECLARED"
-                elif minutes == 0.0:
-                    did_not_play, minutes_status = True, "PARSED"
-                elif minutes is None:
-                    did_not_play, minutes_status = not played_signal, "UNAVAILABLE"
-                else:
-                    did_not_play, minutes_status = False, "PARSED"
-
-                if minutes_status == "UNAVAILABLE" and played_signal:
-                    logger.warning(
-                        "ESPN: could not parse minutes for %r (raw %r) but the "
-                        "box score records stats — grading from the stat line, "
-                        "not voiding.", name, raw.get("MIN"),
-                    )
-
-                if name in out:
-                    out[name]["ambiguous_name"] = True
-                    logger.warning(
-                        "ESPN: duplicate player name %r in event %s — marked "
-                        "ambiguous. This path has no NBA personId to settle by, "
-                        "so the matcher must refuse rather than pick.",
-                        name, (summary.get("header") or {}).get("id", "?"),
-                    )
-                    continue
-
-                out[name] = {
-                    "player_name": name,
-                    "ambiguous_name": False,
-                    # DELIBERATELY None: ESPN's athlete id is not an NBA
-                    # personId, and a reader of this field will assume it is.
-                    "nba_player_id": None,
-                    "espn_athlete_id": str(info.get("id")) if info.get("id") else None,
-                    "team_tricode": tricode,
-                    "is_home": tricode is not None and tricode == home_abbr,
-                    "minutes_played": minutes,
-                    "minutes_status": minutes_status,
-                    "did_not_play": did_not_play,
-                    "not_playing_reason": athlete.get("reason"),
-                    "source": "espn",
-                    **values,
-                }
-
-    logger.info(
-        "ESPN: extracted %d player stat lines from event %s (%d DNP)",
-        len(out), (summary.get("header") or {}).get("id", "?"),
-        sum(1 for p in out.values() if p["did_not_play"]),
-    )
+        out[name] = {
+            "player_name": name,
+            "ambiguous_name": False,
+            "nba_player_id": None,
+            "espn_athlete_id": row.espn_athlete_id,
+            # NEITHER IS AVAILABLE AND NEITHER IS READ. `espn_game` carries
+            # ESPN's team id, not an NBA tricode, and no settlement consumer
+            # reads these two fields (checked: only features/matchup uses the
+            # name, against different data). None is the honest value; a
+            # guessed tricode would be worse than an absent one.
+            "team_tricode": None,
+            "is_home": None,
+            "minutes_played": minutes,
+            "minutes_status": minutes_status,
+            "did_not_play": did_not_play,
+            "not_playing_reason": None,
+            "source": "espn",
+            **values,
+        }
     return out
-
-
-def _home_abbreviation(summary: dict[str, Any]) -> str | None:
-    header = summary.get("header") or {}
-    for competition in header.get("competitions") or []:
-        for competitor in competition.get("competitors") or []:
-            if competitor.get("homeAway") == "home":
-                return (competitor.get("team") or {}).get("abbreviation")
-    return None
 
 
 def select_event_by_players(
@@ -343,18 +218,23 @@ def select_event_by_players(
     expected_players: set[str],
 ) -> str:
     """
-    Pick the event whose box score actually contains the players being graded.
+    The event whose box score contains EVERY player we are grading.
 
-    THE EVENT ID IS DERIVED, NOT ASSUMED. ESPN's payload carries no NBA game
-    id, and `games` — the one table with both an nba_game_id and a team pair —
-    has no writer in this tree, so there is nothing to join on. What IS
-    available is the thing settlement already matches on: player names.
+    A UNIQUE PARTIAL OVERLAP IS NOT ENOUGH, and the first version accepted
+    one. If the game we want is not final yet, and another game that night
+    contains a single same-named player, a partial rule picks that event and
+    grades a whole game's props against a different game's box score.
 
-    REFUSES RATHER THAN GUESSES, in both ambiguous cases: no event contains
-    any of the players, or two events tie on overlap. A wrong event here would
-    grade a whole game's props against a different game's box score, which is
-    worse than leaving them PENDING for the next run — settlement has a
-    six-hour misfire grace precisely so that waiting is cheap.
+    "Every player" means every expected player who appears ANYWHERE on the
+    slate. A player absent from all of them -- someone who did not travel and
+    so never reached a box score -- must not block grading for the rest of the
+    game, and is reported rather than silently tolerated. But a player who
+    turns up in a DIFFERENT event means the set is split across games, and
+    that is a refusal: something upstream is wrong and guessing cannot fix it.
+
+    Names are compared through `settlement.names.normalise_player_name`, the
+    same rule `_match_player` settles with, so the selector cannot fail to
+    recognise a player the matcher would have matched.
     """
     if not expected_players:
         raise EspnBoxScoreError(
@@ -362,64 +242,104 @@ def select_event_by_players(
             "identified. This path matches on the players being graded."
         )
 
-    wanted = {p.strip().lower() for p in expected_players if p and p.strip()}
-    scores: list[tuple[int, str]] = []
-    for event_id, stats in candidates.items():
-        have = {name.strip().lower() for name in stats}
-        scores.append((len(wanted & have), event_id))
+    wanted = {normalise_player_name(p) for p in expected_players if p and p.strip()}
+    if not wanted:
+        raise EspnBoxScoreError(
+            "Every expected player name was blank once normalised, so the "
+            "ESPN event cannot be identified."
+        )
 
-    scores.sort(reverse=True)
-    if not scores or scores[0][0] == 0:
+    have: dict[str, set[str]] = {
+        event_id: {normalise_player_name(n) for n in stats}
+        for event_id, stats in candidates.items()
+    }
+    anywhere = set().union(*have.values()) if have else set()
+    reachable = wanted & anywhere
+    if not reachable:
         raise EspnBoxScoreError(
             f"None of the {len(wanted)} player(s) being graded appear in any "
             f"of the {len(candidates)} final ESPN event(s) for this date, so "
             f"the event cannot be identified."
         )
-    if len(scores) > 1 and scores[1][0] == scores[0][0]:
+
+    missing_everywhere = sorted(wanted - anywhere)
+    complete = [eid for eid, names in have.items() if reachable <= names]
+
+    if not complete:
+        best = max(((len(reachable & names), eid) for eid, names in have.items()),
+                   default=(0, "?"))
         raise EspnBoxScoreError(
-            f"Two ESPN events match {scores[0][0]} of the players being graded "
-            f"equally well ({scores[0][1]}, {scores[1][1]}). Refusing to pick: "
-            f"grading against the wrong game is worse than grading later."
+            f"No single final ESPN event contains all {len(reachable)} of the "
+            f"players being graded that appear on this slate (best was "
+            f"{best[1]} with {best[0]}). The player set is split across "
+            f"events, so settling against any one of them would grade this "
+            f"game against another's box score."
         )
-    return scores[0][1]
+    if len(complete) > 1:
+        raise EspnBoxScoreError(
+            f"{len(complete)} final ESPN events each contain all "
+            f"{len(reachable)} players being graded ({', '.join(sorted(complete))}). "
+            f"Refusing to pick: grading against the wrong game is worse than "
+            f"grading later."
+        )
+
+    if missing_everywhere:
+        logger.warning(
+            "ESPN: %d of the players being graded reached no box score on this "
+            "slate (%s) — they are likely scratches who did not travel, and "
+            "they do not block the rest of the game. They will not settle.",
+            len(missing_everywhere), ", ".join(missing_everywhere[:5]),
+        )
+    return complete[0]
 
 
 def fetch_espn_player_stats_for_game(
     game_date: str | date | datetime,
     expected_players: set[str],
     session: requests.Session | None = None,
+    cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """
-    (player stats by name, raw summary) for the event matching these players.
+    (player stats by name, raw-ish summary) for the event matching these players.
 
-    One scoreboard call plus one summary call per FINAL event on the date.
-    A full slate is ~12 requests, against a host that answers.
+    ``cache`` IS NOT AN OPTIMISATION, IT IS A RATE-LIMIT GUARD. Without it the
+    whole slate is re-fetched once per game: a twelve-game CDN outage made one
+    scoreboard plus twelve summary calls THIRTEEN TIMES -- about 156 requests
+    against a host whose 429 would then strand the grading this exists to
+    rescue. The runner creates one dict per settlement run and passes it down,
+    so the slate is fetched once. It is explicit rather than module-level
+    state, so two runs cannot see each other's.
     """
-    event_ids = final_event_ids_for_date(game_date, session=session)
-    if not event_ids:
-        raise EspnGameNotFinalError(
-            f"ESPN lists no FINAL NBA events on {game_date}, so there is "
-            f"nothing to settle against yet."
-        )
+    key = f"espn_slate:{_as_date(game_date).isoformat()}"
+    store = cache if cache is not None else {}
 
-    candidates: dict[str, dict[str, dict[str, Any]]] = {}
-    summaries: dict[str, dict[str, Any]] = {}
-    for event_id in event_ids:
-        try:
-            summary = fetch_event_summary(event_id, session=session)
-            candidates[event_id] = extract_espn_player_stats(summary)
-            summaries[event_id] = summary
-        except EspnGameNotFinalError:
-            continue  # the scoreboard and the summary disagreed; trust the summary
-        except EspnBoxScoreError as exc:
-            logger.warning("ESPN: event %s unusable (%s); trying the rest.", event_id, exc)
+    if key not in store:
+        slate_games = final_events_for_date(game_date, session=session)
+        if not slate_games:
+            raise EspnGameNotFinalError(
+                f"ESPN lists no final NBA events on {game_date}, so there is "
+                f"nothing to settle against yet."
+            )
+        built: dict[str, tuple[dict[str, dict[str, Any]], Any]] = {}
+        for game in slate_games:
+            event_id = str(game.espn_event_id)
+            try:
+                summary = fetch_summary(event_id, session=session)
+                built[event_id] = (settlement_rows(summary, game), summary)
+            except Exception as exc:  # noqa: BLE001 — one bad event is not the slate
+                logger.warning(
+                    "ESPN: event %s unusable (%s); trying the rest.", event_id, exc,
+                )
+        store[key] = built
 
-    if not candidates:
+    built = store[key]
+    if not built:
         raise EspnBoxScoreError(
-            f"ESPN returned no usable final box score among "
-            f"{len(event_ids)} event(s) on {game_date}."
+            f"ESPN returned no usable final box score on {game_date}."
         )
 
+    candidates = {eid: rows for eid, (rows, _) in built.items()}
     chosen = select_event_by_players(candidates, expected_players)
+    rows, summary = built[chosen]
     logger.info("ESPN: graded against event %s on %s", chosen, game_date)
-    return candidates[chosen], summaries[chosen]
+    return rows, {"espn_event_id": chosen, "summary": summary}

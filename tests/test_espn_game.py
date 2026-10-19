@@ -13,6 +13,7 @@ import requests
 
 from src.ingestion.espn_client import EspnConfig, EspnError
 from src.ingestion.espn_game import (
+    _split_made_attempted,
     fetch_summary,
     parse_box_score,
     parse_plays,
@@ -322,3 +323,23 @@ def test_a_dnp_with_no_stats_is_still_not_flagged():
     )
     assert notes == [], f"an empty DNP row was wrongly flagged: {notes}"
     assert rows[0].did_not_play is True
+
+
+@pytest.mark.parametrize("raw", ["3-x", "x-5", "3-", "-5", "12-abc"])
+def test_a_one_sided_made_attempted_pair_yields_neither_half(raw):
+    """
+    BOTH HALVES OR NEITHER. This docstring said "never a guess" while
+    returning ``(3.0, None)`` for ``"3-x"``: a made count with no attempts
+    beside it. A shooting split with a numerator and no denominator is not a
+    partial reading, it is a wrong one — FG% from it is infinite, and a prop
+    graded on attempts would be graded against a missing number. Found by
+    cubic on PR #16; the settlement fallback reads these columns now, so the
+    half-read would have reached grading.
+    """
+    assert _split_made_attempted(raw) == (None, None)
+
+
+def test_a_well_formed_pair_still_splits():
+    """The control: the fix must not have made the parser refuse everything."""
+    assert _split_made_attempted("12-24") == (12.0, 24.0)
+    assert _split_made_attempted("0-0") == (0.0, 0.0)

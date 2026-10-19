@@ -36,6 +36,7 @@ from src.settlement.evaluator import (
     compute_clv,
     settle_prop,
 )
+from src.settlement.names import normalise_player_name
 from src.utils.timezones import pacific_calendar_date
 
 logger = logging.getLogger(__name__)
@@ -91,10 +92,8 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
             return None
         return candidate
 
-    def norm(s: str) -> str:
-        return "".join(ch for ch in s.casefold() if ch.isalnum())
-
-    target = norm(player_name)
+    target = normalise_player_name(player_name)
+    norm = normalise_player_name
     for name, stats in stats_by_name.items():
         if norm(name) == target:
             if stats.get("ambiguous_name"):
@@ -106,6 +105,18 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
                 return None
             return stats
     return None
+
+
+#: What `extract_player_stats` has always implied without saying: a row with
+#: no explicit source came from the NBA CDN, because until the ESPN fallback
+#: existed that was the only producer.
+CDN_RESULT_SOURCE = "nba_cdn_liveData"
+ESPN_RESULT_SOURCE = "espn_site_api_summary"
+
+
+def _result_source(player_stats: dict) -> str:
+    """The source that actually produced this stat line."""
+    return ESPN_RESULT_SOURCE if player_stats.get("source") == "espn" else CDN_RESULT_SOURCE
 
 
 def stake_or_default(stake: Decimal | None) -> Decimal:
@@ -135,6 +146,11 @@ def settle_pending_props(
     # UTC-dated cutoff would drop the most recent night's props.
     cutoff = pacific_calendar_date() - timedelta(days=max_game_age_days)
     http = session_http or requests.Session()
+    # ONE SLATE FETCH PER RUN, not per game. Without this the ESPN fallback
+    # re-fetched the whole slate for every game: a twelve-game CDN outage made
+    # about 156 requests instead of thirteen, against a host whose 429 would
+    # then strand the grading the fallback exists to rescue.
+    espn_cache: dict[str, Any] = {}
 
     with session_scope() as db:
         pending = db.execute(
@@ -167,6 +183,7 @@ def settle_pending_props(
                     session=http,
                     game_date=props[0].game_date,
                     expected_players={p.player_name for p in props if p.player_name},
+                    espn_cache=espn_cache,
                 )
             except GameNotFinalError as exc:
                 report.games_not_final += 1
@@ -237,7 +254,14 @@ def settle_pending_props(
                     prop.clv_line_points = clv["clv_line_points"]
                     prop.clv_prob_points = clv["clv_prob_points"]
                     prop.settlement_note = result.note
-                    prop.result_source = "nba_cdn_liveData"
+                    # PROVENANCE IS NOT DECORATION. This was hardcoded, so
+                    # every ESPN-graded row claimed the NBA CDN as its source.
+                    # The settlement audit's whole value is being able to ask
+                    # "where did this number come from" and get a true answer;
+                    # a row that lies about its source cannot be re-checked
+                    # against the feed it names. The fetched row says which
+                    # source produced it, and the CDN value stands otherwise.
+                    prop.result_source = _result_source(player_stats)
                     prop.settled_at_utc = datetime.now(timezone.utc)
                     prop.raw_boxscore_json = {
                         "gameId": game_id,

@@ -946,10 +946,26 @@ def section_5(report: Report) -> None:
             if isinstance(n, ast.FunctionDef)
         }
 
-        def _delegates_to_a_guard(node: ast.FunctionDef) -> str | None:
-            for call in ast.walk(node):
-                if not isinstance(call, ast.Call):
+        def _own_calls(node: ast.FunctionDef):
+            """
+            Calls this function makes ITSELF, not ones a nested def makes.
+
+            `ast.walk` descends into nested function bodies, so a `run_*` job
+            containing an inner helper that happens to be guarded read as safe
+            even when the job's own body was not. That is the direction that
+            matters: it would let a later unguarded job pass this gate
+            silently, which is the whole failure this check exists to catch.
+            """
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda, ast.ClassDef)):
                     continue
+                for inner in ast.walk(child):
+                    if isinstance(inner, ast.Call):
+                        yield inner
+
+        def _delegates_to_a_guard(node: ast.FunctionDef) -> str | None:
+            for call in _own_calls(node):
                 name = getattr(call.func, "id", None)
                 if name and name != node.name and catches.get(name):
                     return name

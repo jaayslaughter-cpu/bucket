@@ -303,12 +303,29 @@ def extract_player_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+#: Why `select_event_by_players` declined, when the reason is "our game is
+#: not among the final ones yet" rather than "ESPN is broken". Matched on the
+#: refusal's own wording because the selector raises one exception type for
+#: several distinguishable situations, and widening its type hierarchy to say
+#: so would spread this distinction across two modules.
+_UNFINISHED_MARKERS = (
+    "appear in any",          # none of our players reached a box score yet
+    "split across events",    # some have, some have not: the game is mid-flight
+)
+
+
+def _looks_unfinished(exc: Exception) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _UNFINISHED_MARKERS)
+
+
 def fetch_player_stats_for_game(
     game_id: str | int,
     session: requests.Session | None = None,
     *,
     game_date: Any = None,
     expected_players: set[str] | None = None,
+    espn_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """
     Final box score -> (player stats by name, raw payload), CDN first.
@@ -356,6 +373,7 @@ def fetch_player_stats_for_game(
         try:
             return fetch_espn_player_stats_for_game(
                 game_date, set(expected_players), session=session,
+                cache=espn_cache,
             )
         except EspnGameNotFinalError as exc:
             raise GameNotFinalError(
@@ -363,6 +381,21 @@ def fetch_player_stats_for_game(
                 f"on {game_date}: {exc}"
             ) from exc
         except EspnBoxScoreError as exc:
+            # A GAME THAT HAS NOT FINISHED MUST NOT READ AS A FETCH FAILURE.
+            # `select_event_by_players` cannot find our event while it is
+            # still being played, and it says so by declining -- but on a
+            # night where OTHER games are already final the slate is
+            # non-empty, so that decline arrives as an ordinary
+            # EspnBoxScoreError. Counted as a failure it inflates
+            # games_failed and fills `report.errors` with games that are
+            # merely in progress, which is how a healthy night starts looking
+            # like an outage. The props stay PENDING either way; only the
+            # label differs, and the label is what an operator reads.
+            if _looks_unfinished(exc):
+                raise GameNotFinalError(
+                    f"No final ESPN event matches {normalize_game_id(game_id)} "
+                    f"on {game_date} yet: {exc}"
+                ) from exc
             # BOTH sources named, because "box score fetch failed" with one
             # cause hides which half of the fallback is actually broken.
             raise BoxScoreError(

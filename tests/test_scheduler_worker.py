@@ -1477,11 +1477,26 @@ def test_the_healthcheck_certifies_the_file_settlement_actually_writes():
     healthcheck that certifies a different path from the one settlement writes
     certifies nothing.
     """
+    import ast
+
     source = (Path(__file__).resolve().parents[1]
               / "scripts" / "railway_healthcheck.py").read_text(encoding="utf-8")
-    assert "calibration_report_path()" in source, (
-        "the healthcheck stopped using the shared resolver"
+
+    # THE CALL, NOT THE SUBSTRING. Grepping the whole file for
+    # "calibration_report_path()" passed on a mention in a comment or a
+    # docstring, so the check survived the implementation regressing — which
+    # is the same assertion-that-cannot-fail shape this suite keeps finding.
+    tree = ast.parse(source)
+    function = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_check_calibration_report"),
+        None,
     )
+    assert function is not None, "_check_calibration_report was renamed or removed"
+    assert any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "calibration_report_path"
+        for n in ast.walk(function)
+    ), "the healthcheck stopped CALLING the shared resolver"
     assert "DEFAULT_CALIBRATION_REPORT" not in source, (
         "the healthcheck grew its own copy of the default back"
     )
