@@ -150,6 +150,29 @@ def redact_webhook(text: Any) -> str:
     )
 
 
+def webhook_configured() -> bool:
+    """
+    Whether a webhook is set at all. The ONE reader of that fact.
+
+    This existed five times as the inline expression
+    ``bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())`` --
+    four times in `scheduler_worker` and once in `railway_healthcheck` --
+    each spelling the variable's name as a literal while THIS module already
+    owned it as `ENV_WEBHOOK_URL`. Renaming the variable would have left five
+    places still reading the old name and a healthcheck able to report
+    "configured" about a different variable than the one dispatch reads.
+
+    "CONFIGURED" IS NOT "USABLE", and the split is deliberate. This asks only
+    whether something is set; `load_webhook_url` decides whether that value is
+    a Discord webhook and raises naming the variable if it is not. Folding the
+    pattern check in here would turn a malformed URL into SILENCE -- dispatch
+    quietly off, nothing sent, nothing said -- where today it is a loud
+    DiscordDispatchError that names the fault. A wrong value should fail
+    loudly; only an absent one should mean "not configured".
+    """
+    return bool((os.environ.get(ENV_WEBHOOK_URL) or "").strip())
+
+
 def load_webhook_url(explicit: str | None = None) -> str:
     """
     Read the webhook URL from the environment. Never hardcoded, never logged.

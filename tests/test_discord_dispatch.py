@@ -534,3 +534,109 @@ def test_a_broken_calibration_file_is_an_error_not_a_silent_withhold(tmp_path):
     ])
     assert result.exit_code == 2
     assert "not valid JSON" in result.output
+
+
+# --- one reader of the webhook variable's name ----------------------------
+
+
+def test_only_the_owning_module_spells_the_webhook_variable():
+    """
+    FIVE READERS OF ONE FACT, which is the defect this tree keeps removing.
+    `bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())` appeared four
+    times in `scheduler_worker` and once in `railway_healthcheck`, each
+    spelling the name as a literal while `src/notify/discord` already owned it
+    as `ENV_WEBHOOK_URL`.
+
+    The cost was not duplication for its own sake: a rename would have left
+    five places reading the old name, and a healthcheck able to report
+    "configured" about a variable nothing dispatches from. The user hit the
+    mirror image of it — a Railway variable named `discord`, which every one of
+    those literals missed in exactly the same way.
+
+    This asserts about source text because the invariant IS about source text:
+    no second module may spell the name. It is not standing in for behaviour —
+    the test below covers that.
+    """
+    from pathlib import Path
+
+    owner = Path("src/notify/discord.py")
+    offenders = []
+    for path in list(Path("src").rglob("*.py")) + list(Path("scripts").rglob("*.py")):
+        if path == owner:
+            continue
+        if '"DISCORD_WEBHOOK_URL"' in path.read_text(encoding="utf-8"):
+            offenders.append(str(path))
+    for path in (Path("scheduler_worker.py"), Path("main.py")):
+        if path.is_file() and '"DISCORD_WEBHOOK_URL"' in path.read_text(encoding="utf-8"):
+            offenders.append(str(path))
+    assert not offenders, (
+        f"these spell the webhook variable's name instead of importing "
+        f"ENV_WEBHOOK_URL from src/notify/discord.py: {offenders}"
+    )
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("https://discord.com/api/webhooks/123/abc", True),
+    ("", False),
+    ("   ", False),          # whitespace is not a webhook
+])
+def test_configured_means_set_and_nothing_more(monkeypatch, value, expected):
+    """
+    "CONFIGURED" IS NOT "USABLE", deliberately. This asks only whether
+    something is set; `load_webhook_url` decides whether it is a Discord
+    webhook. Folding the pattern check in would turn a malformed URL into
+    SILENCE — dispatch quietly off, nothing sent, nothing said — where it is
+    now a loud error naming the variable.
+    """
+    from src.notify.discord import ENV_WEBHOOK_URL, webhook_configured
+
+    monkeypatch.setenv(ENV_WEBHOOK_URL, value)
+    assert webhook_configured() is expected
+
+
+def test_an_unset_variable_is_not_configured(monkeypatch):
+    from src.notify.discord import ENV_WEBHOOK_URL, webhook_configured
+
+    monkeypatch.delenv(ENV_WEBHOOK_URL, raising=False)
+    assert webhook_configured() is False
+
+
+def test_a_malformed_value_is_configured_but_fails_loudly(monkeypatch):
+    """
+    The split, end to end. A value of `discord` — the literal mistake that
+    started this — counts as configured, so dispatch turns ON and then
+    `load_webhook_url` raises NAMING THE VARIABLE. That is the right order:
+    the operator learns the value is wrong rather than watching a silent slate.
+    """
+    from src.notify.discord import (
+        ENV_WEBHOOK_URL,
+        DiscordDispatchError,
+        load_webhook_url,
+        webhook_configured,
+    )
+
+    monkeypatch.setenv(ENV_WEBHOOK_URL, "discord")
+    assert webhook_configured() is True
+    with pytest.raises(DiscordDispatchError, match=ENV_WEBHOOK_URL):
+        load_webhook_url()
+
+
+def test_the_healthcheck_and_dispatch_cannot_disagree(monkeypatch):
+    """
+    THE FAILURE THE CONSOLIDATION PREVENTS. Both read the same name through the
+    same predicate, so the probe cannot report OK about a variable dispatch
+    does not read. Exercised in both states.
+    """
+    import scripts.railway_healthcheck as hc
+    from src.notify.discord import ENV_WEBHOOK_URL, webhook_configured
+
+    monkeypatch.setenv(ENV_WEBHOOK_URL, "https://discord.com/api/webhooks/1/x")
+    assert webhook_configured() is True
+    assert hc._check_dispatch()[0].status == hc.OK
+
+    monkeypatch.delenv(ENV_WEBHOOK_URL, raising=False)
+    assert webhook_configured() is False
+    warned = hc._check_dispatch()[0]
+    assert warned.status == hc.WARN
+    # The remedy names the two ways the user's own deployment got this wrong.
+    assert "case-sensitive" in warned.detail and "per-service" in warned.detail

@@ -231,10 +231,30 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `resolve_state_root()` in `src/utils/volume.py` reads
   `RAILWAY_VOLUME_MOUNT_PATH` and reports how it chose,
   `scripts/seed_volume.py` does the copying, and
-  `scripts/railway_healthcheck.py` exits NONZERO on an unseeded volume. Still
-  nobody's code can mount a volume, and **there is no boot-time fetch** — no
-  S3 client, no storage client, nothing that downloads a model.
-  `docs/deploy_railway.md`.
+  `scripts/railway_healthcheck.py` exits NONZERO on an unseeded volume.
+  **A BOOT-TIME FETCH NOW EXISTS**, where this said for weeks that it did not:
+  `src/models/artifact_store.py` pulls complete families from Supabase Storage
+  over plain HTTPS, atomically per market, refusing a booster without its
+  `.meta.json` sidecar or its `.mean.json` mean head — a half-fetched family
+  returns null projections beside live probabilities, which is the failure that
+  looks most like a working deployment. `scripts/start.sh` runs it at boot via
+  `python -m scripts.fetch_artifacts --pull`, and the module's own header opens
+  with what it closes. The stale claim survived here because the module landed
+  and nobody came back to this list; it was found on 2026-10-20 by reading a
+  live Railway boot log that printed the step.
+  **What remains true** is narrower, and it is still what blocks a deploy:
+  nobody's code can mount a volume, and the fetch is a deliberate no-op when
+  unconfigured — which is the state of the live service, so artifacts still
+  reach it only by hand through `scripts/seed_volume.py`.
+  Two things measured on that same boot log, kept because both cost a day:
+  the volume must be mounted at **`/app/data`** and nowhere else, since
+  `artifacts_dir` in `config/model_comparison.yaml` is relative and resolves
+  against `WORKDIR=/app` — seeding a volume mounted elsewhere copies every file
+  and changes nothing, which `seed_volume` now says in as many words; and
+  `RAILWAY_VOLUME_MOUNT_PATH` on that service was set to the DATABASE's
+  `/var/lib/postgresql/data`, a path the worker has no volume at and cannot
+  create as non-root, so the resolver chose it over `/app/data` and every
+  artifact check failed. `docs/deploy_railway.md`.
 - **The BigDataBall workbook is needed once, not per deploy — and a stale one
   is now the thing to watch.** Fixed 2026-10-10. It *was* true that a missing
   workbook failed the whole slate: `ingest_market_lines` was unguarded, so
