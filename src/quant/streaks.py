@@ -152,7 +152,27 @@ def load_streak_curve(
             f"DATA_NOT_AVAILABLE: cannot read {config_path}: {exc}"
         ) from exc
 
-    block = ((raw.get("platforms") or {}).get(str(platform).lower()) or {})
+    # EVERY LEVEL CHECKED BEFORE IT IS INDEXED. `raw.get(...)` on a document
+    # that parsed as a list, and `platforms.get(...)` on a platforms key that
+    # parsed as one, both raise AttributeError -- a traceback where the
+    # reader needs to be told which file is malformed and how.
+    if not isinstance(raw, Mapping):
+        raise StreakError(
+            f"{config_path} does not contain a mapping (parsed as "
+            f"{type(raw).__name__}), so it has no platforms to read."
+        )
+    platforms = raw.get("platforms") or {}
+    if not isinstance(platforms, Mapping):
+        raise StreakError(
+            f"{config_path}: `platforms` is {type(platforms).__name__}, not a "
+            f"mapping of operator -> curves."
+        )
+    block = platforms.get(str(platform).lower()) or {}
+    if not isinstance(block, Mapping):
+        raise StreakError(
+            f"{config_path}: {platform!r} is {type(block).__name__}, not a "
+            f"mapping containing a `streaks` curve."
+        )
     streaks = block.get("streaks")
     if not streaks:
         raise StreakError(

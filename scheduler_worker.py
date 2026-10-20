@@ -66,7 +66,12 @@ if TYPE_CHECKING:  # the annotation only; importing it at runtime would make
 
 logger = logging.getLogger("propiq.scheduler")
 
-# Pacific, for the reason in the module docstring.
+# Two module-level imports, both deliberate despite this file's deferred-import
+# policy. `src.notify.discord` reads the webhook variable's NAME, which lives
+# there and is never spelled again here; it imports only the standard library at
+# module scope, so it pulls in none of the heavy layers those deferrals avoid.
+# `src.utils.timezones` is Pacific, for the reason in the module docstring.
+from src.notify.discord import ENV_WEBHOOK_URL, webhook_configured  # noqa: E402
 from src.utils.timezones import DISPLAY_TZ, DISPLAY_TZ_NAME  # noqa: E402
 
 ENV_SLATE_HOUR = "PROPIQ_SLATE_HOUR_PT"
@@ -327,8 +332,7 @@ def notify_failure(stage: str, detail: str, *, dedupe: bool = True) -> dict[str,
     safe = scrub_alert(detail)
     logger.error("ALERT [%s] %s", stage, safe)
 
-    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
-    if not _flag(ENV_ALERT_FAILURES, webhook_configured):
+    if not _flag(ENV_ALERT_FAILURES, webhook_configured()):
         return {"status": "SKIPPED", "reason": "alerting off", "stage": stage}
 
     if dedupe and _alert_already_sent_today(stage):
@@ -1442,11 +1446,10 @@ def run_dispatch() -> dict[str, Any]:
     import json
     from pathlib import Path
 
-    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
-    if not _flag(ENV_DISPATCH, webhook_configured):
+    if not _flag(ENV_DISPATCH, webhook_configured()):
         logger.info(
-            "Dispatch off (%s unset and no DISCORD_WEBHOOK_URL). Nothing sent.",
-            ENV_DISPATCH,
+            "Dispatch off (%s unset and no %s). Nothing sent.",
+            ENV_DISPATCH, ENV_WEBHOOK_URL,
         )
         return {"status": "SKIPPED", "reason": "dispatch disabled"}
 
@@ -1855,8 +1858,7 @@ def run_prelock(
                 "withheld": 0, "unknown": 0, "sent": False,
             }
 
-        webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
-        if not _flag(ENV_DISPATCH, webhook_configured):
+        if not _flag(ENV_DISPATCH, webhook_configured()):
             logger.info("Dispatch off — pre-lock result for %s not sent.", game)
             return {
                 "status": "OK", "game": game, "checked": len(rows),
@@ -1954,8 +1956,7 @@ def run_results_card(slate_date: str | None = None) -> dict[str, Any]:
     Off unless a webhook is configured, like dispatch. A failure is logged and
     returned: the grading is the durable part and a missing card costs nothing.
     """
-    webhook_configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
-    if not _flag(ENV_RESULTS_CARD, _flag(ENV_DISPATCH, webhook_configured)):
+    if not _flag(ENV_RESULTS_CARD, _flag(ENV_DISPATCH, webhook_configured())):
         logger.info("Results card off. Nothing sent.")
         return {"status": "SKIPPED", "reason": "results card disabled"}
 

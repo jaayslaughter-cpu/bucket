@@ -681,13 +681,21 @@ def _check_dispatch() -> list[Check]:
     its presence is reported, and `src/notify/discord.py` redacts it from every
     error and log line for the same reason.
     """
-    configured = bool((os.environ.get("DISCORD_WEBHOOK_URL") or "").strip())
-    if configured:
+    # THROUGH THE SHARED PREDICATE, so this check and dispatch can never
+    # disagree about what "configured" means. This probe spelled the variable's
+    # name as a literal while `scheduler_worker` spelled it three more times and
+    # `src/notify/discord` already owned it, so a rename would have left a
+    # healthcheck reporting OK about a variable nothing reads.
+    from src.notify.discord import ENV_WEBHOOK_URL, webhook_configured
+
+    if webhook_configured():
         return [Check("discord_webhook", OK, "configured (value not shown)")]
     return [Check(
         "discord_webhook", WARN,
-        "DISCORD_WEBHOOK_URL is unset, so nothing is dispatched. The pipeline "
-        "still runs and still writes to Postgres.",
+        f"{ENV_WEBHOOK_URL} is unset, so nothing is dispatched. The name is "
+        f"case-sensitive and per-service: a variable called `discord`, or one "
+        f"set on another service, is not this. The pipeline still runs and "
+        f"still writes to Postgres.",
     )]
 
 

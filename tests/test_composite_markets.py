@@ -752,3 +752,130 @@ def test_a_loaded_curve_cannot_be_repriced_in_place():
     with pytest.raises(TypeError):
         curve.multipliers[11] = 1e9
     assert st.load_streak_curve("underdog").multipliers[11] == 1000.0
+
+
+# --- the follow-up round: a fractional push is real on a fantasy score -----
+
+
+def test_an_exact_fpts_tie_is_a_push_not_a_refusal():
+    """
+    THE GUARD'S PREMISE DID NOT HOLD FOR FPTS. `settle_prop` refuses a tie on
+    a fractional line as "arithmetically impossible for an integer stat" —
+    correct for every counting stat, and false for a fantasy score. 1.2*REB
+    and 1.5*AST reach x.5 with entirely ordinary numbers: 20 PTS, 5 REB,
+    1 AST is 27.5 EXACTLY, so a 27.5 line is a legitimate PUSH.
+
+    Refused, it raised, the runner left the row PENDING, and every later run
+    did the same while blaming a parsing bug that did not exist.
+    """
+    from decimal import Decimal
+
+    from src.settlement.evaluator import settle_prop
+
+    box = {"points": 20, "reboundsTotal": 5, "assists": 1,
+           "steals": 0, "blocks": 0, "turnovers": 0}
+    graded = settle_prop(
+        market="FPTS", predicted_line=27.5, predicted_side="OVER",
+        player_stats=box, odds=-110, platform="underdog",
+    )
+    assert str(graded.outcome) == "PUSH"
+    assert graded.actual_result == Decimal("27.5")
+    assert graded.profit_units == Decimal(0), "a push returns the stake"
+
+
+def test_the_fractional_push_guard_still_bites_on_counting_stats():
+    """
+    The guard is not weakened, only made market-aware. A PTS prop tying a
+    fractional line is still impossible and still refused loudly: that is a
+    mis-parse, and recording it would launder a data bug into a graded row.
+    """
+    from src.settlement.evaluator import SettlementError, settle_prop
+
+    for market, stats in (
+        ("PTS", {"points": 20.5}),
+        ("PRA", {"points": 20.5, "reboundsTotal": 0, "assists": 0}),
+    ):
+        with pytest.raises(SettlementError, match="arithmetically impossible"):
+            settle_prop(
+                market=market, predicted_line=20.5, predicted_side="OVER",
+                player_stats=stats, odds=-110,
+            )
+
+
+def test_integer_fpts_weights_keep_the_guard(monkeypatch):
+    """
+    DERIVED FROM THE WEIGHTS, NOT THE MARKET'S NAME, and this test exists
+    because the weaker version of it could not tell the difference: asserting
+    only that FPTS-on-underdog is fractional passes for `return market ==
+    FPTS` too, which is the "asserts the code looks right" trap cubic has
+    been right about all session.
+
+    So an operator whose matrix is ALL WHOLE NUMBERS is injected here. Its
+    fantasy scores are integers, a fractional tie there really is impossible,
+    and the guard must stay on — otherwise the exemption is "FPTS is special"
+    rather than "these particular weights are fractional".
+    """
+    from src.settlement import evaluator as ev
+
+    assert ev.fractional_values_possible("FPTS", platform="underdog") is True
+    assert ev.fractional_values_possible("PTS") is False
+    assert ev.fractional_values_possible("PRA") is False
+
+    whole = {"PTS": 1.0, "REB": 1.0, "AST": 2.0,
+             "STL": 3.0, "BLK": 3.0, "TOV": -1.0}
+    monkeypatch.setattr(ev, "fantasy_weights", lambda _p: whole)
+    assert ev.fractional_values_possible("FPTS", platform="underdog") is False, (
+        "the exemption is keyed on the market's name, not on its weights"
+    )
+
+    # AND END TO END, on the case that is still a data bug. With integer
+    # weights the score is an integer, so it can only tie a .5 line if a
+    # COMPONENT arrived fractional — 20.5 points is a mis-parse, which is
+    # exactly what the guard exists to refuse. It must still refuse it on
+    # FPTS: the exemption is about fractional WEIGHTS, not about trusting
+    # whatever the box score said.
+    with pytest.raises(ev.SettlementError, match="arithmetically impossible"):
+        ev.settle_prop(
+            market="FPTS", predicted_line=27.5, predicted_side="OVER",
+            player_stats={"points": 20.5, "reboundsTotal": 5, "assists": 1,
+                          "steals": 0, "blocks": 0, "turnovers": 0},
+            odds=-110, platform="underdog",
+        )
+
+
+def test_an_overflowed_variance_abstains_like_the_mean_does():
+    """
+    `_finite` guards each sd, but squaring and weighting six of them near the
+    float ceiling overflows anyway. An sd of inf reads downstream as
+    "infinitely uncertain" rather than "unusable" — every Over and Under
+    equally likely, and the row looks priced instead of absent.
+    """
+    spec = cm.composite("PR")
+    # `(1e200) ** 2` RAISES OverflowError while `1e200 * 1e200` returns inf,
+    # so the accumulation fails both ways from inputs `_finite` accepted.
+    # Either way the answer is "no usable spread", not a crash and not inf.
+    with pytest.raises(cm.CompositeMarketError, match="not usable"):
+        cm.composite_variance(spec, {"PTS": 1e200, "REB": 1e200},
+                              {("PTS", "REB"): 0.4})
+    with pytest.raises(cm.CompositeMarketError, match="not usable"):
+        cm.composite_variance(spec, {"PTS": 1e180, "REB": 1e180},
+                              {("PTS", "REB"): 0.4})
+
+
+@pytest.mark.parametrize("document,pattern", [
+    ("- not: a mapping\n", "does not contain a mapping"),
+    ("platforms: [underdog]\n", "`platforms` is list"),
+    ("platforms:\n  underdog: 3.0\n", "is float, not a"),
+])
+def test_malformed_streak_yaml_is_named_not_an_attribute_error(
+    tmp_path, document, pattern,
+):
+    """
+    `raw.get(...)` and `platforms.get(...)` ran before any mapping check, so a
+    document that parsed as a list raised AttributeError — a traceback where
+    the reader needs to be told which file is malformed and in what way.
+    """
+    bad = tmp_path / "s.yaml"
+    bad.write_text(document, encoding="utf-8")
+    with pytest.raises(st.StreakError, match=pattern):
+        st.load_streak_curve("underdog", path=bad)

@@ -122,10 +122,13 @@ def _main_line_sort_key(row: Any, imbalance: float, ladder_mid: float) -> tuple:
 
     The second key is the OVERROUND, and it is not a tiebreak of convenience:
     at equal balance the TIGHTER two-way price is the one the book is making
-    a market on. -200/-200 carries about 19 points of vig and is a rung the
-    book does not want traded, however symmetrical it looks. The last two
-    keys only make the answer total: nearest the middle of the posted ladder,
-    then the lower point.
+    a market on. Measured through `price_overround` rather than asserted:
+    -200/-200 is 33.33 percentage points of overround against -115/-115's
+    6.98, so it is a rung the book does not want traded however symmetrical
+    it looks. (An earlier version of this docstring said "about 19 points of
+    vig", which is not the overround of -200/-200 or of anything else here.)
+    The last two keys only make the answer total: nearest the middle of the
+    posted ladder, then the lower point.
     """
     overround = price_overround(row.over_odds_american, row.under_odds_american)
     return (
