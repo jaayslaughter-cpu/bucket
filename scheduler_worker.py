@@ -1132,6 +1132,37 @@ def _run_slate_locked(argv: list[str] | None = None) -> int:
         run_dispatch()
     else:
         logger.warning("Slate returned %s — no board, no card.", code)
+        # THE FAILURE PATH THAT WENT SILENT, and it is the one that fires.
+        # This function's own docstring says it exists because "a boot ERROR,
+        # a FAILED slate, a FAILED settlement and a probe FAILURE were
+        # log-only" -- yet the two branches above alert on a SystemExit and on
+        # a raised exception, and NOTHING alerted when `main.main()` simply
+        # RETURNED non-zero. That is not the rare case: main wraps its whole
+        # body in `except Exception`, logs "Pipeline FAILED", records the run
+        # and returns 1, so the ordinary internal error reaches here as a
+        # return code and never as an exception.
+        #
+        # Measured on the live worker: the 2026-10-20 and 2026-10-21 slates
+        # both failed this way -- `MarketFramesUnavailable`, nothing ever
+        # ingested -- and the operator got a cheerful "0 graded" results card
+        # at 03:30 and silence at 09:00 on the first slate of the season. A
+        # board going empty for days with nobody told is the exact failure
+        # `notify_failure` was written for.
+        #
+        # The CAUSE is not in hand here: `main.main()` returns an int, and the
+        # exception string lives in its own log line and in the `pipeline_runs`
+        # row it writes before returning. So this names the code and where the
+        # cause is, rather than inventing a reason it does not know.
+        notify_failure(
+            "slate",
+            f"The 09:00 PT slate exited {code} without building a board, so "
+            f"no card was sent and nothing was scored for today. The cause is "
+            f"the `Pipeline FAILED:` log line from this run, and the same "
+            f"string is stored on the run's `pipeline_runs` row. Common "
+            f"causes: nothing ingested yet (no team_game_stats or "
+            f"game_market_lines rows, which refuses the feature build), or no "
+            f"resolvable model artifact.",
+        )
     return int(code)
 
 
