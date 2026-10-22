@@ -217,6 +217,99 @@ def test_a_zero_system_exit_is_not_reported_as_a_failure(monkeypatch):
     assert alerts == []
 
 
+def test_a_nonzero_return_is_alerted_not_only_logged(monkeypatch):
+    """
+    FOUND IN PRODUCTION, 2026-10-22, and the SECOND TIME this exact gap has
+    been found in this function. `test_a_preflight_exit_is_caught_alerted_and
+    _returned` above records the first: SystemExit slipped past `except
+    Exception` and the one failure a misconfigured deploy is guaranteed to hit
+    told nobody. This is the same sentence with a different branch.
+
+    `main.main` wraps its ENTIRE body in `except Exception`, logs "Pipeline
+    FAILED", records the run and RETURNS 1 (main.py:1842-1851). So the
+    ordinary internal error never reaches `run_slate` as an exception at all
+    — it arrives as a return code, and that branch only called
+    `logger.warning`. Every line in Railway's log view is already red because
+    Python logging writes to stderr, so a silent real failure is
+    indistinguishable from an INFO line by eye.
+
+    Measured on the live worker: the 2026-10-20 and 2026-10-21 slates both
+    failed this way (`MarketFramesUnavailable`, nothing ever ingested). The
+    operator received a "0 graded" results card at 03:30 and NOTHING at 09:00
+    on the first slate of the season.
+    """
+    import main
+
+    alerts = []
+    monkeypatch.setattr(
+        worker, "notify_failure",
+        lambda stage, detail, **kw: alerts.append((stage, detail)) or {},
+    )
+    monkeypatch.setattr(worker, "run_board", lambda: {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: {})
+    # Returns, does not raise -- exactly what main.main does on any internal
+    # failure, which is the whole point of this test.
+    monkeypatch.setattr(main, "main", lambda argv=None: 1)
+
+    assert worker.run_slate([]) == 1
+    assert [stage for stage, _ in alerts] == ["slate"], (
+        "a slate that failed by RETURNING non-zero sent no alert"
+    )
+    # The alert must say where the cause is, since the code alone is not one.
+    detail = alerts[0][1]
+    assert "pipeline_runs" in detail and "Pipeline FAILED" in detail
+    assert "no card was sent" in detail
+
+
+def test_a_successful_slate_still_sends_no_failure_alert(monkeypatch):
+    """
+    The guard against the obvious over-correction: alerting on every return
+    would turn each clean run into an incident, which is how alerting gets
+    muted and then the real failure is missed anyway.
+    """
+    import main
+
+    alerts = []
+    monkeypatch.setattr(
+        worker, "notify_failure", lambda *a, **k: alerts.append(a) or {},
+    )
+    boarded = []
+    monkeypatch.setattr(worker, "run_board", lambda: boarded.append("board") or {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: boarded.append("card") or {})
+    monkeypatch.setattr(main, "main", lambda argv=None: 0)
+
+    assert worker.run_slate([]) == 0
+    assert alerts == []
+    assert boarded == ["board", "card"], "a clean slate must still build and send"
+
+
+def test_a_failing_slate_alerts_exactly_once(monkeypatch):
+    """
+    NOT TWICE. The SystemExit branch alerts and returns early; this checks it
+    does not then fall through to the new one. A duplicate alert per failure
+    trains the reader to ignore the channel.
+    """
+    import main
+
+    alerts = []
+    monkeypatch.setattr(
+        worker, "notify_failure",
+        lambda stage, detail, **kw: alerts.append((stage, detail)) or {},
+    )
+    monkeypatch.setattr(worker, "run_board", lambda: {})
+    monkeypatch.setattr(worker, "run_dispatch", lambda: {})
+
+    for failure in (
+        lambda argv=None: (_ for _ in ()).throw(SystemExit(1)),
+        lambda argv=None: (_ for _ in ()).throw(RuntimeError("boom")),
+        lambda argv=None: 1,
+    ):
+        alerts.clear()
+        monkeypatch.setattr(main, "main", failure)
+        assert worker.run_slate([]) == 1
+        assert len(alerts) == 1, f"{len(alerts)} alerts for one failure"
+
+
 def test_a_keyboard_interrupt_still_propagates(monkeypatch):
     """
     The fix catches SystemExit, NOT BaseException. A Ctrl-C or a SIGINT during
