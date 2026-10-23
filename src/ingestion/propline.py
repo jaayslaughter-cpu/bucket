@@ -54,6 +54,24 @@ ENV_API_KEY = "PROPLINE_API_KEY"
 # is logged and skipped, never guessed into a stat. Guessing here would
 # attach a real posted line to the wrong statistic, which is worse than not
 # ingesting it at all.
+# WHAT PROPLINE SERVES THAT THIS DELIBERATELY DOES NOT REQUEST, read from its
+# docs on 2026-10-24: `player_points_assists` (PA), `player_points_rebounds`
+# (PR), `player_rebounds_assists` (RA), `player_blocks_steals` (STOCKS) and
+# `player_turnovers` (TOV). `evaluator.MARKET_COMPONENTS` can already SETTLE
+# all five, which makes them look like a free win. They are not:
+# `features.builder.ROLLING_STATS` produces no rolling features for them, so
+# nothing can score them, `recorder` would skip every row for "no model
+# probability", and the lines would be captured for a market no artifact
+# exists for. `test_market_map_covers_the_projects_stats` guards exactly this
+# and caught the attempt.
+#
+# THE ORDER IS: rollups in `features.builder`, then retrain, THEN these keys.
+# Adding the keys first inverts it. AGENTS.md section 7 lists the rollups as
+# not built.
+#
+# AND THERE IS NO FANTASY-POINTS KEY AT ALL in PropLine's NBA list, so
+# `config/fantasy_scoring.yaml` and the FPTS grading added in #17 serve
+# pick'em boards (PrizePicks/Underdog) -- the only FPTS line source there is.
 DEFAULT_MARKET_MAP: dict[str, str] = {
     "player_points": "PTS",
     "player_rebounds": "REB",
