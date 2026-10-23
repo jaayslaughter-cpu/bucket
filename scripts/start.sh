@@ -35,6 +35,87 @@ cd "$(dirname "$0")/.."
 
 echo "PropIQ start: migrate -> probe -> worker. RESEARCH_ONLY."
 
+# --- THE VOLUME'S OWNER, FIXED AS ROOT, AND ROOT THEN GIVEN UP ---------------
+#
+# WHY THIS BLOCK EXISTS. A Railway volume is mounted by the platform as root
+# (docs.railway.com/volumes#permissions), and a mount REPLACES the directory
+# the Dockerfile created and chowned -- so /app/data arrives root-owned however
+# carefully the image prepared it. This container's `USER propiq` is uid 10001,
+# so the first write fails with EACCES, and because every writer here catches
+# broadly the symptom is "calibration report failed" nightly rather than a
+# permissions problem. MEASURED on this deployment, 2026-10-23 18:05 UTC:
+#
+#   [FAIL] state_root_writable: /app/data EXISTS AND THE WRITE WAS REFUSED
+#   for uid 10001 ... Permission denied: '/app/data/.propiq_write_probe.1'
+#
+# Railway's own documented remedy is RAILWAY_RUN_UID=0, which starts the
+# container as root. That ALONE would leave the worker running as root for the
+# rest of the deployment's life, which is exactly the blast radius the
+# Dockerfile's `USER propiq` exists to avoid. So root is used for one thing --
+# taking ownership of the mount -- and given up before anything else runs.
+#
+# THE chown PERSISTS, because it is written to the volume and not to the
+# container layer: a later deploy finds the state root already owned by 10001
+# and the chown is a no-op. The ownership outlives RAILWAY_RUN_UID itself, so
+# removing that variable later costs the drop, not the fix.
+#
+# IT RUNS BEFORE THE ARTIFACT FETCH AND THE PROBE, both of which write to the
+# state root. Fixing ownership after them would report a fault that had just
+# been repaired, and the fetch would have already failed for want of it.
+#
+# WHERE the state root is comes from `resolve_state_root` -- the one resolver
+# the slate, the probe and the artifact store already share. Hardcoding
+# /app/data here would be a second reader of that fact, and it would silently
+# skip the chown on any deployment whose volume is mounted elsewhere.
+#
+# `setpriv` RATHER THAN `su` OR `runuser` because it EXECS instead of forking:
+# those two leave a parent as PID 1 that would swallow the SIGTERM
+# `scheduler_worker` installs a handler for, and the worker would be SIGKILLed
+# mid-slate -- the exact failure the `exec` at the bottom of this file exists
+# to prevent. `--clear-groups`, NOT `--init-groups`: the latter requires a
+# passwd entry for the uid and fails outright without one ("uid 10001 not
+# found", measured), while propiq has no supplementary groups to initialise.
+#
+# THE DROP IS PROVEN BEFORE IT IS RELIED ON. The same invocation is tried on
+# `true` first, so a setpriv that is absent or refused is REPORTED and the boot
+# continues, rather than `set -e` killing a container that would otherwise have
+# run perfectly well as root.
+#
+# A SENTINEL GUARDS AGAINST A BOOT LOOP: if the drop somehow left this process
+# as root, the re-executed script must not try again forever.
+PROPIQ_RUN_UID=10001
+PROPIQ_RUN_GID=10001
+
+if [ "$(id -u)" -eq 0 ] \
+   && [ -z "${PROPIQ_PRIVS_DROPPED:-}" ] \
+   && [ "${PROPIQ_DROP_PRIVS:-true}" != "false" ]; then
+  echo "--- running as root: taking the state root, then dropping privileges"
+
+  state_root="$(python -c 'from src.utils.volume import resolve_state_root; print(resolve_state_root()[0])' 2>/dev/null || true)"
+
+  if [ -n "${state_root}" ] && [ -d "${state_root}" ]; then
+    if chown -R "${PROPIQ_RUN_UID}:${PROPIQ_RUN_GID}" "${state_root}"; then
+      echo "    chowned ${state_root} to ${PROPIQ_RUN_UID}:${PROPIQ_RUN_GID}"
+    else
+      echo "    chown of ${state_root} FAILED -- the probe below will say so."
+    fi
+  else
+    echo "    no state root directory to chown (${state_root:-unresolved})."
+  fi
+
+  if setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
+             --clear-groups true 2>/dev/null; then
+    echo "    dropping to uid ${PROPIQ_RUN_UID} and re-running this script"
+    export PROPIQ_PRIVS_DROPPED=1
+    exec setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
+                 --clear-groups "$0" "$@"
+  fi
+
+  echo "    WARNING: setpriv is unavailable or refused the drop, so THE WORKER"
+  echo "    IS CONTINUING AS ROOT. The state root's ownership is fixed either"
+  echo "    way; this is a blast-radius regression, not a functional one."
+fi
+
 # Default ON. This script is a container entrypoint, so the DATABASE_URL in
 # scope is the platform's injected one and nobody is there to pass --apply.
 # `scripts/migrate_db` keeps the read-only default for the case where a human

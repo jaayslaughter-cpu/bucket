@@ -27,7 +27,11 @@ RESEARCH_ONLY project. Nothing here prices, sizes or places a wager.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import stat
 import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -785,6 +789,13 @@ def test_the_start_script_actually_runs(tmp_path):
             "PROPIQ_STATE_DIR": str(tmp_path / "empty-volume"),
             "PROPIQ_MODEL": str(tmp_path / "absent.json"),
             "PYTHONPATH": str(REPO),
+            # OFF so this test asserts the same thing whoever runs it. The
+            # chown-then-drop block fires only as uid 0, so without this the
+            # test would cover a different path in a root container (this
+            # project's own cloud sessions) than under CI's unprivileged
+            # runner, and would then fail there for want of a readable tmp
+            # path after the drop. The block has its own tests below.
+            "PROPIQ_DROP_PRIVS": "false",
         },
         capture_output=True, text=True, timeout=240,
     )
@@ -793,6 +804,261 @@ def test_the_start_script_actually_runs(tmp_path):
     # The probe found an unseeded volume and said so, and the worker still ran.
     assert "HEALTHCHECK REPORTED FAILURE" in result.stdout
     assert "migrations skipped" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# scripts/start.sh — the volume's owner, and root given up once it is fixed
+#
+# THE DEFECT THESE COVER WAS LIVE IN PRODUCTION. Railway mounts a volume as
+# root and a mount replaces the directory the Dockerfile chowned, so /app/data
+# arrived root-owned while the container ran as uid 10001. Measured in the
+# deploy log, 2026-10-23 18:05 UTC:
+#
+#   [FAIL] state_root_writable: /app/data EXISTS AND THE WRITE WAS REFUSED
+#   for uid 10001 ... Permission denied: '/app/data/.propiq_write_probe.1'
+#
+# Nothing was lost -- projections still went to Postgres -- but the artifacts
+# and the calibration report had nowhere durable to live, so every card was
+# withheld for a reason that was not the real one.
+# ---------------------------------------------------------------------------
+
+#: The chown-then-drop path only executes as uid 0, so the tests that run it
+#: for real are skipped where pytest is not root (GitHub Actions runs as the
+#: unprivileged `runner`). The source-order and flag tests below are not
+#: skipped, so the contract is still guarded on every CI run.
+root_only = pytest.mark.skipif(
+    os.geteuid() != 0,
+    reason="the chown-then-drop block runs only as uid 0",
+)
+
+
+def _make_world_traversable(path: Path) -> None:
+    """
+    Let uid 10001 reach `path` after the drop.
+
+    Test scaffolding, not a production concern: pytest's own tmp directories
+    are mode 0700 under /tmp/pytest-of-root, so an unprivileged child cannot
+    traverse down to them. On a container the state root's parents are /app,
+    mode 0755. This reproduces that, and nothing else.
+    """
+    for parent in [path, *path.parents]:
+        if parent == Path(parent.root):
+            break
+        parent.chmod(parent.stat().st_mode | stat.S_IXOTH | stat.S_IROTH)
+
+
+def test_the_state_root_is_chowned_before_anything_writes_to_it():
+    """
+    THE ORDER IS THE CONTRACT. `fetch_artifacts --pull` writes artifacts into
+    the state root and the probe writes a file there to test it; fixing the
+    ownership after either one would report a fault that had just been
+    repaired, and the fetch would already have failed for want of it.
+    """
+    code = _start_script_code()
+    chown = next(i for i, l in enumerate(code) if l.strip().startswith("if chown"))
+    fetch = next(i for i, l in enumerate(code) if "scripts.fetch_artifacts" in l)
+    probe = next(i for i, l in enumerate(code) if "scripts.railway_healthcheck" in l)
+    assert chown < fetch < probe
+
+
+def test_the_drop_execs_rather_than_forking_so_the_worker_stays_pid_1():
+    """
+    `su` and `runuser` FORK, leaving a parent as PID 1 that swallows the
+    SIGTERM `scheduler_worker` installs a handler for -- the worker would be
+    SIGKILLed mid-slate, which is the exact failure the `exec` at the bottom
+    of the script exists to prevent. `setpriv` execs.
+    """
+    code = _start_script_code()
+    drop = [l for l in code if "setpriv" in l]
+    assert drop, "the privilege drop is gone"
+    assert any(l.strip().startswith("exec setpriv") for l in drop)
+    joined = "\n".join(code)
+    for forking in ("su propiq", "runuser", "gosu"):
+        assert forking not in joined, f"{forking} forks; PID 1 would not be the worker"
+
+
+def test_it_clears_groups_rather_than_initialising_them():
+    """
+    MEASURED, not preferred: `--init-groups` requires a passwd entry for the
+    uid and fails outright without one --
+
+        setpriv: uid 10001 not found, --init-groups requires an user that
+        can be found on the system
+
+    -- which is the shape of any host that runs this script outside the image.
+    propiq has no supplementary groups to initialise, so `--clear-groups` is
+    the same effective privilege and works everywhere.
+    """
+    code = "\n".join(_start_script_code())
+    assert "--clear-groups" in code
+    assert "--init-groups" not in code
+
+
+def test_the_chown_target_comes_from_the_shared_resolver():
+    """
+    NOT a hardcoded /app/data. `resolve_state_root` is what the slate, the
+    probe and the artifact store already read; a second reader here would skip
+    the chown entirely on a deployment whose volume is mounted elsewhere, and
+    the symptom would be the unwritable-volume failure this block exists to
+    fix, on a deployment that looked configured.
+    """
+    code = "\n".join(_start_script_code())
+    assert "resolve_state_root" in code
+
+
+def test_an_unprivileged_boot_does_not_try_to_chown_anything(tmp_path):
+    """
+    The block must be inert for every developer and every CI run. A `chown`
+    attempted as a normal user fails, and under `set -e` that would kill a
+    boot that was previously fine.
+    """
+    body = (REPO / "scripts" / "start.sh").read_text(encoding="utf-8")
+    stub = tmp_path / "start.sh"
+    stub.write_text(
+        body.replace("exec python scheduler_worker.py", "echo WORKER-WOULD-START"),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", str(stub)],
+        cwd=REPO,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "PROPIQ_MIGRATE_ON_BOOT": "false",
+            "PROPIQ_STATE_DIR": str(tmp_path / "vol"),
+            "PYTHONPATH": str(REPO),
+            # Forced off, which is what a non-root boot does on its own. The
+            # assertion is that the chown block left no trace either way.
+            "PROPIQ_DROP_PRIVS": "false",
+        },
+        capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "WORKER-WOULD-START" in result.stdout
+    assert "dropping privileges" not in result.stdout
+    assert "chowned" not in result.stdout
+
+
+@root_only
+def test_as_root_it_takes_the_state_root_and_then_runs_unprivileged():
+    """
+    THE WHOLE FIX, END TO END, against a root-owned directory standing in for
+    the mounted volume. Three things must all hold: the directory ends up owned
+    by 10001, the worker runs as 10001 rather than root, and the probe -- which
+    writes a file into the state root to test it -- no longer reports it
+    unwritable. The third is the production symptom.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-volume-"))
+    try:
+        volume = workdir / "app-data"
+        volume.mkdir()
+        os.chown(volume, 0, 0)
+        volume.chmod(0o755)
+        _make_world_traversable(workdir)
+        assert volume.stat().st_uid == 0, "the premise: root owns the mount"
+
+        stub = workdir / "start.sh"
+        stub.write_text(
+            (REPO / "scripts" / "start.sh").read_text(encoding="utf-8").replace(
+                "exec python scheduler_worker.py",
+                'echo "WORKER-RAN-AS-UID=$(id -u)"',
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(stub)],
+            cwd=REPO,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PROPIQ_MIGRATE_ON_BOOT": "false",
+                "PROPIQ_STATE_DIR": str(volume),
+                "PYTHONPATH": str(REPO),
+            },
+            capture_output=True, text=True, timeout=240,
+        )
+        assert result.returncode == 0, result.stderr[-3000:]
+
+        assert volume.stat().st_uid == 10001, "the mount was not taken over"
+        assert "WORKER-RAN-AS-UID=10001" in result.stdout, (
+            "root was not given up before the worker started"
+        )
+        # THE PRODUCTION SYMPTOM, gone. The probe still FAILS overall (the
+        # volume carries no artifact), so assert on this check's own verdict
+        # rather than on the run's -- and on `[OK  ]` rather than the absence
+        # of the name, because the probe prints the name either way.
+        assert "[OK  ] state_root_writable" in result.stdout, result.stdout[-3000:]
+        assert "[FAIL] state_root_writable" not in result.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@root_only
+def test_the_sentinel_is_what_stops_a_second_drop_and_not_luck():
+    """
+    `exec`-ing the script back into itself is a loop if the drop silently did
+    not take, and the sentinel is the only thing between that and a container
+    that restarts forever.
+
+    SO THIS MUTATES THE SCRIPT rather than just running it. The first version
+    of this test set PROPIQ_PRIVS_DROPPED and asserted no second drop, which
+    PASSED against a script with no privilege block at all -- an assertion
+    satisfied by the absence of the thing it was meant to check, the trap this
+    file's own header names. Here the sentinel's condition is STRIPPED and the
+    behaviour must change: with it, an already-dropped boot runs straight
+    through; without it, the same boot drops again.
+    """
+    body = (REPO / "scripts" / "start.sh").read_text(encoding="utf-8")
+    sentinel = '&& [ -z "${PROPIQ_PRIVS_DROPPED:-}" ] \\\n'
+    assert sentinel in body, "the sentinel's spelling moved; this test is stale"
+
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-sentinel-"))
+    try:
+        _make_world_traversable(workdir)
+
+        def boot(script_body: str, name: str) -> subprocess.CompletedProcess:
+            stub = workdir / name
+            stub.write_text(
+                script_body.replace(
+                    "exec python scheduler_worker.py",
+                    'echo "WORKER-RAN-AS-UID=$(id -u)"',
+                ),
+                encoding="utf-8",
+            )
+            # Readable and executable by the dropped uid: the unguarded mutant
+            # re-execs this very file as 10001, and a 0600 stub would fail with
+            # EACCES for a reason that has nothing to do with the sentinel.
+            stub.chmod(0o755)
+            vol = workdir / f"vol-{name}"
+            vol.mkdir(exist_ok=True)
+            return subprocess.run(
+                ["bash", str(stub)],
+                cwd=REPO,
+                env={
+                    "PATH": "/usr/bin:/bin:/usr/local/bin",
+                    "PROPIQ_MIGRATE_ON_BOOT": "false",
+                    "PROPIQ_STATE_DIR": str(vol),
+                    "PYTHONPATH": str(REPO),
+                    # The premise of both boots: the drop already happened.
+                    "PROPIQ_PRIVS_DROPPED": "1",
+                },
+                capture_output=True, text=True, timeout=240,
+            )
+
+        guarded = boot(body, "guarded.sh")
+        assert guarded.returncode == 0, guarded.stderr[-2000:]
+        assert "WORKER-RAN-AS-UID=0" in guarded.stdout
+        assert "dropping to uid" not in guarded.stdout
+
+        # The mutant is expected to misbehave, so it is judged on what it did,
+        # not on its exit code.
+        without = boot(body.replace(sentinel, ""), "unguarded.sh")
+        assert "dropping to uid" in without.stdout, (
+            "stripping the sentinel changed nothing, so it is not what stops "
+            "the second drop and this test proves nothing"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

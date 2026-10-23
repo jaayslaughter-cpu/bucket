@@ -194,10 +194,66 @@ write fails with `EACCES`, and because every writer catches broadly you would
 see *"calibration report failed"* nightly rather than a permissions problem.
 
 `scheduler_worker.check_state_dir()` probes it at boot and says so. If it fires,
-the first log line is an ERROR naming the path and the uid. Two fixes:
+the first log line is an ERROR naming the path and the uid. **It fired on this
+deployment on 2026-10-23**, which is how the rest of this section got corrected:
 
-1. `chown` the volume to uid 10001 (a one-off `railway run chown -R 10001:10001 /app/data`, or an init step).
-2. Run the service as root — drop the `USER propiq` line. Smaller blast radius is worth keeping, so prefer (1).
+```
+[FAIL] state_root_writable: /app/data EXISTS AND THE WRITE WAS REFUSED for
+uid 10001 ... Permission denied: '/app/data/.propiq_write_probe.1'
+```
+
+### It is fixed, and `scripts/start.sh` is where
+
+**Set `RAILWAY_RUN_UID=0` on the service.** That is Railway's own documented
+remedy for an image with a non-root user
+([docs.railway.com/volumes#permissions](https://docs.railway.com/volumes#permissions)):
+volumes are mounted as root, so the platform has to start the container as root
+for it to be able to take ownership.
+
+On its own that would leave the **worker** running as root for the rest of the
+deployment's life, which is the blast radius `USER propiq` exists to avoid. So
+`scripts/start.sh` uses root for exactly one thing and then gives it up, before
+the migrations, the artifact fetch or the probe:
+
+1. resolve the state root through `resolve_state_root` — *not* a hardcoded
+   `/app/data`, which would skip the chown on a volume mounted anywhere else;
+2. `chown -R 10001:10001` it;
+3. `exec setpriv --reuid=10001 --regid=10001 --clear-groups "$0" "$@"` — the
+   script re-runs itself unprivileged and a sentinel stops a second pass.
+
+**The chown persists**, because it is written to the volume rather than the
+container layer: the next deploy finds the state root already owned by 10001
+and the chown is a no-op. Removing `RAILWAY_RUN_UID` later costs the drop, not
+the fix.
+
+Three details that are measured rather than preferred:
+
+- **`setpriv`, not `su` or `runuser`.** Those fork, leaving a parent as PID 1
+  that swallows the SIGTERM `scheduler_worker` handles — the worker would be
+  SIGKILLed mid-slate, the exact failure the `exec` at the end of the script
+  prevents. `setpriv` execs.
+- **`--clear-groups`, not `--init-groups`.** The latter needs a passwd entry
+  for the uid and fails without one (`setpriv: uid 10001 not found,
+  --init-groups requires an user that can be found on the system`), which is
+  the shape of any host running the script outside the image. `propiq` has no
+  supplementary groups to initialise.
+- **The drop is tried on `true` first.** A `setpriv` that is missing or refused
+  is reported and the boot continues as root rather than `set -e` killing a
+  container that would otherwise run fine. A blast-radius regression is not
+  worth an outage.
+
+`PROPIQ_DROP_PRIVS=false` turns the whole block off, which is only for a host
+that manages the volume's ownership itself.
+
+#### What was here before, and why it was wrong
+
+This page used to offer `railway run chown -R 10001:10001 /app/data` as the
+one-off fix. **That cannot work.** `railway run` executes the command on the
+machine you type it on, with the service's variables injected — it does not run
+inside the container. The command would have chowned a local directory, or
+failed for want of one, and reported success either way while the volume stayed
+root-owned. `railway ssh` does reach the container, but the container ran as
+uid 10001 and so could not chown anything it did not already own.
 
 Nothing is lost while it is unwritable: projections and `prop_results` still go
 to Postgres. What stops is the calibration evidence, so every card is withheld.
