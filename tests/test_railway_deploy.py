@@ -906,36 +906,196 @@ def test_the_chown_target_comes_from_the_shared_resolver():
     assert "resolve_state_root" in code
 
 
-def test_an_unprivileged_boot_does_not_try_to_chown_anything(tmp_path):
+def test_an_unprivileged_boot_does_not_try_to_chown_anything():
     """
-    The block must be inert for every developer and every CI run. A `chown`
-    attempted as a normal user fails, and under `set -e` that would kill a
-    boot that was previously fine.
+    The block must be inert for every developer and every CI run: a `chown` as
+    a normal user fails, and under `set -e` that would kill a boot that was
+    previously fine.
+
+    RUN GENUINELY UNPRIVILEGED. The first version of this test set
+    PROPIQ_DROP_PRIVS=false, which on a root CI runner bypassed the entire
+    block -- so a regression that chowned unconditionally on a NON-root boot
+    would still have passed. cubic, PR #21. Here the stub is executed as uid
+    10001 when this process is root, and directly otherwise, so the path under
+    test is the real one either way.
     """
-    body = (REPO / "scripts" / "start.sh").read_text(encoding="utf-8")
-    stub = tmp_path / "start.sh"
-    stub.write_text(
-        body.replace("exec python scheduler_worker.py", "echo WORKER-WOULD-START"),
-        encoding="utf-8",
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-nonroot-"))
+    try:
+        body = (REPO / "scripts" / "start.sh").read_text(encoding="utf-8")
+        stub = workdir / "start.sh"
+        stub.write_text(
+            body.replace("exec python scheduler_worker.py",
+                         'echo "WORKER-RAN-AS-UID=$(id -u)"'),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        volume = workdir / "vol"
+        volume.mkdir()
+        _make_world_traversable(workdir)
+        for path in (workdir, stub, volume):
+            path.chmod(path.stat().st_mode | stat.S_IWOTH)
+
+        argv = ["bash", str(stub)]
+        if os.geteuid() == 0:
+            argv = ["setpriv", "--reuid=10001", "--regid=10001",
+                    "--clear-groups", *argv]
+
+        result = subprocess.run(
+            argv,
+            cwd=REPO,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PROPIQ_MIGRATE_ON_BOOT": "false",
+                "PROPIQ_STATE_DIR": str(volume),
+                "PYTHONPATH": str(REPO),
+            },
+            capture_output=True, text=True, timeout=240,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "WORKER-RAN-AS-UID=0" not in result.stdout, (
+            "this test is meant to cover a NON-root boot"
+        )
+        assert "WORKER-WOULD-START" not in result.stdout
+        assert "dropping privileges" not in result.stdout
+        assert "chowned" not in result.stdout
+        assert "REFUSING to chown" not in result.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@root_only
+def test_a_system_directory_as_the_state_root_is_refused_not_chowned():
+    """
+    THE DEFECT THIS EXISTS FOR ALREADY HAPPENED HERE. On 2026-10-12
+    RAILWAY_VOLUME_MOUNT_PATH on this very service was set to the DATABASE's
+    `/var/lib/postgresql/data` (AGENTS.md section 7). With an unbounded
+    recursive chown running as root at boot, that misconfiguration would have
+    rewritten the ownership of Postgres's own data directory.
+
+    So a state root under an FHS system directory must be REFUSED and named,
+    and -- the part that matters -- the directory must be left alone.
+    """
+    probe = Path("/var/lib/propiq-chown-guard-probe")
+    probe.mkdir(parents=True, exist_ok=True)
+    inner = probe / "untouched.txt"
+    inner.write_text("owned by root", encoding="utf-8")
+    os.chown(probe, 0, 0)
+    os.chown(inner, 0, 0)
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-guard-"))
+    try:
+        stub = workdir / "start.sh"
+        stub.write_text(
+            (REPO / "scripts" / "start.sh").read_text(encoding="utf-8").replace(
+                "exec python scheduler_worker.py",
+                'echo "WORKER-RAN-AS-UID=$(id -u)"',
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        _make_world_traversable(workdir)
+
+        result = subprocess.run(
+            ["bash", str(stub)],
+            cwd=REPO,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PROPIQ_MIGRATE_ON_BOOT": "false",
+                # The shape of the real 2026-10-12 misconfiguration.
+                "PROPIQ_STATE_DIR": str(probe),
+                "PYTHONPATH": str(REPO),
+            },
+            capture_output=True, text=True, timeout=240,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "REFUSING to chown" in result.stdout, result.stdout[-2000:]
+        assert "chowned" not in result.stdout
+        # THE ASSERTION THAT MATTERS: nothing was touched, recursively.
+        assert probe.stat().st_uid == 0
+        assert inner.stat().st_uid == 0
+        # And the boot carried on -- a misconfigured state root is reported,
+        # not fatal, and the drop still happens.
+        assert "WORKER-RAN-AS-UID=10001" in result.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+@root_only
+def test_a_symlinked_state_root_takes_the_volume_behind_it():
+    """
+    `chown -R` defaults to `-P` and does NOT follow a symlink given as its
+    argument, so a symlinked state root had its LINK INODE rewritten and
+    nothing recursed into -- the volume behind it stayed root-owned and every
+    post-drop write still failed, with the chown reporting success. cubic,
+    PR #21.
+
+    Two things now prevent that: the path is canonicalised with `.resolve()`
+    before the chown, and the chown target carries a trailing `/.`. This
+    asserts the OUTCOME, so it holds whichever of the two is doing the work.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-symlink-"))
+    try:
+        real = workdir / "real-volume"
+        nested = real / "external"
+        nested.mkdir(parents=True)
+        leaf = nested / "artifact.json"
+        leaf.write_text("{}", encoding="utf-8")
+        link = workdir / "linked-volume"
+        link.symlink_to(real, target_is_directory=True)
+        for path in (real, nested, leaf):
+            os.chown(path, 0, 0)
+        real.chmod(0o755)
+        _make_world_traversable(workdir)
+
+        stub = workdir / "start.sh"
+        stub.write_text(
+            (REPO / "scripts" / "start.sh").read_text(encoding="utf-8").replace(
+                "exec python scheduler_worker.py",
+                'echo "WORKER-RAN-AS-UID=$(id -u)"',
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(stub)],
+            cwd=REPO,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PROPIQ_MIGRATE_ON_BOOT": "false",
+                "PROPIQ_STATE_DIR": str(link),
+                "PYTHONPATH": str(REPO),
+            },
+            capture_output=True, text=True, timeout=240,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert real.stat().st_uid == 10001, (
+            "the symlink was chowned and the volume behind it was not"
+        )
+        assert leaf.stat().st_uid == 10001, "and not recursively either"
+        assert "WORKER-RAN-AS-UID=10001" in result.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_the_re_exec_marker_cannot_be_supplied_by_the_environment():
+    """
+    An operator who set the marker's name as a Railway variable -- copied from
+    a log line or from the script -- would skip the whole block, and the worker
+    would run as ROOT for the rest of the deployment's life, silently, under
+    the very RAILWAY_RUN_UID=0 that made it root. cubic, PR #21.
+
+    So the marker is positional. Asserted on the code: nothing in the script
+    may read it from the environment.
+    """
+    code = "\n".join(_start_script_code())
+    assert "--propiq-privs-dropped" in code, "the marker is gone"
+    assert 'PROPIQ_PRIVS_DROPPED' not in code, (
+        "the re-exec marker is readable from the deployment environment again"
     )
-    result = subprocess.run(
-        ["bash", str(stub)],
-        cwd=REPO,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "PROPIQ_MIGRATE_ON_BOOT": "false",
-            "PROPIQ_STATE_DIR": str(tmp_path / "vol"),
-            "PYTHONPATH": str(REPO),
-            # Forced off, which is what a non-root boot does on its own. The
-            # assertion is that the chown block left no trace either way.
-            "PROPIQ_DROP_PRIVS": "false",
-        },
-        capture_output=True, text=True, timeout=240,
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert "WORKER-WOULD-START" in result.stdout
-    assert "dropping privileges" not in result.stdout
-    assert "chowned" not in result.stdout
+    # It is consumed as $1 and passed back as an argument to the re-exec.
+    assert '[ "${1:-}" = "${PROPIQ_PRIVS_MARKER}" ]' in code
+    assert '"${PROPIQ_PRIVS_MARKER}" "$@"' in code
 
 
 @root_only
@@ -950,11 +1110,21 @@ def test_as_root_it_takes_the_state_root_and_then_runs_unprivileged():
     workdir = Path(tempfile.mkdtemp(prefix="propiq-volume-"))
     try:
         volume = workdir / "app-data"
-        volume.mkdir()
-        os.chown(volume, 0, 0)
+        # NOT AN EMPTY DIRECTORY. The first version of this test asserted only
+        # the top-level uid against an empty volume, so a chown that dropped
+        # its -R would have passed it. cubic, PR #21. This mirrors the layout a
+        # seeded volume actually has, root-owned all the way down.
+        nested = volume / "external" / "model_runs" / "comparison"
+        nested.mkdir(parents=True)
+        artifact = nested / "xgboost_PTS.json"
+        artifact.write_text("{}", encoding="utf-8")
+        for path in (volume, volume / "external", volume / "external" / "model_runs",
+                     nested, artifact):
+            os.chown(path, 0, 0)
         volume.chmod(0o755)
         _make_world_traversable(workdir)
         assert volume.stat().st_uid == 0, "the premise: root owns the mount"
+        assert artifact.stat().st_uid == 0, "the premise: root owns it recursively"
 
         stub = workdir / "start.sh"
         stub.write_text(
@@ -980,6 +1150,11 @@ def test_as_root_it_takes_the_state_root_and_then_runs_unprivileged():
         assert result.returncode == 0, result.stderr[-3000:]
 
         assert volume.stat().st_uid == 10001, "the mount was not taken over"
+        assert artifact.stat().st_uid == 10001, (
+            "the chown was not recursive: a nested artifact is still root's, "
+            "so score_prob_over could not rewrite it"
+        )
+        assert nested.stat().st_uid == 10001
         assert "WORKER-RAN-AS-UID=10001" in result.stdout, (
             "root was not given up before the worker started"
         )
@@ -1009,7 +1184,7 @@ def test_the_sentinel_is_what_stops_a_second_drop_and_not_luck():
     through; without it, the same boot drops again.
     """
     body = (REPO / "scripts" / "start.sh").read_text(encoding="utf-8")
-    sentinel = '&& [ -z "${PROPIQ_PRIVS_DROPPED:-}" ] \\\n'
+    sentinel = '&& [ "${propiq_already_dropped}" = false ] \\\n'
     assert sentinel in body, "the sentinel's spelling moved; this test is stale"
 
     workdir = Path(tempfile.mkdtemp(prefix="propiq-sentinel-"))
@@ -1032,15 +1207,15 @@ def test_the_sentinel_is_what_stops_a_second_drop_and_not_luck():
             vol = workdir / f"vol-{name}"
             vol.mkdir(exist_ok=True)
             return subprocess.run(
-                ["bash", str(stub)],
+                # The premise of both boots: the drop already happened, stated
+                # the only way the script accepts it -- as an argument.
+                ["bash", str(stub), "--propiq-privs-dropped"],
                 cwd=REPO,
                 env={
                     "PATH": "/usr/bin:/bin:/usr/local/bin",
                     "PROPIQ_MIGRATE_ON_BOOT": "false",
                     "PROPIQ_STATE_DIR": str(vol),
                     "PYTHONPATH": str(REPO),
-                    # The premise of both boots: the drop already happened.
-                    "PROPIQ_PRIVS_DROPPED": "1",
                 },
                 capture_output=True, text=True, timeout=240,
             )

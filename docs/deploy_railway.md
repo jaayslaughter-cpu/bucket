@@ -226,7 +226,25 @@ container layer: the next deploy finds the state root already owned by 10001
 and the chown is a no-op. Removing `RAILWAY_RUN_UID` later costs the drop, not
 the fix.
 
-Three details that are measured rather than preferred:
+**Root will not recurse over a system directory.** `resolve_state_root` reads
+`PROPIQ_STATE_DIR` and `RAILWAY_VOLUME_MOUNT_PATH`, both operator-set, and a
+recursive chown as root follows whatever they say — and this service has
+*already* had `RAILWAY_VOLUME_MOUNT_PATH` pointing at the database's
+`/var/lib/postgresql/data` (§7 of `AGENTS.md`, measured 2026-10-12). Unbounded,
+that misconfiguration would have chowned Postgres's own data directory at boot.
+So the path is canonicalised and then refused if it is, or sits under, an FHS
+system directory (`/bin /boot /dev /etc /home /lib /lib64 /proc /root /run
+/sbin /sys /usr /var`) or `/` itself. **The refusal is the diagnosis** — a state
+root there is a mount-path defect, and the log says so instead of silently
+chowning it. It is a floor, not a proof.
+
+**The re-exec marker is an argument, not a variable.** It is passed as
+`--propiq-privs-dropped` and never read from the environment. Setting a
+variable with that meaning in the dashboard would otherwise skip the whole
+block and leave the worker running as root for the life of the deployment,
+silently, under the very `RAILWAY_RUN_UID=0` that made it root.
+
+Three further details that are measured rather than preferred:
 
 - **`setpriv`, not `su` or `runuser`.** Those fork, leaving a parent as PID 1
   that swallows the SIGTERM `scheduler_worker` handles — the worker would be

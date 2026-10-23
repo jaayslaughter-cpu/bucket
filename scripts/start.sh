@@ -82,33 +82,96 @@ echo "PropIQ start: migrate -> probe -> worker. RESEARCH_ONLY."
 # run perfectly well as root.
 #
 # A SENTINEL GUARDS AGAINST A BOOT LOOP: if the drop somehow left this process
-# as root, the re-executed script must not try again forever.
+# as root, the re-executed script must not try again forever. It is passed as an
+# ARGUMENT and never read from the environment -- see below.
 PROPIQ_RUN_UID=10001
 PROPIQ_RUN_GID=10001
 
+# THE RE-EXEC MARKER IS AN ARGUMENT, NOT A VARIABLE, and that is a security
+# property rather than a style choice. The first version read
+# $PROPIQ_PRIVS_DROPPED, which the deployment environment supplies: an operator
+# who set that name in the Railway dashboard -- copied from a log line or from
+# this file -- would skip the whole block, and the worker would run as root for
+# the rest of the deployment's life with nothing saying so, precisely under the
+# RAILWAY_RUN_UID=0 that makes it root in the first place. cubic, PR #21.
+# `railway.json` passes no arguments, so this positional cannot collide.
+PROPIQ_PRIVS_MARKER="--propiq-privs-dropped"
+propiq_already_dropped=false
+if [ "${1:-}" = "${PROPIQ_PRIVS_MARKER}" ]; then
+  propiq_already_dropped=true
+  shift
+fi
+
 if [ "$(id -u)" -eq 0 ] \
-   && [ -z "${PROPIQ_PRIVS_DROPPED:-}" ] \
+   && [ "${propiq_already_dropped}" = false ] \
    && [ "${PROPIQ_DROP_PRIVS:-true}" != "false" ]; then
   echo "--- running as root: taking the state root, then dropping privileges"
 
-  state_root="$(python -c 'from src.utils.volume import resolve_state_root; print(resolve_state_root()[0])' 2>/dev/null || true)"
+  # CANONICAL, because `..` and a symlinked state root must not smuggle the
+  # target somewhere else: `.resolve()` collapses both before anything is
+  # chowned, and the guard below then judges the real path.
+  state_root="$(python -c 'from pathlib import Path
+from src.utils.volume import resolve_state_root
+print(Path(resolve_state_root()[0]).resolve())' 2>/dev/null || true)"
 
-  if [ -n "${state_root}" ] && [ -d "${state_root}" ]; then
-    if chown -R "${PROPIQ_RUN_UID}:${PROPIQ_RUN_GID}" "${state_root}"; then
+  # A BOUND ON WHAT ROOT WILL RECURSE OVER.
+  #
+  # `resolve_state_root` reads PROPIQ_STATE_DIR and RAILWAY_VOLUME_MOUNT_PATH,
+  # both operator-set, and a recursive chown as root follows whatever they say.
+  # THIS REPOSITORY HAS ALREADY HAD RAILWAY_VOLUME_MOUNT_PATH POINTING AT THE
+  # DATABASE'S /var/lib/postgresql/data -- measured 2026-10-12, recorded in
+  # AGENTS.md section 7. With this block live and unbounded, that same
+  # misconfiguration would have chowned Postgres's own data directory out from
+  # under it, as root, at boot. cubic, PR #21.
+  #
+  # IT IS A FLOOR, NOT A PROOF: a denylist of the FHS system directories plus a
+  # refusal of `/` itself. It is stated as a list because the paths that matter
+  # are known and stable, and it covers the one failure this project has
+  # actually had. A state root under any of them is a misconfiguration, so
+  # REFUSING IS ITSELF THE DIAGNOSIS -- more use than silently chowning it and
+  # breaking something else.
+  state_root_safe=true
+  case "${state_root}" in
+    /) state_root_safe=false ;;
+    /*) : ;;
+    *) state_root_safe=false ;;
+  esac
+  if [ "${state_root_safe}" = true ]; then
+    for forbidden in /bin /boot /dev /etc /home /lib /lib64 /proc /root /run \
+                     /sbin /sys /usr /var; do
+      if [ "${state_root}" = "${forbidden}" ] \
+         || [ "${state_root#"${forbidden}"/}" != "${state_root}" ]; then
+        state_root_safe=false
+        break
+      fi
+    done
+  fi
+
+  if [ -z "${state_root}" ] || [ ! -d "${state_root}" ]; then
+    echo "    no state root directory to chown (${state_root:-unresolved})."
+  elif [ "${state_root_safe}" != true ]; then
+    echo "    REFUSING to chown ${state_root}: it is a system directory, which"
+    echo "    means the state root is misconfigured rather than that the volume"
+    echo "    needs taking. Check RAILWAY_VOLUME_MOUNT_PATH and"
+    echo "    PROPIQ_STATE_DIR -- this service's volume belongs at /app/data."
+  else
+    # THE TRAILING `/.` FORCES THE REFERENT. `chown -R` defaults to -P and does
+    # NOT follow a symlink given as its argument, so a symlinked state root
+    # would have had its link inode rewritten and nothing recursed into, while
+    # the volume behind it stayed root-owned and every later write still failed.
+    # cubic, PR #21. `--` so a state root beginning with a dash is a path.
+    if chown -R "${PROPIQ_RUN_UID}:${PROPIQ_RUN_GID}" -- "${state_root}/."; then
       echo "    chowned ${state_root} to ${PROPIQ_RUN_UID}:${PROPIQ_RUN_GID}"
     else
       echo "    chown of ${state_root} FAILED -- the probe below will say so."
     fi
-  else
-    echo "    no state root directory to chown (${state_root:-unresolved})."
   fi
 
   if setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
              --clear-groups true 2>/dev/null; then
     echo "    dropping to uid ${PROPIQ_RUN_UID} and re-running this script"
-    export PROPIQ_PRIVS_DROPPED=1
     exec setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
-                 --clear-groups "$0" "$@"
+                 --clear-groups "$0" "${PROPIQ_PRIVS_MARKER}" "$@"
   fi
 
   echo "    WARNING: setpriv is unavailable or refused the drop, so THE WORKER"
