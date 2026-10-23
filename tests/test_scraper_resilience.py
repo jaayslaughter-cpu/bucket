@@ -666,3 +666,42 @@ def test_a_description_that_is_not_a_string_is_not_a_player(description):
         "a row with no readable player name must be dropped, not named after "
         "whatever str() made of the payload"
     )
+
+
+def test_every_market_ingestion_requests_can_actually_be_settled():
+    """
+    INGESTION AND SETTLEMENT DRIFTED, and nothing compared the two lists.
+
+    The grader has been able to settle PA, PR, RA, STOCKS and TOV all along —
+    `MARKET_COMPONENTS` carries TOV and STOCKS directly and derives PA/PR/RA/
+    PRA from `SUM_COMPOSITES` — while `DEFAULT_MARKET_MAP` requested seven
+    keys and skipped the other five PropLine serves.
+
+    THE DIRECTION THAT MATTERS IS THIS ONE. A market the grader cannot settle
+    would have its rows recorded and then stranded PENDING for ever, which is
+    the silent-accumulation failure this tree keeps closing. The reverse is
+    fine and deliberate: the grader may support more than ingestion asks for.
+    """
+    from src.ingestion.propline import DEFAULT_MARKET_MAP
+    from src.settlement.evaluator import FPTS, MARKET_COMPONENTS
+
+    settleable = set(MARKET_COMPONENTS) | {FPTS}
+    requested = set(DEFAULT_MARKET_MAP.values())
+    orphans = sorted(requested - settleable)
+    assert not orphans, (
+        f"ingestion requests {orphans}, which settlement cannot grade — those "
+        f"rows would sit PENDING for ever"
+    )
+
+
+def test_no_fantasy_points_market_is_requested_from_propline():
+    """
+    PropLine's NBA list has NO fantasy-points key (checked against its docs on
+    2026-10-24). Mapping one would request a market the provider does not
+    serve and quietly get nothing back, while suggesting FPTS lines have a
+    sportsbook source. They do not: FPTS comes from pick'em boards only.
+    """
+    from src.ingestion.propline import DEFAULT_MARKET_MAP
+
+    assert "FPTS" not in set(DEFAULT_MARKET_MAP.values())
+    assert not [k for k in DEFAULT_MARKET_MAP if "fantasy" in k]
