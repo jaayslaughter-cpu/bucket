@@ -43,6 +43,64 @@ from pathlib import Path
 
 logger = logging.getLogger("propiq.ingest_bigdataball")
 
+#: The libraries whose exceptions mean "the database was the problem", not the
+#: workbook. Matched on the exception's own module rather than on its message:
+#: psycopg's wording is version- and locale-dependent, and this project has
+#: been bitten before by a check that read prose instead of the thing itself.
+#: `src.db.session.DatabaseConfigError` is matched by name below.
+_DB_MODULES = frozenset({"sqlalchemy", "psycopg", "psycopg2", "asyncpg"})
+
+_DB_ADVICE = (
+    "This is the DATABASE, not the workbook. Check $DATABASE_URL: the password "
+    "must be the real one (an unsubstituted placeholder fails exactly like a "
+    "wrong password), and from outside Railway the host must be the TCP "
+    "proxy's, since postgres.railway.internal only resolves inside the "
+    "platform's network.",
+)
+
+_SHEET_ADVICE = (
+    "This names a WORKSHEET, so pass --sheet with your export's tab name.",
+)
+
+_COLUMN_ADVICE = (
+    "This names a COLUMN, so the export is a different variant than this "
+    "loader expects (it needs GAME-ID, DATE and TEAM).",
+)
+
+_GENERIC_ADVICE = (
+    "If this names a worksheet, pass --sheet. If it names a column, the "
+    "export is a different variant than this loader expects (it needs "
+    "GAME-ID, DATE and TEAM).",
+)
+
+
+def advice_for(exc: BaseException) -> tuple[str, ...]:
+    """
+    The remedy that matches what actually failed.
+
+    WHY THIS EXISTS. The first version printed the workbook advice for EVERY
+    failure, so a wrong database password was answered with "If this names a
+    worksheet, pass --sheet" -- measured on a real run, 2026-10-24:
+
+        ERROR: the ingest failed: OperationalError: ... password
+        authentication failed for user "postgres"
+        If this names a worksheet, pass --sheet. ...
+
+    An operator reading that goes looking at their spreadsheet while the fault
+    is in a connection string. Advice that fits every error tells you nothing
+    about any of them.
+    """
+    root = type(exc).__module__.split(".")[0]
+    if root in _DB_MODULES or "DatabaseConfig" in type(exc).__name__:
+        return _DB_ADVICE
+
+    text = str(exc).lower()
+    if "worksheet" in text or "sheet named" in text:
+        return _SHEET_ADVICE
+    if "column" in text or "key error" in text or isinstance(exc, KeyError):
+        return _COLUMN_ADVICE
+    return _GENERIC_ADVICE
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
@@ -105,9 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — report, never traceback at an operator
         print(f"ERROR: the ingest failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
-        print("If this names a worksheet, pass --sheet. If it names a column, "
-              "the export is a different variant than this loader expects "
-              "(it needs GAME-ID, DATE and TEAM).", file=sys.stderr)
+        for line in advice_for(exc):
+            print(line, file=sys.stderr)
         return 1
 
     valid = (
