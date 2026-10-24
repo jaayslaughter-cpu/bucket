@@ -167,10 +167,36 @@ print(Path(resolve_state_root()[0]).resolve())' 2>/dev/null || true)"
     fi
   fi
 
+  # $HOME MUST MOVE WITH THE UID. THIS CRASHED PRODUCTION, 2026-10-24 00:51
+  # UTC. `setpriv` changes the uid and leaves the ENVIRONMENT alone, and under
+  # RAILWAY_RUN_UID=0 the container starts as root with HOME=/root. So the
+  # re-executed script ran as 10001 still carrying HOME=/root, libpq went
+  # looking for a client certificate at $HOME/.postgresql/postgresql.crt, and
+  # could not traverse /root:
+  #
+  #   ERROR: could not create the ORM tables: connection failed: could not
+  #   open certificate file "/root/.postgresql/postgresql.crt": Permission
+  #   denied
+  #
+  # Migrations hard-fail the boot by design, so the container crash-looped. It
+  # had never happened before because the container used to BE propiq from the
+  # start, with HOME=/home/propiq, where no such file exists and libpq carries
+  # on. Dropping the uid without the environment is a half-finished drop.
+  #
+  # The home directory is read from the passwd entry rather than written here,
+  # so it cannot disagree with the Dockerfile's `useradd`.
+  propiq_name="$(getent passwd "${PROPIQ_RUN_UID}" 2>/dev/null | cut -d: -f1 || true)"
+  propiq_home="$(getent passwd "${PROPIQ_RUN_UID}" 2>/dev/null | cut -d: -f6 || true)"
+  [ -n "${propiq_name}" ] || propiq_name="propiq"
+  [ -n "${propiq_home}" ] || propiq_home="/home/${propiq_name}"
+
   if setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
              --clear-groups true 2>/dev/null; then
-    echo "    dropping to uid ${PROPIQ_RUN_UID} and re-running this script"
-    exec setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
+    echo "    dropping to uid ${PROPIQ_RUN_UID} (HOME=${propiq_home}) and"
+    echo "    re-running this script"
+    exec env "HOME=${propiq_home}" "USER=${propiq_name}" \
+             "LOGNAME=${propiq_name}" \
+         setpriv --reuid="${PROPIQ_RUN_UID}" --regid="${PROPIQ_RUN_GID}" \
                  --clear-groups "$0" "${PROPIQ_PRIVS_MARKER}" "$@"
   fi
 

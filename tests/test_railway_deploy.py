@@ -873,10 +873,23 @@ def test_the_drop_execs_rather_than_forking_so_the_worker_stays_pid_1():
     of the script exists to prevent. `setpriv` execs.
     """
     code = _start_script_code()
-    drop = [l for l in code if "setpriv" in l]
-    assert drop, "the privilege drop is gone"
-    assert any(l.strip().startswith("exec setpriv") for l in drop)
     joined = "\n".join(code)
+    assert "setpriv" in joined, "the privilege drop is gone"
+
+    # The drop must be reached by `exec`, so the shell replaces itself rather
+    # than waiting on a child. It is a CHAIN -- `exec env ... setpriv ... "$0"`
+    # -- and every link execs the next, so the pid is carried all the way to
+    # the re-run script and on to the worker. Asserted on the chain rather than
+    # a literal prefix, which is what this test used to pin and which broke the
+    # moment `env` was inserted to carry $HOME across the drop.
+    drop_line = next(
+        (i for i, l in enumerate(code) if l.strip().startswith("exec ")
+         and ("setpriv" in l or "setpriv" in "".join(code[i:i + 4]))),
+        None,
+    )
+    assert drop_line is not None, "the drop is not reached by exec"
+    assert "&" not in code[drop_line], "backgrounding the drop would fork"
+
     for forking in ("su propiq", "runuser", "gosu"):
         assert forking not in joined, f"{forking} forks; PID 1 would not be the worker"
 
@@ -1088,6 +1101,69 @@ def test_a_symlinked_state_root_takes_the_volume_behind_it():
         )
         assert leaf.stat().st_uid == 10001, "and not recursively either"
         assert "WORKER-RAN-AS-UID=10001" in result.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@root_only
+def test_the_drop_moves_home_with_the_uid():
+    """
+    THIS CRASHED PRODUCTION. 2026-10-24 00:51 UTC, the first boot with
+    RAILWAY_RUN_UID=0 set. The chown and the drop both worked -- and then the
+    migrations crash-looped the container:
+
+      ERROR: could not create the ORM tables: connection failed: could not
+      open certificate file "/root/.postgresql/postgresql.crt": Permission
+      denied
+
+    `setpriv` changes the uid and leaves the ENVIRONMENT alone. Under
+    RAILWAY_RUN_UID=0 the container starts as root with HOME=/root, so the
+    re-executed script ran as 10001 still carrying HOME=/root; libpq looked
+    for a client certificate under a directory uid 10001 cannot traverse and
+    reported it as a connection failure. Migrations hard-fail the boot by
+    design, so the container never came up.
+
+    It had never happened before because the container used to BE propiq from
+    the start. Dropping the uid without the environment is a half-finished
+    drop, and $HOME is the variable that bites.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="propiq-home-"))
+    try:
+        volume = workdir / "app-data"
+        volume.mkdir()
+        os.chown(volume, 0, 0)
+        volume.chmod(0o755)
+        _make_world_traversable(workdir)
+
+        stub = workdir / "start.sh"
+        stub.write_text(
+            (REPO / "scripts" / "start.sh").read_text(encoding="utf-8").replace(
+                "exec python scheduler_worker.py",
+                'echo "WORKER-RAN-AS-UID=$(id -u) HOME=$HOME"',
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(stub)],
+            cwd=REPO,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "PROPIQ_MIGRATE_ON_BOOT": "false",
+                "PROPIQ_STATE_DIR": str(volume),
+                "PYTHONPATH": str(REPO),
+                # EXACTLY WHAT RAILWAY_RUN_UID=0 HANDS THE SCRIPT.
+                "HOME": "/root",
+            },
+            capture_output=True, text=True, timeout=240,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "WORKER-RAN-AS-UID=10001" in result.stdout
+        assert "HOME=/root" not in result.stdout, (
+            "the uid was dropped but $HOME was left at root's, which is what "
+            "crash-looped the container: libpq cannot traverse /root as 10001"
+        )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
