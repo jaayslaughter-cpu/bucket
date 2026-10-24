@@ -183,6 +183,111 @@ def _winner_rank_key(scores: dict[str, Any]) -> tuple[float, float, int, float]:
     )
 
 
+#: What `_decisiveness` reports when it cannot run at all. `decisive: None` is
+#: deliberately NOT False: "we could not test this" and "we tested it and the
+#: lead is noise" are different states, and collapsing them would let a missing
+#: measurement read as a measured tie — the same defect `_winner_rank_key`
+#: already documents for ECE.
+_UNTESTED_LEAD = {
+    "decisive": None,
+    "decisiveness_note": "",
+}
+
+
+def _decisiveness(
+    ranked: list[tuple[str, dict[str, Any]]],
+    detail_rows: list[dict[str, Any]],
+    market: str,
+) -> dict[str, Any]:
+    """
+    Paired-bootstrap the leader's Brier lead over the runner-up.
+
+    CLUSTERED BY `event_id`, because props from one game share a game script
+    and resampling rows independently would treat eight correlated props as
+    eight independent observations — understating the interval and calling
+    noise decisive. See `src.models.paired_bootstrap`.
+
+    Never raises: this is a report on a comparison, and a comparison that
+    cannot be tested is reported as untested rather than failing the run that
+    produced it.
+    """
+    if len(ranked) < 2:
+        return {
+            **_UNTESTED_LEAD,
+            "decisiveness_note": "Only one model scored; no lead to test.",
+        }
+
+    leader_name, runner_up_name = ranked[0][0], ranked[1][0]
+    by_model: dict[str, dict[Any, float]] = {leader_name: {}, runner_up_name: {}}
+    truth: dict[Any, float] = {}
+    game_of: dict[Any, Any] = {}
+
+    for row in detail_rows:
+        if row.get("target_market") != market:
+            continue
+        name = row.get("model_name")
+        if name not in by_model:
+            continue
+        actual, line = row.get("actual_stat_value"), row.get("prop_line")
+        probability = (
+            row.get("probability_over_calibrated")
+            if row.get("probability_over_calibrated") is not None
+            else row.get("probability_over_raw")
+        )
+        if actual is None or line is None or probability is None:
+            continue
+        # The row key must identify the SAME prop across both models.
+        key = (row.get("event_id"), row.get("player_id"), line)
+        by_model[name][key] = float(probability)
+        truth[key] = 1.0 if float(actual) > float(line) else 0.0
+        game_of[key] = row.get("event_id")
+
+    shared = sorted(
+        set(by_model[leader_name]) & set(by_model[runner_up_name]),
+        key=repr,
+    )
+    if len(shared) < _MIN_ROWS_FOR_DECISIVENESS:
+        return {
+            **_UNTESTED_LEAD,
+            "decisiveness_note": (
+                f"Only {len(shared)} row(s) scored by both models; below the "
+                f"{_MIN_ROWS_FOR_DECISIVENESS} this test needs to say anything."
+            ),
+        }
+
+    from src.models.paired_bootstrap import PairedBootstrapError, decisive_winner
+
+    try:
+        result = decisive_winner(
+            [truth[k] for k in shared],
+            [by_model[leader_name][k] for k in shared],
+            [by_model[runner_up_name][k] for k in shared],
+            metric="brier",
+            games=[game_of[k] for k in shared],
+        )
+    except PairedBootstrapError as exc:
+        return {
+            **_UNTESTED_LEAD,
+            "decisiveness_note": f"Lead could not be tested: {exc}",
+        }
+
+    return {
+        "decisive": result["decisive"],
+        "decisiveness_note": result["note"],
+        "runner_up": runner_up_name,
+        "lead_brier_difference": result["difference"],
+        "lead_ci_low": result["ci_low"],
+        "lead_ci_high": result["ci_high"],
+        "lead_n_rows": result["n_rows"],
+        "lead_n_games": result["n_games"],
+    }
+
+
+#: Below this many rows scored by BOTH models the interval is so wide that
+#: "not decisive" would be a statement about the sample rather than the models.
+_MIN_ROWS_FOR_DECISIVENESS = 50
+
+
 def _accepts_sample_weight(fit_callable: Any) -> bool:
     """Does this component's fit take a ``sample_weight`` keyword?"""
     try:
@@ -897,6 +1002,16 @@ def compare_models_on_panel(
                 "calibration_error": ranked[0][1].get("calibration_error"),
                 "note": "Lowest Brier on validation window; not a profitability claim",
             }
+            # IS THE LEAD REAL? The ranking above is three point estimates in a
+            # tuple. On a validation window of a few thousand rows a Brier gap
+            # in the fourth decimal happens by chance routinely, and promoting
+            # it credits a retrain with an improvement it did not make. This
+            # does NOT re-choose the winner -- it says whether choosing it was
+            # supported, and `decisive: False` means the top two are tied on the
+            # evidence however far apart their point estimates look.
+            winners[market].update(
+                _decisiveness(ranked, detail_rows, market)
+            )
 
     detail_frame = pd.DataFrame(detail_rows)
     market_rows: list[dict[str, Any]] = []
