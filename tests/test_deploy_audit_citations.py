@@ -63,7 +63,7 @@ ANCHORS = [
     # this file exists to catch.
     ("src/quant/devig_methods.py", 99, "_bisect"),
     ("src/quant/devig_methods.py", 136, "_shin_probabilities"),
-    ("src/models/residuals.py", 79, "variance_for"),
+    ("src/models/residuals.py", 101, "variance_for"),
     ("src/quant/psd_repair.py", 105, "nearest_correlation"),
     ("src/models/prob_calibration.py", 34, "IsotonicRegression"),
     ("src/quant/dfs_payouts.py", 513, "independent_hit_count_distribution"),

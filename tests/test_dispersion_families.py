@@ -253,3 +253,144 @@ def test_variance_inflation_abstains_on_too_few_rows():
 
     tiny = pd.DataFrame({"PTS": [20.0, 21.0], "REB": [5.0, 6.0], "AST": [4.0, 5.0]})
     assert np.isnan(fit_combo_variance_inflation(tiny)["inflation"])
+
+
+# ---------------------------------------------------------------------------
+# HOW THE FOLDS WERE GROUPED, recorded on the artifact rather than only logged.
+#
+# THE ASYMMETRY THIS CLOSES. `_in_sample_fallback` already carries its
+# degradation in `fallback_reason`, for the reason its own docstring gives:
+# "Returned unlabelled, this would be indistinguishable from a real
+# out-of-fold fit while being systematically overconfident." The POSITIONAL
+# path had exactly that property and carried nothing. An NBA slate is ~150
+# rows, so a positional fold boundary leaves one night partly in train and
+# partly in validation, and phi then comes partly from residuals of a model
+# that had already seen that night. A log warning scrolls away; the artifact
+# ships to the mounted volume and drives every P(over) for a season.
+# ---------------------------------------------------------------------------
+
+def _fold_inputs(n=400, per_day=8, seed=3):
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+    X = pd.DataFrame({"f": rng.normal(size=n)})
+    mu = rng.uniform(5, 25, n)
+    y = rng.poisson(mu).astype(float)
+    dates = pd.Series(
+        pd.date_range("2025-11-01", periods=n // per_day + 1).repeat(per_day)[:n]
+    )
+    return X, y, dates
+
+
+def _mean_predictor(X_tr, y_tr, X_va):
+    return np.full(len(X_va), float(np.mean(y_tr)))
+
+
+def test_a_date_grouped_fit_says_so_on_the_artifact():
+    from src.models.residuals import FOLD_BASIS_DATE, fit_dispersion_out_of_fold
+
+    X, y, dates = _fold_inputs()
+    fitted = fit_dispersion_out_of_fold(
+        _mean_predictor, X, y, market="PTS", dates=dates
+    )
+    assert fitted.fold_basis == FOLD_BASIS_DATE
+
+
+def test_a_positional_fit_is_not_indistinguishable_from_a_dated_one():
+    """
+    THE DEFECT. Without dates the folds are positional and the guarantee is
+    weaker, and the only trace was a log line. Two artifacts with different
+    leakage properties must not compare equal on the record that ships.
+    """
+    from src.models.residuals import (
+        FOLD_BASIS_POSITIONAL,
+        fit_dispersion_out_of_fold,
+    )
+
+    X, y, dates = _fold_inputs()
+    dated = fit_dispersion_out_of_fold(
+        _mean_predictor, X, y, market="PTS", dates=dates
+    )
+    undated = fit_dispersion_out_of_fold(_mean_predictor, X, y, market="PTS")
+
+    assert undated.fold_basis == FOLD_BASIS_POSITIONAL
+    assert dated.fold_basis != undated.fold_basis, (
+        "a positional fit is still indistinguishable from a date-grouped one"
+    )
+
+
+def test_an_in_sample_fallback_records_its_basis_too():
+    """The third basis, so the field covers every path out of the fitter
+    rather than two of three."""
+    from src.models.residuals import (
+        FOLD_BASIS_IN_SAMPLE,
+        fit_dispersion_out_of_fold,
+    )
+
+    X, y, _ = _fold_inputs(n=20)  # too few rows for folds
+    fitted = fit_dispersion_out_of_fold(_mean_predictor, X, y, market="PTS")
+    assert fitted.fold_basis == FOLD_BASIS_IN_SAMPLE
+    assert fitted.fallback_reason is not None
+
+
+def test_the_basis_survives_a_round_trip_and_reaches_the_metadata():
+    """
+    It has to land in the `.meta.json` beside the booster, because that file
+    is what an auditor reads months later — not this process's stdout.
+    """
+    from src.models.residuals import (
+        FOLD_BASIS_POSITIONAL,
+        CountDispersion,
+        fit_dispersion_out_of_fold,
+    )
+
+    X, y, _ = _fold_inputs()
+    fitted = fit_dispersion_out_of_fold(_mean_predictor, X, y, market="PTS")
+    assert CountDispersion.from_dict(fitted.to_dict()).fold_basis == (
+        FOLD_BASIS_POSITIONAL
+    )
+    assert fitted.as_metadata()["dispersion_fold_basis"] == FOLD_BASIS_POSITIONAL
+
+
+def test_an_artifact_written_before_this_field_loads_as_unknown_not_as_dated():
+    """
+    BACKWARD COMPATIBILITY WITHOUT A FALSE GUARANTEE. Every artifact now on
+    the volume predates this field. Defaulting them to `date_grouped` would
+    manufacture a guarantee nobody made; `unknown` is what they are.
+    """
+    from src.models.residuals import (
+        FOLD_BASIS_DATE,
+        FOLD_BASIS_UNKNOWN,
+        CountDispersion,
+    )
+
+    legacy = {
+        "family": "negbin",
+        "phi": 2.5,
+        "n_train_rows": 1000,
+        "selection_scores": {},
+        "fallback_reason": None,
+        "zero_inflation": 0.0,
+        "sigma_scale": 1.0,
+    }
+    rehydrated = CountDispersion.from_dict(legacy)
+    assert rehydrated.fold_basis == FOLD_BASIS_UNKNOWN
+    assert rehydrated.fold_basis != FOLD_BASIS_DATE
+
+
+def test_the_live_callers_pass_dates_when_the_frame_has_them():
+    """
+    Both fitters that ship — catboost_pipeline and xgb_adapter — must hand the
+    dates through, or the stamp would honestly record `positional` on every
+    production artifact. Asserted on the call sites, since running either
+    fitter needs a trained booster.
+    """
+    from pathlib import Path
+
+    for module in ("catboost_pipeline", "xgb_adapter"):
+        source = Path(f"src/models/{module}.py").read_text(encoding="utf-8")
+        call = source.split("fit_dispersion_out_of_fold(", 1)
+        assert len(call) == 2, f"{module} no longer calls the out-of-fold fitter"
+        assert "dates=" in call[1][:400], (
+            f"{module} does not pass dates, so its folds are positional"
+        )
