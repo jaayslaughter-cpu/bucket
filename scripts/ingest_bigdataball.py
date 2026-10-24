@@ -43,14 +43,26 @@ from pathlib import Path
 
 logger = logging.getLogger("propiq.ingest_bigdataball")
 
-#: The libraries whose exceptions mean "the database was the problem", not the
+#: The libraries whose exceptions can mean the database rather than the
 #: workbook. Matched on the exception's own module rather than on its message:
 #: psycopg's wording is version- and locale-dependent, and this project has
 #: been bitten before by a check that read prose instead of the thing itself.
-#: `src.db.session.DatabaseConfigError` is matched by name below.
 _DB_MODULES = frozenset({"sqlalchemy", "psycopg", "psycopg2", "asyncpg"})
 
-_DB_ADVICE = (
+#: DBAPI's CONNECTION-shaped errors, as an ALLOWLIST rather than "every error
+#: from a database module". A class this does not know about falls through to
+#: the text classifier and gets the cautious answer, instead of a confident
+#: wrong one -- which is the whole failure this function exists to stop.
+_CONNECTION_ERRORS = frozenset({"OperationalError", "InterfaceError"})
+
+#: ...and the ones that come from the ROWS, not the connection. A DataError is
+#: a value the column's type rejected and an IntegrityError is a constraint the
+#: rows violated: both are the workbook's contents, and answering them with
+#: "check your connection string" is the same misdirection in the other
+#: direction. cubic, PR #23.
+_ROW_ERRORS = frozenset({"DataError", "IntegrityError"})
+
+_DB_UNREACHABLE_ADVICE = (
     "This is the DATABASE, not the workbook. Check $DATABASE_URL: the password "
     "must be the real one (an unsubstituted placeholder fails exactly like a "
     "wrong password), and from outside Railway the host must be the TCP "
@@ -58,19 +70,39 @@ _DB_ADVICE = (
     "platform's network.",
 )
 
+#: DIFFERENT FAULT, DIFFERENT REMEDY. `DatabaseConfigError` means nothing is
+#: configured at all, so telling someone their password is wrong sends them to
+#: check a value that does not exist. cubic, PR #23.
+_DB_UNSET_ADVICE = (
+    "No database is configured at all. Set $DATABASE_URL (or "
+    "PGHOST/PGUSER/PGPASSWORD/PGDATABASE) before running this without "
+    "--dry-run. A dry run needs no database and would have got this far.",
+)
+
 _SHEET_ADVICE = (
     "This names a WORKSHEET, so pass --sheet with your export's tab name.",
 )
 
+#: THE COLUMNS ARE NOT RESTATED HERE. `load_bigdataball_workbook` already
+#: raises "missing required columns (...)" naming every one it needs, and that
+#: message is printed verbatim on the line above this advice. The first version
+#: listed three of the four -- it omitted VENUE -- which is what a second
+#: reader of someone else's fact always eventually does. cubic, PR #23.
 _COLUMN_ADVICE = (
     "This names a COLUMN, so the export is a different variant than this "
-    "loader expects (it needs GAME-ID, DATE and TEAM).",
+    "loader expects. The error above lists the columns it needs.",
+)
+
+_ROW_ADVICE = (
+    "The database rejected the ROWS, so this is the export's contents rather "
+    "than its shape or the connection. The error above names the column and "
+    "the value it refused.",
 )
 
 _GENERIC_ADVICE = (
     "If this names a worksheet, pass --sheet. If it names a column, the "
-    "export is a different variant than this loader expects (it needs "
-    "GAME-ID, DATE and TEAM).",
+    "export is a different variant than this loader expects. If it names a "
+    "host or a password, check $DATABASE_URL.",
 )
 
 
@@ -89,15 +121,30 @@ def advice_for(exc: BaseException) -> tuple[str, ...]:
     An operator reading that goes looking at their spreadsheet while the fault
     is in a connection string. Advice that fits every error tells you nothing
     about any of them.
+
+    THE BRANCHES ARE DELIBERATELY NARROW. Each one is claimed only for errors
+    whose cause is known; everything else gets `_GENERIC_ADVICE`, which names
+    the possibilities instead of picking one. A wrong confident answer costs an
+    operator more than an honest vague one.
     """
+    name = type(exc).__name__
     root = type(exc).__module__.split(".")[0]
-    if root in _DB_MODULES or "DatabaseConfig" in type(exc).__name__:
-        return _DB_ADVICE
+
+    if "DatabaseConfig" in name:
+        return _DB_UNSET_ADVICE
+    if root in _DB_MODULES:
+        if name in _CONNECTION_ERRORS:
+            return _DB_UNREACHABLE_ADVICE
+        if name in _ROW_ERRORS:
+            return _ROW_ADVICE
+        # Anything else from a database library -- ProgrammingError for a
+        # schema the migrations have not applied, say -- is not confidently
+        # any of the above, so it falls through rather than being guessed.
 
     text = str(exc).lower()
     if "worksheet" in text or "sheet named" in text:
         return _SHEET_ADVICE
-    if "column" in text or "key error" in text or isinstance(exc, KeyError):
+    if "column" in text or isinstance(exc, KeyError):
         return _COLUMN_ADVICE
     return _GENERIC_ADVICE
 

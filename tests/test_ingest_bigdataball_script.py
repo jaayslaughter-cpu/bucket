@@ -149,8 +149,10 @@ def test_a_database_failure_is_not_blamed_on_the_workbook(
     OperationalError.__module__ = "sqlalchemy.exc"
 
     def explode(path, persist=True):
+        # TEST-NET-3 (RFC 5737), not the real endpoint from the log. A test
+        # fixture is a bad place to keep a production address. cubic, PR #23.
         raise OperationalError(
-            'connection failed: connection to server at "66.33.22.239", port '
+            'connection failed: connection to server at "203.0.113.10", port '
             '27751 failed: FATAL:  password authentication failed for user '
             '"postgres"'
         )
@@ -161,45 +163,104 @@ def test_a_database_failure_is_not_blamed_on_the_workbook(
     assert "DATABASE_URL" in err
     assert "placeholder" in err
     assert "--sheet" not in err, "a connection error is not a worksheet problem"
-    assert "GAME-ID" not in err, "nor a column problem"
+    assert "WORKSHEET" not in err, "nor a worksheet problem"
+
+
+def _exc(name: str, module: str) -> type[Exception]:
+    """An exception class with a given name and module, as the classifier sees
+    it — so the branches can be covered without importing SQLAlchemy."""
+    cls = type(name, (Exception,), {})
+    cls.__module__ = module
+    return cls
 
 
 def test_the_classifier_matches_each_fault_to_its_own_remedy():
     """
-    Asserted on `advice_for` directly, so each branch is covered without
-    five subprocess-shaped tests. Classified on the exception's MODULE, not
-    its message: psycopg's wording is version- and locale-dependent, and this
-    repository has been bitten before by a check that read prose.
+    Asserted on `advice_for` directly, so each branch is covered without one
+    subprocess-shaped test per branch. Classified on the exception's MODULE
+    and NAME, never its message: psycopg's wording is version- and
+    locale-dependent, and this repository has been bitten before by a check
+    that read prose.
     """
-    class Op(Exception):
-        pass
-    Op.__module__ = "psycopg"
+    op = _exc("OperationalError", "sqlalchemy.exc")
+    iface = _exc("InterfaceError", "psycopg")
+    cfg = _exc("DatabaseConfigError", "src.db.session")
 
-    class Cfg(Exception):
-        pass
-    Cfg.__name__ = "DatabaseConfigError"
-    Cfg.__module__ = "src.db.session"
-
-    assert script.advice_for(Op("whatever")) == script._DB_ADVICE
-    assert script.advice_for(Cfg("no database configured")) == script._DB_ADVICE
+    assert script.advice_for(op("nope")) == script._DB_UNREACHABLE_ADVICE
+    assert script.advice_for(iface("nope")) == script._DB_UNREACHABLE_ADVICE
+    # UNSET is not WRONG: pointing at a password that does not exist yet
+    # sends the operator to check nothing.
+    assert script.advice_for(cfg("none configured")) == script._DB_UNSET_ADVICE
     assert script.advice_for(
         ValueError("Worksheet named 'X' not found")
     ) == script._SHEET_ADVICE
     assert script.advice_for(KeyError("GAME-ID")) == script._COLUMN_ADVICE
-    # Nothing recognisable falls back to naming both possibilities rather
-    # than guessing one.
+    # Nothing recognisable names the possibilities rather than guessing one.
     assert script.advice_for(RuntimeError("boom")) == script._GENERIC_ADVICE
 
 
-def test_the_database_advice_names_the_two_ways_the_url_is_wrong(capsys):
+def test_a_rejected_row_is_not_blamed_on_the_connection():
+    """
+    A DataError is a value the column's type refused and an IntegrityError is
+    a constraint the rows violated. Both come from the WORKBOOK'S CONTENTS,
+    reached only after the connection succeeded — so answering them with
+    "check $DATABASE_URL" is the same misdirection in the other direction.
+    cubic, PR #23.
+    """
+    for name in ("DataError", "IntegrityError"):
+        cls = _exc(name, "sqlalchemy.exc")
+        advice = script.advice_for(cls("value too long for type character(3)"))
+        assert advice == script._ROW_ADVICE
+        assert "DATABASE_URL" not in " ".join(advice)
+
+
+def test_an_unknown_database_error_is_not_guessed():
+    """
+    The branches are an ALLOWLIST. A ProgrammingError — a schema the
+    migrations have not applied — is confidently neither a connection fault
+    nor a bad row, so it must fall through to the advice that names the
+    possibilities instead of picking the wrong one.
+    """
+    cls = _exc("ProgrammingError", "sqlalchemy.exc")
+    assert script.advice_for(cls('relation "team_game_stats" does not exist')) \
+        == script._GENERIC_ADVICE
+
+
+def test_the_database_advice_names_the_two_ways_the_url_is_wrong():
     """
     Both were hit for real tonight: an unsubstituted `...` placeholder, and
     the private `postgres.railway.internal` host, which does not resolve from
     outside the platform.
     """
-    lines = " ".join(script._DB_ADVICE)
+    lines = " ".join(script._DB_UNREACHABLE_ADVICE)
     assert "placeholder" in lines
     assert "postgres.railway.internal" in lines
+
+
+def test_the_advice_does_not_restate_the_loaders_required_columns():
+    """
+    `load_bigdataball_workbook` already raises "missing required columns
+    (GAME-ID / DATE / TEAM / VENUE)" and that message is printed verbatim one
+    line above this advice. The first version of the advice listed three of
+    the four — it omitted VENUE — which is what a second reader of someone
+    else's fact eventually does. So the advice must point AT that error, not
+    carry its own copy of the list.
+
+    ASSERTED ON THE ADVICE STRINGS, not the file's source. The first version
+    of this test read the whole module and tripped over the COMMENT that
+    explains why the columns are not restated — a source assertion satisfied
+    by prose about the code, which is the trap this repository has hit five
+    times. What the operator reads is the tuples.
+    """
+    advice = " ".join(
+        script._COLUMN_ADVICE + script._GENERIC_ADVICE + script._ROW_ADVICE
+    )
+    for column in ("GAME-ID", "VENUE"):
+        assert column not in advice, (
+            f"{column} is restated in the advice; the loader's own error "
+            f"already names every required column"
+        )
+    assert "error above" in " ".join(script._COLUMN_ADVICE)
 
 
 def test_the_sheet_override_lands_where_the_default_lives(
