@@ -983,8 +983,14 @@ def test_a_system_directory_as_the_state_root_is_refused_not_chowned():
     So a state root under an FHS system directory must be REFUSED and named,
     and -- the part that matters -- the directory must be left alone.
     """
-    probe = Path("/var/lib/propiq-chown-guard-probe")
-    probe.mkdir(parents=True, exist_ok=True)
+    # A UNIQUE DIRECTORY, NOT A FIXED NAME. The first version used
+    # /var/lib/propiq-chown-guard-probe with exist_ok=True and rmtree'd it
+    # unconditionally, so a pre-existing directory of that name -- or a
+    # concurrent run -- would have been deleted by a test whose whole subject
+    # is not destroying things under /var/lib. cubic, PR #21. `dir=/var/lib`
+    # keeps it under a denylisted prefix, which is the point.
+    probe = Path(tempfile.mkdtemp(prefix="propiq-chown-guard-", dir="/var/lib"))
+    probe.chmod(0o755)
     inner = probe / "untouched.txt"
     inner.write_text("owned by root", encoding="utf-8")
     os.chown(probe, 0, 0)
