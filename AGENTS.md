@@ -255,6 +255,17 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `/var/lib/postgresql/data`, a path the worker has no volume at and cannot
   create as non-root, so the resolver chose it over `/app/data` and every
   artifact check failed. `docs/deploy_railway.md`.
+  **A third, fixed 2026-10-23: the mount arrives root-owned.** Railway mounts
+  volumes as root and a mount replaces the directory the Dockerfile chowned, so
+  `/app/data` was unwritable to uid 10001 and the probe said so
+  (`[FAIL] state_root_writable ... Permission denied`). The remedy this page
+  used to give — `railway run chown -R 10001:10001 /app/data` — could not work:
+  `railway run` executes locally, not in the container. It is now
+  `RAILWAY_RUN_UID=0` on the service plus a block at the top of
+  `scripts/start.sh` that chowns the resolved state root and then
+  `exec setpriv`s itself down to 10001, before the fetch or the probe writes
+  anything. The chown is on the volume, so it outlives the variable.
+  `tests/test_railway_deploy.py`.
 - **The BigDataBall workbook is needed once, not per deploy — and a stale one
   is now the thing to watch.** Fixed 2026-10-10. It *was* true that a missing
   workbook failed the whole slate: `ingest_market_lines` was unguarded, so
