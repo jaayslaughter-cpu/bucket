@@ -1105,6 +1105,35 @@ def test_a_symlinked_state_root_takes_the_volume_behind_it():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_the_drop_sets_home_user_and_logname_before_setpriv():
+    """
+    THE CI-VISIBLE HALF OF THE OUTAGE GUARD.
+
+    `test_the_drop_moves_home_with_the_uid` below boots the script for real and
+    is the better test, but it is `@root_only` and GitHub Actions runs as an
+    unprivileged user -- so on CI it SKIPS, and the fix for the bug that took
+    production down would be guarded by nothing there. cubic, PR #22. That is
+    the same shape as the original defect: a contract whose only coverage ran
+    in an environment CI does not have.
+
+    So this asserts the contract on the source, unskipped: the drop passes all
+    three variables through `env`, and does so BEFORE `setpriv` on the exec
+    line, because `env` after `setpriv` would set them for a process that has
+    already been re-executed.
+    """
+    code = "\n".join(_start_script_code())
+    assert "exec env " in code, "the drop no longer goes through env"
+    for var in ("HOME=", "USER=", "LOGNAME="):
+        assert var in code, f"{var} is not carried across the drop"
+    # Order on the exec chain: env first, setpriv second.
+    exec_env = code.index("exec env ")
+    setpriv_after = code.index("setpriv", exec_env)
+    for var in ("HOME=", "USER=", "LOGNAME="):
+        assert exec_env < code.index(var, exec_env) < setpriv_after, (
+            f"{var} must be set by env BEFORE setpriv on the exec chain"
+        )
+
+
 @root_only
 def test_the_drop_moves_home_with_the_uid():
     """
