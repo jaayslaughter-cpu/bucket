@@ -836,15 +836,19 @@ def _make_world_traversable(path: Path) -> None:
     """
     Let uid 10001 reach `path` after the drop.
 
-    Test scaffolding, not a production concern: pytest's own tmp directories
-    are mode 0700 under /tmp/pytest-of-root, so an unprivileged child cannot
-    traverse down to them. On a container the state root's parents are /app,
-    mode 0755. This reproduces that, and nothing else.
+    Test scaffolding, not a production concern: `mkdtemp` creates mode 0700, so
+    an unprivileged child cannot traverse into it. On a container the state
+    root's parent is /app, mode 0755. This reproduces that for ONE directory --
+    the test's own -- and nothing else.
+
+    IT MUST NOT CLIMB. The first version walked every parent up to `/` and so
+    tried to `chmod /tmp`, which CI's unprivileged runner is not permitted to
+    do (`PermissionError: [Errno 1] Operation not permitted: '/tmp'`) and which
+    a root runner did silently. A test has no business changing the mode of a
+    directory it did not create, and it does not need to: the system temp
+    directory is already world-traversable.
     """
-    for parent in [path, *path.parents]:
-        if parent == Path(parent.root):
-            break
-        parent.chmod(parent.stat().st_mode | stat.S_IXOTH | stat.S_IROTH)
+    path.chmod(path.stat().st_mode | stat.S_IXOTH | stat.S_IROTH)
 
 
 def test_the_state_root_is_chowned_before_anything_writes_to_it():
@@ -931,9 +935,13 @@ def test_an_unprivileged_boot_does_not_try_to_chown_anything():
         stub.chmod(0o755)
         volume = workdir / "vol"
         volume.mkdir()
+        # The dropped uid needs to traverse in, read the stub, and WRITE into
+        # the volume -- the probe creates a file there. Nothing wider: adding
+        # o+w to the script itself would let the unprivileged child rewrite
+        # the thing under test.
         _make_world_traversable(workdir)
-        for path in (workdir, stub, volume):
-            path.chmod(path.stat().st_mode | stat.S_IWOTH)
+        _make_world_traversable(stub)
+        volume.chmod(volume.stat().st_mode | stat.S_IRWXO)
 
         argv = ["bash", str(stub)]
         if os.geteuid() == 0:
