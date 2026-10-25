@@ -2149,10 +2149,13 @@ def describe(scheduler: Any) -> list[dict[str, Any]]:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
-    )
+    from src.utils.logstreams import configure_logging
+
+    # Was dead code: `main` is imported above and calls this at module
+    # scope, and `basicConfig` is a silent no-op once the root logger has
+    # handlers. `configure_logging` is idempotent, so this now states the
+    # intent without depending on which module got there first.
+    configure_logging()
     cap_thread_counts()
     state_state = check_state_dir()
     # Asked at boot, beside the state directory, because a redeploy breaks the

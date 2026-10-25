@@ -436,6 +436,8 @@ def build_feature_matrix(
     *,
     team_games: pd.DataFrame | None = None,
     market_lines: pd.DataFrame | None = None,
+    pbp_player_games: pd.DataFrame | None = None,
+    shot_summary: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build the leakage-safe feature matrix from a raw player game-log panel.
@@ -453,6 +455,22 @@ def build_feature_matrix(
     spread and total are read, because those are posted before tip. Closing
     lines are refused outright — see src/features/market_context.py — since
     a number known only at tip is the market's final answer, not a feature.
+
+    ``pbp_player_games`` is ``src.features.pbp.summarise_player_games``' output
+    and ``shot_summary`` is ``src.features.shot_zones.summarise_player_games``'.
+    Both are OPTIONAL and both are joined through their shifting attachers, so
+    a row receives only what the player's PREVIOUS games looked like. Absent,
+    the layers are not created — their columns do not exist rather than being
+    filled, which is what keeps "nobody has shot-charted this player" distinct
+    from "this player takes league-average shots".
+
+    WIRED ON REQUEST, 2026-10-25, WITHOUT THE MEASUREMENT THAT WOULD JUSTIFY
+    IT. `scripts/feature_ab.py --layer pbp|shot_zones` runs the comparison with
+    a layer on and off and is how this project decides whether a layer earns a
+    place. It has not been run on this panel — there is no panel yet. So these
+    two are present because they were asked for; whether they help is still an
+    open question, and ``resolved_feature_schema_version`` keeps a run with
+    them distinguishable from one without so the answer stays recoverable.
     """
     if player_panel.empty:
         logger.warning("Empty player panel — returning it unchanged.")
@@ -569,6 +587,69 @@ def build_feature_matrix(
         logger.info(
             "Market context skipped: no market_lines frame supplied, so no "
             "implied team totals. Pass the BigDataBall market_lines frame."
+        )
+
+    # --- PLAY-BY-PLAY AND SHOT MIX --------------------------------------------
+    #
+    # WIRED ON REQUEST, 2026-10-25, AND THE CAVEAT BELONGS NEXT TO THE CODE.
+    # Both layers existed and were reachable only through
+    # `scripts/feature_ab.py --layer pbp|shot_zones`, which measures a layer
+    # with it on and off. That measurement has NOT been run on this panel, so
+    # these columns are here because they were asked for, not because they are
+    # known to help. `feature_ab` is still the way to find out, and the schema
+    # digest below keeps a run with them distinguishable from one without.
+    #
+    # COVERAGE IS UNEVEN AND THAT IS THE RISK. Counted on the real panel
+    # 2026-10-05: PBP_RIM_RATE_L10 is populated for 126,624 of 214,381 rows
+    # (59.1%), 2021-22 through 2025-26 and absent before; shot_zones reaches
+    # 97.8%. Neither is filled with a league average when absent -- both leave
+    # NaN deliberately, because "no shot chart exists for this player" must not
+    # read as a measured shot profile. A booster handles NaN natively; what it
+    # cannot handle is a fabricated value.
+    #
+    # THE SHIFT IS INSIDE THE ATTACHERS. `attach_pbp_rolling_features` and
+    # `attach_shot_rolling_features` both shift before rolling and drop the
+    # same-game columns before returning. The same-game summarisers
+    # (`summarise_player_games`) are NOT called here -- pbp.py's own docstring
+    # says they are "not safe to join directly", and joining one would put the
+    # game being predicted into its own features.
+    if pbp_player_games is not None and not pbp_player_games.empty:
+        try:
+            from src.features.pbp import attach_pbp_rolling_features
+
+            before_pbp = set(df.columns)
+            df = attach_pbp_rolling_features(df, pbp_player_games)
+            if _records_a_layer(before_pbp, df, "pbp"):
+                market_layers.append("pbp")
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Play-by-play layer skipped (%s) — its columns are absent, not "
+                "filled with a league average.", exc,
+            )
+    else:
+        logger.info(
+            "Play-by-play layer skipped: no pbp_player_games frame supplied. "
+            "Build one with scripts/build_pbp_panel.py."
+        )
+
+    if shot_summary is not None and not shot_summary.empty:
+        try:
+            from src.features.shot_zones import attach_shot_rolling_features
+
+            before_shots = set(df.columns)
+            df = attach_shot_rolling_features(df, shot_summary)
+            if _records_a_layer(before_shots, df, "shot_zones"):
+                market_layers.append("shot_zones")
+        except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+            logger.warning(
+                "Shot-zone layer skipped (%s) — its columns are absent, not "
+                "filled with a league average.", exc,
+            )
+    else:
+        logger.info(
+            "Shot-zone layer skipped: no shot_summary frame supplied. Build one "
+            "with scripts/build_shot_panel.py, which checks the log against the "
+            "panel's own FGA first."
         )
 
     # PACE_MULTIPLIER is NOT materialized when absent. Writing 1.0 into the

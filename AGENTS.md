@@ -43,7 +43,7 @@ the first question about any change, not the last.
 
 - Every grouped rolling feature is `.shift(1)` within player-season. No
   exceptions, including the ones that look harmless.
-- `src/features/builder.py:685` `assert_no_lookahead()` runs over whatever the
+- `src/features/builder.py:766` `assert_no_lookahead()` runs over whatever the
   layers produced and is not optional.
 - Season grouping comes from `src/features/season.py`. A layer that needs a
   season key and has none derives it **privately** and drops it before
@@ -131,7 +131,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:264`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:265`
 `load_master_guideline()` returns `None` and the caller logs it. ABSENT MEANS
 NO BOOKMAKER FILTER: `ingest_prop_lines` leaves `books = None`, so every prop
 source the feed returns is accepted. `approved_prop_sources` is the only key

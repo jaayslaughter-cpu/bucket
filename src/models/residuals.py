@@ -22,7 +22,7 @@ test rows.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -60,6 +60,25 @@ MAX_ZERO_INFLATION = 0.85
 MIN_SIGMA_SCALE = 0.5
 MAX_SIGMA_SCALE = 5.0
 
+# What the out-of-fold residuals were actually grouped by, recorded ON THE
+# ARTIFACT rather than only in a log line.
+#
+# WHY THIS IS A FIELD AND NOT A WARNING. `_in_sample_fallback` already carries
+# its degradation in `fallback_reason`, for a reason it states plainly:
+# "Returned unlabelled, this would be indistinguishable from a real
+# out-of-fold fit while being systematically overconfident." The POSITIONAL
+# path has the same property and did not carry it. An NBA slate is ~150 rows,
+# so a positional fold boundary leaves one night partly in train and partly in
+# validation, and phi then comes partly from residuals of a model that had
+# already seen that night. The warning scrolls away; the artifact ships to the
+# volume and drives every P(over) for a season.
+FOLD_BASIS_DATE = "date_grouped"
+FOLD_BASIS_POSITIONAL = "positional"
+FOLD_BASIS_IN_SAMPLE = "in_sample"
+#: Artifacts written before this field existed. Not conflated with
+#: `date_grouped`: "we do not know how this was folded" is not a guarantee.
+FOLD_BASIS_UNKNOWN = "unknown"
+
 
 @dataclass(frozen=True)
 class CountDispersion:
@@ -75,6 +94,9 @@ class CountDispersion:
     # model it actually was.
     zero_inflation: float = 0.0
     sigma_scale: float = 1.0
+    #: Defaulted so an artifact written before this existed still loads — as
+    #: UNKNOWN, which is what it is, rather than as a guarantee nobody made.
+    fold_basis: str = FOLD_BASIS_UNKNOWN
 
     def variance_for(self, mean: float) -> float:
         """Predicted variance at a given mean."""
@@ -119,6 +141,7 @@ class CountDispersion:
             "fallback_reason": self.fallback_reason,
             "zero_inflation": self.zero_inflation,
             "sigma_scale": self.sigma_scale,
+            "fold_basis": self.fold_basis,
         }
 
     @classmethod
@@ -137,6 +160,7 @@ class CountDispersion:
             # Absent on artifacts written before these families existed.
             zero_inflation=float(payload.get("zero_inflation") or 0.0),
             sigma_scale=float(payload.get("sigma_scale") or 1.0),
+            fold_basis=str(payload.get("fold_basis") or FOLD_BASIS_UNKNOWN),
         )
 
     def as_metadata(self) -> dict[str, object]:
@@ -148,6 +172,7 @@ class CountDispersion:
             "dispersion_fallback_reason": self.fallback_reason,
             "dispersion_zero_inflation": round(self.zero_inflation, 4),
             "dispersion_sigma_scale": round(self.sigma_scale, 4),
+            "dispersion_fold_basis": self.fold_basis,
         }
 
 
@@ -372,6 +397,7 @@ def fit_dispersion_out_of_fold(
                 f"{reason} — dispersion estimated IN-SAMPLE, so the spread is "
                 "likely understated and the distribution overconfident"
             ),
+            fold_basis=FOLD_BASIS_IN_SAMPLE,
         )
 
     if n < MIN_ROWS_TO_FIT * 2:
@@ -408,11 +434,19 @@ def fit_dispersion_out_of_fold(
         )
         return _in_sample_fallback(f"only {int(scored.sum())} out-of-fold rows survived")
 
+    basis = FOLD_BASIS_DATE if dates is not None else FOLD_BASIS_POSITIONAL
     logger.info(
-        "dispersion %s: estimating from %d out-of-fold residuals across %d folds",
-        market or "?", int(scored.sum()), splits,
+        "dispersion %s: estimating from %d out-of-fold residuals across %d folds (%s)",
+        market or "?", int(scored.sum()), splits, basis,
     )
-    return fit_count_dispersion(y[scored], oof_pred[scored], market=market)
+    # STAMPED, not logged. `fit_count_dispersion` cannot know how its caller
+    # folded, so the basis is recorded here -- on the object that gets written
+    # to the volume -- and a positional fit is no longer indistinguishable
+    # from a date-grouped one. `replace` because CountDispersion is frozen.
+    return replace(
+        fit_count_dispersion(y[scored], oof_pred[scored], market=market),
+        fold_basis=basis,
+    )
 
 
 def over_under_push_from_dispersion(
