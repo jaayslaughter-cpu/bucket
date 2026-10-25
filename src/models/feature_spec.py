@@ -79,9 +79,22 @@ logger = logging.getLogger(__name__)
 #: rollup columns. `tests/test_feature_market_fallback.py` asserts the
 #: configured markets stay inside the set, so adding one fails there instead
 #: of quietly fitting a points model.
+#: Kept equal to `src.features.builder.ROLLING_STATS`, which is the ground
+#: truth: those are the stats the panel builder actually rolls forward, so
+#: those are the markets whose `{M}_L2/_L5/_L10/_SEASON/_BASELINE` columns
+#: exist. NOT imported from there -- `builder` pulls in the whole features
+#: package and this module is on the import path of every adapter -- so
+#: `tests/test_feature_market_fallback.py` asserts the two are identical and
+#: fails if either moves. MIN was missing from this set while being in
+#: ROLLING_STATS, found by building a panel for each stat and looking.
 MARKETS_WITH_OWN_FEATURES: frozenset[str] = frozenset(
-    {"PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA"}
+    {"PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN"}
 )
+
+#: The template substituted when a market has none of its own. Named rather
+#: than inlined so the warning, the recorded field and the tests cannot
+#: disagree about what was substituted.
+FALLBACK_FEATURE_MARKET = "PTS"
 
 SCHEMA_VERSION = "fs_v2_wave5b"
 
@@ -158,6 +171,12 @@ class FeatureSpec(BaseModel):
             "categorical": list(self.categorical),
             "fingerprint": self.fingerprint(),
             "n_features": len(self.features),
+            # THE FIELD HAS TO REACH THE SIDECAR OR IT RECORDS NOTHING. This
+            # dict is hand-written rather than a model dump, so adding the
+            # field to the model did not add it here -- the spec knew which
+            # market's columns it carried and the `.meta.json` beside the
+            # booster did not, which is the one place an operator would look.
+            "feature_market": self.feature_market,
             "notes": self.notes,
         }
 
@@ -177,7 +196,9 @@ def build_prop_feature_spec(
     columns when provided so train and slate share the same order.
     """
     m = market.upper()
-    feature_market = m if m in MARKETS_WITH_OWN_FEATURES else "PTS"
+    feature_market = (
+        m if m in MARKETS_WITH_OWN_FEATURES else FALLBACK_FEATURE_MARKET
+    )
     if feature_market != m:
         logger.warning(
             "No %s rollup columns exist, so the %s feature spec is built from "

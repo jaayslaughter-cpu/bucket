@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from src.models.feature_spec import (
+    FALLBACK_FEATURE_MARKET,
     MARKETS_WITH_OWN_FEATURES,
     FeatureSpec,
     build_prop_feature_spec,
@@ -53,7 +54,7 @@ def test_a_market_with_its_own_columns_records_itself(market, caplog):
     assert "rollup columns" not in caplog.text
 
 
-@pytest.mark.parametrize("market", ["PA", "PR", "RA", "FPTS", "FG3A", "TOV", "MIN"])
+@pytest.mark.parametrize("market", ["PA", "PR", "RA", "FPTS", "FG3A", "TOV"])
 def test_a_market_without_its_own_columns_says_so_loudly(market, caplog):
     """
     THE DEFECT. Each of these silently became a PTS spec. FG3A, TOV and MIN
@@ -96,34 +97,109 @@ def test_the_substituted_features_really_are_the_other_market_s(caplog):
     assert all(c in pa.features for c in pts_history)
 
 
-def test_every_market_the_project_is_configured_for_has_its_own_columns():
+def test_the_owned_set_equals_what_the_builder_actually_rolls_forward():
     """
-    THE GUARD THAT MAKES THE FALLBACK SAFE TO LEAVE IN PLACE. The substitution
-    is currently unreachable because every configured market has its own
-    rollups. Adding PA, PR, RA or FPTS to the config without building the
-    rollups first would arm it — and this is where that shows up, rather than
-    in a season of points-shaped PA probabilities.
+    THE CIRCULARITY THIS FILE FIRST HAD. My original version asserted that
+    every configured market is "in" MARKETS_WITH_OWN_FEATURES — but that
+    constant is hand-written, so the assertion proved only that I had typed
+    the same list twice. The idea for grounding it came from the audit package
+    uploaded on 2026-10-25, and it is strictly better: the ground truth is
+    `builder.ROLLING_STATS`, the stats the panel actually rolls forward.
+
+    It immediately found a disagreement: MIN was in ROLLING_STATS and absent
+    from the owned set, so a MIN spec substituted PTS features for a market
+    the builder can serve perfectly well.
+
+    The constant is not imported from `builder` on purpose — that module pulls
+    in the whole features package and this one is on every adapter's import
+    path — so this test is what keeps them identical.
     """
+    from src.features.builder import ROLLING_STATS
+
+    assert set(ROLLING_STATS) == set(MARKETS_WITH_OWN_FEATURES), (
+        f"the owned set and the builder's ROLLING_STATS have drifted. "
+        f"only in ROLLING_STATS: {sorted(set(ROLLING_STATS) - MARKETS_WITH_OWN_FEATURES)}; "
+        f"only in the owned set: {sorted(MARKETS_WITH_OWN_FEATURES - set(ROLLING_STATS))}"
+    )
+
+
+@pytest.mark.parametrize("market", sorted(MARKETS_WITH_OWN_FEATURES))
+def test_the_builder_really_does_produce_each_owned_market_s_columns(market):
+    """
+    Not "it is in a tuple" — the builder is RUN, on a panel carrying that
+    stat, and the own-stat columns are looked for in the output. A market in
+    the owned set whose columns the builder cannot build would make the
+    substitution's absence a lie.
+
+    PRA is the documented exception: the builder refuses to roll a raw PRA
+    column (two definitions existed and the raw one lost) and derives it from
+    PTS+REB+AST, so its panel carries the components.
+    """
+    import pandas as pd
+
+    from src.features.builder import build_feature_matrix
+
+    frame = {
+        "PLAYER_ID": ["1"] * 5,
+        "GAME_DATE": pd.date_range("2026-10-01", periods=5),
+    }
+    if market == "PRA":
+        frame.update({"PTS": [10.0, 12, 14, 16, 18],
+                      "REB": [4.0, 5, 6, 7, 8],
+                      "AST": [2.0, 3, 4, 5, 6]})
+    else:
+        frame[market] = [10.0, 12, 14, 16, 18]
+
+    built = set(build_feature_matrix(pd.DataFrame(frame)).columns)
+    for suffix in ("_L2", "_L5", "_L10"):
+        assert f"{market}{suffix}" in built, (
+            f"{market} is in MARKETS_WITH_OWN_FEATURES but the builder did "
+            f"not produce {market}{suffix} from a panel carrying {market}"
+        )
+
+
+def test_no_configured_market_is_being_substituted():
+    """The live question, kept now that the set itself is grounded above."""
     import yaml
 
+    from src.models.labels import LAUNCH_MARKETS, POST_LAUNCH_MARKETS
     from src.pipeline.slate_board import DEFAULT_MARKETS
 
     cfg = yaml.safe_load(
         (ROOT / "config" / "model_comparison.yaml").read_text(encoding="utf-8")
     )
-    configured = set(cfg.get("markets_launch") or []) | set(
-        cfg.get("markets_post_launch") or []
+    configured = (
+        set(cfg.get("markets_launch") or [])
+        | set(cfg.get("markets_post_launch") or [])
+        | set(LAUNCH_MARKETS)
+        | set(POST_LAUNCH_MARKETS)
+        | set(DEFAULT_MARKETS)
     )
-    configured |= set(DEFAULT_MARKETS)
     assert configured, "parsed no configured markets, so this proves nothing"
 
     substituted = sorted(configured - MARKETS_WITH_OWN_FEATURES)
     assert not substituted, (
         f"these configured markets have no rollup columns and are therefore "
-        f"being scored on PTS features: {substituted}. Build the rollups, or "
-        f"take them out of the config — do not add them to "
-        f"MARKETS_WITH_OWN_FEATURES, which would only silence the warning."
+        f"being scored on {FALLBACK_FEATURE_MARKET} features: {substituted}. "
+        f"Build the rollups, or take them out of the config — do NOT add them "
+        f"to MARKETS_WITH_OWN_FEATURES, which only silences the warning."
     )
+
+
+def test_the_recorded_market_reaches_the_sidecar():
+    """
+    THE GAP MY OWN FIX HAD, caught by the uploaded package. `to_meta` is
+    hand-written rather than a model dump, so adding the field to the model
+    did not put it in the `.meta.json`. The spec knew which market's columns
+    it carried and the file beside the booster did not — and that file is the
+    one place an operator looks.
+    """
+    meta = build_prop_feature_spec("FPTS").to_meta()
+    assert meta["market"] == "FPTS"
+    assert meta["feature_market"] == FALLBACK_FEATURE_MARKET
+
+    own = build_prop_feature_spec("PTS").to_meta()
+    assert own["feature_market"] == "PTS"
 
 
 def test_the_substitution_does_not_mix_two_markets_columns():
