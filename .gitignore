@@ -70,6 +70,13 @@ data/external/player_logs/
 *.h5
 *.hdf5
 
+# ONE EXCEPTION, and it is a test fixture rather than data. It was produced by
+# running nba-scraper-2026-27's own canonical mapper over its own fixture
+# payload and captured, so tests/test_scraper_panel.py exercises the real
+# producer's output shape without that package being installed. Ignored, the
+# whole file would have been missing on CI while passing locally.
+!tests/fixtures/scraper_canonical/**/*.parquet
+
 # Local research dumps (keep out of git)
 *.html
 *_files/
