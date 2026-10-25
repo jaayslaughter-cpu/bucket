@@ -52,12 +52,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
 from pydantic import BaseModel, Field
 
 from src.models.labels import default_feature_cols
+
+logger = logging.getLogger(__name__)
+
+#: Markets whose OWN rollup columns exist in the panel. `default_feature_cols`
+#: templates `{MARKET}_L2`, `{MARKET}_L5`, ... so a market outside this set
+#: produces column names nothing builds, and `assert_compatible` would refuse
+#: the spec outright. The fallback below exists for that reason -- but it used
+#: to be SILENT, which is worse than the refusal it avoids: the returned spec
+#: recorded `market="PA"` while carrying PTS columns, so a PA model was fitted
+#: on points history and nothing downstream could tell.
+#:
+#: NOTHING IS BEING SUBSTITUTED TODAY, and that is the point of naming the set
+#: rather than inlining it. `config/model_comparison.yaml`'s `markets_launch`
+#: + `markets_post_launch` and `pipeline.slate_board.DEFAULT_MARKETS` are all
+#: inside this set, so the fallback is currently unreachable in production. It
+#: is a trap armed for the next market somebody asks for -- PA, PR, RA and
+#: FPTS are the four named in the 2026-10-25 autonomy brief, and each has no
+#: rollup columns. `tests/test_feature_market_fallback.py` asserts the
+#: configured markets stay inside the set, so adding one fails there instead
+#: of quietly fitting a points model.
+MARKETS_WITH_OWN_FEATURES: frozenset[str] = frozenset(
+    {"PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA"}
+)
 
 SCHEMA_VERSION = "fs_v2_wave5b"
 
@@ -70,6 +94,14 @@ class FeatureSpec(BaseModel):
     market: str
     features: list[str] = Field(default_factory=list)
     categorical: list[str] = Field(default_factory=list)
+    #: The market whose rollup columns these features ACTUALLY are. Equal to
+    #: `market` for every market in `MARKETS_WITH_OWN_FEATURES`; for anything
+    #: else it names the fallback that was substituted, so a sidecar says so
+    #: instead of implying a contract it does not hold. Defaults to "" rather
+    #: than to `market`, because a spec written before this field existed did
+    #: not record the answer and guessing it would invent one -- the same
+    #: reasoning `CountDispersion.fold_basis` uses for `unknown`.
+    feature_market: str = ""
     notes: str = "train≡slate column freeze; leakage-safe cols only"
 
     def fingerprint(self) -> str:
@@ -145,19 +177,38 @@ def build_prop_feature_spec(
     columns when provided so train and slate share the same order.
     """
     m = market.upper()
-    base = list(default_feature_cols(m if m in {"PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA"} else "PTS"))  # type: ignore[arg-type]
+    feature_market = m if m in MARKETS_WITH_OWN_FEATURES else "PTS"
+    if feature_market != m:
+        logger.warning(
+            "No %s rollup columns exist, so the %s feature spec is built from "
+            "%s features. The spec records feature_market=%s; a model fitted "
+            "this way is a %s model wearing a %s label, and its probabilities "
+            "are NOT about %s. Markets with their own columns: %s.",
+            m, m, feature_market, feature_market, feature_market, m, m,
+            ", ".join(sorted(MARKETS_WITH_OWN_FEATURES)),
+        )
+    base = list(default_feature_cols(feature_market))  # type: ignore[arg-type]
 
     extras: list[str] = [
         "days_rest",
         "is_back_to_back",
     ]
     if include_wave5a:
+        # TEMPLATED ON `feature_market`, NOT ON `m`. These were templated on
+        # the ASKED-FOR market while the base list came from the substituted
+        # one, so a PA spec carried PTS_L2..PTS_SEASON alongside
+        # PA_STREAK_ABOVE, PA_STREAK_BELOW and PA_HOT_Z -- three columns
+        # `attach_form_streaks` and `hot_hand` never build for PA. The spec was
+        # then a mixture of two markets, and which way it broke depended on the
+        # caller: with `available_columns` the three were silently filtered
+        # out, without it `assert_compatible` refused the whole spec. Both
+        # halves of the substitution now come from the same market.
         extras.extend(
             [
                 "USAGE_PROXY_L10",
-                f"{m}_STREAK_ABOVE",
-                f"{m}_STREAK_BELOW",
-                f"{m}_HOT_Z",
+                f"{feature_market}_STREAK_ABOVE",
+                f"{feature_market}_STREAK_BELOW",
+                f"{feature_market}_HOT_Z",
                 "MINUTES_STABLE",
             ]
         )
@@ -183,6 +234,7 @@ def build_prop_feature_spec(
         market=m,
         features=ordered,
         categorical=cats,
+        feature_market=feature_market,
     )
 
 
@@ -217,6 +269,11 @@ def spec_from_artifact_meta(meta: Mapping[str, Any]) -> FeatureSpec:
         categorical=[str(c) for c in (
             meta.get("categorical_features") or block.get("categorical") or []
         )],
+        # Whatever the sidecar recorded, and "" when it recorded nothing. A
+        # sidecar written before this field existed did not answer the
+        # question, and defaulting it to `market` would answer it wrongly for
+        # exactly the specs the field exists to expose.
+        feature_market=str(block.get("feature_market") or ""),
     )
 
 
