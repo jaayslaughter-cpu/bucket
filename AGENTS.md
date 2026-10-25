@@ -131,7 +131,7 @@ slate cutoff is a Pacific **calendar day**.
 
 **Config:** `config/model_comparison.yaml` (model + feature + eligibility +
 drift blocks), `config/dfs_payouts.yaml`, and a master guideline at
-`config/master_guideline_props.yaml` — not in the repo; `main.py:264`
+`config/master_guideline_props.yaml` — not in the repo; `main.py:265`
 `load_master_guideline()` returns `None` and the caller logs it. ABSENT MEANS
 NO BOOKMAKER FILTER: `ingest_prop_lines` leaves `books = None`, so every prop
 source the feed returns is accepted. `approved_prop_sources` is the only key

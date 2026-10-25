@@ -70,14 +70,15 @@ from src.models.labels import (
     RESEARCH_LINE_COL,
     mask_probabilities_at_unsupported_lines,
 )
+from src.utils.logstreams import configure_logging
 from src.utils.timezones import DISPLAY_TZ_NAME, now_pacific, pacific_calendar_date
 
 load_dotenv()
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
-)
+# INFO to stdout, WARNING+ to stderr. Railway tags everything a container
+# writes to stderr as severity "error", and `basicConfig` defaults to stderr,
+# which rendered every INFO line in this file as a deployment error.
+configure_logging()
 logger = logging.getLogger("propiq.main")
 logger.info("Display timezone=%s (storage=%s)", DISPLAY_TZ_NAME, "UTC")
 
