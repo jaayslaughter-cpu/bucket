@@ -1,0 +1,249 @@
+<#
+scripts/ingest_from_windows.ps1 — one command that gets the workbook into Postgres.
+
+WHY THIS EXISTS. The team-game ingest is the one step in this project that
+cannot be automated: the BigDataBall export is a licensed file on an operator's
+machine, and Railway's Postgres is only reachable from there through its TCP
+proxy. Between 2026-10-23 and 2026-10-28 that step was attempted repeatedly
+from a PowerShell prompt and failed every time, never on the ingest itself:
+
+  * A MULTI-LINE PASTE COLLAPSES. Pasting several commands at once put the
+    connection string on the end of the `Read-Host` line, and the NEXT command
+    was consumed as the answer to the prompt -- so DATABASE_URL was literally
+    set to `if ($env:DATABASE_URL) { ... }` and psycopg reported
+    `missing "=" after "if"`.
+  * THE WRONG URL. `DATABASE_URL` on Railway points at
+    `postgres.railway.internal`, which resolves only inside Railway's network.
+    From a laptop it can never connect. `DATABASE_PUBLIC_URL` is the one that
+    works, via the TCP proxy.
+  * `$env:` IS PER-WINDOW. A variable set in one terminal is gone in the next,
+    so the ingest ran without it and reported `fe_sendauth: no password
+    supplied`.
+  * PLACEHOLDERS PASTED LITERALLY. `PASTE_HERE`, `...` and
+    `C:\real\path\to\...` were all submitted as real values.
+
+A script has none of those failure modes: one invocation, no pasting into a
+prompt mid-sequence, no placeholders, and the variable lives as long as the
+script does. It also verifies the write instead of trusting the exit code --
+on 2026-10-25 the ingest reported "2,644 rows" while the database stayed empty,
+and three days of slates then failed with `-> 0 rows`.
+
+USAGE, from the repository root:
+
+    powershell -ExecutionPolicy Bypass -File scripts\ingest_from_windows.ps1
+
+It will ask for the connection string once, and find the workbook itself if it
+is anywhere under your user folder.
+
+    -Xlsx "C:\path\to\export.xlsx"   skip the search
+    -DryRun                           parse and report, write nothing
+    -Sheet "Team Stats"               if your export's tab is named differently
+
+RESEARCH_ONLY. This moves team-game and market-line rows. It prices nothing,
+places nothing and grades nothing.
+#>
+
+[CmdletBinding()]
+param(
+    [string] $Xlsx = "",
+    [switch] $DryRun,
+    [string] $Sheet = "",
+    # The public endpoint of the Railway Postgres TCP proxy. Only change this
+    # if the proxy is recreated, which gives it a new host and port.
+    [string] $ProxyEndpoint = "autorack.proxy.rlwy.net:27751"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Say  ([string] $m) { Write-Host $m }
+function Good ([string] $m) { Write-Host "  OK   $m" -ForegroundColor Green }
+function Bad  ([string] $m) { Write-Host "  FAIL $m" -ForegroundColor Red }
+function Note ([string] $m) { Write-Host "       $m" -ForegroundColor DarkGray }
+
+Say ""
+Say "PropIQ workbook ingest - RESEARCH_ONLY"
+Say "======================================"
+Say ""
+
+# --- [1] the repository ----------------------------------------------------
+# Resolved from THIS SCRIPT's location, not from the current directory, so it
+# does not matter where the window happens to be sitting.
+$repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if (-not (Test-Path (Join-Path $repo "scripts\ingest_bigdataball.py"))) {
+    Bad "this script is not inside the PropIQ repository (looked in $repo)"
+    exit 1
+}
+Set-Location $repo
+Good "repository: $repo"
+
+# --- [2] python and psycopg ------------------------------------------------
+try {
+    $pyv = (& python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>&1 | Out-String).Trim()
+} catch {
+    Bad "python is not on PATH"
+    exit 1
+}
+Good "python $pyv"
+
+$hasPsycopg = $false
+try {
+    & python -c "import psycopg" 2>$null
+    if ($LASTEXITCODE -eq 0) { $hasPsycopg = $true }
+} catch { }
+if (-not $hasPsycopg) {
+    Note "psycopg is missing; installing it"
+    & python -m pip install --quiet "psycopg[binary]"
+    & python -c "import psycopg" 2>$null
+    if ($LASTEXITCODE -ne 0) { Bad "psycopg still will not import"; exit 1 }
+}
+Good "psycopg importable"
+
+# --- [3] the workbook ------------------------------------------------------
+if ($Xlsx -eq "") {
+    Note "looking for the BigDataBall export under $HOME ..."
+    $found = Get-ChildItem -Path $HOME -Recurse -File -Filter "*NBA_Box_Score_Team-Stats*.xlsx" `
+                 -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending |
+             Select-Object -First 1
+    if ($null -eq $found) {
+        Bad "no *NBA_Box_Score_Team-Stats*.xlsx found under $HOME"
+        Note "pass it explicitly:  -Xlsx `"C:\path\to\export.xlsx`""
+        exit 1
+    }
+    $Xlsx = $found.FullName
+}
+if (-not (Test-Path $Xlsx)) { Bad "no workbook at $Xlsx"; exit 1 }
+$size = [math]::Round((Get-Item $Xlsx).Length / 1MB, 2)
+Good "workbook: $Xlsx  ($size MB)"
+
+# --- [4] the connection string --------------------------------------------
+# Asked for HERE, inside the script, so there is no sequence of pasted
+# commands for a multi-line paste to collapse.
+Say ""
+Say "Paste DATABASE_PUBLIC_URL from Railway (Postgres service -> Variables)."
+Say "It is NOT the one ending in postgres.railway.internal - but if you paste"
+Say "that one by mistake, this script rewrites the host for you."
+Say ""
+$raw = (Read-Host "connection string").Trim()
+
+if ($raw -eq "") { Bad "nothing was entered"; exit 1 }
+if ($raw -notmatch '^postgres(ql)?://') {
+    Bad "that does not look like a connection string (it must start postgresql://)"
+    Note "what was entered began: $($raw.Substring(0, [Math]::Min(12, $raw.Length)))..."
+    exit 1
+}
+
+# The internal host can never resolve off-platform; rewrite it to the proxy.
+$conn = $raw -replace 'postgres\.railway\.internal:5432', $ProxyEndpoint
+if ($conn -ne $raw) { Note "rewrote the internal host to $ProxyEndpoint" }
+
+# Echo the host ONLY. The password is never printed, logged or written to disk.
+if ($conn -match '@([^/?]+)') { Good "target host: $($matches[1])" }
+else { Bad "could not read a host out of that string"; exit 1 }
+
+$env:DATABASE_URL = $conn
+
+# --- [5] prove the connection before doing any work -----------------------
+Say ""
+Say "[1/4] connecting ..."
+$probe = @'
+import os, sys
+import psycopg
+try:
+    with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=20) as c:
+        with c.cursor() as cur:
+            cur.execute("select current_database(), current_user, version()")
+            db, who, ver = cur.fetchone()
+    print(f"OK\t{db}\t{who}\t{ver.split(',')[0]}")
+except Exception as exc:
+    print(f"ERR\t{type(exc).__name__}\t{exc}")
+    sys.exit(1)
+'@
+$probeOut = ($probe | & python - 2>&1 | Out-String).Trim()
+if ($probeOut -notmatch '^OK') {
+    Bad "could not connect"
+    Note $probeOut
+    Note "A timeout usually means the TCP proxy is gone - check Railway ->"
+    Note "Postgres -> Settings -> Networking. An authentication failure means"
+    Note "the password was rotated; copy DATABASE_PUBLIC_URL again."
+    exit 1
+}
+$parts = $probeOut -split "`t"
+Good "connected to database '$($parts[1])' as '$($parts[2])' ($($parts[3]))"
+$targetDb = $parts[1]
+
+# --- [6] the row count BEFORE ---------------------------------------------
+$countScript = @'
+import os, sys
+import psycopg
+with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=20) as c:
+    with c.cursor() as cur:
+        out = []
+        for t in ("team_game_stats", "game_market_lines", "player_game_logs"):
+            try:
+                cur.execute(f"select count(*) from {t}")
+                out.append(f"{t}={cur.fetchone()[0]}")
+            except Exception as exc:
+                c.rollback()
+                out.append(f"{t}=<{type(exc).__name__}>")
+        print("\t".join(out))
+'@
+Say ""
+Say "[2/4] counting rows before ..."
+$before = ($countScript | & python - 2>&1 | Out-String).Trim()
+Note $before
+
+# --- [7] the ingest -------------------------------------------------------
+$ingestArgs = @("-m", "scripts.ingest_bigdataball", "--xlsx", $Xlsx)
+if ($DryRun)       { $ingestArgs += "--dry-run" }
+if ($Sheet -ne "") { $ingestArgs += @("--sheet", $Sheet) }
+
+Say ""
+if ($DryRun) { Say "[3/4] parsing (DRY RUN - nothing will be written) ..." }
+else         { Say "[3/4] ingesting ..." }
+Say ""
+
+# Streamed so the whole tail is visible. The exit code is kept, but it is
+# NOT what this script trusts - step 4 is.
+& python @ingestArgs
+$ingestExit = $LASTEXITCODE
+Say ""
+if ($ingestExit -eq 0) { Good "ingest exited 0" }
+else                   { Bad  "ingest exited $ingestExit" }
+
+# --- [8] VERIFY the write, which is the whole point ----------------------
+Say ""
+Say "[4/4] counting rows after ..."
+$after = ($countScript | & python - 2>&1 | Out-String).Trim()
+Note $after
+
+Say ""
+Say "======================================"
+if ($DryRun) {
+    Say "DRY RUN complete - nothing was written."
+    Say "Re-run without -DryRun to persist."
+    exit $ingestExit
+}
+
+# The counts are what decides, not the exit code: on 2026-10-25 an ingest
+# reported thousands of rows and the table stayed empty.
+$teamAfter = -1
+if ($after -match 'team_game_stats=(\d+)') { $teamAfter = [int]$matches[1] }
+
+if ($teamAfter -gt 0) {
+    Good "team_game_stats now holds $teamAfter row(s) in database '$targetDb'"
+    Say ""
+    Say "The 09:00 PT slate reads these tables. The next run should build a"
+    Say "board instead of exiting 1 - though it will still abstain on every"
+    Say "row until a model artifact exists, which is the separate blocker."
+    exit 0
+}
+
+Bad "team_game_stats is still empty after the ingest"
+Say ""
+Say "This is the exact failure that wasted 2026-10-23 to 2026-10-28: an ingest"
+Say "that reports success while the table stays empty. The tail above is the"
+Say "evidence - look for an 'Upserted N team-game stat rows' line. If it is"
+Say "absent, the write never reached a commit. If it is present, this ran"
+Say "against a different database than the worker reads ('$targetDb' here)."
+exit 1
