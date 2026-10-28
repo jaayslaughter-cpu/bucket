@@ -38,6 +38,10 @@ is anywhere under your user folder.
     -Xlsx "C:\path\to\export.xlsx"   skip the search
     -DryRun                           parse and report, write nothing
     -Sheet "Team Stats"               if your export's tab is named differently
+    -Repo "C:\path\to\bucket"        if run from a copy outside the checkout
+
+It can be run from inside the checkout, from any directory, or from a copy
+saved elsewhere -- it looks for the repository in all three places.
 
 RESEARCH_ONLY. This moves team-game and market-line rows. It prices nothing,
 places nothing and grades nothing.
@@ -48,6 +52,9 @@ param(
     [string] $Xlsx = "",
     [switch] $DryRun,
     [string] $Sheet = "",
+    # The PropIQ checkout. Normally found automatically; pass it when the
+    # script is being run from a copy outside the repository.
+    [string] $Repo = "",
     # The public endpoint of the Railway Postgres TCP proxy. Only change this
     # if the proxy is recreated, which gives it a new host and port.
     [string] $ProxyEndpoint = "autorack.proxy.rlwy.net:27751"
@@ -66,11 +73,36 @@ Say "======================================"
 Say ""
 
 # --- [1] the repository ----------------------------------------------------
-# Resolved from THIS SCRIPT's location, not from the current directory, so it
-# does not matter where the window happens to be sitting.
-$repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-if (-not (Test-Path (Join-Path $repo "scripts\ingest_bigdataball.py"))) {
-    Bad "this script is not inside the PropIQ repository (looked in $repo)"
+# THREE PLACES, IN ORDER, because every one of them has actually happened.
+# Resolving only from the script's own location broke when the script was run
+# from a Downloads copy rather than from inside the checkout, and resolving
+# only from the current directory broke when the window was sitting at
+# C:\Users\<name>.
+function Test-PropIQRepo ([string] $candidate) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
+    return (Test-Path (Join-Path $candidate "scripts\ingest_bigdataball.py"))
+}
+
+$candidates = @()
+if ($Repo -ne "") { $candidates += $Repo }
+# Beside the script: <repo>\scripts\this.ps1
+$candidates += (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
+# Wherever the window is sitting, and its parent
+$candidates += (Get-Location).Path
+$candidates += (Split-Path -Parent (Get-Location).Path)
+# The conventional checkout
+$candidates += (Join-Path $HOME "bucket")
+
+$repo = $null
+foreach ($c in $candidates) {
+    if (Test-PropIQRepo $c) { $repo = $c; break }
+}
+if ($null -eq $repo) {
+    Bad "could not find the PropIQ checkout"
+    Note "looked for scripts\ingest_bigdataball.py in:"
+    foreach ($c in ($candidates | Select-Object -Unique)) { Note "  $c" }
+    Note ""
+    Note "Pass it explicitly:  -Repo `"C:\path\to\bucket`""
     exit 1
 }
 Set-Location $repo
