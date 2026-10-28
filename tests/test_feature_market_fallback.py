@@ -272,3 +272,78 @@ def test_a_sidecar_that_did_record_it_is_believed():
         "feature_spec": {"feature_market": "PTS"},
     })
     assert spec.feature_market == "PTS"
+
+
+# --- the Wave 5a gate ----------------------------------------------------
+
+
+def test_no_market_s_spec_names_a_wave5a_column_nothing_builds():
+    """
+    A LIVE DEFECT FOR THREE CONFIGURED MARKETS, flagged in review on
+    2026-10-28 and not a hypothetical. The extras were templated for every
+    market, but `sports_ev_features.STREAK_STATS` is (PTS, REB, AST, FG3M) and
+    `hot_hand.HOT_STATS` adds STL and BLK — so a STL or BLK spec named
+    STL_STREAK_ABOVE, and a PRA spec named all three. PRA, STL and BLK are all
+    in `markets_post_launch`.
+
+    Which way it broke depended on the caller: `assert_compatible` refused the
+    spec outright, while a caller passing `available_columns` silently got a
+    narrower feature set than the spec claimed.
+
+    The two sets are NOT the same, which is why the gate has two halves.
+    """
+    from src.features.hot_hand import HOT_STATS
+    from src.features.sports_ev_features import STREAK_STATS
+
+    for market in sorted(MARKETS_WITH_OWN_FEATURES):
+        spec = build_prop_feature_spec(market)
+        has_streak = [c for c in spec.features if c.endswith(("_STREAK_ABOVE", "_STREAK_BELOW"))]
+        has_hot = [c for c in spec.features if c.endswith("_HOT_Z")]
+
+        if market in STREAK_STATS:
+            assert has_streak, f"{market} is a streak stat but its spec has no streak columns"
+        else:
+            assert not has_streak, (
+                f"{market}'s spec names {has_streak}, which attach_form_streaks "
+                f"does not build — STREAK_STATS is {STREAK_STATS}"
+            )
+
+        if market in HOT_STATS:
+            assert has_hot, f"{market} is a hot stat but its spec has no HOT_Z"
+        else:
+            assert not has_hot, (
+                f"{market}'s spec names {has_hot}, which hot_hand does not "
+                f"build — HOT_STATS is {HOT_STATS}"
+            )
+
+
+def test_the_gate_reads_the_layers_rather_than_restating_them(monkeypatch):
+    """
+    Behavioural, not a source grep: narrow a layer's own tuple and the spec
+    has to follow, or the gate holds a second copy of it.
+
+    STL, NOT PTS. My first version monkeypatched `STREAK_STATS` and checked
+    PTS, and it failed — because `labels.default_feature_cols` has a
+    per-market table that already lists PTS_HOT_Z / PTS_STREAK_ABOVE, and
+    that table is correct: it omits them for PRA, noting "hot_hand covers the
+    six single stats and _STREAK_STATS covers four, neither of them the
+    combo". So PTS's streak columns come from the BASE list and the gate has
+    no say in them.
+
+    STL is the market the gate actually decides: its base list carries no
+    Wave 5a column at all, and `HOT_STATS` includes STL, so STL_HOT_Z exists
+    only because the gate let it through.
+    """
+    import src.features.hot_hand as hh
+
+    before = build_prop_feature_spec("STL")
+    assert "STL_HOT_Z" in before.features, (
+        "this test is only meaningful while the gate is what supplies STL_HOT_Z"
+    )
+
+    monkeypatch.setattr(hh, "HOT_STATS", ("PTS",))
+    after = build_prop_feature_spec("STL")
+    assert "STL_HOT_Z" not in after.features, (
+        "STL kept HOT_Z after STL left HOT_STATS, so the gate is reading a "
+        "local copy of the layer's stat tuple"
+    )

@@ -224,15 +224,26 @@ def build_prop_feature_spec(
         # caller: with `available_columns` the three were silently filtered
         # out, without it `assert_compatible` refused the whole spec. Both
         # halves of the substitution now come from the same market.
-        extras.extend(
-            [
-                "USAGE_PROXY_L10",
-                f"{feature_market}_STREAK_ABOVE",
-                f"{feature_market}_STREAK_BELOW",
-                f"{feature_market}_HOT_Z",
-                "MINUTES_STABLE",
-            ]
-        )
+        #
+        # AND GATED ON WHAT ACTUALLY BUILDS THEM, which was a live defect for
+        # three CONFIGURED markets and not a hypothetical: `_STREAK_STATS` is
+        # (PTS, REB, AST, FG3M) and `_STAT_HOT` adds STL and BLK, so a STL or
+        # BLK spec named STL_STREAK_ABOVE / BLK_STREAK_ABOVE and a PRA spec
+        # named all three -- columns no layer produces. Whether that refused
+        # the spec or quietly narrowed it depended on whether the caller
+        # passed `available_columns`. The two sets are read from the layers
+        # that own them rather than restated here, and they are NOT the same
+        # set, which is why there are two gates.
+        from src.features.hot_hand import HOT_STATS
+        from src.features.sports_ev_features import STREAK_STATS
+
+        extras.append("USAGE_PROXY_L10")
+        if feature_market in STREAK_STATS:
+            extras.append(f"{feature_market}_STREAK_ABOVE")
+            extras.append(f"{feature_market}_STREAK_BELOW")
+        if feature_market in HOT_STATS:
+            extras.append(f"{feature_market}_HOT_Z")
+        extras.append("MINUTES_STABLE")
 
     ordered: list[str] = []
     for c in base + extras:

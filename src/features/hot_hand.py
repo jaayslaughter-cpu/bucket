@@ -20,6 +20,11 @@ DEFAULT_Z_THRESHOLD = 1.0
 DEFAULT_MINUTES_STABLE_RATIO = 0.15  # |MIN_L5/MIN_SEASON - 1| < this
 _STAT_HOT = ("PTS", "REB", "AST", "FG3M", "STL", "BLK")
 
+#: Public alias, for the reason given on `sports_ev_features.STREAK_STATS`.
+#: Note it is NOT the same set: HOT_Z is built for STL and BLK, the streak
+#: columns are not, so the two gates are separate.
+HOT_STATS: tuple[str, ...] = _STAT_HOT
+
 
 def _group_shift_roll_l3(
     df: pd.DataFrame,
