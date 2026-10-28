@@ -16,6 +16,12 @@ import pandas as pd
 from src.features.season import drop_season_key, player_season_keys
 
 _STREAK_STATS = ("PTS", "REB", "AST", "FG3M")
+
+#: Public alias. `models.feature_spec` gates the Wave 5a streak columns on
+#: this, because a spec that names `STL_STREAK_ABOVE` -- which this layer
+#: does not build -- is either refused outright by `assert_compatible` or
+#: silently dropped by `resolve_feature_cols`, depending on the caller.
+STREAK_STATS: tuple[str, ...] = _STREAK_STATS
 _OPP_ALLOWED_STATS = ("PTS", "REB", "AST", "FG3M", "STL", "BLK")
 
 

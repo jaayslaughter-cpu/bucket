@@ -67,6 +67,28 @@ function Good ([string] $m) { Write-Host "  OK   $m" -ForegroundColor Green }
 function Bad  ([string] $m) { Write-Host "  FAIL $m" -ForegroundColor Red }
 function Note ([string] $m) { Write-Host "       $m" -ForegroundColor DarkGray }
 
+function Invoke-Python {
+    <#
+      Run python with stdin script text and return its combined output as a
+      STRING, never as an error.
+
+      WHY THIS WRAPPER. With $ErrorActionPreference = "Stop", redirecting a
+      native command's stderr with `2>&1` is raised as a terminating error in
+      Windows PowerShell 5.1. The post-ingest row count is the single most
+      important step here, so an aborted script at that point would lose the
+      one number this exists to report.
+    #>
+    param([string] $Script)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = ($Script | & python - 2>&1 | Out-String)
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return $out.Trim()
+}
+
 Say ""
 Say "PropIQ workbook ingest - RESEARCH_ONLY"
 Say "======================================"
@@ -117,18 +139,22 @@ try {
 }
 Good "python $pyv"
 
+# Only the real run connects, so a dry run does not need the driver and must
+# not go to the network to fetch it.
 $hasPsycopg = $false
-try {
-    & python -c "import psycopg" 2>$null
-    if ($LASTEXITCODE -eq 0) { $hasPsycopg = $true }
-} catch { }
-if (-not $hasPsycopg) {
-    Note "psycopg is missing; installing it"
-    & python -m pip install --quiet "psycopg[binary]"
-    & python -c "import psycopg" 2>$null
-    if ($LASTEXITCODE -ne 0) { Bad "psycopg still will not import"; exit 1 }
+if (-not $DryRun) {
+    try {
+        & python -c "import psycopg" 2>$null
+        if ($LASTEXITCODE -eq 0) { $hasPsycopg = $true }
+    } catch { }
+    if (-not $hasPsycopg) {
+        Note "psycopg is missing; installing it"
+        & python -m pip install --quiet "psycopg[binary]"
+        & python -c "import psycopg" 2>$null
+        if ($LASTEXITCODE -ne 0) { Bad "psycopg still will not import"; exit 1 }
+    }
+    Good "psycopg importable"
 }
-Good "psycopg importable"
 
 # --- [3] the workbook ------------------------------------------------------
 if ($Xlsx -eq "") {
@@ -148,6 +174,31 @@ if (-not (Test-Path $Xlsx)) { Bad "no workbook at $Xlsx"; exit 1 }
 $size = [math]::Round((Get-Item $Xlsx).Length / 1MB, 2)
 Good "workbook: $Xlsx  ($size MB)"
 
+# --- [3b] a dry run stops here: it needs no database ----------------------
+# `scripts/ingest_bigdataball` states it ("A dry run needs no database and
+# would have got this far"), so asking for a connection string and probing
+# Railway made --dry-run unusable for the one case it is for: checking the
+# parse when the database is unreachable.
+if ($DryRun) {
+    Say ""
+    Say "DRY RUN - no database is needed, so none is asked for."
+    Say ""
+    $dryArgs = @("-m", "scripts.ingest_bigdataball", "--xlsx", $Xlsx, "--dry-run")
+    if ($Sheet -ne "") { $dryArgs += @("--sheet", $Sheet) }
+    & python @dryArgs
+    $dryExit = $LASTEXITCODE
+    Say ""
+    Say "======================================"
+    if ($dryExit -eq 0) {
+        Good "parsed cleanly - nothing was written"
+        Say "Re-run without -DryRun to persist."
+    } else {
+        Bad "the parse failed (exit $dryExit); the tail above says why"
+    }
+    exit $dryExit
+}
+
+
 # --- [4] the connection string --------------------------------------------
 # Asked for HERE, inside the script, so there is no sequence of pasted
 # commands for a multi-line paste to collapse.
@@ -161,7 +212,11 @@ $raw = (Read-Host "connection string").Trim()
 if ($raw -eq "") { Bad "nothing was entered"; exit 1 }
 if ($raw -notmatch '^postgres(ql)?://') {
     Bad "that does not look like a connection string (it must start postgresql://)"
-    Note "what was entered began: $($raw.Substring(0, [Math]::Min(12, $raw.Length)))..."
+    # DELIBERATELY ECHOES NOTHING. An earlier version printed the first twelve
+    # characters to help, which prints a password outright when the pasted
+    # value was the password alone -- breaking this script's one promise.
+    Note "nothing was echoed, in case what was pasted was a credential."
+    Note "Copy DATABASE_PUBLIC_URL from Railway -> Postgres -> Variables."
     exit 1
 }
 
@@ -191,7 +246,7 @@ except Exception as exc:
     print(f"ERR\t{type(exc).__name__}\t{exc}")
     sys.exit(1)
 '@
-$probeOut = ($probe | & python - 2>&1 | Out-String).Trim()
+$probeOut = Invoke-Python $probe
 if ($probeOut -notmatch '^OK') {
     Bad "could not connect"
     Note $probeOut
@@ -222,17 +277,16 @@ with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=20) as c:
 '@
 Say ""
 Say "[2/4] counting rows before ..."
-$before = ($countScript | & python - 2>&1 | Out-String).Trim()
+$before = Invoke-Python $countScript
 Note $before
 
 # --- [7] the ingest -------------------------------------------------------
+# A dry run has already exited above, so this is always the real thing.
 $ingestArgs = @("-m", "scripts.ingest_bigdataball", "--xlsx", $Xlsx)
-if ($DryRun)       { $ingestArgs += "--dry-run" }
 if ($Sheet -ne "") { $ingestArgs += @("--sheet", $Sheet) }
 
 Say ""
-if ($DryRun) { Say "[3/4] parsing (DRY RUN - nothing will be written) ..." }
-else         { Say "[3/4] ingesting ..." }
+Say "[3/4] ingesting ..."
 Say ""
 
 # Streamed so the whole tail is visible. The exit code is kept, but it is
@@ -246,24 +300,38 @@ else                   { Bad  "ingest exited $ingestExit" }
 # --- [8] VERIFY the write, which is the whole point ----------------------
 Say ""
 Say "[4/4] counting rows after ..."
-$after = ($countScript | & python - 2>&1 | Out-String).Trim()
+$after = Invoke-Python $countScript
 Note $after
 
 Say ""
 Say "======================================"
-if ($DryRun) {
-    Say "DRY RUN complete - nothing was written."
-    Say "Re-run without -DryRun to persist."
-    exit $ingestExit
+
+# THE DELTA DECIDES, not the exit code and not the absolute count.
+#
+# `-gt 0` was wrong twice over: it reported success on an already-populated
+# table, so a rerun that wrote nothing -- or failed outright -- still exited 0
+# as long as some earlier run had left rows behind. The exit code is no better:
+# on 2026-10-25 an ingest reported "2,644 rows / 1,322 games" and exited 0
+# while the table stayed empty. So both counts are parsed and compared.
+function Get-Count ([string] $text, [string] $table) {
+    if ($text -match "$table=(\d+)") { return [int]$matches[1] }
+    return -1
 }
 
-# The counts are what decides, not the exit code: on 2026-10-25 an ingest
-# reported thousands of rows and the table stayed empty.
-$teamAfter = -1
-if ($after -match 'team_game_stats=(\d+)') { $teamAfter = [int]$matches[1] }
+$teamBefore = Get-Count $before "team_game_stats"
+$teamAfter  = Get-Count $after  "team_game_stats"
 
-if ($teamAfter -gt 0) {
-    Good "team_game_stats now holds $teamAfter row(s) in database '$targetDb'"
+if ($teamBefore -lt 0 -or $teamAfter -lt 0) {
+    Bad "could not read a team_game_stats count, so the write is unverified"
+    Note "before: $before"
+    Note "after : $after"
+    exit 1
+}
+
+$delta = $teamAfter - $teamBefore
+
+if ($delta -gt 0) {
+    Good "team_game_stats went from $teamBefore to $teamAfter (+$delta) in '$targetDb'"
     Say ""
     Say "The 09:00 PT slate reads these tables. The next run should build a"
     Say "board instead of exiting 1 - though it will still abstain on every"
@@ -271,7 +339,24 @@ if ($teamAfter -gt 0) {
     exit 0
 }
 
-Bad "team_game_stats is still empty after the ingest"
+if ($delta -eq 0 -and $teamAfter -gt 0) {
+    # Not necessarily a failure: the upsert is idempotent, so re-ingesting the
+    # same workbook legitimately changes nothing. Said plainly either way,
+    # because "0 new rows" and "it worked" are different sentences.
+    Write-Host "  NOTE team_game_stats holds $teamAfter row(s) and did not change." -ForegroundColor Yellow
+    Say ""
+    Say "The upsert is idempotent, so re-ingesting the SAME workbook correctly"
+    Say "adds nothing. That is fine if these rows are the ones you wanted."
+    Say "If you expected new rows, the workbook holds games already ingested -"
+    Say "check the date range in the tail above."
+    if ($ingestExit -ne 0) {
+        Bad "but the ingest exited $ingestExit, so something did fail"
+        exit 1
+    }
+    exit 0
+}
+
+Bad "team_game_stats is still empty after the ingest (before=$teamBefore after=$teamAfter)"
 Say ""
 Say "This is the exact failure that wasted 2026-10-23 to 2026-10-28: an ingest"
 Say "that reports success while the table stays empty. The tail above is the"

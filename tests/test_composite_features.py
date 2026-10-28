@@ -27,11 +27,11 @@ from src.models.composite_features import (
     COMPOSITE_SUFFIXES,
     attach_composite_rollups,
     composite_columns,
-    composite_spec,
 )
 from src.quant.composite_markets import (
     SUM_COMPOSITES,
     CompositeMarketError,
+    composite,
     fantasy_weights,
 )
 
@@ -129,29 +129,37 @@ def test_fpts_without_a_platform_refuses_rather_than_guessing(rolled, caplog):
         out, report = attach_composite_rollups(rolled, ["FPTS"])
 
     assert "FPTS" in report.skipped
-    assert "DATA_NOT_AVAILABLE" in report.skipped["FPTS"]
+    assert "needs a platform" in report.skipped["FPTS"]
     assert not [c for c in out.columns if c.startswith("FPTS_")], (
         "FPTS columns were written without an operator's weights"
     )
 
 
-def test_the_refusal_comes_from_the_one_reader_of_the_weights(rolled):
+def test_the_refusal_comes_from_the_one_dispatch(rolled):
     """
-    The reason must be `fantasy_weights`' own, which names the config file and
-    every configured operator. A hand-written guard here produced a thinner
-    message AND re-read the YAML to list the platforms — a second reader of
-    the fact that file owns. Mutation testing showed the guard was not
-    load-bearing, so it was deleted; this pins what replaced it.
+    ONE ERROR PATH, which is why `composite_spec` was deleted. This module
+    first had its own FPTS branch plus a helper that re-read
+    `fantasy_scoring.yaml` to list the operators — a second dispatch AND a
+    second reader of the fact that file owns, in the module whose docstring
+    claims to avoid exactly that. Review caught it on 2026-10-28.
+
+    So the refusal is now `composite()`'s own, and this pins that it reaches
+    the caller intact rather than being reworded on the way out.
     """
     _, report = attach_composite_rollups(rolled, ["FPTS"])
     why = report.skipped["FPTS"]
-    assert "DATA_NOT_AVAILABLE" in why
-    assert "fantasy_scoring.yaml" in why, (
-        f"the refusal does not say where the weights would come from: {why}"
+
+    # The expected text is taken FROM `composite()` rather than written out
+    # here, so this test cannot drift from the one dispatch it is pinning.
+    with pytest.raises(CompositeMarketError) as raised:
+        composite("FPTS")
+    expected = str(raised.value)
+
+    assert why == expected, (
+        f"the reason was reworded on the way out; composite() says {expected!r} "
+        f"and the report says {why!r}"
     )
-    assert "prizepicks" in why and "underdog" in why, (
-        f"the refusal leaves the operator guessing which platforms exist: {why}"
-    )
+    assert "fantasy_scoring.yaml" in why
 
 
 def test_fpts_differs_from_a_plain_sum(rolled):
@@ -197,21 +205,46 @@ def test_fpts_is_skipped_when_tov_rollups_are_absent(rolled):
 
     assert not [c for c in out.columns if c.startswith("FPTS_")]
     assert "FPTS" in report.skipped
-    assert "TOV" in report.skipped["FPTS"]
+    # THE ABSENT COLUMN BY NAME. Asserting "TOV" alone passed whichever
+    # component was missing, because the old reason recited the whole formula
+    # and every component appears in it. Review caught that on 2026-10-28.
+    why = report.skipped["FPTS"]
+    assert "TOV_L5" in why, why
+    assert "PTS_L5" not in why, (
+        f"the reason names a component that was present, so it still cannot "
+        f"distinguish which one was missing: {why}"
+    )
 
 
-def test_tov_is_now_rolled_so_fpts_is_buildable_at_all():
-    """The prerequisite, asserted against the builder rather than assumed."""
+def test_fpts_needs_a_tov_layer_the_builder_deliberately_does_not_provide():
+    """
+    WHY FPTS IS NOT PROJECTABLE YET, recorded rather than left as a surprise.
+
+    TOV was added to `ROLLING_STATS` on 2026-10-28 and reverted the same day.
+    `fouls.py` had already written down why: a stat in that tuple gets
+    `_BASELINE`, `_L2`, `_L2_PACE` and a member of every downstream form,
+    halflife and minutes-weighted layer — "applying a fatigue haircut and a
+    pace multiplier to a foul count as though a foul were production to be
+    projected". A turnover is not production either, and the haircut has the
+    WRONG SIGN for it: fatigue raises turnovers while the layer-2 multiplier
+    shrinks TOV_L2 on a back-to-back.
+
+    So FPTS waits for a self-contained TOV layer, the way PF got one. Until
+    then the refusal above is the behaviour, and this test says why rather
+    than letting someone re-add the two characters.
+    """
     from src.features.builder import ROLLING_STATS
 
-    assert "TOV" in ROLLING_STATS, (
-        "TOV left ROLLING_STATS, so FPTS can no longer be projected — its "
-        "weights carry a negative TOV term"
+    assert "TOV" not in ROLLING_STATS, (
+        "TOV is back in ROLLING_STATS. If that is deliberate, the fatigue "
+        "haircut and the pace multiplier now apply to a turnover count — see "
+        "fouls.py on why PF is not in there either."
     )
-    for component in fantasy_weights("underdog"):
-        assert component in ROLLING_STATS, (
-            f"FPTS needs {component} rollups and the builder does not produce them"
-        )
+    needed = sorted(fantasy_weights("underdog"))
+    unrollable = [c for c in needed if c not in ROLLING_STATS]
+    assert unrollable == ["TOV"], (
+        f"FPTS's unrollable components changed to {unrollable}"
+    )
 
 
 # --- not becoming a second writer ---------------------------------------
@@ -228,6 +261,11 @@ def test_pra_already_present_is_left_to_the_builder(rolled):
     out, report = attach_composite_rollups(frame, ["PRA"])
     assert out["PRA_L5"].iloc[0] == -999.0, "PRA_L5 was overwritten by default"
     assert "PRA_L5" not in report.attached.get("PRA", [])
+    # And it is RECORDED, not merely skipped in silence: a caller that asked
+    # for PRA and got no new columns can see that someone else owns it.
+    assert "PRA_L5" in report.preexisting.get("PRA", []), (
+        "a column left to its owner left no trace in the report"
+    )
 
 
 def test_overwrite_is_opt_in_and_then_recomputes(rolled):
@@ -249,7 +287,7 @@ def test_the_input_frame_is_not_mutated(rolled):
 
 def test_an_unknown_market_raises_rather_than_returning_something_plausible():
     with pytest.raises(CompositeMarketError, match="not a composite"):
-        composite_spec("POINTS_PLUS_VIBES")
+        composite("POINTS_PLUS_VIBES")
 
 
 def test_composite_columns_predicts_what_attach_produces(rolled):
@@ -260,7 +298,7 @@ def test_composite_columns_predicts_what_attach_produces(rolled):
 
 
 def test_a_sum_composite_weights_every_component_at_one():
-    spec = composite_spec("PA")
+    spec = composite("PA")
     assert set(spec.weights) == set(SUM_COMPOSITES["PA"])
     assert all(w == 1.0 for w in spec.weights.values())
 

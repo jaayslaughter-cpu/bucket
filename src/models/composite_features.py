@@ -58,11 +58,9 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 from src.quant.composite_markets import (
-    FPTS,
     SUM_COMPOSITES,
-    Composite,
     CompositeMarketError,
-    fantasy_weights,
+    composite,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +75,13 @@ COMPOSITE_SUFFIXES: tuple[str, ...] = ("L2", "L5", "L10", "SEASON", "BASELINE")
 #: FPTS is weighted and needs an operator.
 SUM_MARKETS: tuple[str, ...] = tuple(SUM_COMPOSITES)
 
+# NO DISPATCH OF ITS OWN. A `composite_spec()` here duplicated
+# `composite_markets.composite()` -- same table, same FPTS branch, a second
+# error path -- which is the defect this module's docstring claims to avoid,
+# committed in the module that claims it. Flagged in review on 2026-10-28 and
+# deleted: every caller below asks `composite()` directly, so there is one
+# dispatch and one refusal.
+
 
 @dataclass
 class CompositeReport:
@@ -84,46 +89,28 @@ class CompositeReport:
 
     attached: dict[str, list[str]] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
+    #: Attached at some suffixes and blocked at others. Its own bucket
+    #: because it used to appear in neither: a market was recorded as skipped
+    #: ONLY when every suffix was blocked, so a missing PA_L2 beside a present
+    #: PA_L5 left nothing in the report to explain it.
+    partial: dict[str, str] = field(default_factory=dict)
+    #: Columns another writer already owns -- `builder`'s PRA. Recorded so a
+    #: caller that asked for PRA and got no new columns can see why.
+    preexisting: dict[str, list[str]] = field(default_factory=dict)
 
     def lines(self) -> list[str]:
         out = []
         for market, cols in sorted(self.attached.items()):
             out.append(f"{market}: {len(cols)} column(s) — {', '.join(cols)}")
+        for market, why in sorted(self.partial.items()):
+            out.append(f"{market}: PARTIAL — {why}")
+        for market, cols in sorted(self.preexisting.items()):
+            out.append(
+                f"{market}: already present, left to its owner — {', '.join(cols)}"
+            )
         for market, why in sorted(self.skipped.items()):
             out.append(f"{market}: SKIPPED — {why}")
         return out
-
-
-def composite_spec(market: str, *, platform: str | None = None) -> Composite:
-    """
-    The weighted decomposition of one composite market.
-
-    Delegates to `composite_markets` rather than deciding anything: an
-    unweighted sum gets weight 1.0 per component, and FPTS gets the
-    operator's. An unknown market raises rather than returning something
-    plausible.
-    """
-    key = market.upper()
-    if key in SUM_COMPOSITES:
-        return Composite(key, {c: 1.0 for c in SUM_COMPOSITES[key]})
-    if key == FPTS:
-        # NO GUARD OF ITS OWN HERE, DELIBERATELY. A hand-written "platform is
-        # required" check was removed on 2026-10-28 after mutation testing
-        # showed it was not load-bearing: `fantasy_weights` already refuses an
-        # absent or unknown operator with
-        #
-        #   DATA_NOT_AVAILABLE: config/fantasy_scoring.yaml has no fpts
-        #   weights for 'None'. Known: ['prizepicks', 'underdog']
-        #
-        # which says more than the guard did. The guard also came with a
-        # helper that re-read `fantasy_scoring.yaml` to list the platforms --
-        # a second reader of the one fact that file owns, which is the defect
-        # this repository keeps removing. One reader, and it is that function.
-        return Composite(FPTS, fantasy_weights(str(platform or "")))
-    raise CompositeMarketError(
-        f"{market!r} is not a composite this project defines. Sums: "
-        f"{', '.join(SUM_MARKETS)}; weighted: {FPTS}."
-    )
 
 
 def composite_columns(
@@ -133,28 +120,30 @@ def composite_columns(
     suffixes: Sequence[str] = COMPOSITE_SUFFIXES,
 ) -> list[str]:
     """The column names `attach_composite_rollups` would produce."""
-    composite_spec(market, platform=platform)  # raises on an unknown market
+    composite(market, platform=platform)  # raises on an unknown market
     return [f"{market.upper()}_{s}" for s in suffixes]
 
 
 def _weighted_sum(
     frame: pd.DataFrame, weights: Mapping[str, float], suffix: str
-) -> pd.Series | None:
+) -> tuple[pd.Series | None, list[str]]:
     """
-    One suffix's weighted sum, or None when a component column is absent.
+    One suffix's weighted sum, plus the component columns that were absent.
 
-    Returning None rather than a partial sum is the whole contract: see the
-    module docstring on FPTS's negative TOV term.
+    Returns ``(None, missing)`` rather than a partial sum -- the whole
+    contract; see the module docstring on FPTS's negative TOV term. The
+    missing NAMES come back so a caller's reason can say which column was
+    gone instead of reciting the formula.
     """
     cols = {name: f"{name}_{suffix}" for name in weights}
-    missing = [c for c in cols.values() if c not in frame.columns]
+    missing = sorted(c for c in cols.values() if c not in frame.columns)
     if missing:
-        return None
+        return None, missing
     total: pd.Series | None = None
     for name, col in cols.items():
         term = pd.to_numeric(frame[col], errors="coerce") * float(weights[name])
         total = term if total is None else total + term
-    return total
+    return total, []
 
 
 def attach_composite_rollups(
@@ -189,43 +178,51 @@ def attach_composite_rollups(
     for raw in wanted:
         market = str(raw).upper()
         try:
-            spec = composite_spec(market, platform=platform)
+            spec = composite(market, platform=platform)
         except CompositeMarketError as exc:
             report.skipped[market] = str(exc)
             logger.warning("Composite %s skipped: %s", market, exc)
             continue
 
         attached: list[str] = []
-        blocked: list[str] = []
+        # suffix -> the component columns that were absent for it. Named
+        # rather than counted: a reason that recites the whole formula
+        # mentions every component whichever one is missing, so a test
+        # asserting "TOV appears in the reason" passed when TOV was present
+        # and something else was gone. Found in review on 2026-10-28.
+        blocked: dict[str, list[str]] = {}
+        owned: list[str] = []
         for suffix in suffixes:
             column = f"{market}_{suffix}"
             if column in out.columns and not overwrite:
-                # Already owned by someone else; do not become a second writer.
+                owned.append(column)
                 continue
-            series = _weighted_sum(out, spec.weights, suffix)
+            series, missing = _weighted_sum(out, spec.weights, suffix)
             if series is None:
-                blocked.append(suffix)
+                blocked[suffix] = missing
                 continue
             out[column] = series
             attached.append(column)
 
         if attached:
             report.attached[market] = attached
-        if blocked and not attached:
-            need = sorted(spec.weights)
-            report.skipped[market] = (
-                f"no component rollups present for {', '.join(blocked)}; "
-                f"{market} = {' + '.join(f'{spec.weights[c]:g}*{c}' for c in need)} "
-                f"and a partial sum would be a different quantity, not a "
-                f"noisier one"
+        if owned:
+            # Not a failure, but not silent either: a caller that asked for
+            # PRA and got nothing back should be able to see that the builder
+            # already owns it.
+            report.preexisting[market] = owned
+        if blocked:
+            absent = sorted({c for cols in blocked.values() for c in cols})
+            note = (
+                f"missing component rollup(s) {', '.join(absent)} at suffix(es) "
+                f"{', '.join(sorted(blocked))}; a partial sum would be a "
+                f"different quantity, not a noisier one"
             )
-            logger.warning("Composite %s skipped: %s", market, report.skipped[market])
-        elif blocked:
-            logger.info(
-                "Composite %s attached at %s but not at %s — a component "
-                "rollup is missing there.",
-                market, ", ".join(c.split("_", 1)[1] for c in attached),
-                ", ".join(blocked),
-            )
+            if attached:
+                report.partial[market] = note
+                logger.info("Composite %s attached in part: %s", market, note)
+            else:
+                report.skipped[market] = note
+                logger.warning("Composite %s skipped: %s", market, note)
 
     return out, report

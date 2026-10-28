@@ -33,12 +33,19 @@ from src.features.team_strength import attach_elo_features, compute_team_elo
 logger = logging.getLogger(__name__)
 
 # Counting stats that get the full rolling treatment.
-#: TOV joined this tuple on 2026-10-28 so FPTS could be projected at all:
-#: its weights carry a NEGATIVE TOV term, so without TOV rollups the only
-#: honest options were to skip FPTS or to overstate every projection of it.
-#: `player_game_logs.tov` has always carried the value and
-#: `boxscores.COLUMN_MAP` has always asked for it.
-ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN", "TOV")
+#: TOV IS DELIBERATELY ABSENT, and was briefly added on 2026-10-28 before
+#: being reverted the same day. FPTS needs TOV rollups, so adding it here
+#: looked like two characters of work -- which is exactly what `fouls.py` says
+#: about PF: a stat in this tuple gets TOV_BASELINE, TOV_L2, TOV_L2_PACE and a
+#: member of every downstream form, halflife and minutes-weighted layer,
+#: "applying a fatigue haircut and a pace multiplier to a foul count as though
+#: a foul were production to be projected". A turnover is not production
+#: either, and the haircut has the WRONG SIGN for it: fatigue raises
+#: turnovers, while the layer-2 multiplier shrinks TOV_L2 on a back-to-back.
+#: FPTS therefore needs a self-contained TOV layer, the way `fouls.py` built
+#: one for PF -- narrower and reversible. Until then
+#: `models.composite_features` skips FPTS and says why.
+ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN")
 
 #: The three stats PRA is the sum of.
 PRA_COMPONENTS: tuple[str, ...] = ("PTS", "REB", "AST")
