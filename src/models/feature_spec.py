@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 #: fails if either moves. MIN was missing from this set while being in
 #: ROLLING_STATS, found by building a panel for each stat and looking.
 MARKETS_WITH_OWN_FEATURES: frozenset[str] = frozenset(
-    {"PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN"}
+    {"PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN", "TOV"}
 )
 
 #: The template substituted when a market has none of its own. Named rather

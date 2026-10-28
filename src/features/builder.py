@@ -33,7 +33,12 @@ from src.features.team_strength import attach_elo_features, compute_team_elo
 logger = logging.getLogger(__name__)
 
 # Counting stats that get the full rolling treatment.
-ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN")
+#: TOV joined this tuple on 2026-10-28 so FPTS could be projected at all:
+#: its weights carry a NEGATIVE TOV term, so without TOV rollups the only
+#: honest options were to skip FPTS or to overstate every projection of it.
+#: `player_game_logs.tov` has always carried the value and
+#: `boxscores.COLUMN_MAP` has always asked for it.
+ROLLING_STATS = ("PTS", "REB", "AST", "PRA", "FG3M", "STL", "BLK", "MIN", "TOV")
 
 #: The three stats PRA is the sum of.
 PRA_COMPONENTS: tuple[str, ...] = ("PTS", "REB", "AST")

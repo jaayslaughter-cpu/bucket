@@ -54,7 +54,7 @@ def test_a_market_with_its_own_columns_records_itself(market, caplog):
     assert "rollup columns" not in caplog.text
 
 
-@pytest.mark.parametrize("market", ["PA", "PR", "RA", "FPTS", "FG3A", "TOV"])
+@pytest.mark.parametrize("market", ["PA", "PR", "RA", "FPTS", "FG3A"])
 def test_a_market_without_its_own_columns_says_so_loudly(market, caplog):
     """
     THE DEFECT. Each of these silently became a PTS spec. FG3A, TOV and MIN
