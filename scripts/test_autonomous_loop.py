@@ -771,7 +771,7 @@ def main() -> int:
 
     print("\nVERDICT: all stages passed — the production loop composes end-to-end")
     print("under mocked boundaries. This is NOT live-readiness proof; run")
-    print("`python main.py railway_healthcheck` and `python main.py verify_wiring`")
+    print("`python -m scripts.railway_healthcheck` and `python -m scripts.verify_wiring`")
     print("against the deployed environment for that.")
     return 0
 
