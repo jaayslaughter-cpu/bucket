@@ -195,8 +195,14 @@ def main(argv: list[str] | None = None) -> int:
                            type(exc).__name__, exc)
             before = None
 
+        # "ATTEMPTED", because that is what the number is: `upsert_*` returns
+        # `len(rows)`. Printed as "Upserted 2,644 rows" it is the exact
+        # sentence an operator reported back as confirmation on 2026-10-25
+        # while the table held nothing. Only the read-back below claims
+        # persistence. Flagged in review, 2026-10-29.
         written = upsert_player_game_logs(panel)
-        print(f"Upserted {written} player game-log rows.")
+        print(f"Attempted {written} player game-log row(s) (handed to the "
+              f"statement; verified below).")
 
         if team_frame is not None:
             from src.db.repository import upsert_team_game_stats
@@ -205,7 +211,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("No team-game rows to write — see the lines above for why.")
             else:
                 team_written = upsert_team_game_stats(team_frame)
-                print(f"Upserted {team_written} team-game stat rows.")
+                print(f"Attempted {team_written} team-game stat row(s) "
+                      f"(handed to the statement; verified below).")
 
         # READ IT BACK ON A FRESH CONNECTION. `upsert_*`'s return value is not
         # evidence of anything; only a reader that any other reader could be

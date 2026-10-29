@@ -186,6 +186,19 @@ def build_team_defense(team_games: pd.DataFrame) -> pd.DataFrame:
                     f", estimated FGA-OREB+TOV+0.44*FTA for {filled} row(s) "
                     f"that carry none"
                 )
+            # A row with neither a stored `poss` nor all four estimate inputs
+            # is still NULL after the coalesce. The single-source branch warns
+            # about the same condition, so this one does too: a silent NaN
+            # POSS is a silent NaN DEF_RATING_L10. Flagged in review,
+            # 2026-10-29.
+            residual = int(tg["POSS"].isna().sum())
+            if residual:
+                logger.warning(
+                    "Defence layer: %d row(s) have no possessions and "
+                    "incomplete FGA/OREB/TOV/FTA, so neither the stored value "
+                    "nor the estimate is available; their per-100 rates will "
+                    "be NULL.", residual,
+                )
     elif estimate is not None:
         tg["POSS"] = estimate
         poss_source = "estimated FGA-OREB+TOV+0.44*FTA"

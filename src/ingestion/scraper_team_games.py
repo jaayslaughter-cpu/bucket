@@ -335,8 +335,16 @@ def aggregate_team_games(
         .rename(columns=STAT_SUMS)
         .reset_index()
     )
+    # PLAYED ROWS ONLY. A DNP contributes nothing to the sums, so counting one
+    # toward the roster minimum lets seven played players plus one inactive
+    # pass as eight and write a team total short by three players' lines --
+    # which is exactly the partial ingest `min_players` exists to catch, let
+    # through by the guard meant to catch it. The loader hands over the raw
+    # parquet (DNPs included) because the sums want them, so this cannot be
+    # left to the caller. Found in review, 2026-10-29.
     counts = (
-        work.groupby(["_game", "team_abbr"], sort=False)
+        work.loc[played_mask]
+        .groupby(["_game", "team_abbr"], sort=False)
         .size()
         .rename("_players")
         .reset_index()
@@ -350,17 +358,21 @@ def aggregate_team_games(
         )
         .reset_index()
     )
+    # LEFT, not inner: a team-game whose every row is a DNP has no played
+    # count at all, and an inner join would make it vanish silently instead of
+    # being reported as the short roster it is.
     out = (
-        sums.merge(counts, on=["_game", "team_abbr"])
+        sums.merge(counts, on=["_game", "team_abbr"], how="left")
         .merge(context, on=["_game", "team_abbr"])
         .merge(gap_counts, on=["_game", "team_abbr"], how="left")
     )
+    out["_players"] = out["_players"].fillna(0).astype(int)
     out["_stat_gaps"] = out["_stat_gaps"].fillna(0).astype(int)
 
     # [5] A short roster is a partial ingest, not a low-scoring team.
     short = out["_players"] < int(min_players)
     report.skipped_short_roster = [
-        f"{g}/{t} ({n} players)"
+        f"{g}/{t} ({n} played)"
         for g, t, n in zip(
             out.loc[short, "_game"], out.loc[short, "team_abbr"],
             out.loc[short, "_players"],

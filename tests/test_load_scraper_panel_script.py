@@ -177,6 +177,13 @@ def test_the_team_game_write_is_read_back(parquet, monkeypatch, capsys):
     assert "read" in out and "fresh connection" in out
     assert "team_game_stats      2 row(s)  (+2 this run)" in out
     assert "2 of this run's 2 team-game key(s) present" in out
+    # THE WORD MATTERS. `upsert_*` returns rows handed to the statement, so
+    # "Upserted 2,644 rows" is the sentence an operator reported back as
+    # confirmation while the table held nothing. Only the read-back claims
+    # persistence; the write claims an attempt.
+    assert "Upserted" not in out
+    assert "Attempted 20 player game-log row(s)" in out
+    assert "Attempted 2 team-game stat row(s)" in out
 
 
 def test_an_empty_table_after_writing_team_games_is_a_failure(

@@ -24,24 +24,27 @@ from datetime import date
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 import src.db.repository as repository
 from src.db.models import Base, GameMarketLine, PlayerGameLog, TeamGameStat
 
 
-@compiles(JSONB, "sqlite")
-def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
-    """SQLite's DDL compiler cannot render JSONB. SQLITE dialect only, and
-    this project has no SQLite path in production ("There is no SQLite
-    fallback by design" -- src/db/session.py), so nothing real can take it."""
-    return "JSON"
-
-
 def _bind(monkeypatch, team_keys=(), market_keys=()):
     """`repository.session_scope` bound to a database holding these keys."""
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    # SQLite's DDL compiler cannot render JSONB. Registered HERE rather than
+    # at module scope, following `tests/test_artifact_freshness.py`: at module
+    # scope, importing this file teaches SQLAlchemy to compile a Postgres type
+    # for SQLite in every other test in the session, and a test that changes
+    # global behaviour by being imported is how a suite starts passing for the
+    # wrong reason. Flagged in review, 2026-10-29.
+    @compiles(JSONB, "sqlite")
+    def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
+        return "JSON"
+
     engine = create_engine("sqlite://")
     Base.metadata.create_all(
         bind=engine,

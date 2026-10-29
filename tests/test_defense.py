@@ -163,6 +163,34 @@ def test_one_writer_s_missing_possessions_are_estimated_not_nulled():
     )
 
 
+def test_a_row_neither_source_can_fill_is_named_in_the_log(caplog):
+    """
+    THE RESIDUAL. Coalescing per row leaves a row with no `poss` AND an
+    incomplete FGA/OREB/TOV/FTA still NULL, and a NULL POSS is a NULL
+    DEF_RATING_L10 for that team-game. The single-source branch warns about
+    the same condition, so this one must too -- an abstention nobody can see
+    is only half an abstention.
+    """
+    import logging
+
+    tg = _team_games()
+    tg["oreb"] = 10.0
+    tg["fta"] = 22.0
+    tg.loc[tg["team_abbr"] == "DDD", "poss"] = np.nan
+    # ... and one of those rows cannot be estimated either.
+    hole = tg.index[tg["team_abbr"] == "DDD"][0]
+    tg.loc[hole, "fga"] = np.nan
+
+    with caplog.at_level(logging.WARNING, logger="src.features.defense"):
+        build_team_defense(tg)
+
+    warnings = [r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING]
+    assert any("1 row(s)" in m and "incomplete" in m for m in warnings), (
+        f"the unfillable row was not reported: {warnings}"
+    )
+
+
 def test_empty_or_incomplete_team_games_is_refused():
     with pytest.raises(DefenseFeatureError, match="empty"):
         build_team_defense(pd.DataFrame())

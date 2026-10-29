@@ -187,7 +187,7 @@ def test_a_short_roster_is_skipped_and_named_without_losing_the_good_games():
     assert len(out) == 2
     assert report.skipped_short_roster
     assert "LAL" in report.skipped_short_roster[0]
-    assert "4 players" in report.skipped_short_roster[0]
+    assert "4 played" in report.skipped_short_roster[0]
     assert "0022600123" in report.skipped_one_sided_games
 
 
@@ -516,3 +516,56 @@ def test_a_dnp_that_arrived_as_the_text_false_is_not_counted_as_played():
     )
     # And the totals are still the ten who played.
     assert out.loc[out["team_abbr"] == "LAL", "points"].iloc[0] == 100.0
+
+
+def test_a_dnp_does_not_count_toward_the_roster_minimum():
+    """
+    THE GUARD LET THROUGH EXACTLY WHAT IT EXISTS TO CATCH. Seven played
+    players plus one inactive is eight ROWS and seven box scores, so the
+    roster count passed at `MIN_PLAYERS_PER_TEAM_GAME` while the total was
+    short by three players' lines. The loader hands over the raw parquet
+    because the sums want the DNP rows, so the count has to exclude them here.
+    Found in review, 2026-10-29.
+    """
+    rows = []
+    # Game 1: LAL dresses seven who played and one who did not.
+    for i in range(7):
+        rows.append(_player("LAL", "GSW", "home", i, game_id="0022600001"))
+    rows.append(_player("LAL", "GSW", "home", 7, game_id="0022600001",
+                        played=False,
+                        **{col: None for col in STAT_SUMS}))
+    for i in range(10):
+        rows.append(_player("GSW", "LAL", "away", i, game_id="0022600001"))
+    # Game 2: both rosters full, so the frame is not empty either way.
+    for team, opponent, side in (("BOS", "NYK", "home"), ("NYK", "BOS", "away")):
+        for i in range(10):
+            rows.append(_player(team, opponent, side, i, game_id="0022600002"))
+
+    out, report = aggregate_team_games(pd.DataFrame(rows))
+
+    assert "0022600001/LAL (7 played)" in report.skipped_short_roster, (
+        f"eight rows passed as eight players: {report.skipped_short_roster}"
+    )
+    assert set(out["_game"] if "_game" in out.columns else out["nba_game_id"]) \
+        == {"0022600002"}, "the short-rostered game was written anyway"
+
+
+def test_a_team_game_of_nothing_but_dnps_is_reported_not_dropped_silently():
+    """
+    Zero played rows means no played count at all. A left join keeps the
+    team-game so it is named as a short roster; an inner one would make it
+    vanish, and a team-game that disappears without a line in the report is
+    the kind of absence nobody can explain afterwards.
+    """
+    rows = [
+        _player("LAL", "GSW", "home", i, played=False,
+                **{col: None for col in STAT_SUMS})
+        for i in range(10)
+    ] + [_player("GSW", "LAL", "away", i) for i in range(10)]
+
+    with pytest.raises(TeamAggregateError) as exc:
+        aggregate_team_games(pd.DataFrame(rows))
+    # Nothing survives, which this module refuses rather than returning an
+    # empty frame -- and the refusal carries the report, so the reason is in
+    # the message an operator sees.
+    assert "0022600123/LAL (0 played)" in str(exc.value)
