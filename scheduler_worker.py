@@ -1536,6 +1536,18 @@ def run_dispatch() -> dict[str, Any]:
                 type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
                 for r in frame.to_dict("records")
             ]
+            # THE SIZE IS COMPUTED HERE, by the caller, and carried onto the
+            # row. `src/notify/` may not import the sizer -- see
+            # `tests/test_advisory_sizing.py::test_no_module_under_src_imports
+            # _this_one`, which exists so sizing cannot reach a dispatch or
+            # execution path. scheduler_worker is outside src/, holds the size
+            # it computed, and hands it over, which is the same shape
+            # `build_dfs_entry_embed` already takes its `advisory_size` in.
+            #
+            # None, never 0.0: `recommended_units_binary` returns 0.0 both for
+            # "no edge" and for inputs it refuses, and a board row printing
+            # "0u" reads as a stake recommendation rather than as its absence.
+            _attach_advisory_units(rows)
             slate = str(frame["slate_date"].iloc[0]) if "slate_date" in frame else None
             embeds = [build_decision_board_embed(
                 rows, slate_date=slate, publication=verdict,
@@ -1557,6 +1569,41 @@ def run_dispatch() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Dispatch raised; the scheduler stays up.")
         return {"status": "FAILED", "error": str(exc)}
+
+
+def _attach_advisory_units(rows: list[Any]) -> None:
+    """
+    Set ``advisory_units`` on each board row, or leave it None.
+
+    RESEARCH_ONLY. `advisory_sizing` stamps ``AUTO_PLACED: False`` on every
+    size it returns and nothing in this project places one; this only puts the
+    number where a reader of the card can see it, beside the EV it belongs to.
+
+    Failures are swallowed deliberately: a card that cannot be sent because a
+    size could not be computed is strictly worse than a card without the size.
+    """
+    try:
+        from src.quant.advisory_sizing import recommended_units_binary
+    except Exception:  # noqa: BLE001 — the card matters more than the size
+        logger.warning("Advisory sizing unavailable; board rows carry no size.")
+        return
+    for row in rows:
+        row.advisory_units = None
+        prob, odds = getattr(row, "model_prob", None), getattr(row, "american_odds", None)
+        if prob is None or odds is None:
+            continue
+        try:
+            american = int(odds)
+            decimal = 1.0 + (
+                american / 100.0 if american > 0 else 100.0 / abs(american)
+            )
+            units = float(
+                recommended_units_binary(float(prob), decimal).recommended_units
+            )
+        except Exception:  # noqa: BLE001 — one unsizable row is not a failed card
+            continue
+        if units > 0:
+            row.advisory_units = units
 
 
 def prelock_lead_minutes() -> int:
