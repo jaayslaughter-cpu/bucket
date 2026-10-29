@@ -107,6 +107,35 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
+def ingested_row_counts() -> dict[str, int]:
+    """
+    How many rows the three ingest-filled tables actually hold, right now.
+
+    WHY A READ-BACK EXISTS AT ALL. Every upsert here returns ``len(rows)`` --
+    rows HANDED TO the statement, not rows the database kept -- so a commit
+    that rolled back still returns the full count. Between 2026-10-23 and
+    2026-10-28 an operator was told "Written to Postgres. 2,644 rows / 1,322
+    games" by `scripts/ingest_bigdataball`, which printed the PARSE counts,
+    and three consecutive slates then logged `team_game_stats -> 0 rows`.
+    Nothing in that path had ever asked the database what it held.
+
+    A SEPARATE CONNECTION IS THE POINT. `session_scope` opens a new one, so
+    this reads what any other reader -- the 09:00 PT slate included -- would
+    see, not what one uncommitted transaction can see.
+    """
+    out: dict[str, int] = {}
+    with session_scope() as session:
+        for name, model in (
+            ("team_game_stats", TeamGameStat),
+            ("game_market_lines", GameMarketLine),
+            ("player_game_logs", PlayerGameLog),
+        ):
+            out[name] = int(
+                session.execute(select(func.count()).select_from(model)).scalar_one()
+            )
+    return out
+
+
 def upsert_team_game_stats(df: pd.DataFrame) -> int:
     if df.empty:
         return 0

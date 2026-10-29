@@ -237,10 +237,43 @@ def main(argv: list[str] | None = None) -> int:
               "refuse. Check the worksheet name and the export's contents.")
         return 1
 
-    print("Written to Postgres. The database survives a redeploy, so no later")
-    print("container needs this file. Re-run when you want fresher team stats:")
-    print("the rows are whatever was last ingested, and `market_frames_"
-          "freshness` logs MARKET DATA IS STALE past PROPIQ_MAX_MARKET_LAG_DAYS.")
+    # READ THE ROWS BACK BEFORE CLAIMING ANYTHING. This used to print "Written
+    # to Postgres." unconditionally, under the PARSE counts above, and that
+    # sentence cost 2026-10-23 to 2026-10-28: an operator reported it verbatim
+    # and the next three slates each logged `team_game_stats -> 0 rows`. Both
+    # were true. The upserts return `len(rows)` -- rows handed to the
+    # statement, not rows kept -- so even they would not have caught it. Only
+    # a read on a fresh connection, which is what any other reader gets, can.
+    try:
+        from src.db.repository import ingested_row_counts
+
+        counts = ingested_row_counts()
+    except Exception as exc:  # noqa: BLE001 — the operator's console, not a traceback
+        print(f"WROTE, BUT COULD NOT VERIFY: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        for line in advice_for(exc):
+            print(line, file=sys.stderr)
+        return 1
+
+    print("Verified by reading the tables back on a fresh connection:")
+    for name in ("team_game_stats", "game_market_lines", "player_game_logs"):
+        print(f"  {name:<20} {counts.get(name, -1):,} row(s)")
+    print()
+
+    if not counts.get("team_game_stats"):
+        print("FAILED: team_game_stats is EMPTY after a persisting run.",
+              file=sys.stderr)
+        print("  - The workbook parsed fine; the write did not survive.",
+              file=sys.stderr)
+        print("  - Most likely $DATABASE_URL points at a different database "
+              "than the one the worker reads.", file=sys.stderr)
+        return 1
+
+    print("Written to Postgres and read back. The database survives a redeploy,")
+    print("so no later container needs this file. Re-run when you want fresher")
+    print("team stats: the rows are whatever was last ingested, and "
+          "`market_frames_")
+    print("freshness` logs MARKET DATA IS STALE past PROPIQ_MAX_MARKET_LAG_DAYS.")
     return 0
 
 

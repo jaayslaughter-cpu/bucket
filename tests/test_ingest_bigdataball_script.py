@@ -26,6 +26,25 @@ def _frames(team_rows: int = 3, market_rows: int = 2) -> tuple:
     return team, market
 
 
+def _stub_verification(monkeypatch, counts=None):
+    """
+    Stand in for the post-write read-back.
+
+    `scripts/ingest_bigdataball` now reads the tables back on a fresh
+    connection before it will say "Written to Postgres", so every test of a
+    PERSISTING run needs that call stubbed or it tries to reach a real
+    database. The verification itself is tested separately below.
+    """
+    import src.db.repository as repository
+
+    monkeypatch.setattr(
+        repository, "ingested_row_counts",
+        lambda: counts if counts is not None else {
+            "team_game_stats": 3, "game_market_lines": 3, "player_game_logs": 0,
+        },
+    )
+
+
 def test_it_calls_the_slate_s_own_ingest_and_does_not_reload_the_workbook(
     monkeypatch, tmp_path, capsys,
 ):
@@ -46,6 +65,7 @@ def test_it_calls_the_slate_s_own_ingest_and_does_not_reload_the_workbook(
         return _frames()
 
     monkeypatch.setattr(orchestrator, "ingest_market_lines", fake)
+    _stub_verification(monkeypatch)
     assert script.main(["--xlsx", str(wb)]) == 0
     assert seen["path"] == wb
     assert seen["persist"] is True
@@ -282,6 +302,7 @@ def test_the_sheet_override_lands_where_the_default_lives(
             orchestrator, "ingest_market_lines",
             lambda path, persist=True: _frames(),
         )
+        _stub_verification(monkeypatch)
         assert script.main(["--xlsx", str(wb), "--sheet", "MY-TAB"]) == 0
         assert bigdataball.DEFAULT_SHEET == "MY-TAB"
     finally:
@@ -299,3 +320,122 @@ def test_it_never_reaches_an_odds_api():
     for forbidden in ("PropLineClient", "fetch_player_props", "requests.get",
                       "normalize_event_props", "run_slate"):
         assert forbidden not in source, f"{forbidden} would spend quota"
+
+
+# --- the read-back, which is the only proof of a write -------------------
+
+
+def test_an_empty_table_after_a_persisting_run_is_a_failure(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    THE FIVE-DAY BUG, PINNED. This script printed "Written to Postgres."
+    unconditionally, directly under the PARSE counts. On 2026-10-25 an
+    operator reported "Written to Postgres. 2,644 rows / 1,322 games" and the
+    slates of 10-26, 10-27 and 10-28 each logged
+    `team_game_stats query window -> 0 rows`. Both statements were true: 2,644
+    rows were parsed, and none were in the table afterwards.
+
+    Nothing in the path had asked the database what it held — and the upsert
+    return values would not have helped, because they are `len(rows)`, the
+    rows handed to the statement rather than the rows kept.
+    """
+    import main as orchestrator
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _frames(),
+    )
+    _stub_verification(monkeypatch, {
+        "team_game_stats": 0, "game_market_lines": 0, "player_game_logs": 0,
+    })
+
+    assert script.main(["--xlsx", str(wb)]) == 1
+
+    captured = capsys.readouterr()
+    assert "team_game_stats is EMPTY" in captured.err
+    assert "Written to Postgres and read back" not in captured.out, (
+        "success was claimed over an empty table"
+    )
+
+
+def test_the_verified_counts_are_printed_not_the_parsed_ones(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    The two numbers must be distinguishable. The parse said 3 rows; the table
+    holds 2,644. Printing only one of them is how "2,644" came to be read as
+    a confirmation.
+    """
+    import main as orchestrator
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _frames(),
+    )
+    _stub_verification(monkeypatch, {
+        "team_game_stats": 2644, "game_market_lines": 2644,
+        "player_game_logs": 17,
+    })
+
+    assert script.main(["--xlsx", str(wb)]) == 0
+    out = capsys.readouterr().out
+    assert "team_game_stats rows : 3" in out          # parsed
+    assert "2,644 row(s)" in out                       # verified
+    assert "read back" in out
+    assert "player_game_logs" in out
+
+
+def test_a_verification_that_cannot_connect_does_not_claim_success(
+    monkeypatch, tmp_path, capsys,
+):
+    """A read-back that fails leaves the write UNVERIFIED, which is not the
+    same as verified-empty and is certainly not success."""
+    import main as orchestrator
+    import src.db.repository as repository
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _frames(),
+    )
+
+    def boom():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(repository, "ingested_row_counts", boom)
+
+    assert script.main(["--xlsx", str(wb)]) == 1
+    captured = capsys.readouterr()
+    assert "COULD NOT VERIFY" in captured.err
+    assert "Written to Postgres" not in captured.out
+
+
+def test_a_dry_run_never_reaches_the_verification(monkeypatch, tmp_path):
+    """A dry run writes nothing, so there is nothing to read back — and it
+    must not need a database to say so."""
+    import main as orchestrator
+    import src.db.repository as repository
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _frames(),
+    )
+
+    called = {"n": 0}
+
+    def counted():
+        called["n"] += 1
+        return {"team_game_stats": 0}
+
+    monkeypatch.setattr(repository, "ingested_row_counts", counted)
+
+    assert script.main(["--xlsx", str(wb), "--dry-run"]) == 0
+    assert called["n"] == 0, "a dry run reached for the database"

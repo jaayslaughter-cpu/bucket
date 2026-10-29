@@ -450,8 +450,37 @@ def ingest_market_lines(
     if persist:
         from src.db.repository import upsert_market_lines, upsert_team_game_stats
 
-        upsert_team_game_stats(stats_df)
-        upsert_market_lines(market_df)
+        # THE RETURN VALUES WERE DISCARDED, and that is part of what cost
+        # 2026-10-23 to 2026-10-28. With them thrown away the only numbers
+        # anybody saw were `len(stats_df)` and `len(market_df)` -- the PARSE
+        # counts -- printed under the words "Written to Postgres." by
+        # `scripts/ingest_bigdataball`. An operator reported "Written to
+        # Postgres. 2,644 rows / 1,322 games" and three consecutive slates
+        # then read `team_game_stats -> 0 rows`. Both were true: 2,644 rows
+        # were PARSED and none were visible afterwards.
+        #
+        # BUT THESE COUNTS ARE NOT PROOF EITHER, and saying so is the point of
+        # this comment. Both upserts `return len(rows)` -- rows HANDED TO the
+        # statement, not rows the database kept -- so a commit that rolled
+        # back still returns 2,644. They are logged because "attempted 2,644"
+        # and "attempted 0" are different diagnoses, and the raise below
+        # catches only the second. Proof of a write is a READ-BACK, which is
+        # what `scripts/ingest_bigdataball` does after this returns.
+        team_written = upsert_team_game_stats(stats_df)
+        market_written = upsert_market_lines(market_df)
+        logger.info(
+            "Handed %d team-game stat row(s) and %d market-line row(s) to the "
+            "database (parsed %d and %d). Rows ATTEMPTED, not confirmed kept.",
+            team_written, market_written, len(stats_df), len(market_df),
+        )
+        if (len(stats_df) or len(market_df)) and not (team_written or market_written):
+            # Parsed rows and wrote none: the one outcome that reads as
+            # success and is not.
+            raise MarketFramesUnavailable(
+                f"PARSED {len(stats_df)} team-game and {len(market_df)} "
+                f"market-line row(s) and handed 0 of each to the database. "
+                f"The workbook is fine; the write path is not."
+            )
     return stats_df, market_df
 
 
