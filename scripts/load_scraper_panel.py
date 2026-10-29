@@ -1,4 +1,4 @@
-"""
+r"""
 scripts/load_scraper_panel.py — load the scraper's parquet into the panel.
 
 WHAT THIS IS FOR. `src/ingestion/boxscores.py` fills `player_game_logs` from
@@ -93,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
                     metavar="NAME",
                     help="season types to keep; repeatable. Default: "
                          "Regular Season, matching what boxscores.py fetches.")
+    ap.add_argument("--team-games", action="store_true",
+                    help="ALSO aggregate team-game rows from the same player "
+                         "box scores and write them to team_game_stats. This "
+                         "is what lets the slate get past step [2] without the "
+                         "licensed workbook; see "
+                         "src/ingestion/scraper_team_games.py for what it "
+                         "recovers (Elo and DEF_*) and what it cannot (MKT_*).")
     ap.add_argument("--verbose", action="store_true", help="debug logging")
     args = ap.parse_args(argv)
 
@@ -131,14 +138,147 @@ def main(argv: list[str] | None = None) -> int:
             print(f"distinct players: {panel['PLAYER_ID'].nunique()}")
             print()
 
+        team_frame = None
+        team_report = None
+        if args.team_games:
+            # SAME PARQUET, read once. A second CLI over the same tree would be
+            # a second reader of its layout, and these two frames are the same
+            # rows summed differently.
+            #
+            # AND IT RUNS UNDER --dry-run TOO. It used to sit after the dry-run
+            # return, so the only way to see whether the aggregation refused a
+            # short roster or a one-sided game was to write to the database
+            # first -- a validation step you could not take before the step it
+            # was meant to validate. Flagged in review on 2026-10-29.
+            # `owned_by` is the one part that needs a connection, and it is
+            # asked for only on a real write; a dry run reports what it would
+            # aggregate, not which keys it would decline.
+            from src.ingestion.scraper_team_games import aggregate_team_games
+
+            owned_by = None
+            if not args.dry_run:
+                from src.db.repository import team_game_sources
+
+                owned_by = team_game_sources()
+
+            print("Aggregating team-game rows from the same player box scores.")
+            team_frame, team_report = aggregate_team_games(
+                frame, season_types=season_types, owned_by=owned_by,
+            )
+            for line in team_report.lines():
+                print("  " + line)
+            if owned_by is None and not team_frame.empty:
+                print("  (dry run: ownership of existing team_game_stats rows "
+                      "was not checked, so a key a licensed ingest already "
+                      "owns is still counted here)")
+            print()
+
         if args.dry_run:
             print("DRY RUN — nothing was written. Drop --dry-run to persist.")
             return 0
 
-        from src.db.repository import upsert_player_game_logs
+        from src.db.repository import (
+            ingested_keys_present,
+            ingested_row_counts,
+            team_game_keys,
+            upsert_player_game_logs,
+        )
 
+        # BEFORE, so a delta can be reported. Every upsert returns `len(rows)`
+        # -- rows handed to the statement, not rows kept -- which is the number
+        # that read "Written to Postgres. 2,644 rows" for five days while the
+        # table held nothing. See `ingested_row_counts`.
+        try:
+            before = ingested_row_counts()
+        except Exception as exc:  # noqa: BLE001 — a baseline, not the write
+            logger.warning("Could not read a baseline count: %s: %s",
+                           type(exc).__name__, exc)
+            before = None
+
+        # "ATTEMPTED", because that is what the number is: `upsert_*` returns
+        # `len(rows)`. Printed as "Upserted 2,644 rows" it is the exact
+        # sentence an operator reported back as confirmation on 2026-10-25
+        # while the table held nothing. Only the read-back below claims
+        # persistence. Flagged in review, 2026-10-29.
         written = upsert_player_game_logs(panel)
-        print(f"Upserted {written} player game-log rows.")
+        print(f"Attempted {written} player game-log row(s) (handed to the "
+              f"statement; verified below).")
+
+        if team_frame is not None:
+            from src.db.repository import upsert_team_game_stats
+
+            if team_frame.empty:
+                print("No team-game rows to write — see the lines above for why.")
+            else:
+                team_written = upsert_team_game_stats(team_frame)
+                print(f"Attempted {team_written} team-game stat row(s) "
+                      f"(handed to the statement; verified below).")
+
+        # READ IT BACK ON A FRESH CONNECTION. `upsert_*`'s return value is not
+        # evidence of anything; only a reader that any other reader could be
+        # -- the 09:00 PT slate included -- is. Added in review on 2026-10-29,
+        # where the team-game write still reported success from the upsert's
+        # own count.
+        print()
+        try:
+            counts = ingested_row_counts()
+        except Exception as exc:  # noqa: BLE001 — the operator's console
+            print(f"WROTE, BUT COULD NOT VERIFY: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            for tip in advice_for(exc):
+                print(f"  - {tip}", file=sys.stderr)
+            return 1
+
+        print("Verified by reading the tables back on a fresh connection:")
+        for name in ("player_game_logs", "team_game_stats", "game_market_lines"):
+            held = counts.get(name, -1)
+            delta = (
+                "" if before is None
+                else f"  ({held - before.get(name, 0):+,} this run)"
+            )
+            print(f"  {name:<20} {held:,} row(s){delta}")
+
+        failures = []
+        if not counts.get("player_game_logs"):
+            failures.append("player_game_logs is EMPTY after a persisting run")
+
+        # AND THESE KEYS, for the team table. A row count passes on rows an
+        # earlier run wrote while this one's write went nowhere, which is
+        # every run after the first -- the same reason
+        # `scripts/ingest_bigdataball` asks by key. There is no equivalent for
+        # `player_game_logs` here: it is keyed on (player, game) and the panel
+        # is tens of thousands of rows, so its delta plus a non-empty table is
+        # what this script claims for it.
+        wanted = team_game_keys(team_frame)
+        if wanted:
+            found = ingested_keys_present(team_games=wanted).get(
+                "team_game_stats", 0
+            )
+            print(f"  {'':<20} {found:,} of this run's {len(wanted):,} "
+                  f"team-game key(s) present")
+            if found < len(wanted):
+                failures.append(
+                    f"{len(wanted) - found:,} of {len(wanted):,} aggregated "
+                    f"team-game key(s) are NOT in the table after the write"
+                )
+        elif team_frame is not None and not team_frame.empty:
+            failures.append("the aggregated frame carries no "
+                            "(nba_game_id, team_abbr) to verify by")
+        print()
+        if failures:
+            print("FAILED: the write did not survive.", file=sys.stderr)
+            for line in failures:
+                print(f"  - {line}", file=sys.stderr)
+            print("  - Most likely $DATABASE_URL points at a different "
+                  "database than the one the worker reads.", file=sys.stderr)
+            return 1
+
+        if team_frame is not None and not team_frame.empty:
+            print("The slate's step [2] needs team_game_stats OR "
+                  "game_market_lines to be non-empty, so this is what lets "
+                  "it build a board without the licensed workbook. The "
+                  "MKT_* and BLOWOUT_* columns stay unbuilt: those come "
+                  "from an opening spread, which no box score carries.")
         return 0
 
     except Exception as exc:  # noqa: BLE001 — this is the operator's console

@@ -107,6 +107,136 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
+def ingested_row_counts() -> dict[str, int]:
+    """
+    How many rows the three ingest-filled tables actually hold, right now.
+
+    WHY A READ-BACK EXISTS AT ALL. Every upsert here returns ``len(rows)`` --
+    rows HANDED TO the statement, not rows the database kept -- so a commit
+    that rolled back still returns the full count. Between 2026-10-23 and
+    2026-10-28 an operator was told "Written to Postgres. 2,644 rows / 1,322
+    games" by `scripts/ingest_bigdataball`, which printed the PARSE counts,
+    and three consecutive slates then logged `team_game_stats -> 0 rows`.
+    Nothing in that path had ever asked the database what it held.
+
+    A SEPARATE CONNECTION IS THE POINT. `session_scope` opens a new one, so
+    this reads what any other reader -- the 09:00 PT slate included -- would
+    see, not what one uncommitted transaction can see.
+    """
+    out: dict[str, int] = {}
+    with session_scope() as session:
+        for name, model in (
+            ("team_game_stats", TeamGameStat),
+            ("game_market_lines", GameMarketLine),
+            ("player_game_logs", PlayerGameLog),
+        ):
+            out[name] = int(
+                session.execute(select(func.count()).select_from(model)).scalar_one()
+            )
+    return out
+
+
+def team_game_sources() -> dict[tuple[str, str], str]:
+    """
+    Which source already owns each ``(nba_game_id, team_abbr)`` row.
+
+    WHY A CALLER NEEDS THIS RATHER THAN TRUSTING THE UPSERT. The
+    ``on_conflict_do_update`` in `upsert_team_game_stats` now refreshes EVERY
+    written column, ``source`` included -- so the upsert itself can no longer
+    stitch a row out of two sources, which is what it used to do. What it does
+    instead is take the row whole: a scraper run over a licensed BigDataBall
+    team-game would replace all fifteen box-score columns with aggregated ones
+    and relabel the row ``scraper_agg``. Aggregated sums are not a licensed
+    export -- they carry no ``poss`` and no spread -- so that is a downgrade,
+    silently, and nothing in the write can tell it apart from a correction.
+
+    So a second writer asks this first and declines the keys it does not own.
+    The decision belongs to the caller because only the caller knows whether
+    its own source outranks what is already there.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                TeamGameStat.nba_game_id, TeamGameStat.team_abbr, TeamGameStat.source
+            )
+        ).all()
+    return {(str(g), str(t)): str(s) for g, t, s in rows}
+
+
+def team_game_keys(frame: pd.DataFrame | None) -> list[tuple[str, str]]:
+    """
+    The distinct ``(nba_game_id, team_abbr)`` pairs a parsed frame carries.
+
+    Both ingest-filled team tables are keyed on this pair --
+    ``game_market_lines`` adds ``source`` to its unique constraint, and one
+    workbook is one source, so the pair answers "is this team-game in there".
+    Paired with `ingested_keys_present`, and here rather than in either
+    script because BOTH of them verify writes this way and a second reading
+    of the same key would be the two-definitions defect.
+
+    An empty list means the frame cannot be verified by key (no rows, or not
+    these columns) and the caller falls back to the row count.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    if not {"nba_game_id", "team_abbr"} <= set(frame.columns):
+        return []
+    pairs = frame[["nba_game_id", "team_abbr"]].dropna().astype(str)
+    return [
+        (str(g), str(t))
+        for g, t in pairs.drop_duplicates().itertuples(index=False, name=None)
+    ]
+
+
+def ingested_keys_present(
+    *,
+    team_games: Sequence[tuple[str, str]] = (),
+    market_lines: Sequence[tuple[str, str]] = (),
+) -> dict[str, int]:
+    """
+    How many of THESE ``(nba_game_id, team_abbr)`` keys the database holds.
+
+    WHY A ROW COUNT IS NOT ENOUGH. `ingested_row_counts` answers "does the
+    table have rows", which an ingest can pass on rows some earlier run wrote
+    while its own write went nowhere -- and the second time anything is
+    ingested, that is the normal case. It also cannot distinguish "all 2,644
+    rows were updates" (a re-run, correct, delta zero) from "none of them
+    landed" (a failure, delta zero). Only asking after the keys THIS run
+    parsed separates those two.
+
+    Read on a fresh connection, for the reason `ingested_row_counts` gives.
+    The whole key column pair is selected and intersected here rather than
+    sent as an ``IN`` clause: these tables are a few thousand rows, and a
+    2,644-tuple ``IN`` is back at the bind-parameter limit `batched` exists
+    for.
+
+    A table nothing was asked about is ABSENT from the result rather than
+    zero: a caller that parsed no market lines must not be answered
+    "0 present", which reads as a write that failed instead of one that was
+    never attempted.
+    """
+    out: dict[str, int] = {}
+    with session_scope() as session:
+        for name, model, wanted in (
+            ("team_game_stats", TeamGameStat, team_games),
+            ("game_market_lines", GameMarketLine, market_lines),
+        ):
+            if not wanted:
+                continue
+            # Both sides as strings. `nba_game_id` is a String column, and a
+            # parsed frame hands over whatever pandas inferred -- an int 1
+            # that fails to match "1" would report a healthy write as a lost
+            # one, which is the false alarm this check would be retired for.
+            held = {
+                (str(g), str(t))
+                for g, t in session.execute(
+                    select(model.nba_game_id, model.team_abbr)
+                ).all()
+            }
+            out[name] = len({(str(g), str(t)) for g, t in wanted} & held)
+    return out
+
+
 def upsert_team_game_stats(df: pd.DataFrame) -> int:
     if df.empty:
         return 0

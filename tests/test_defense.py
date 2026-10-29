@@ -132,6 +132,65 @@ def test_possessions_fall_back_to_the_standard_estimate():
     assert out["DEF_PACE_L10"].notna().any()
 
 
+def test_one_writer_s_missing_possessions_are_estimated_not_nulled():
+    """
+    A SECOND WRITER MADE THIS REACHABLE. `scraper_team_games` aggregates team
+    rows out of player box scores and leaves `poss` NULL on purpose -- the
+    formula belongs to `attach_team_pace`. So `team_game_stats` now holds
+    licensed rows that carry possessions beside aggregated rows that do not.
+
+    The old branch asked `poss.notna().any()` and then took the whole column,
+    which handed every aggregated row NaN POSS and therefore NaN for every
+    per-100 rate built from it, DEF_RATING_L10 included -- while those rows
+    carried the FGA/OREB/TOV/FTA the estimate needs all along.
+    """
+    tg = _team_games()
+    tg["oreb"] = 10.0
+    tg["fta"] = 22.0
+    # DDD is the aggregated writer's team: its rows report no possessions.
+    tg.loc[tg["team_abbr"] == "DDD", "poss"] = np.nan
+    assert tg["poss"].notna().any(), "the licensed rows must still carry poss"
+
+    out = build_team_defense(tg)
+    ddd = out.loc[out["team_abbr"] == "DDD"]
+    assert not ddd.empty
+    assert ddd["DEF_PACE_L10"].notna().any(), (
+        "DDD's possessions were estimable from FGA-OREB+TOV+0.44*FTA and were "
+        "nulled instead, because another team's row carried `poss`"
+    )
+    assert ddd["DEF_RATING_L10"].notna().any(), (
+        "a NaN POSS makes every per-100 rate NaN, which is the whole cost"
+    )
+
+
+def test_a_row_neither_source_can_fill_is_named_in_the_log(caplog):
+    """
+    THE RESIDUAL. Coalescing per row leaves a row with no `poss` AND an
+    incomplete FGA/OREB/TOV/FTA still NULL, and a NULL POSS is a NULL
+    DEF_RATING_L10 for that team-game. The single-source branch warns about
+    the same condition, so this one must too -- an abstention nobody can see
+    is only half an abstention.
+    """
+    import logging
+
+    tg = _team_games()
+    tg["oreb"] = 10.0
+    tg["fta"] = 22.0
+    tg.loc[tg["team_abbr"] == "DDD", "poss"] = np.nan
+    # ... and one of those rows cannot be estimated either.
+    hole = tg.index[tg["team_abbr"] == "DDD"][0]
+    tg.loc[hole, "fga"] = np.nan
+
+    with caplog.at_level(logging.WARNING, logger="src.features.defense"):
+        build_team_defense(tg)
+
+    warnings = [r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING]
+    assert any("1 row(s)" in m and "incomplete" in m for m in warnings), (
+        f"the unfillable row was not reported: {warnings}"
+    )
+
+
 def test_empty_or_incomplete_team_games_is_refused():
     with pytest.raises(DefenseFeatureError, match="empty"):
         build_team_defense(pd.DataFrame())

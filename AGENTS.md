@@ -342,4 +342,21 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `research_slate_from_predictions` drops the detail row's `game_date` and
   stamps its `slate_date` parameter instead. `docs/integration_audit.md` §2.2.
 
+- **`team_game_stats` has a second writer now, and it has never run.** Added
+  2026-10-29. A team box score is the sum of its players', so
+  `src/ingestion/scraper_team_games.py` aggregates team rows out of the same
+  multi-source parquet `src/ingestion/scraper_panel.py` maps into
+  `player_game_logs`, and `scripts/load_scraper_panel.py --team-games` writes
+  them. That is what lets a slate past step [2] without the licensed workbook.
+  Three things are still true and none is a code change. The scraper only runs
+  where nba.com answers, which is the operator's own machine and not this
+  container, so no aggregated row exists in the real database yet. The five
+  `MKT_*` columns and the two `BLOWOUT_*` hinges are permanently unbuilt this
+  way: they come from an opening spread, which no box score carries. And a row
+  the licensed source owns is left alone — the writer asks
+  `repository.team_game_sources` first — because an aggregated row carries no
+  possessions and no spread, so taking over a BigDataBall team-game would be a
+  silent downgrade. `docs/deploy_railway.md` §3b,
+  `tests/test_scraper_team_games.py`.
+
 Run `python -m scripts.verify_wiring` for the current state of all of these.
