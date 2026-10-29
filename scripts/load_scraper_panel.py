@@ -93,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
                     metavar="NAME",
                     help="season types to keep; repeatable. Default: "
                          "Regular Season, matching what boxscores.py fetches.")
+    ap.add_argument("--team-games", action="store_true",
+                    help="ALSO aggregate team-game rows from the same player "
+                         "box scores and write them to team_game_stats. This "
+                         "is what lets the slate get past step [2] without the "
+                         "licensed workbook; see "
+                         "src/ingestion/scraper_team_games.py for what it "
+                         "recovers (Elo and DEF_*) and what it cannot (MKT_*).")
     ap.add_argument("--verbose", action="store_true", help="debug logging")
     args = ap.parse_args(argv)
 
@@ -139,6 +146,33 @@ def main(argv: list[str] | None = None) -> int:
 
         written = upsert_player_game_logs(panel)
         print(f"Upserted {written} player game-log rows.")
+
+        if args.team_games:
+            # SAME PARQUET, read once. A second CLI over the same tree would be
+            # a second reader of its layout, and these two frames are the same
+            # rows summed differently.
+            from src.db.repository import team_game_sources, upsert_team_game_stats
+            from src.ingestion.scraper_team_games import aggregate_team_games
+
+            print()
+            print("Aggregating team-game rows from the same player box scores.")
+            team_frame, team_report = aggregate_team_games(
+                frame, season_types=season_types, owned_by=team_game_sources(),
+            )
+            for line in team_report.lines():
+                print("  " + line)
+            print()
+            if team_frame.empty:
+                print("No team-game rows to write — see the lines above for why.")
+            else:
+                team_written = upsert_team_game_stats(team_frame)
+                print(f"Upserted {team_written} team-game stat rows.")
+                print()
+                print("The slate's step [2] needs team_game_stats OR "
+                      "game_market_lines to be non-empty, so this is what lets "
+                      "it build a board without the licensed workbook. The "
+                      "MKT_* and BLOWOUT_* columns stay unbuilt: those come "
+                      "from an opening spread, which no box score carries.")
         return 0
 
     except Exception as exc:  # noqa: BLE001 — this is the operator's console

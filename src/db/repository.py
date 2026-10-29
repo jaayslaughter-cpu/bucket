@@ -136,6 +136,31 @@ def ingested_row_counts() -> dict[str, int]:
     return out
 
 
+def team_game_sources() -> dict[tuple[str, str], str]:
+    """
+    Which source already owns each ``(nba_game_id, team_abbr)`` row.
+
+    WHY A CALLER NEEDS THIS RATHER THAN TRUSTING THE UPSERT. The
+    ``on_conflict_do_update`` in `upsert_team_game_stats` refreshes only
+    ``points, pace, off_eff, def_eff, poss, opponent_abbr, is_home,
+    is_neutral_site`` -- not the fifteen box-score columns and not ``source``.
+    That is fine for re-ingesting the same workbook, and wrong for two
+    different sources: writing over a licensed BigDataBall row would replace
+    its points while leaving its own fg/fga/reb untouched AND leaving it
+    labelled ``bigdataball``. The result is a row stitched from two sources
+    that claims to be from one, which is worse than either of them.
+
+    So a second writer asks this first and declines the keys it does not own.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                TeamGameStat.nba_game_id, TeamGameStat.team_abbr, TeamGameStat.source
+            )
+        ).all()
+    return {(str(g), str(t)): str(s) for g, t, s in rows}
+
+
 def upsert_team_game_stats(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
