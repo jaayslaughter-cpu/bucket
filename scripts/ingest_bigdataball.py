@@ -197,6 +197,22 @@ def main(argv: list[str] | None = None) -> int:
                     args.sheet, bigdataball.DEFAULT_SHEET)
         bigdataball.DEFAULT_SHEET = args.sheet
 
+    # BEFORE THE WRITE, because the write happens inside the call below and
+    # there is no second chance at it. A delta is the only thing that tells
+    # "2,644 rows were updates" from "2,644 rows went nowhere" -- both leave
+    # the table exactly as big as it was. Unreachable here is not fatal: the
+    # ingest is about to fail on the same connection and say so properly.
+    before: dict[str, int] | None = None
+    if not args.dry_run:
+        try:
+            from src.db.repository import ingested_row_counts
+
+            before = ingested_row_counts()
+            logger.info("Before the write: %s", before)
+        except Exception as exc:  # noqa: BLE001 — a baseline, not the ingest
+            logger.warning("Could not read a baseline count: %s: %s",
+                           type(exc).__name__, exc)
+
     logger.info("Reading %s", path)
     try:
         # THE SAME CALL STEP [2] MAKES. persist=False is a real dry run: the
@@ -244,10 +260,23 @@ def main(argv: list[str] | None = None) -> int:
     # were true. The upserts return `len(rows)` -- rows handed to the
     # statement, not rows kept -- so even they would not have caught it. Only
     # a read on a fresh connection, which is what any other reader gets, can.
+    #
+    # AND IT ASKS FOR THESE KEYS, not for a row count. "team_game_stats is not
+    # empty" passes on rows some earlier run wrote while this run's write went
+    # nowhere -- which is every run after the first. Flagged in review on
+    # 2026-10-29, when the check was still absolute.
     try:
-        from src.db.repository import ingested_row_counts
+        from src.db.repository import (
+            ingested_keys_present,
+            ingested_row_counts,
+            team_game_keys,
+        )
 
         counts = ingested_row_counts()
+        present = ingested_keys_present(
+            team_games=team_game_keys(team_games),
+            market_lines=team_game_keys(market_lines),
+        )
     except Exception as exc:  # noqa: BLE001 — the operator's console, not a traceback
         print(f"WROTE, BUT COULD NOT VERIFY: {type(exc).__name__}: {exc}",
               file=sys.stderr)
@@ -256,14 +285,37 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("Verified by reading the tables back on a fresh connection:")
-    for name in ("team_game_stats", "game_market_lines", "player_game_logs"):
-        print(f"  {name:<20} {counts.get(name, -1):,} row(s)")
+    failures: list[str] = []
+    for name, frame in (
+        ("team_game_stats", team_games),
+        ("game_market_lines", market_lines),
+    ):
+        held = counts.get(name, -1)
+        delta = "" if before is None else f"  ({held - before.get(name, 0):+,} this run)"
+        print(f"  {name:<20} {held:,} row(s){delta}")
+        wanted = team_game_keys(frame)
+        if not wanted:
+            continue
+        found = present.get(name, 0)
+        print(f"  {'':<20} {found:,} of this run's {len(wanted):,} "
+              f"team-game key(s) present")
+        if found < len(wanted):
+            failures.append(
+                f"{name}: {len(wanted) - found:,} of {len(wanted):,} parsed "
+                f"keys are NOT in the table after a persisting run"
+            )
+    print(f"  {'player_game_logs':<20} {counts.get('player_game_logs', -1):,} "
+          f"row(s)  (not written by this script)")
     print()
 
     if not counts.get("team_game_stats"):
-        print("FAILED: team_game_stats is EMPTY after a persisting run.",
-              file=sys.stderr)
-        print("  - The workbook parsed fine; the write did not survive.",
+        failures.append("team_game_stats is EMPTY after a persisting run")
+
+    if failures:
+        print("FAILED: the write did not survive.", file=sys.stderr)
+        for line in failures:
+            print(f"  - {line}", file=sys.stderr)
+        print("  - The workbook parsed fine; the rows are not readable.",
               file=sys.stderr)
         print("  - Most likely $DATABASE_URL points at a different database "
               "than the one the worker reads.", file=sys.stderr)

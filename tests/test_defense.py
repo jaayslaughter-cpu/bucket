@@ -132,6 +132,37 @@ def test_possessions_fall_back_to_the_standard_estimate():
     assert out["DEF_PACE_L10"].notna().any()
 
 
+def test_one_writer_s_missing_possessions_are_estimated_not_nulled():
+    """
+    A SECOND WRITER MADE THIS REACHABLE. `scraper_team_games` aggregates team
+    rows out of player box scores and leaves `poss` NULL on purpose -- the
+    formula belongs to `attach_team_pace`. So `team_game_stats` now holds
+    licensed rows that carry possessions beside aggregated rows that do not.
+
+    The old branch asked `poss.notna().any()` and then took the whole column,
+    which handed every aggregated row NaN POSS and therefore NaN for every
+    per-100 rate built from it, DEF_RATING_L10 included -- while those rows
+    carried the FGA/OREB/TOV/FTA the estimate needs all along.
+    """
+    tg = _team_games()
+    tg["oreb"] = 10.0
+    tg["fta"] = 22.0
+    # DDD is the aggregated writer's team: its rows report no possessions.
+    tg.loc[tg["team_abbr"] == "DDD", "poss"] = np.nan
+    assert tg["poss"].notna().any(), "the licensed rows must still carry poss"
+
+    out = build_team_defense(tg)
+    ddd = out.loc[out["team_abbr"] == "DDD"]
+    assert not ddd.empty
+    assert ddd["DEF_PACE_L10"].notna().any(), (
+        "DDD's possessions were estimable from FGA-OREB+TOV+0.44*FTA and were "
+        "nulled instead, because another team's row carried `poss`"
+    )
+    assert ddd["DEF_RATING_L10"].notna().any(), (
+        "a NaN POSS makes every per-100 rate NaN, which is the whole cost"
+    )
+
+
 def test_empty_or_incomplete_team_games_is_refused():
     with pytest.raises(DefenseFeatureError, match="empty"):
         build_team_defense(pd.DataFrame())

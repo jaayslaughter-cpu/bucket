@@ -473,14 +473,12 @@ def ingest_market_lines(
             "database (parsed %d and %d). Rows ATTEMPTED, not confirmed kept.",
             team_written, market_written, len(stats_df), len(market_df),
         )
-        if (len(stats_df) or len(market_df)) and not (team_written or market_written):
-            # Parsed rows and wrote none: the one outcome that reads as
-            # success and is not.
-            raise MarketFramesUnavailable(
-                f"PARSED {len(stats_df)} team-game and {len(market_df)} "
-                f"market-line row(s) and handed 0 of each to the database. "
-                f"The workbook is fine; the write path is not."
-            )
+        # NO ZERO-WRITE GUARD HERE, and deliberately so after one was tried.
+        # `upsert_*` returns `len(rows)` built from a nonempty frame, so it is
+        # never 0 when the frame is not -- a guard on it was unreachable code
+        # that read as a safety net. Flagged in review, 2026-10-29. The only
+        # thing that can establish persistence is the read-back in
+        # `scripts/ingest_bigdataball`, and that is where it lives.
     return stats_df, market_df
 
 

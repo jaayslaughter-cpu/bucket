@@ -26,6 +26,19 @@ def _frames(team_rows: int = 3, market_rows: int = 2) -> tuple:
     return team, market
 
 
+def _keyed_frames(games=("0022500001", "0022500002")) -> tuple:
+    """Frames that carry the key pair, so the per-key read-back applies.
+
+    `_frames` deliberately does not: it covers the fallback, where a frame
+    cannot be verified by key and only the row count is available.
+    """
+    rows = [
+        {"nba_game_id": g, "team_abbr": t, "status": "VALID"}
+        for g in games for t in ("LAL", "GSW")
+    ]
+    return pd.DataFrame(rows), pd.DataFrame(rows)
+
+
 def _stub_verification(monkeypatch, counts=None):
     """
     Stand in for the post-write read-back.
@@ -42,6 +55,15 @@ def _stub_verification(monkeypatch, counts=None):
         lambda: counts if counts is not None else {
             "team_game_stats": 3, "game_market_lines": 3, "player_game_logs": 0,
         },
+    )
+    # By default every parsed key is present: the frames most tests use carry
+    # no `team_abbr`, so the key check does not apply to them at all, and the
+    # ones that do are asserting something else.
+    _tables = {"team_games": "team_game_stats",
+               "market_lines": "game_market_lines"}
+    monkeypatch.setattr(
+        repository, "ingested_keys_present",
+        lambda **kw: {_tables[arg]: len(set(keys)) for arg, keys in kw.items()},
     )
 
 
@@ -439,3 +461,118 @@ def test_a_dry_run_never_reaches_the_verification(monkeypatch, tmp_path):
 
     assert script.main(["--xlsx", str(wb), "--dry-run"]) == 0
     assert called["n"] == 0, "a dry run reached for the database"
+
+
+def test_a_run_whose_own_keys_are_not_in_the_table_fails(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    A ROW COUNT IS NOT PROOF OF THIS RUN'S WRITE. The table holds 2,644 rows
+    from some earlier ingest and not one of the four keys this run parsed —
+    which is the normal shape of the failure after the first successful
+    ingest, and exactly what the absolute check passed on. Flagged in review
+    on 2026-10-29.
+    """
+    import main as orchestrator
+    import src.db.repository as repository
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _keyed_frames(),
+    )
+    _stub_verification(monkeypatch, {
+        "team_game_stats": 2644, "game_market_lines": 2644,
+        "player_game_logs": 0,
+    })
+    monkeypatch.setattr(
+        repository, "ingested_keys_present",
+        lambda **kw: {"team_game_stats": 0, "game_market_lines": 0},
+    )
+
+    assert script.main(["--xlsx", str(wb)]) == 1
+    captured = capsys.readouterr()
+    assert "0 of this run's 4 team-game key(s) present" in captured.out
+    assert "are NOT in the table" in captured.err
+    assert "Written to Postgres and read back" not in captured.out
+
+
+def test_market_lines_that_do_not_land_are_a_failure_too(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    THE HALF THAT USED TO BE UNCHECKED. Only `team_game_stats` was required,
+    so a workbook whose spread columns all failed to write still exited 0 —
+    and `game_market_lines` is the table the EV path abstains without.
+    """
+    import main as orchestrator
+    import src.db.repository as repository
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _keyed_frames(),
+    )
+    _stub_verification(monkeypatch, {
+        "team_game_stats": 4, "game_market_lines": 0, "player_game_logs": 0,
+    })
+    monkeypatch.setattr(
+        repository, "ingested_keys_present",
+        lambda **kw: {"team_game_stats": 4, "game_market_lines": 0},
+    )
+
+    assert script.main(["--xlsx", str(wb)]) == 1
+    assert "game_market_lines" in capsys.readouterr().err
+
+
+def test_the_delta_separates_a_re_run_from_a_write_that_vanished(
+    monkeypatch, tmp_path, capsys,
+):
+    """
+    Both leave the table the same size. A re-ingest of the same workbook is
+    all updates and legitimately adds nothing, so the delta alone cannot
+    decide — which is why the keys are asked for as well, and why the delta
+    is reported rather than acted on.
+    """
+    import main as orchestrator
+
+    wb = tmp_path / "wb.xlsx"
+    wb.write_bytes(b"stub")
+    monkeypatch.setattr(
+        orchestrator, "ingest_market_lines",
+        lambda path, persist=True: _keyed_frames(),
+    )
+    _stub_verification(monkeypatch, {
+        "team_game_stats": 4, "game_market_lines": 4, "player_game_logs": 0,
+    })
+
+    assert script.main(["--xlsx", str(wb)]) == 0
+    out = capsys.readouterr().out
+    # Baseline and post-write counts come from the same stub, so a re-run's
+    # delta is what is printed: zero, beside four keys present.
+    assert "(+0 this run)" in out
+    assert "4 of this run's 4 team-game key(s) present" in out
+    assert "Written to Postgres and read back" in out
+
+
+def test_the_key_helper_reads_the_frame_rather_than_assuming_it():
+    """
+    No columns, no keys — and then the row count is the only check available.
+    Asserted on the helper because the alternative is a KeyError inside a
+    verification step that exists to avoid false confidence.
+
+    ONE DEFINITION, in `src/db/repository.py`: both this script and
+    `scripts/load_scraper_panel.py` verify their writes by this key, and a
+    second reading of it would be the defect this repository removes.
+    """
+    from src.db.repository import team_game_keys
+
+    assert team_game_keys(pd.DataFrame()) == []
+    assert team_game_keys(pd.DataFrame({"nba_game_id": ["1"]})) == []
+    assert team_game_keys(None) == []
+    frame = pd.DataFrame({
+        "nba_game_id": ["1", "1", "2"], "team_abbr": ["LAL", "LAL", "GSW"],
+    })
+    assert team_game_keys(frame) == [("1", "LAL"), ("2", "GSW")]

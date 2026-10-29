@@ -116,9 +116,11 @@ def build_team_defense(team_games: pd.DataFrame) -> pd.DataFrame:
     src/ingestion/bigdataball.py. Each team's "allowed" totals are read off
     the opposing row of the same game.
 
-    Possessions come from the frame's ``poss`` when present and otherwise
-    from the standard estimate ``FGA - OREB + TOV + 0.44*FTA``. When neither
-    is available the per-100 rates are not created -- a per-possession rate
+    Possessions come from the frame's ``poss`` per ROW where that row has
+    one, and otherwise from the standard estimate
+    ``FGA - OREB + TOV + 0.44*FTA``, because the table now has two writers
+    and only one of them reports possessions. When neither is available the
+    per-100 rates are not created -- a per-possession rate
     without possessions does not exist, and a per-game number wearing a
     per-100 name would be worse than nothing.
     """
@@ -143,13 +145,49 @@ def build_team_defense(team_games: pd.DataFrame) -> pd.DataFrame:
     for c in numeric:
         tg[c] = pd.to_numeric(tg[c], errors="coerce")
 
-    # Possessions: measured if the source carries them, else the standard
-    # estimate, else nothing. Never a stand-in constant.
-    if "poss" in tg.columns and tg["poss"].notna().any():
-        tg["POSS"] = tg["poss"]
-        poss_source = "team_games.poss"
-    elif {"fga", "oreb", "tov", "fta"}.issubset(tg.columns):
-        tg["POSS"] = tg["fga"] - tg["oreb"] + tg["tov"] + 0.44 * tg["fta"]
+    # Possessions: measured where the source carries them, the standard
+    # estimate where it does not, nothing when neither is available. Never a
+    # stand-in constant.
+    #
+    # ROW BY ROW, NOT FRAME BY FRAME. This used to branch on
+    # `tg["poss"].notna().any()` and then take the whole column, which was
+    # correct while `team_game_stats` had ONE writer. It stopped being correct
+    # the moment a second one existed: `scraper_team_games` aggregates team
+    # rows from player box scores and deliberately leaves `poss` NULL (the
+    # formula belongs to `attach_team_pace`), so a table holding one licensed
+    # BigDataBall game and one aggregated game took the branch on the licensed
+    # row and handed every aggregated row NaN POSS -- and then NaN for every
+    # per-100 rate built from it, including DEF_RATING_L10. Those rows carry
+    # fga/oreb/tov/fta and could always have been estimated. Found in review
+    # on 2026-10-29, with the second writer in the same change.
+    measured = tg["poss"] if "poss" in tg.columns else None
+    estimate = (
+        tg["fga"] - tg["oreb"] + tg["tov"] + 0.44 * tg["fta"]
+        if {"fga", "oreb", "tov", "fta"}.issubset(tg.columns)
+        else None
+    )
+    if measured is not None and measured.notna().any():
+        if estimate is None:
+            tg["POSS"] = measured
+            poss_source = "team_games.poss"
+            gaps = int(measured.isna().sum())
+            if gaps:
+                logger.warning(
+                    "Defence layer: %d row(s) have no possessions and no "
+                    "FGA/OREB/TOV/FTA to estimate them from; their per-100 "
+                    "rates will be NULL.", gaps,
+                )
+        else:
+            filled = int((measured.isna() & estimate.notna()).sum())
+            tg["POSS"] = measured.fillna(estimate)
+            poss_source = "team_games.poss"
+            if filled:
+                poss_source += (
+                    f", estimated FGA-OREB+TOV+0.44*FTA for {filled} row(s) "
+                    f"that carry none"
+                )
+    elif estimate is not None:
+        tg["POSS"] = estimate
         poss_source = "estimated FGA-OREB+TOV+0.44*FTA"
     else:
         raise DefenseFeatureError(
