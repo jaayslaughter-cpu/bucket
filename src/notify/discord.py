@@ -340,13 +340,20 @@ def build_decision_board_embed(
         )
     elif not priced:
         lines.append(
-            f"**{len(considered)} recommended, none priced** — no two-way odds "
-            "reached the gate, so every one of these rests on the model alone "
-            "and none has a market price behind it."
+            f"**{len(considered)} recommended out of {len(candidates)} line(s) "
+            f"evaluated, none priced** — no two-way odds reached the gate, so "
+            "every one of these rests on the model alone and none has a "
+            "market price behind it."
         )
     else:
+        # THE DENOMINATOR ON EVERY SUMMARY, not only the empty one. "3
+        # recommended" out of 400 evaluated and out of 6 evaluated are very
+        # different nights, and the abstained count alone does not say which
+        # -- it is the same subtraction a reader should not have to do.
+        # Flagged in review on 2026-10-30.
         lines.append(
-            f"**{len(priced)} recommended on a price** · "
+            f"**{len(priced)} of {len(candidates)} line(s) evaluated "
+            f"recommended on a price** · "
             f"{len(considered) - len(priced)} on the model alone "
             f"· {len(candidates) - len(considered)} abstained"
         )

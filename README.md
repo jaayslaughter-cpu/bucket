@@ -122,7 +122,8 @@ Seed team-game data. Either source works; the second needs no licensed file:
 # (a) the licensed BigDataBall workbook — never committed, once per database
 mkdir -p data/external/bigdataball
 cp ~/Downloads/2025-2026_NBA_Box_Score_Team-Stats*.xlsx data/external/bigdataball/
-python -m scripts.ingest_bigdataball --xlsx data/external/bigdataball/*.xlsx
+python -m scripts.ingest_bigdataball \
+    --xlsx data/external/bigdataball/2025-2026_NBA_Box_Score_Team-Stats.xlsx
 
 # (b) from the scraper's parquet — player box scores summed into team rows
 python -m scripts.load_scraper_panel --canonical-dir ../nba-scraper-2026-27/data \
@@ -157,7 +158,7 @@ variables that matter most:
 | `PROPIQ_SLATE_HOUR_PT` / `PROPIQ_SLATE_MINUTE_PT` | no | `09:00` | Slate job time, 24h Pacific. |
 | `PROPIQ_SETTLE_HOUR_PT` / `PROPIQ_SETTLE_MINUTE_PT` | no | `03:30` | Settlement job time, 24h Pacific. |
 | `PROPIQ_MAX_MARKET_LAG_DAYS` | no | `10` | How stale the Elo/market frames may be before the slate logs `MARKET DATA IS STALE` (`main.py:683`). |
-| `PROPIQ_MAX_PANEL_LAG_DAYS` | no | — | The separate check on the PLAYER panel's newest completed game (`main.py:118`). Not the same variable as the one above. |
+| `PROPIQ_MAX_PANEL_LAG_DAYS` | no | `3` | The separate check on the PLAYER panel's newest completed game (`main.py:118-119`). Not the same variable as the one above, and a much tighter default. |
 | `LOG_LEVEL` | no | `INFO` | INFO on stdout is deliberate — a red line in Railway means something went wrong. |
 
 Display timezone is **not** an environment variable, whatever `.env.example`
@@ -184,10 +185,19 @@ remaining blockers. The essentials:
    passes.
 3. **Mount the volume at `/app/data`.** Two things must survive a redeploy:
    the trained artifacts (`data/external/model_runs/`) and the calibration
-   report (`calibration.json`). There is no boot-time fetch — train into the
-   volume, or put the artifact plus its `.meta.json` sidecar there and point
-   `$PROPIQ_MODEL` at it. An unseeded volume is an ERROR in the first lines of
-   the log, not a silent abstention. The mount arrives root-owned, which
+   report (`calibration.json`). `scripts/start.sh` runs
+   `python -m scripts.fetch_artifacts --pull` on every boot, which is a no-op
+   when no artifact store is configured and leaves the volume exactly as it
+   was when a configured store cannot be reached — so with a store set up,
+   seeding is automatic; without one it is manual. To seed by hand, train into
+   the volume, or place **all three** files — `xgboost_{MARKET}.json`, its
+   `.meta.json` and its `.mean.json` — and point `$PROPIQ_MODEL` at the
+   booster. All three are required (`artifact_store.py:81`): without the
+   `.meta.json` the booster cannot be scored with at all, and without the
+   `.mean.json` head it returns **null projections beside live
+   probabilities**, which is the failure that looks like it is working. An
+   unseeded volume is an ERROR in the first lines of the log, not a silent
+   abstention. The mount arrives root-owned, which
    `scripts/start.sh` handles by chowning the state root and then
    `setpriv`-ing itself down to uid 10001.
 4. **Boot sequence** (`scripts/start.sh`, in order):
@@ -203,11 +213,20 @@ Daily jobs: **slate at 09:00 PT** (ingest, features, score, gate, dispatch) and
 
 ## The quantitative engine
 
-- **Markets.** Launch: PTS, REB, AST. Post-launch: FG3M, STL, BLK, PRA.
-  Combination markets PA, PR and RA are projected from component rollups (a
-  composite mean is a linear sum — no correlation term needed). FPTS is graded
-  but not yet projected: it needs a TOV layer whose fatigue haircut has the
-  correct sign.
+- **Markets.** The slate scores **PTS, REB and AST** —
+  `slate_board.DEFAULT_MARKETS`. FG3M, STL, BLK and PRA are configured as
+  post-launch in `config/model_comparison.yaml` and are not on the nightly
+  board.
+
+  Combination markets PA, PR and RA have their **feature rollups** built
+  (`src/models/composite_features.py` attaches `PA_L5` and the rest from
+  component rollups — a composite mean is a linear sum, so no correlation
+  term is needed) and can be **graded** (`src/quant/composite_markets.py`).
+  They are **not projected onto the board**: nothing in `main.py` or
+  `src/pipeline/` calls the attachment, and no artifact is trained for them.
+  Rollups and grading are not a board row, and this section claimed they were
+  until review caught it on 2026-10-30. FPTS is graded and not projected
+  either: it needs a TOV layer whose fatigue haircut has the correct sign.
 - **De-vigging.** Four methods — `multiplicative` (default), `shin`,
   `odds_ratio`, `logarithmic` — in `src/quant/devig_methods.py`. A missing
   correlation is never defaulted to zero: PTS, REB and AST are all driven by
@@ -228,8 +247,14 @@ Daily jobs: **slate at 09:00 PT** (ingest, features, score, gate, dispatch) and
 - **The publication gate.** Cards are withheld until calibration evidence
   exists — **100** graded predictions with an **ECE at or below 0.05**, from a
   recent report (`src/quant/publication_gate.py:65-70`). With zero graded
-  games the system sends nothing, which is the correct behavior for an
+  games no board rows are published, which is the correct behavior for an
   unmeasured model.
+
+  **Withheld is not silent.** The worker still posts an abstention embed
+  carrying the gate's own reason, because a channel that goes quiet reads as
+  a broken pipeline rather than as a model with nothing to say. Set
+  `PROPIQ_DISPATCH_ABSTENTIONS=false` to mute those and send only published
+  boards; it defaults to on.
 
 ## Diagnostics
 
@@ -254,10 +279,10 @@ Expected shape of a healthy `test_autonomous_loop` run: seven `PASS` lines and
 | Symptom | Cause and fix |
 |---|---|
 | `HTTP 403` from cdn.nba.com / stats.nba.com in a container | Datacenter IPs are refused. The data plane must run from a residential connection — use `scripts/ingest_from_windows.ps1` from your machine, which ingests through Railway's TCP proxy into the deployed database. |
-| `ERROR ... model artifact` at boot | The volume at `/app/data` has no artifact. Train into the volume or place `xgboost_{MARKET}.json` + its `.meta.json` sidecar in `data/external/model_runs/`. |
+| `ERROR ... model artifact` at boot | The volume at `/app/data` has no artifact. Train into the volume, or place all three of `xgboost_{MARKET}.json`, `.meta.json` and `.mean.json` in `data/external/model_runs/` — a booster missing the `.mean.json` head returns null projections beside live probabilities. |
 | First write fails with `EACCES` | The volume mount is commonly root-owned; the container runs as uid 10001. `scheduler_worker.check_state_dir()` names this at boot — see `docs/deploy_railway.md` for the fix. |
 | `PROPIQ_PARLAY_LEDGER` ERROR in the first log lines | The ledger is CSV while a database is configured — the CSV writes succeed and are destroyed by the next redeploy. Set it to `postgres`. |
-| No Discord messages | Dispatch defaults to OFF without `DISCORD_WEBHOOK_URL`. With the webhook set, sending is still opt-in per invocation (`--send`); a dry run prints the payload. |
+| No Discord messages | The **scheduled worker** dispatches whenever `DISCORD_WEBHOOK_URL` is set, unless `PROPIQ_DISPATCH` is false — every `send_embeds` call in `scheduler_worker.py` passes `dry_run=False`. `--send` governs **manual CLI runs only**, which are dry-run by default and print the payload. |
 | `MARKET DATA IS STALE` in the log | The Elo/market frames are older than `PROPIQ_MAX_MARKET_LAG_DAYS`. Re-ingest the workbook, or re-run `load_scraper_panel --team-games`. |
 | Step [2] refuses with empty tables | Neither the workbook nor ingested rows exist. Seed `team_game_stats` once against the deployment's database — the licensed workbook, or `scripts/load_scraper_panel --team-games` from the scraper's parquet. |
 | "Written to Postgres" but the next slate reads 0 rows | Fixed, and worth knowing why: `upsert_*` returns rows *handed to* the statement, not rows kept. Both ingest scripts now read their own keys back on a fresh connection and exit 1 if they are not there. |
