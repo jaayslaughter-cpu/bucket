@@ -184,7 +184,7 @@ remaining blockers. The essentials:
    replica is a second scheduler — two ingests, two dispatches, two settlement
    passes.
 3. **Mount the volume at `/app/data`.** Two things must survive a redeploy:
-   the trained artifacts (`data/external/model_runs/`) and the calibration
+   the trained artifacts (`data/external/model_runs/comparison/`) and the calibration
    report (`calibration.json`). `scripts/start.sh` runs
    `python -m scripts.fetch_artifacts --pull` on every boot, which is a no-op
    when no artifact store is configured and leaves the volume exactly as it
@@ -279,10 +279,10 @@ Expected shape of a healthy `test_autonomous_loop` run: seven `PASS` lines and
 | Symptom | Cause and fix |
 |---|---|
 | `HTTP 403` from cdn.nba.com / stats.nba.com in a container | Datacenter IPs are refused. The data plane must run from a residential connection — use `scripts/ingest_from_windows.ps1` from your machine, which ingests through Railway's TCP proxy into the deployed database. |
-| `ERROR ... model artifact` at boot | The volume at `/app/data` has no artifact. Train into the volume, or place all three of `xgboost_{MARKET}.json`, `.meta.json` and `.mean.json` in `data/external/model_runs/` — a booster missing the `.mean.json` head returns null projections beside live probabilities. |
+| `ERROR ... model artifact` at boot | The volume at `/app/data` has no artifact. Train into the volume, or place all three of `xgboost_{MARKET}.json`, `.meta.json` and `.mean.json` in **`data/external/model_runs/comparison/`** (`main.py:208` — the parent directory is not searched) — a booster missing the `.mean.json` head returns null projections beside live probabilities. |
 | First write fails with `EACCES` | The volume mount is commonly root-owned; the container runs as uid 10001. `scheduler_worker.check_state_dir()` names this at boot — see `docs/deploy_railway.md` for the fix. |
 | `PROPIQ_PARLAY_LEDGER` ERROR in the first log lines | The ledger is CSV while a database is configured — the CSV writes succeed and are destroyed by the next redeploy. Set it to `postgres`. |
-| No Discord messages | The **scheduled worker** dispatches whenever `DISCORD_WEBHOOK_URL` is set, unless `PROPIQ_DISPATCH` is false — every `send_embeds` call in `scheduler_worker.py` passes `dry_run=False`. `--send` governs **manual CLI runs only**, which are dry-run by default and print the payload. |
+| No Discord messages | The **scheduled worker** dispatches whenever `DISCORD_WEBHOOK_URL` is set — every `send_embeds` call in `scheduler_worker.py` passes `dry_run=False`. Three things stop it: `PROPIQ_DISPATCH` false; `PROPIQ_DISPATCH_ABSTENTIONS` false, which mutes withheld *and* empty boards and so silences everything while the gate is closed; and nothing being wrong at all, if the slate exited 1 before a board existed. `--send` governs **manual CLI runs only**, which are dry-run by default and print the payload. |
 | `MARKET DATA IS STALE` in the log | The Elo/market frames are older than `PROPIQ_MAX_MARKET_LAG_DAYS`. Re-ingest the workbook, or re-run `load_scraper_panel --team-games`. |
 | Step [2] refuses with empty tables | Neither the workbook nor ingested rows exist. Seed `team_game_stats` once against the deployment's database — the licensed workbook, or `scripts/load_scraper_panel --team-games` from the scraper's parquet. |
 | "Written to Postgres" but the next slate reads 0 rows | Fixed, and worth knowing why: `upsert_*` returns rows *handed to* the statement, not rows kept. Both ingest scripts now read their own keys back on a fresh connection and exit 1 if they are not there. |
