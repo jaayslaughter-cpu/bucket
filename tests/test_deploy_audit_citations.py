@@ -71,8 +71,8 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 2095, "job_defaults"),
-    ("scheduler_worker.py", 2096, "max_instances"),
+    ("scheduler_worker.py", 2157, "job_defaults"),
+    ("scheduler_worker.py", 2158, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
@@ -82,6 +82,17 @@ ANCHORS = [
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 663, "def newest_team_game_date"),
     ("main.py", 183, "Deliberately NOT read"),
+    # README.md, rewritten 2026-10-29. Its predecessor named `TZ_DISPLAY` as a
+    # variable nothing reads, `PROPIQ_SLATE_HOUR` without the `_PT` suffix the
+    # code requires, and the panel-lag variable for the MARKET staleness
+    # check -- three settings an operator could have set to no effect. The
+    # rewrite cites the lines instead of restating them, so these keep it
+    # honest the way `tests/test_agents_md.py` keeps AGENTS.md honest.
+    ("main.py", 683, "MARKET DATA IS STALE"),
+    ("main.py", 118, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
+    ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
+    ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
+    ("src/quant/publication_gate.py", 70, "DEFAULT_MIN_SCORED = 100"),
 ]
 
 #: A citation into a CANDIDATE repository, which is not in this tree:
@@ -196,3 +207,118 @@ def test_the_audits_do_not_claim_a_banned_source_is_required():
                             para,
                             re.I,
                         ), f"{audit} mentions {banned} without refusing it: {para}"
+
+
+# --- the README names settings an operator will actually set ---------------
+#
+# THE FAILURE THIS CATCHES IS SILENT ON BOTH SIDES. A README that names
+# `PROPIQ_SLATE_HOUR` where the code reads `PROPIQ_SLATE_HOUR_PT` costs an
+# operator a variable that does nothing and a worker that keeps its default
+# schedule -- no error, no log line, nothing to notice. The previous README
+# named three such settings; `TZ_DISPLAY` is still in `.env.example` and is
+# read by nothing, which is how all three got there.
+
+#: Parsed from README.md's own table rather than restated, so the two cannot
+#: drift. A hand-kept list only checked list -> README: a variable ADDED to the
+#: table and not to the list was never validated at all, which is how the
+#: stale-setting regression would come back. Flagged in review on 2026-10-30.
+README_ENV_TABLE_ROW = re.compile(r"^\|\s*`([A-Z][A-Z0-9_]*)`(?:\s*/\s*`([A-Z][A-Z0-9_]*)`)?\s*\|")
+
+
+def _readme_env_vars() -> list[str]:
+    """Every variable the README's environment table documents."""
+    out: list[str] = []
+    for line in (REPO / "README.md").read_text(encoding="utf-8").splitlines():
+        match = README_ENV_TABLE_ROW.match(line.strip())
+        if match:
+            out.extend(name for name in match.groups() if name)
+    return out
+
+
+def _reads_env(name: str) -> bool:
+    """
+    Whether anything actually LOOKS THE VARIABLE UP, rather than mentioning it.
+
+    A substring search over raw text counts a comment, a docstring, or a
+    constant that merely names the setting -- which is how `TZ_DISPLAY` would
+    have passed while being read by nothing. Python sources are parsed and
+    only real string literals under an ``os.environ`` / ``getenv`` call, or a
+    module-level constant bound to the name, count; shell sources are matched
+    on an actual expansion or assignment. Flagged in review on 2026-10-30.
+    """
+    needle_py = re.compile(
+        r"""(?:os\.environ(?:\.get)?\(\s*|getenv\(\s*|environ\[)['"]""" + name + r"""['"]"""
+        r"""|=\s*['"]""" + name + r"""['"]""",
+    )
+    needle_sh = re.compile(
+        r"\$\{?" + name + r"\b|^\s*(?:export\s+)?" + name + r"=", re.MULTILINE
+    )
+    for path in REPO.rglob("*.py"):
+        if ".venv" in path.parts or "tests" in path.parts:
+            continue
+        if needle_py.search(path.read_text(encoding="utf-8", errors="ignore")):
+            return True
+    for path in (REPO / "Dockerfile", REPO / "scripts" / "start.sh",
+                 REPO / "railway.json", REPO / "Procfile"):
+        if path.is_file() and needle_sh.search(
+            path.read_text(encoding="utf-8", errors="ignore")
+        ):
+            return True
+    return False
+
+
+README_ENV_VARS = (
+    "DATABASE_URL",
+    "DISCORD_WEBHOOK_URL",
+    "BIGDATABALL_XLSX",
+    "PROPIQ_PARLAY_LEDGER",
+    "PROPIQ_CALIBRATION_REPORT",
+    "PROPLINE_API_KEY",
+    "PROPIQ_MODEL",
+    "PROPIQ_MIGRATE_ON_BOOT",
+    "PROPIQ_SLATE_HOUR_PT",
+    "PROPIQ_SLATE_MINUTE_PT",
+    "PROPIQ_SETTLE_HOUR_PT",
+    "PROPIQ_SETTLE_MINUTE_PT",
+    "PROPIQ_MAX_MARKET_LAG_DAYS",
+    "PROPIQ_MAX_PANEL_LAG_DAYS",
+    "LOG_LEVEL",
+)
+
+
+@pytest.mark.parametrize("name", README_ENV_VARS)
+def test_every_env_var_the_readme_documents_is_read_by_the_code(name: str):
+    assert _reads_env(name), (
+        f"README.md documents {name}, which nothing actually looks up. An "
+        f"operator who sets it gets silence."
+    )
+
+
+def test_the_table_and_the_validated_set_are_the_same_set():
+    """
+    BOTH DIRECTIONS. The list below is the one this file parametrises over, so
+    a variable added to the README's table and not to the list would never be
+    validated -- the regression returns by the same door it left. Parsed from
+    the table and compared as sets, so neither side can grow alone.
+    """
+    documented = set(_readme_env_vars())
+    validated = set(README_ENV_VARS)
+    assert documented == validated, (
+        f"only in README: {sorted(documented - validated)}; "
+        f"only in the list: {sorted(validated - documented)}"
+    )
+
+
+def test_the_readme_does_not_resurrect_the_settings_nothing_reads():
+    """`TZ_DISPLAY` is the specific one: it is in `.env.example` and is read
+    by nothing, because the display timezone is a constant in
+    `src/utils/timezones.py`. The README may MENTION it to say so -- which it
+    does -- but must not list it as a variable in the table."""
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "| `TZ_DISPLAY`" not in readme, (
+        "TZ_DISPLAY is documented as a working variable; nothing reads it"
+    )
+    assert "read by nothing" in readme, (
+        "the README should say outright that TZ_DISPLAY does nothing, since "
+        ".env.example still offers it"
+    )

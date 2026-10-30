@@ -325,16 +325,35 @@ def build_decision_board_embed(
 
     lines: list[str] = []
     if not considered:
-        lines.append("Nothing recommended on this slate.")
+        # WITH THE DENOMINATOR. "Nothing recommended" alone reads identically
+        # whether the pipeline evaluated 412 lines and liked none of them or
+        # evaluated nothing at all -- a quiet night and a broken pipeline, the
+        # two states an operator most needs to tell apart at a glance. Found
+        # in the 2026-10-29 production sweep.
+        lines.append(
+            f"**0 qualifying plays out of {len(candidates)} line(s) "
+            f"evaluated.** Nothing cleared the threshold on this slate."
+            if candidates else
+            "**0 lines evaluated.** The board carried no rows at all, which "
+            "is the pipeline reporting its own state rather than a slate with "
+            "no value in it."
+        )
     elif not priced:
         lines.append(
-            f"**{len(considered)} recommended, none priced** — no two-way odds "
-            "reached the gate, so every one of these rests on the model alone "
-            "and none has a market price behind it."
+            f"**{len(considered)} recommended out of {len(candidates)} line(s) "
+            f"evaluated, none priced** — no two-way odds reached the gate, so "
+            "every one of these rests on the model alone and none has a "
+            "market price behind it."
         )
     else:
+        # THE DENOMINATOR ON EVERY SUMMARY, not only the empty one. "3
+        # recommended" out of 400 evaluated and out of 6 evaluated are very
+        # different nights, and the abstained count alone does not say which
+        # -- it is the same subtraction a reader should not have to do.
+        # Flagged in review on 2026-10-30.
         lines.append(
-            f"**{len(priced)} recommended on a price** · "
+            f"**{len(priced)} of {len(candidates)} line(s) evaluated "
+            f"recommended on a price** · "
             f"{len(considered) - len(priced)} on the model alone "
             f"· {len(candidates) - len(considered)} abstained"
         )
@@ -381,6 +400,34 @@ def build_decision_board_embed(
                 f"model {_prob(getattr(c, 'model_prob', None))} · "
                 f"{getattr(c, 'book_source', None) or 'book'}"
             )
+            # HOW MUCH, which the board has never answered. An EV percentage
+            # says there is an edge; the next question a reader has is the
+            # size, and the DFS entry embed has shown one since it was
+            # written while the board -- the card read every morning -- did
+            # not. Sized through `advisory_sizing.recommended_units_binary`,
+            # the one sizer in this repository, never a second formula here;
+            # it stamps AUTO_PLACED: False on everything it returns.
+            # READ OFF THE ROW, NEVER COMPUTED HERE. `tests/test_advisory_
+            # sizing.py::test_no_module_under_src_imports_this_one` forbids any
+            # module under src/ from importing the sizer: "a size is held by a
+            # caller that already computed it, never fetched by a module that
+            # sends or places anything." The first version of this block
+            # imported it and the guard caught it on 2026-10-29 -- which is
+            # the case the guard was written for. The caller
+            # (`scheduler_worker.run_dispatch`, outside src/) sets the
+            # attribute, exactly as `build_dfs_entry_embed` takes its
+            # `advisory_size` as a parameter.
+            #
+            # NONE, NEVER ZERO: the caller sends None for "no size", because a
+            # row printing "0u" reads as a recommendation to stake nothing on
+            # a real edge rather than as the absence of one.
+            units = getattr(c, "advisory_units", None)
+            if units is not None:
+                value += (
+                    f"\n**{units:g}u** advisory — fractional Kelly, capped. "
+                    f"Optimal only if the probability is right, so it inherits "
+                    f"the model's calibration error. PropIQ does not place it."
+                )
         else:
             value = (
                 f"`{basis}` — model {_prob(getattr(c, 'model_prob', None))}. "
