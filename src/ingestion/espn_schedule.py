@@ -30,10 +30,32 @@ TWO THINGS THAT WILL BITE A CALLER, both handled explicitly:
    ``unmapped_teams`` -- an unrecognised code is surfaced, never guessed into
    the nearest NBA team.
 
-NOT VERIFIED AGAINST THE LIVE ENDPOINT. The environment this was written in
+VERIFIED AGAINST THE LIVE ENDPOINT on 2026-10-30, which this docstring
+previously said was impossible. It read: "The environment this was written in
 denies outbound CONNECT to site.api.espn.com (and every other data host), so
 the parser is exercised against fixtures derived from the documented schema
-only. Treat the first live run as the real test.
+only. Treat the first live run as the real test."
+
+That was true when written and is not true now -- site.api.espn.com answers
+over the agent proxy. The first live run has been made:
+``scoreboard?dates=20261028`` returned 12 events, and ``espn_game.fetch_summary``
+on one of them returned a FINAL game with 27 box-score rows, 19 of them played,
+carrying MIN/PTS/FGM/FGA/FG3M/FG3A/FTM/FTA/OREB/DREB/REB/AST/STL/BLK/TOV/PF --
+every column ``scraper_team_games.STAT_SUMS`` sums and every one the panel
+reads. The parser handled it unchanged.
+
+WHAT THAT DOES AND DOES NOT UNLOCK, because the distinction is the whole point
+of item 1 above. It gives this project a box-score source the DEPLOYED
+CONTAINER can reach, where stats.nba.com and cdn.nba.com both refuse a
+datacenter IP (403 and a read timeout respectively, on an honest User-Agent,
+re-tested the same day). What it does not give is an NBA game id: an ESPN
+event id is 401909881, and ``team_game_stats``'s season filter reads character
+3 of ``nba_game_id`` and wants ``2`` (``repository.py:709``, ``utils/ids.py``).
+ESPN's id has ``1`` there. So ESPN can fill the PLAYER panel, which is not
+filtered on the id, and cannot fill ``team_game_stats`` under that query
+without either a real NBA id or an explicit second id namespace. Nothing here
+synthesises one: an id that looks like the NBA's and is not would collide with
+the real game the moment a licensed or scraped ingest covers the same night.
 """
 
 from __future__ import annotations
