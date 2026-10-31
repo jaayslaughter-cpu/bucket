@@ -71,8 +71,8 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 2358, "job_defaults"),
-    ("scheduler_worker.py", 2359, "max_instances"),
+    ("scheduler_worker.py", 2387, "job_defaults"),
+    ("scheduler_worker.py", 2388, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
