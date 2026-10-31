@@ -2180,6 +2180,35 @@ def run_espn_ingest() -> dict[str, Any]:
                 out["status"] = "FAILED"
                 return out
 
+        # AND THE NAMESPACE AGAIN, AFTER THE WRITE. The check above is a
+        # preflight: another ingest can add NBA rows between it and the
+        # upsert, so a concurrent run can still produce the mixed panel the
+        # guard promises to prevent. `numReplicas` is 1 and `max_instances`
+        # is 1, so this job cannot race ITSELF -- the exposure is a manual
+        # `scripts/load_espn_panel` or an operator's own ingest landing in
+        # the same seconds. Preventing that needs a database-level
+        # invariant; this at least turns a silent split history into a loud
+        # failure, which is the difference between a board nobody can trust
+        # and a board nobody builds. Flagged in review 2026-10-31.
+        settled = player_id_namespaces()
+        if len([n for n in settled if n != "espn"]) > 0:
+            logger.error(
+                "ESPN ingest: the panel holds MIXED id namespaces after the "
+                "write (%s). Another ingest wrote between the preflight check "
+                "and this one. Rolling features for any player in both are "
+                "now computed over a split history.", settled,
+            )
+            notify_failure(
+                "espn-ingest",
+                f"The panel holds mixed player-id namespaces after this "
+                f"write ({settled}). Something else ingested concurrently. "
+                f"Rolling features for any player in both are wrong until "
+                f"one source is re-ingested for the whole window.",
+            )
+            out["status"] = "FAILED"
+            out["namespaces_after"] = settled
+            return out
+
         # READ BACK, not asserted: an upsert returns rows handed to the
         # statement. See `repository.ingested_row_counts`.
         if not after.get("player_game_logs"):

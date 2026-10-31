@@ -362,3 +362,32 @@ def test_the_team_report_reaches_the_log(wired, monkeypatch, caplog):
         worker.run_espn_ingest()
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "team-games out" in logged
+
+
+def test_a_namespace_that_goes_mixed_during_the_write_is_caught(
+    wired, monkeypatch,
+):
+    """
+    THE RACE THE PREFLIGHT CANNOT CLOSE. Another ingest can add NBA rows
+    between the check and the upsert. `numReplicas` and `max_instances` are
+    both 1 so this job cannot race itself, but a manual loader can — and a
+    silently split history is the one failure nothing downstream detects.
+    Re-checked after the write so it becomes loud instead.
+    """
+    import src.db.repository as repository
+
+    calls = {"n": 0}
+
+    def namespaces():
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else {"espn": 19, "nba": 300}
+
+    monkeypatch.setattr(repository, "player_id_namespaces", namespaces)
+    alerts: list = []
+    monkeypatch.setattr(worker, "notify_failure",
+                        lambda stage, detail, **kw: alerts.append(detail) or {})
+
+    out = worker.run_espn_ingest()
+    assert out["status"] == "FAILED"
+    assert out["namespaces_after"] == {"espn": 19, "nba": 300}
+    assert "concurrently" in alerts[0]
