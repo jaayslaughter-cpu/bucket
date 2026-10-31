@@ -240,7 +240,7 @@ def test_a_row_the_licensed_source_owns_is_declined():
     out, report = aggregate_team_games(_game(), owned_by=owned)
 
     assert set(out["team_abbr"]) == {"GSW"}, "a licensed row was overwritten"
-    assert report.declined_to_authoritative == ["0022600123/LAL"]
+    assert report.declined_to_authoritative == ["0022600123/LAL -> bigdataball"]
 
 
 def test_a_row_this_writer_owns_is_refreshed():
@@ -569,3 +569,71 @@ def test_a_team_game_of_nothing_but_dnps_is_reported_not_dropped_silently():
     # empty frame -- and the refusal carries the report, so the reason is in
     # the message an operator sees.
     assert "0022600123/LAL (0 played)" in str(exc.value)
+
+
+# --- precedence is a RANK, and it matches the game not the id ------------
+
+
+def test_a_lower_ranked_writer_declines_to_a_higher_one():
+    """
+    RANKED, NOT ONE NAME. The guard declined only `bigdataball`, so once a
+    third source existed an ESPN run overwrote scraper rows — and an ESPN
+    aggregate carries no possessions, so that is a downgrade the statement
+    cannot tell from a correction. Found in review 2026-10-31.
+    """
+    owned = {("0022600123", "LAL"): "scraper_agg"}
+    out, report = aggregate_team_games(
+        _game(), owned_by=owned, team_source="espn_agg",
+    )
+    assert set(out["team_abbr"]) == {"GSW"}
+    assert report.declined_to_authoritative == ["0022600123/LAL -> scraper_agg"]
+
+
+def test_a_higher_ranked_writer_still_overwrites_a_lower_one():
+    """The ordering has to work in both directions, or it is just a second
+    hardcoded name. A scraper run may replace an ESPN aggregate."""
+    owned = {("0022600123", "LAL"): "espn_agg"}
+    out, report = aggregate_team_games(
+        _game(), owned_by=owned, team_source="scraper_agg",
+    )
+    assert set(out["team_abbr"]) == {"LAL", "GSW"}
+    assert report.declined_to_authoritative == []
+
+
+def test_an_unknown_source_cannot_displace_a_known_one_by_being_unknown():
+    """A source missing from the table ranks LAST. Ranking it first would let
+    any typo overwrite the licensed workbook."""
+    owned = {("0022600123", "LAL"): "bigdataball"}
+    out, _ = aggregate_team_games(
+        _game(), owned_by=owned, team_source="something_new",
+    )
+    assert set(out["team_abbr"]) == {"GSW"}
+
+
+def test_the_same_game_under_two_id_namespaces_is_not_written_twice():
+    """
+    THE DUPLICATE THE PREFIX CREATED. An `espn:` id is a different STRING
+    from the NBA id for the SAME GAME, so matching ownership on (id, team)
+    found no conflict and both rows landed — one real result, two team-game
+    rows, and Elo updating twice off it. `owned_by_date` keys on
+    (game_date, team), which is the game rather than whichever namespace
+    named it. Found in review 2026-10-31.
+    """
+    owned_by_date = {("2026-10-23", "LAL"): "bigdataball"}
+    out, report = aggregate_team_games(
+        _game(), owned_by_date=owned_by_date, team_source="espn_agg",
+    )
+    assert set(out["team_abbr"]) == {"GSW"}, (
+        "the licensed night was duplicated under the espn: namespace"
+    )
+    assert "bigdataball" in report.declined_to_authoritative[0]
+
+
+def test_a_date_held_by_a_lower_source_is_still_overwritten():
+    """The date key must respect the same ranking, or it becomes a blanket
+    refusal that blocks the correction it exists to allow."""
+    owned_by_date = {("2026-10-23", "LAL"): "espn_agg"}
+    out, _ = aggregate_team_games(
+        _game(), owned_by_date=owned_by_date, team_source="scraper_agg",
+    )
+    assert set(out["team_abbr"]) == {"LAL", "GSW"}

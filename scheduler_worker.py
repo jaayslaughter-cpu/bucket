@@ -76,6 +76,11 @@ from src.utils.timezones import DISPLAY_TZ, DISPLAY_TZ_NAME  # noqa: E402
 
 ENV_SLATE_HOUR = "PROPIQ_SLATE_HOUR_PT"
 ENV_SLATE_MINUTE = "PROPIQ_SLATE_MINUTE_PT"
+ENV_ESPN_INGEST = "PROPIQ_ESPN_INGEST"
+ENV_ESPN_HOUR = "PROPIQ_ESPN_HOUR_PT"
+ENV_ESPN_MINUTE = "PROPIQ_ESPN_MINUTE_PT"
+ENV_ESPN_LOOKBACK = "PROPIQ_ESPN_LOOKBACK_DAYS"
+ENV_ESPN_BACKFILL = "PROPIQ_ESPN_BACKFILL_DAYS"
 ENV_SETTLE_HOUR = "PROPIQ_SETTLE_HOUR_PT"
 ENV_SETTLE_MINUTE = "PROPIQ_SETTLE_MINUTE_PT"
 ENV_MAX_THREADS = "PROPIQ_MAX_THREADS"
@@ -131,6 +136,20 @@ def calibration_report_path(explicit: str | Path | None = None) -> Path:
 DEFAULT_SLATE_HOUR, DEFAULT_SLATE_MINUTE = 9, 0
 # 03:30 PT: after even a West Coast overtime game has finished and been posted.
 DEFAULT_SETTLE_HOUR, DEFAULT_SETTLE_MINUTE = 3, 30
+#: 02:00 PT. AFTER the last game of the night has finished -- a 19:30 PT tip
+#: on the west coast is final well before 23:00 -- and BEFORE settlement at
+#: 03:30 and the slate at 09:00, both of which read what this writes.
+DEFAULT_ESPN_HOUR, DEFAULT_ESPN_MINUTE = 2, 0
+#: How many days back a NIGHTLY run reads. Three, not one: a game finishing
+#: after midnight Pacific lands on the next calendar day, and ESPN corrects a
+#: box score for a day or two afterwards. The upsert is idempotent, so
+#: re-reading a settled night costs a fetch and changes nothing.
+DEFAULT_ESPN_LOOKBACK_DAYS = 3
+#: How far back the FIRST run reads, when the panel is empty. A three-day
+#: window would leave every rolling feature null -- `PTS_L10` needs ten prior
+#: games -- so an empty panel is seeded properly rather than left in a state
+#: that looks ingested and scores nothing.
+DEFAULT_ESPN_BACKFILL_DAYS = 30
 
 # A job that misses its window by less than this still runs; past it, the slate
 # has moved on and running late would project games that have already tipped.
@@ -142,6 +161,9 @@ DEFAULT_MISFIRE_GRACE_SECONDS = 15 * 60
 
 SLATE_MISFIRE_GRACE_SECONDS = 60 * 60
 SETTLE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+#: Six hours, same as settlement: a worker that was down at 02:00 should still
+#: fill the panel when it comes back, because the 09:00 slate reads it.
+ESPN_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
@@ -2001,6 +2023,214 @@ def _flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def run_espn_ingest() -> dict[str, Any]:
+    """
+    Fill the panel from ESPN box scores. The only ingest that needs no laptop.
+
+    WHY THIS JOB EXISTS. The other two paths cannot run here: the BigDataBall
+    workbook is a licensed file a human downloads, and the scraper's parquet
+    needs an IP nba.com will answer. This container can reach ESPN and cannot
+    reach either of those -- measured 2026-10-30 -- so without this job the
+    panel can only be filled by hand, which is what kept five consecutive
+    slates dead at step [2].
+
+    SELF-SEEDING. An empty panel is read with `PROPIQ_ESPN_BACKFILL_DAYS`
+    (30) rather than the nightly `PROPIQ_ESPN_LOOKBACK_DAYS` (3), because
+    three days of history leaves every rolling feature null and a panel that
+    looks ingested while scoring nothing is worse than an empty one. After
+    the first run the short window is enough.
+
+    ONE NAMESPACE PER PANEL, enforced here as in the CLI: ESPN ids are
+    `espn:`-prefixed, `features/builder` groups rolling features by
+    PLAYER_ID, and a panel holding both namespaces gives any player in both a
+    split history and a confident mean over half a season. This REFUSES
+    rather than mixing, and says so loudly -- there is no unattended override,
+    because the operator who knows the windows do not overlap is the one who
+    should pass `--allow-mixed-ids` to the CLI by hand.
+
+    RESEARCH_ONLY. Box-score rows. Nothing here prices or places anything.
+    """
+    if not _flag(ENV_ESPN_INGEST, True):
+        logger.info("ESPN ingest disabled (%s). Nothing fetched.", ENV_ESPN_INGEST)
+        return {"status": "SKIPPED", "reason": "disabled"}
+
+    from datetime import timedelta
+
+    from src.utils.timezones import pacific_calendar_date
+
+    try:
+        from src.db.repository import (
+            ingested_keys_present,
+            ingested_row_counts,
+            player_id_namespaces,
+            team_game_keys,
+            team_game_owners_by_date,
+            team_game_sources,
+            upsert_player_game_logs,
+            upsert_team_game_stats,
+        )
+        from src.ingestion.espn_panel import (
+            ESPN_TEAM_SOURCE,
+            fetch_player_rows_for_dates,
+        )
+        from src.ingestion.scraper_panel import to_player_panel
+        from src.ingestion.scraper_team_games import aggregate_team_games
+
+        namespaces = player_id_namespaces()
+        foreign = {name: n for name, n in namespaces.items() if name != "espn"}
+        if foreign:
+            detail = ", ".join(f"{k}: {v:,} row(s)" for k, v in sorted(foreign.items()))
+            logger.error(
+                "ESPN ingest REFUSED: the panel already holds non-ESPN player "
+                "ids (%s). Adding ESPN rows would split those players' "
+                "histories in builder's groupby(PLAYER_ID). Re-ingest that "
+                "source for this window, or run scripts/load_espn_panel with "
+                "--allow-mixed-ids by hand if you know they do not overlap.",
+                detail,
+            )
+            notify_failure(
+                "espn-ingest",
+                f"Refused: the panel already holds non-ESPN player ids ({detail}). "
+                f"Mixing them would give any player in both a split rolling "
+                f"history, with no error anywhere.",
+            )
+            return {"status": "REFUSED", "reason": "mixed id namespaces",
+                    "namespaces": namespaces}
+
+        empty_panel = not namespaces
+        days_back = _int_env(
+            ENV_ESPN_BACKFILL if empty_panel else ENV_ESPN_LOOKBACK,
+            DEFAULT_ESPN_BACKFILL_DAYS if empty_panel else DEFAULT_ESPN_LOOKBACK_DAYS,
+            low=1, high=400,
+        )
+        end = pacific_calendar_date()
+        days = [end - timedelta(days=offset) for offset in range(days_back)]
+        logger.info(
+            "ESPN ingest: reading %d day(s) back from %s (%s).",
+            days_back, end, "empty panel, seeding" if empty_panel else "nightly",
+        )
+
+        frame, report = fetch_player_rows_for_dates(days)
+        for line in report.lines():
+            logger.info("  %s", line)
+        if frame.empty:
+            logger.warning("ESPN ingest: no player rows in the window.")
+            return {"status": "DATA_NOT_AVAILABLE",
+                    "reason": "no finished game in the window",
+                    "games_seen": report.games_seen}
+
+        panel, _ = to_player_panel(frame)
+        # BOTH OWNERSHIP VIEWS. `team_game_sources` catches a row this
+        # namespace already holds; `team_game_owners_by_date` catches the
+        # SAME GAME under the other namespace, which the id key cannot see.
+        teams, team_report = aggregate_team_games(
+            frame,
+            owned_by=team_game_sources(),
+            owned_by_date=team_game_owners_by_date(),
+            team_source=ESPN_TEAM_SOURCE,
+        )
+        # The aggregation's own refusals -- short rosters, one-sided games,
+        # stat gaps, rows left to a higher-precedence source. Dropped on the
+        # floor until review 2026-10-31, which made incomplete team coverage
+        # undiagnosable from the nightly log.
+        for line in team_report.lines():
+            logger.info("  %s", line)
+        before = ingested_row_counts()
+        upsert_player_game_logs(panel)
+        if not teams.empty:
+            upsert_team_game_stats(teams)
+        after = ingested_row_counts()
+
+        out = {
+            "status": "OK",
+            "days": days_back,
+            "games_parsed": report.games_parsed,
+            "panel_rows": int(len(panel)),
+            "team_games": int(len(teams)),
+            "player_game_logs": after.get("player_game_logs"),
+            "team_game_stats": after.get("team_game_stats"),
+            "added_player_rows": (
+                after.get("player_game_logs", 0) - before.get("player_game_logs", 0)
+            ),
+            "added_team_games": (
+                after.get("team_game_stats", 0) - before.get("team_game_stats", 0)
+            ),
+            "skipped_not_final": len(report.skipped_not_final),
+        }
+        # THE TEAM WRITE IS VERIFIED BY KEY, not by the table being
+        # non-empty: a count passes on rows an earlier run wrote while this
+        # one's went nowhere, which is every run after the first. Same check
+        # `scripts/ingest_bigdataball` and `load_scraper_panel` make.
+        if not teams.empty:
+            wanted = team_game_keys(teams)
+            found = ingested_keys_present(team_games=wanted).get(
+                "team_game_stats", 0
+            )
+            out["team_keys_present"] = f"{found}/{len(wanted)}"
+            if found < len(wanted):
+                logger.error(
+                    "ESPN ingest: %d of %d team-game key(s) are NOT in the "
+                    "table after the write.", len(wanted) - found, len(wanted),
+                )
+                notify_failure(
+                    "espn-ingest",
+                    f"{len(wanted) - found} of {len(wanted)} team-game key(s) "
+                    f"are missing after the write; it did not survive.",
+                )
+                out["status"] = "FAILED"
+                return out
+
+        # AND THE NAMESPACE AGAIN, AFTER THE WRITE. The check above is a
+        # preflight: another ingest can add NBA rows between it and the
+        # upsert, so a concurrent run can still produce the mixed panel the
+        # guard promises to prevent. `numReplicas` is 1 and `max_instances`
+        # is 1, so this job cannot race ITSELF -- the exposure is a manual
+        # `scripts/load_espn_panel` or an operator's own ingest landing in
+        # the same seconds. Preventing that needs a database-level
+        # invariant; this at least turns a silent split history into a loud
+        # failure, which is the difference between a board nobody can trust
+        # and a board nobody builds. Flagged in review 2026-10-31.
+        settled = player_id_namespaces()
+        if len([n for n in settled if n != "espn"]) > 0:
+            logger.error(
+                "ESPN ingest: the panel holds MIXED id namespaces after the "
+                "write (%s). Another ingest wrote between the preflight check "
+                "and this one. Rolling features for any player in both are "
+                "now computed over a split history.", settled,
+            )
+            notify_failure(
+                "espn-ingest",
+                f"The panel holds mixed player-id namespaces after this "
+                f"write ({settled}). Something else ingested concurrently. "
+                f"Rolling features for any player in both are wrong until "
+                f"one source is re-ingested for the whole window.",
+            )
+            out["status"] = "FAILED"
+            out["namespaces_after"] = settled
+            return out
+
+        # READ BACK, not asserted: an upsert returns rows handed to the
+        # statement. See `repository.ingested_row_counts`.
+        if not after.get("player_game_logs"):
+            logger.error(
+                "ESPN ingest wrote %d panel row(s) and player_game_logs reads "
+                "EMPTY on a fresh connection.", len(panel),
+            )
+            notify_failure(
+                "espn-ingest",
+                f"Wrote {len(panel)} panel row(s); the table reads empty "
+                f"afterwards. The write did not survive.",
+            )
+            out["status"] = "FAILED"
+            return out
+        logger.info("ESPN ingest: %s", out)
+        return out
+    except Exception as exc:  # noqa: BLE001 — the scheduler stays up
+        logger.exception("ESPN ingest raised; the scheduler stays up.")
+        notify_failure("espn-ingest", f"The ESPN ingest raised: {exc}")
+        return {"status": "FAILED", "error": str(exc)}
+
+
 def run_settlement() -> dict[str, Any]:
     """Grade every PENDING prop, then rebuild the calibration report.
 
@@ -2177,6 +2407,19 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=SLATE_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_espn_ingest,
+        trigger="cron",
+        hour=_int_env(ENV_ESPN_HOUR, DEFAULT_ESPN_HOUR, low=0, high=23),
+        minute=_int_env(ENV_ESPN_MINUTE, DEFAULT_ESPN_MINUTE, low=0, high=59),
+        timezone=DISPLAY_TZ,
+        id="espn_ingest",
+        name="Fill the panel from ESPN box scores",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=ESPN_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
     scheduler.add_job(
