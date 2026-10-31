@@ -168,3 +168,88 @@ def test_both_ingest_filled_tables_can_be_verified(monkeypatch, table):
         market_lines=[("0022600001", "LAL")],
     )
     assert present[table] == 1
+
+
+# --- the second id namespace -------------------------------------------
+
+
+def _bind_players(monkeypatch, player_ids):
+    """`repository.session_scope` bound to a panel holding these player ids."""
+    from datetime import date as _date
+
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(JSONB, "sqlite")
+    def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
+        return "JSON"
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(bind=engine, tables=[PlayerGameLog.__table__])
+    factory = sessionmaker(bind=engine)
+    with factory() as seed:
+        for i, pid in enumerate(player_ids):
+            seed.add(PlayerGameLog(
+                nba_game_id=f"g{i}", nba_player_id=str(pid),
+                player_name=f"P{i}", game_date=_date(2026, 10, 29),
+                season="2026-27", source="test",
+            ))
+        seed.commit()
+
+    @contextlib.contextmanager
+    def _scope():
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(repository, "session_scope", _scope)
+
+
+def test_a_single_namespace_panel_reports_one_namespace(monkeypatch):
+    _bind_players(monkeypatch, ["espn:1", "espn:2", "espn:3"])
+    assert repository.player_id_namespaces() == {"espn": 3}
+
+
+def test_a_mixed_panel_is_visible_rather_than_silent(monkeypatch):
+    """
+    THE FAILURE THIS EXISTS FOR. `builder.py:518` groups rolling features by
+    PLAYER_ID, so the same player under two namespaces is two players with
+    half a history each -- a confident PTS_L10 over the wrong games, with no
+    error anywhere. A mixed panel has to be VISIBLE before it is written to,
+    because afterwards nothing downstream can tell.
+    """
+    _bind_players(monkeypatch, ["espn:1", "espn:2", "203507", "1629029"])
+    counts = repository.player_id_namespaces()
+    assert counts == {"espn": 2, "nba": 2}
+    assert len(counts) > 1, "mixing must be detectable from this alone"
+
+
+def test_an_empty_panel_has_no_namespaces(monkeypatch):
+    _bind_players(monkeypatch, [])
+    assert repository.player_id_namespaces() == {}
+
+
+def test_an_espn_team_game_is_visible_to_the_newest_game_query(monkeypatch):
+    """
+    WITHOUT THE NAMESPACE BRANCH THESE ROWS ARE NOT MISCLASSIFIED, THEY ARE
+    INVISIBLE. An `espn:` id fails both the length test and the season-digit
+    test, so the newest-game query returned None over a table full of them --
+    the slate would report "nothing ingested" against data it had just
+    written, which is the exact five-day failure in reverse.
+    """
+    from datetime import date as _date
+
+    _bind(monkeypatch, team_keys=[("espn:401909881", "LAL")])
+    with repository.session_scope() as s:
+        row = s.query(TeamGameStat).first()
+        row.game_date = _date(2026, 10, 28)
+        s.commit()
+    assert repository.newest_team_game_date() is not None, (
+        "an espn-namespaced team game is invisible to the regular-season filter"
+    )
+
+
+def test_an_nba_id_with_a_playoff_digit_is_still_excluded(monkeypatch):
+    """The new branch widens the filter for ONE namespace, not for everything:
+    a playoff NBA id must still be filtered out."""
+    _bind(monkeypatch, team_keys=[("0042600123", "LAL")])
+    assert repository.newest_team_game_date() is None

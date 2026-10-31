@@ -64,7 +64,17 @@ logger = logging.getLogger(__name__)
 #: two seconds across 578 rows and did NOT establish which side was right.
 #: Preferring the league's feed is a tie-break, and the row's ``SOURCE`` column
 #: records which one was taken so the choice stays auditable.
-SOURCE_PRECEDENCE: tuple[str, ...] = ("nba_stats", "nba_live", "basketball_reference")
+SOURCE_PRECEDENCE: tuple[str, ...] = (
+    "nba_stats", "nba_live", "basketball_reference",
+    # LAST, and deliberately. `ingestion/espn_panel` is the only source
+    # a datacenter can reach, which makes it indispensable and not
+    # authoritative: it is a public aggregator, while the three above
+    # report the NBA's own numbers. Where both have a game, theirs wins.
+    # Added 2026-10-31; before that `espn` ranked as an UNKNOWN source,
+    # which also sorts last but does so by accident and logs a warning
+    # on every load.
+    "espn",
+)
 
 #: Season types kept by default: what `boxscores.py` already fetches.
 DEFAULT_SEASON_TYPES: tuple[str, ...] = ("Regular Season",)

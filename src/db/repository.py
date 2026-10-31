@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
@@ -33,6 +33,7 @@ from src.db.models import (
 )
 from src.db.session import session_scope
 from src.utils.ids import (
+    ESPN_ID_PREFIX,
     GAME_ID_WIDTH,
     REGULAR_SEASON_ID_DIGIT,
     SEASON_TYPE_SQL_POSITION,
@@ -186,6 +187,39 @@ def team_game_keys(frame: pd.DataFrame | None) -> list[tuple[str, str]]:
         (str(g), str(t))
         for g, t in pairs.drop_duplicates().itertuples(index=False, name=None)
     ]
+
+
+def player_id_namespaces() -> dict[str, int]:
+    """
+    How many panel rows carry each player-id namespace.
+
+    THE HAZARD THIS EXISTS FOR, which is worse than the game-id one.
+    `features/builder.py:518` builds every rolling feature with
+    ``df.groupby("PLAYER_ID")``. An ESPN row keys Giannis as
+    ``espn:3032977`` and an NBA-sourced row keys him as ``203507``. If both
+    are in the panel, that is TWO players to the groupby: each carries part
+    of a season, ``PTS_L10`` is a mean over the wrong games, and nothing
+    raises -- the run exits 0 and the board looks normal.
+
+    A mixed panel is worse than an empty one. An empty panel stops the slate
+    at step [2], loudly. A mixed one scores it.
+
+    So the condition is measured rather than hoped against, and a writer
+    checks this before adding rows in a namespace the panel does not already
+    use. Read on a fresh connection, like the other verification reads here.
+    """
+    out: dict[str, int] = {}
+    with session_scope() as session:
+        rows = session.execute(
+            select(PlayerGameLog.nba_player_id, func.count())
+            .group_by(PlayerGameLog.nba_player_id)
+        ).all()
+    for player_id, count in rows:
+        key = ESPN_ID_PREFIX.rstrip(":") if str(player_id).startswith(
+            ESPN_ID_PREFIX
+        ) else "nba"
+        out[key] = out.get(key, 0) + int(count)
+    return out
 
 
 def ingested_keys_present(
@@ -704,10 +738,25 @@ def newest_team_game_date() -> str | None:
         # argument against loading a frame to take one maximum still holds --
         # the index has the number. The season-type digit and its position
         # come from `utils.ids`, so the mapping is not restated here as SQL.
-        is_regular = and_(
-            func.length(TeamGameStat.nba_game_id) == GAME_ID_WIDTH,
-            func.substr(TeamGameStat.nba_game_id, SEASON_TYPE_SQL_POSITION, 1)
-            == REGULAR_SEASON_ID_DIGIT,
+        # TWO NAMESPACES, ONE CONDITION. An NBA id states its season type in
+        # character 3; an `espn:` id has no such digit and does not need one,
+        # because `ingestion/espn_panel` refuses every game whose ESPN season
+        # type is not 2, so the whole namespace is regular season by
+        # construction -- `utils/ids.ESPN_IDS_ARE_REGULAR_SEASON`, where that
+        # guarantee is written down beside the prefix it belongs to.
+        #
+        # WITHOUT THIS BRANCH the ESPN rows are not misclassified, they are
+        # INVISIBLE: an `espn:` id fails the length test and the digit test
+        # both, so the newest-game query would return None over a table full
+        # of them and the slate would report "nothing ingested" against data
+        # it had just written. Added 2026-10-31 with the ESPN path.
+        is_regular = or_(
+            and_(
+                func.length(TeamGameStat.nba_game_id) == GAME_ID_WIDTH,
+                func.substr(TeamGameStat.nba_game_id, SEASON_TYPE_SQL_POSITION, 1)
+                == REGULAR_SEASON_ID_DIGIT,
+            ),
+            TeamGameStat.nba_game_id.startswith(ESPN_ID_PREFIX),
         )
         newest = session.execute(
             select(func.max(TeamGameStat.game_date)).where(is_regular)

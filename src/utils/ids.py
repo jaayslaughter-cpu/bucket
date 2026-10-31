@@ -127,6 +127,45 @@ SEASON_TYPE_SQL_POSITION = 3
 REGULAR_SEASON_ID_DIGIT = "2"
 
 
+#: THE SECOND ID NAMESPACE, and the only one. An ESPN event id is "401909881"
+#: -- nine characters, with "1" where an NBA id carries its season-type digit.
+#: It is not an NBA game id and `espn_schedule`'s docstring has said since it
+#: was written that the two "must never be joined directly".
+#:
+#: WHY A PREFIX RATHER THAN A SYNTHESISED NBA ID. The container can reach
+#: ESPN and cannot reach nba.com (403 from cdn, read timeout from stats, on an
+#: honest User-Agent -- measured 2026-10-30), so ESPN is the only box-score
+#: source an unattended deploy has. Minting an NBA-SHAPED id for those rows
+#: would be the one unrecoverable mistake available here: the moment a
+#: licensed or scraped ingest covers the same night, the invented id either
+#: collides with a real game or sits beside it as a duplicate, and nothing
+#: downstream could tell which row is the real one. A prefixed id cannot be
+#: mistaken for an NBA id by anything, including a careless join.
+ESPN_ID_PREFIX = "espn:"
+
+#: An ``espn:`` row is REGULAR SEASON BY CONSTRUCTION, which is why a filter
+#: can accept the whole namespace without reading a digit out of it:
+#: `ingestion/espn_panel` refuses any game whose ESPN season type is not 2,
+#: so a preseason or playoff game never reaches the table wearing this prefix.
+#: The guarantee lives here, next to the prefix, because the SQL that relies
+#: on it is in `db/repository` and the code that enforces it is in
+#: `ingestion/` -- neither is a good home for a fact the other depends on.
+ESPN_IDS_ARE_REGULAR_SEASON = True
+
+
+def is_espn_id(value: object) -> bool:
+    """Whether a game id is in the ESPN namespace rather than the NBA's."""
+    return str(value or "").startswith(ESPN_ID_PREFIX)
+
+
+def espn_game_id(event_id: object) -> str:
+    """``401909881`` -> ``espn:401909881``, idempotently."""
+    raw = str(event_id or "").strip()
+    if not raw:
+        raise ValueError("DATA_NOT_AVAILABLE: an ESPN event id is required")
+    return raw if raw.startswith(ESPN_ID_PREFIX) else f"{ESPN_ID_PREFIX}{raw}"
+
+
 def season_type_from_game_id(value: object) -> str:
     """
     What kind of game this id belongs to, or ``SEASON_TYPE_UNKNOWN``.

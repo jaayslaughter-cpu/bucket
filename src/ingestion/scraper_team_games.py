@@ -218,6 +218,7 @@ def aggregate_team_games(
     min_players: int = MIN_PLAYERS_PER_TEAM_GAME,
     owned_by: dict[tuple[str, str], str] | None = None,
     precedence: tuple[str, ...] = SOURCE_PRECEDENCE,
+    team_source: str = TEAM_SOURCE,
 ) -> tuple[pd.DataFrame, TeamAggregateReport]:
     """
     Sum player box scores into one row per team-game.
@@ -457,7 +458,14 @@ def aggregate_team_games(
         # docstring: the scraper has no venue field, and the altitude tax reads
         # this to avoid taxing both teams at a neutral site.
         "is_neutral_site": False,
-        "source": TEAM_SOURCE,
+        # NAMED BY THE CALLER, because the ownership guard reads this column
+        # to decide whose row it may overwrite. Aggregates from ESPN box
+        # scores labelled `scraper_agg` would be taken for scraper rows and
+        # silently replaced by the next scraper run -- the same one-
+        # directional ownership bug review found on 2026-10-29, reintroduced
+        # by a hardcoded label. Found 2026-10-31 when the ESPN path's first
+        # real aggregate came out wearing the wrong source.
+        "source": str(team_source),
     })
     for team_col in STAT_SUMS.values():
         built[team_col] = pd.to_numeric(out[team_col], errors="coerce")

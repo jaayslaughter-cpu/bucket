@@ -359,4 +359,30 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   silent downgrade. `docs/deploy_railway.md` §3b,
   `tests/test_scraper_team_games.py`.
 
+- **There is a third ingest source now, and it is the only one a datacenter
+  can use.** Added 2026-10-31. `src/ingestion/espn_panel.py` maps ESPN box
+  scores onto the same canonical frame `scraper_panel` and
+  `scraper_team_games` already consume, and `scripts/load_espn_panel.py`
+  writes both tables from it. Measured the day before: `site.api.espn.com`
+  answers from the deployed container, `cdn.nba.com` returns 403 and
+  `stats.nba.com` times out, both on an honest User-Agent — so this is the
+  only path that does not need the operator's own machine. A live run over
+  two days produced 429 player rows and 32 team-games.
+
+  **Its rows carry a second id namespace and that is the thing to be careful
+  about.** An ESPN event id is not an NBA game id and an ESPN athlete id is
+  not an NBA player id, so both are `espn:`-prefixed
+  (`ESPN_ID_PREFIX` in `src/utils/ids.py`); a synthesised NBA-shaped id would collide
+  with the real game the moment a licensed ingest covered the same night.
+  `features/builder.py:518` groups every rolling feature by `PLAYER_ID`, so a
+  panel holding both namespaces gives any player in both a SPLIT history and
+  a confident mean over half a season, with no error anywhere. One namespace
+  per panel: `repository.player_id_namespaces()` measures it and the loader
+  refuses to add to a panel that holds the other one.
+
+  What it cannot do is a betting line. `game_market_lines` stays empty, and
+  the five `MKT_*` columns and two `BLOWOUT_*` hinges stay unbuilt — the same
+  permanent limit the scraper path has. Step [2] needs `team_game_stats` OR
+  `game_market_lines`, so team stats alone clears it.
+
 Run `python -m scripts.verify_wiring` for the current state of all of these.
