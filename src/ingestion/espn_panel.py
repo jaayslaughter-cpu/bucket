@@ -70,6 +70,15 @@ logger = logging.getLogger(__name__)
 #: convention of naming the feed, not the file.
 ESPN_SOURCE = "espn"
 
+#: What `aggregate_team_games` writes in a team row's `source` when the rows
+#: were summed from these box scores. DISTINCT FROM `scraper_agg`, because the
+#: ownership guard reads that column to decide whose row it may overwrite: an
+#: ESPN aggregate labelled `scraper_agg` would be taken for a scraper row and
+#: silently replaced by the next scraper run. Here rather than in either
+#: caller, because `scripts/load_espn_panel` and `scheduler_worker` both need
+#: it and a second spelling of it is the two-definitions defect.
+ESPN_TEAM_SOURCE = "espn_agg"
+
 #: ESPN's own season-type numbering. 2 is the regular season; 1 is preseason
 #: and 3 the postseason. ONLY 2 IS INGESTED, and that is what lets
 #: `utils/ids.ESPN_IDS_ARE_REGULAR_SEASON` hold -- a filter downstream accepts

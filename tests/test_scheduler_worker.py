@@ -47,11 +47,36 @@ def _jobs() -> dict[str, dict]:
 # --- the schedule --------------------------------------------------------
 
 def test_both_halves_of_the_loop_are_scheduled():
-    """Projecting without grading fills the ledger with PENDING rows for ever."""
+    """
+    Projecting without grading fills the ledger with PENDING rows for ever.
+
+    ASSERTED AS "NEITHER IS MISSING", not as "there are exactly two". The
+    equality held until `espn_ingest` was added on 2026-10-31 and then failed
+    for a job that was supposed to be there -- a test that breaks on every
+    addition teaches people to edit the test rather than read it. What must
+    never happen is one half of the loop going absent, and that is what this
+    now says.
+    """
     jobs = _jobs()
-    assert set(jobs) == {"slate", "settlement"}
+    assert {"slate", "settlement"} <= set(jobs)
     assert jobs["slate"]["func"] is worker.run_slate
     assert jobs["settlement"]["func"] is worker.run_settlement
+
+
+def test_the_panel_is_filled_before_either_half_reads_it():
+    """
+    The third job, and its whole point is WHEN it runs. Settlement grades
+    against the panel and the slate builds features from it, so an ingest
+    scheduled after either one fills the panel for tomorrow while today reads
+    yesterday's.
+    """
+    jobs = _jobs()
+    assert "espn_ingest" in jobs
+    assert jobs["espn_ingest"]["func"] is worker.run_espn_ingest
+    assert jobs["espn_ingest"]["hour"] < jobs["settlement"]["hour"], (
+        "the ingest must finish before settlement reads the panel"
+    )
+    assert jobs["settlement"]["hour"] < jobs["slate"]["hour"]
 
 
 def test_the_schedule_is_anchored_to_pacific_not_utc():

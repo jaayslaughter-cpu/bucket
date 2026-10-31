@@ -34,12 +34,6 @@ from datetime import date, timedelta
 
 logger = logging.getLogger("load_espn_panel")
 
-#: What `aggregate_team_games` writes in the `source` column for these rows.
-#: Distinct from `scraper_agg` because the ownership guard reads that column
-#: and must not take an ESPN aggregate for a scraper one.
-ESPN_TEAM_SOURCE = "espn_agg"
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m scripts.load_espn_panel",
@@ -111,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     team_frame = None
     if args.team_games:
+        from src.ingestion.espn_panel import ESPN_TEAM_SOURCE
         from src.ingestion.scraper_team_games import aggregate_team_games
 
         owned_by = None
