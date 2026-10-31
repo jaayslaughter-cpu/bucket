@@ -2060,8 +2060,12 @@ def run_espn_ingest() -> dict[str, Any]:
 
     try:
         from src.db.repository import (
+            ingested_keys_present,
             ingested_row_counts,
             player_id_namespaces,
+            team_game_keys,
+            team_game_owners_by_date,
+            team_game_sources,
             upsert_player_game_logs,
             upsert_team_game_stats,
         )
@@ -2116,9 +2120,21 @@ def run_espn_ingest() -> dict[str, Any]:
                     "games_seen": report.games_seen}
 
         panel, _ = to_player_panel(frame)
+        # BOTH OWNERSHIP VIEWS. `team_game_sources` catches a row this
+        # namespace already holds; `team_game_owners_by_date` catches the
+        # SAME GAME under the other namespace, which the id key cannot see.
         teams, team_report = aggregate_team_games(
-            frame, team_source=ESPN_TEAM_SOURCE,
+            frame,
+            owned_by=team_game_sources(),
+            owned_by_date=team_game_owners_by_date(),
+            team_source=ESPN_TEAM_SOURCE,
         )
+        # The aggregation's own refusals -- short rosters, one-sided games,
+        # stat gaps, rows left to a higher-precedence source. Dropped on the
+        # floor until review 2026-10-31, which made incomplete team coverage
+        # undiagnosable from the nightly log.
+        for line in team_report.lines():
+            logger.info("  %s", line)
         before = ingested_row_counts()
         upsert_player_game_logs(panel)
         if not teams.empty:
@@ -2141,6 +2157,29 @@ def run_espn_ingest() -> dict[str, Any]:
             ),
             "skipped_not_final": len(report.skipped_not_final),
         }
+        # THE TEAM WRITE IS VERIFIED BY KEY, not by the table being
+        # non-empty: a count passes on rows an earlier run wrote while this
+        # one's went nowhere, which is every run after the first. Same check
+        # `scripts/ingest_bigdataball` and `load_scraper_panel` make.
+        if not teams.empty:
+            wanted = team_game_keys(teams)
+            found = ingested_keys_present(team_games=wanted).get(
+                "team_game_stats", 0
+            )
+            out["team_keys_present"] = f"{found}/{len(wanted)}"
+            if found < len(wanted):
+                logger.error(
+                    "ESPN ingest: %d of %d team-game key(s) are NOT in the "
+                    "table after the write.", len(wanted) - found, len(wanted),
+                )
+                notify_failure(
+                    "espn-ingest",
+                    f"{len(wanted) - found} of {len(wanted)} team-game key(s) "
+                    f"are missing after the write; it did not survive.",
+                )
+                out["status"] = "FAILED"
+                return out
+
         # READ BACK, not asserted: an upsert returns rows handed to the
         # statement. See `repository.ingested_row_counts`.
         if not after.get("player_game_logs"):

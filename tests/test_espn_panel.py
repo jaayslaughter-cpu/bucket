@@ -59,12 +59,24 @@ def test_a_real_payload_yields_both_teams_and_every_stat():
     assert len(frame) == 27
     assert set(frame["team_abbr"]) == {"MIA", "ATL"}
     assert set(frame["home_away"]) == {"home", "away"}
+    played = frame.loc[frame["played"]]
+    assert len(played) == 19
+    # VALUES, not column names. Asserting presence alone passes on a column
+    # of nulls, which is what a renamed or mis-mapped ESPN label produces --
+    # the mapping would be broken for fourteen of the fifteen stats and this
+    # test would not notice. Flagged in review 2026-10-31.
     for col in ("pts", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "oreb",
                 "dreb", "reb", "ast", "stl", "blk", "tov", "pf"):
         assert col in frame.columns, f"{col} missing from the canonical frame"
-    played = frame.loc[frame["played"]]
-    assert len(played) == 19
-    assert played["pts"].notna().all()
+        assert played[col].notna().all(), f"{col} is null on a played row"
+        assert (played[col] >= 0).all(), f"{col} went negative"
+    # And the arithmetic ESPN's own box score has to satisfy.
+    assert (played["fgm"] <= played["fga"]).all()
+    assert (played["fg3m"] <= played["fg3a"]).all()
+    assert (played["ftm"] <= played["fta"]).all()
+    assert (played["oreb"] + played["dreb"] == played["reb"]).all()
+    giannis = played.loc[played["player_name"] == "Giannis Antetokounmpo"].iloc[0]
+    assert (giannis["pts"], giannis["reb"], giannis["ast"]) == (24.0, 18.0, 3.0)
 
 
 def test_the_frame_feeds_both_existing_consumers_unchanged():
@@ -319,3 +331,55 @@ def test_the_fixture_is_a_real_response_not_a_hand_written_one():
     raw = json.dumps(payload)
     assert "-" in raw and '"FG"' not in raw[:200]
     assert copy.deepcopy(payload) == payload
+
+
+def test_a_late_game_is_filed_on_its_pacific_day_not_its_utc_one():
+    """
+    EVERY WEST COAST GAME. A 19:30 PT tip is 02:30Z the NEXT day, and a slate
+    date in this project is a Pacific calendar day — so the UTC date files
+    roughly every late game one day forward, into the wrong rolling window
+    and away from the (date, home, away) tuple the slate joins on.
+
+    The fixture's own game is 23:00Z, which agrees in both zones and hid
+    this. Flagged in review 2026-10-31.
+    """
+    payload = _payload()
+    payload["header"]["competitions"][0]["date"] = "2026-10-29T02:30Z"
+    rows = _rows(payload)
+    assert {r["game_date"].isoformat() for r in rows} == {"2026-10-28"}
+
+
+def test_a_game_with_no_usable_date_is_refused():
+    """`player_game_logs.game_date` is NOT NULL and every rolling window
+    orders by it, so a dateless row is one the write rejects or the features
+    silently misplace."""
+    payload = _payload()
+    payload["header"]["competitions"][0]["date"] = "not-a-date"
+    report = EspnPanelReport()
+    assert _rows(payload, report) == []
+    assert report.skipped_no_date == ["401909881"]
+
+
+def test_one_unreadable_payload_does_not_end_the_night(monkeypatch):
+    """
+    An unexpected nested shape raises AttributeError or TypeError, neither of
+    which is an EspnPanelError. Letting one past abandons every later game in
+    the window — the isolation rule `espn_client`'s retry budget follows.
+    """
+    from src.ingestion import espn_panel
+
+    # A header that is a STRING, so `header.get(...)` raises AttributeError --
+    # not an EspnPanelError, which is the whole point. A `competitors` of the
+    # wrong type is caught by the one-sided refusal instead and proves
+    # nothing about the broad handler.
+    payloads = {"bad": {"header": "not a dict"}, "good": _payload()}
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: payloads[
+            "bad" if params.get("event") == "bad" else "good"
+        ],
+    )
+    frame, report = espn_panel.fetch_player_rows(["bad", "401909881"])
+    assert len(frame) == 27, "the good game was lost with the bad one"
+    assert any("unreadable payload" in n or "DATA_NOT_AVAILABLE" in n
+               for n in report.notes)

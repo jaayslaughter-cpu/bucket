@@ -48,11 +48,28 @@ def _stub_db(monkeypatch, *, namespaces, counts=None, keys_present=None):
     counts = counts or {
         "player_game_logs": 19, "team_game_stats": 2, "game_market_lines": 0,
     }
+    # Writes are COUNTED, and each `ingested_row_counts` call records how many
+    # had happened — so a refusal that wrote anyway, or a verification read
+    # that never ran after the write, both fail rather than passing quietly.
+    seen = {"writes": 0, "count_calls": []}
+
+    def _counts():
+        seen["count_calls"].append(seen["writes"])
+        return counts
+
+    def _upsert(df):
+        seen["writes"] += 1
+        return len(df)
+
     monkeypatch.setattr(repository, "player_id_namespaces", lambda: namespaces)
-    monkeypatch.setattr(repository, "ingested_row_counts", lambda: counts)
+    monkeypatch.setattr(repository, "ingested_row_counts", _counts)
     monkeypatch.setattr(repository, "team_game_sources", lambda: {})
-    monkeypatch.setattr(repository, "upsert_player_game_logs", lambda df: len(df))
-    monkeypatch.setattr(repository, "upsert_team_game_stats", lambda df: len(df))
+    monkeypatch.setattr(repository, "team_game_owners_by_date", lambda: {})
+    monkeypatch.setattr(repository, "team_game_keys",
+                        lambda df: [(str(g), str(t)) for g, t in
+                                    zip(df["nba_game_id"], df["team_abbr"])])
+    monkeypatch.setattr(repository, "upsert_player_game_logs", _upsert)
+    monkeypatch.setattr(repository, "upsert_team_game_stats", _upsert)
     monkeypatch.setattr(
         repository, "ingested_keys_present",
         lambda **kw: {"team_game_stats": (
@@ -60,6 +77,7 @@ def _stub_db(monkeypatch, *, namespaces, counts=None, keys_present=None):
             else keys_present
         )},
     )
+    return seen
 
 
 # --- the refusal this script exists for ---------------------------------
@@ -196,3 +214,71 @@ def test_it_never_reaches_an_odds_api():
     for forbidden in ("PropLineClient", "fetch_player_props", "run_slate",
                       "normalize_event_props"):
         assert forbidden not in source
+
+
+# --- the checks cubic asked for on 2026-10-31 ---------------------------
+
+
+def test_a_refusal_writes_nothing(espn, monkeypatch):
+    """
+    The namespace guard is pre-write. Asserting only the exit code would pass
+    on a loader that refused in its output and wrote anyway — which is the
+    one outcome the guard exists to prevent.
+    """
+    seen = _stub_db(monkeypatch, namespaces={"nba": 100})
+    assert script.main(["--days", "1", "--end", "2026-10-28"]) == 1
+    assert seen["writes"] == 0
+
+
+def test_an_unreadable_namespace_check_writes_nothing_either(espn, monkeypatch):
+    import src.db.repository as repository
+
+    seen = _stub_db(monkeypatch, namespaces={})
+
+    def boom():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(repository, "player_id_namespaces", boom)
+    assert script.main(["--days", "1", "--end", "2026-10-28"]) == 1
+    assert seen["writes"] == 0
+
+
+def test_the_verification_read_happens_after_the_write(espn, monkeypatch):
+    """A baseline is not a verification. Same number twice tells them apart
+    only if the stub records when each was asked."""
+    seen = _stub_db(monkeypatch, namespaces={})
+    assert script.main(["--days", "1", "--end", "2026-10-28"]) == 0
+    assert seen["count_calls"][0] == 0
+    assert seen["count_calls"][-1] > 0
+
+
+def test_the_help_names_the_override_and_what_it_costs(capsys):
+    """
+    THE OPERATOR-FACING CONTRACT. `--allow-mixed-ids` is the one flag that can
+    corrupt a panel in a way nothing downstream detects, so its help text has
+    to say so where an operator reads it, not only in the module docstring.
+    """
+    with pytest.raises(SystemExit):
+        script.main(["--help"])
+    out = capsys.readouterr().out
+    assert "--allow-mixed-ids" in out
+    assert "rolling feature" in out
+
+
+def test_a_database_failure_after_the_fetch_is_named_not_tracebacked(
+    espn, monkeypatch, capsys,
+):
+    """A fetch can succeed and the write still fail. The operator gets a
+    named error and a nonzero exit, not a traceback."""
+    import src.db.repository as repository
+
+    _stub_db(monkeypatch, namespaces={})
+
+    def boom(df):
+        raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr(repository, "upsert_player_game_logs", boom)
+    assert script.main(["--days", "1", "--end", "2026-10-28"]) == 1
+    err = capsys.readouterr().err
+    assert "connection reset by peer" in err
+    assert "Traceback" not in err

@@ -31,6 +31,10 @@ import argparse
 import logging
 import sys
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - the annotation only
+    import pandas as pd
 
 logger = logging.getLogger("load_espn_panel")
 
@@ -96,6 +100,21 @@ def main(argv: list[str] | None = None) -> int:
               "every one was refused — the lines above say which.")
         return 1
 
+    try:
+        return _map_and_write(args, frame)
+    except Exception as exc:  # noqa: BLE001 — the operator's console
+        # A FETCH THAT SUCCEEDS AND A WRITE THAT FAILS IS THE NORMAL SHAPE OF
+        # A BAD RUN: a malformed payload the mapper does not expect, or an
+        # ordinary database error. `load_scraper_panel` wraps its whole body
+        # for this reason and this one did not, so an operator got a
+        # traceback instead of a named error. Found in review 2026-10-31.
+        logger.error("%s: %s", type(exc).__name__, exc)
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+def _map_and_write(args: argparse.Namespace, frame: "pd.DataFrame") -> int:
+    """The half after the fetch: map, aggregate, write, read back."""
     from src.ingestion.scraper_panel import to_player_panel
 
     panel, panel_report = to_player_panel(frame)
@@ -108,13 +127,21 @@ def main(argv: list[str] | None = None) -> int:
         from src.ingestion.espn_panel import ESPN_TEAM_SOURCE
         from src.ingestion.scraper_team_games import aggregate_team_games
 
-        owned_by = None
+        owned_by = owned_by_date = None
         if not args.dry_run:
-            from src.db.repository import team_game_sources
+            from src.db.repository import (
+                team_game_owners_by_date,
+                team_game_sources,
+            )
 
             owned_by = team_game_sources()
+            # KEYED ON THE GAME, not on an id. An `espn:` id is a different
+            # string from the NBA id for the same night, so the id view alone
+            # would write a second row for a game the workbook already holds.
+            owned_by_date = team_game_owners_by_date()
         team_frame, team_report = aggregate_team_games(
-            frame, owned_by=owned_by, team_source=ESPN_TEAM_SOURCE,
+            frame, owned_by=owned_by, owned_by_date=owned_by_date,
+            team_source=ESPN_TEAM_SOURCE,
         )
         print("Team games aggregated from the same box scores:")
         for line in team_report.lines():

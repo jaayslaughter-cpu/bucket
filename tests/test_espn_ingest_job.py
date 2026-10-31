@@ -36,27 +36,46 @@ def _frame() -> pd.DataFrame:
 
 @pytest.fixture
 def wired(monkeypatch):
-    """The job with its boundaries stubbed; returns what it was asked for."""
-    import src.db.repository as repository
-    from src.ingestion import espn_panel
+    """
+    The job with its boundaries stubbed; returns what it was asked for.
 
-    seen: dict = {"days": None, "panel_rows": None, "team_rows": None,
-                  "team_source": None}
+    BASELINE AND VERIFICATION ARE DIFFERENT READS. `ingested_row_counts` is
+    called once BEFORE the write and once after; a stub returning the same
+    number both times cannot tell a verification from a baseline, so a job
+    that skipped the second read would pass. The stub returns them in order
+    and records how many writes happened in between.
+    """
+    import src.db.repository as repository
+    from src.ingestion import espn_panel, scraper_team_games
+
+    seen: dict = {
+        "days": None, "panel_rows": None, "team_rows": None,
+        "team_source": None, "writes": 0, "count_calls": [],
+        "team_keys_asked": None, "owned_by_date": None,
+    }
 
     def fake_fetch(days, **kwargs):
         seen["days"] = list(days)
         return _frame(), EspnPanelReport(games_seen=1, games_parsed=1, rows_out=27)
 
     monkeypatch.setattr(espn_panel, "fetch_player_rows_for_dates", fake_fetch)
-    monkeypatch.setattr(repository, "ingested_row_counts",
-                        lambda: {"player_game_logs": 19, "team_game_stats": 2,
-                                 "game_market_lines": 0})
-    monkeypatch.setattr(
-        repository, "upsert_player_game_logs",
-        lambda df: seen.__setitem__("panel_rows", len(df)) or len(df))
 
-    real_agg = worker.__dict__.get("_noop")
-    from src.ingestion import scraper_team_games
+    def counts():
+        seen["count_calls"].append(seen["writes"])
+        return {"player_game_logs": 19, "team_game_stats": 2,
+                "game_market_lines": 0}
+
+    monkeypatch.setattr(repository, "ingested_row_counts", counts)
+    monkeypatch.setattr(repository, "team_game_sources", lambda: {})
+    monkeypatch.setattr(repository, "team_game_owners_by_date",
+                        lambda: seen.get("owned_by_date") or {})
+
+    def upsert_panel(df):
+        seen["writes"] += 1
+        seen["panel_rows"] = len(df)
+        return len(df)
+
+    monkeypatch.setattr(repository, "upsert_player_game_logs", upsert_panel)
 
     original = scraper_team_games.aggregate_team_games
 
@@ -65,10 +84,24 @@ def wired(monkeypatch):
         return original(frame, **kwargs)
 
     monkeypatch.setattr(scraper_team_games, "aggregate_team_games", spy_agg)
-    monkeypatch.setattr(
-        repository, "upsert_team_game_stats",
-        lambda df: seen.__setitem__("team_rows", len(df)) or len(df))
-    assert real_agg is None
+
+    def upsert_teams(df):
+        seen["writes"] += 1
+        seen["team_rows"] = len(df)
+        return len(df)
+
+    monkeypatch.setattr(repository, "upsert_team_game_stats", upsert_teams)
+    monkeypatch.setattr(repository, "team_game_keys",
+                        lambda df: [(str(g), str(t)) for g, t in
+                                    zip(df["nba_game_id"], df["team_abbr"])])
+
+    def keys_present(**kw):
+        seen["team_keys_asked"] = list(kw.get("team_games", ()))
+        n = seen.get("keys_found")
+        return {"team_game_stats": len(set(kw.get("team_games", ())))
+                if n is None else n}
+
+    monkeypatch.setattr(repository, "ingested_keys_present", keys_present)
     return seen
 
 
@@ -243,3 +276,89 @@ def test_a_window_with_no_finished_game_is_named_not_called_success(
     out = worker.run_espn_ingest()
     assert out["status"] == "DATA_NOT_AVAILABLE"
     assert out["games_seen"] == 4
+
+
+# --- the checks cubic asked for on 2026-10-31 ---------------------------
+
+
+def test_the_verification_read_happens_after_the_write(wired, monkeypatch):
+    """
+    A BASELINE IS NOT A VERIFICATION. `ingested_row_counts` is called once
+    before the write and once after; a stub returning the same number both
+    times cannot tell them apart, so a job that skipped the second read would
+    pass. The fixture records how many writes had happened at each call.
+    """
+    import src.db.repository as repository
+
+    monkeypatch.setattr(repository, "player_id_namespaces", lambda: {})
+    worker.run_espn_ingest()
+    assert wired["count_calls"][0] == 0, "the baseline ran after a write"
+    assert wired["count_calls"][-1] > 0, (
+        "nothing was read back after the write — the second call never happened"
+    )
+
+
+def test_a_team_key_that_does_not_land_fails_the_ingest(wired, monkeypatch):
+    """
+    THE TEAM WRITE NEEDS ITS OWN PROOF. The row count passes on rows an
+    earlier run wrote; only this run's keys say this run persisted. Before
+    this, zeroing the counts zeroed player AND team together, so a team-only
+    failure was invisible.
+    """
+    import src.db.repository as repository
+
+    monkeypatch.setattr(repository, "player_id_namespaces", lambda: {})
+    wired["keys_found"] = 0
+    alerts: list = []
+    monkeypatch.setattr(worker, "notify_failure",
+                        lambda stage, detail, **kw: alerts.append(detail) or {})
+    out = worker.run_espn_ingest()
+    assert out["status"] == "FAILED"
+    assert "team-game key(s) are missing" in alerts[0]
+    assert wired["team_keys_asked"], "it never asked for this run's keys"
+
+
+def test_the_ingest_asks_who_owns_the_night_not_just_the_id(wired, monkeypatch):
+    """
+    An `espn:` id is a different string from the NBA id for the same game, so
+    the id view alone finds no conflict and writes a second row for a night
+    the workbook already holds. The date view is what sees it.
+    """
+    import src.db.repository as repository
+
+    monkeypatch.setattr(repository, "player_id_namespaces", lambda: {})
+    wired["owned_by_date"] = {("2026-10-28", "ATL"): "bigdataball",
+                              ("2026-10-28", "MIA"): "bigdataball"}
+    out = worker.run_espn_ingest()
+    assert out["team_games"] == 0, (
+        "a night the licensed source already holds was written again under "
+        "the espn: namespace"
+    )
+
+
+def test_a_refusal_writes_nothing_at_all(wired, monkeypatch):
+    """The guard is pre-write. Asserting the status without asserting that no
+    write happened would pass on a job that refused and wrote anyway."""
+    import src.db.repository as repository
+
+    monkeypatch.setattr(repository, "player_id_namespaces",
+                        lambda: {"nba": 100, "espn": 1})
+    monkeypatch.setattr(worker, "notify_failure", lambda *a, **k: {})
+    out = worker.run_espn_ingest()
+    assert out["status"] == "REFUSED"
+    assert wired["writes"] == 0
+
+
+def test_the_team_report_reaches_the_log(wired, monkeypatch, caplog):
+    """Short rosters, one-sided games and stat gaps are the aggregation's own
+    refusals. Dropped on the floor, incomplete team coverage is undiagnosable
+    from the nightly log."""
+    import logging
+
+    import src.db.repository as repository
+
+    monkeypatch.setattr(repository, "player_id_namespaces", lambda: {})
+    with caplog.at_level(logging.INFO, logger="propiq.scheduler"):
+        worker.run_espn_ingest()
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "team-games out" in logged

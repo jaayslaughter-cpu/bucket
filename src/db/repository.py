@@ -189,6 +189,33 @@ def team_game_keys(frame: pd.DataFrame | None) -> list[tuple[str, str]]:
     ]
 
 
+def team_game_owners_by_date() -> dict[tuple[str, str], str]:
+    """
+    Which source holds each ``(game_date, team_abbr)``, across ID NAMESPACES.
+
+    `team_game_sources` keys on ``(nba_game_id, team_abbr)``, which cannot see
+    that ``espn:401909881`` and ``0022600123`` are the SAME GAME under two
+    namespaces. A night held by the licensed workbook and re-read from ESPN
+    therefore produced two rows for one result -- no key conflict, nothing
+    overwritten, and Elo updating twice off one game.
+
+    A team plays at most once a day, so (date, team) names the game itself
+    rather than whichever source's id happened to label it. Found in review
+    2026-10-31, with the second namespace.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                TeamGameStat.game_date, TeamGameStat.team_abbr, TeamGameStat.source
+            )
+        ).all()
+    out: dict[tuple[str, str], str] = {}
+    for day, team, source in rows:
+        key = (day.isoformat() if hasattr(day, "isoformat") else str(day), str(team))
+        out[key] = str(source)
+    return out
+
+
 def player_id_namespaces() -> dict[str, int]:
     """
     How many panel rows carry each player-id namespace.

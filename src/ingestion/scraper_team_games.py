@@ -69,6 +69,28 @@ logger = logging.getLogger(__name__)
 #: precedence below is that the two stay distinguishable.
 TEAM_SOURCE = "scraper_agg"
 
+#: Which team-source outranks which, best first. Used to decide whose row a
+#: writer may replace: it declines to anything ABOVE it, refreshes its own,
+#: and overwrites anything below. A source not named here ranks LAST, so an
+#: unknown writer can never displace a known one by being unrecognised.
+#:
+#: The order is about what the row CONTAINS, not who is newest. The licensed
+#: workbook carries possessions and a spread; a scraper aggregate carries the
+#: NBA's own box score; an ESPN aggregate carries a public one and no
+#: possessions at all. Each step down loses something that cannot be
+#: recovered from the row above it.
+TEAM_SOURCE_PRECEDENCE: tuple[str, ...] = (
+    "bigdataball", "scraper_agg", "espn_agg",
+)
+
+
+def _source_rank(name: object) -> int:
+    """Lower is better. An unknown source sorts last, never first."""
+    try:
+        return TEAM_SOURCE_PRECEDENCE.index(str(name))
+    except ValueError:
+        return len(TEAM_SOURCE_PRECEDENCE)
+
 #: The source whose rows this writer will not touch. Licensed, richer (it has
 #: the venue and the source's own pace figures), and therefore authoritative
 #: wherever it exists.
@@ -217,6 +239,7 @@ def aggregate_team_games(
     season_types: Sequence[str] = DEFAULT_SEASON_TYPES,
     min_players: int = MIN_PLAYERS_PER_TEAM_GAME,
     owned_by: dict[tuple[str, str], str] | None = None,
+    owned_by_date: dict[tuple[str, str], str] | None = None,
     precedence: tuple[str, ...] = SOURCE_PRECEDENCE,
     team_source: str = TEAM_SOURCE,
 ) -> tuple[pd.DataFrame, TeamAggregateReport]:
@@ -410,23 +433,53 @@ def aggregate_team_games(
             + "; ".join(report.lines())
         )
 
-    # [7] Precedence. A licensed row is left exactly as it is.
+    # [7] Precedence, BY RANK AND BY GAME -- not by one source name and not
+    # by id. Two defects, both found in review on 2026-10-31 once a THIRD
+    # team source existed:
+    #
+    #   * it declined only `AUTHORITATIVE_SOURCE`, so with bigdataball >
+    #     scraper_agg > espn_agg an ESPN run happily overwrote scraper rows.
+    #     Ranked now, so a writer only declines to a source ABOVE it and
+    #     still refreshes its own and anything below.
+    #
+    #   * it matched on (game_id, team), and an `espn:` id is a different
+    #     string from the NBA id for the SAME GAME. So a night held by the
+    #     workbook and re-read from ESPN produced two rows for one game under
+    #     two keys -- no conflict, no overwrite, and Elo updating twice off
+    #     one result. `owned_by_date` keys on (game_date, team), which is the
+    #     game itself rather than whichever id namespace named it.
     owned_by = owned_by or {}
-    declined = [
-        (g, t) for g, t in zip(out["_game"], out["team_abbr"])
-        if owned_by.get((str(g), str(t))) == AUTHORITATIVE_SOURCE
+    owned_by_date = owned_by_date or {}
+    writer_rank = _source_rank(team_source)
+
+    def _outranked(game: object, team: object, day: object) -> str | None:
+        """The name of a higher-ranked source already holding this, if any."""
+        for holder in (
+            owned_by.get((str(game), str(team))),
+            owned_by_date.get((str(day), str(team))),
+        ):
+            if holder and holder != team_source and _source_rank(holder) < writer_rank:
+                return holder
+        return None
+
+    days = [
+        d.isoformat() if hasattr(d, "isoformat") else str(d)
+        for d in pd.to_datetime(out["game_date"], errors="coerce").dt.date
     ]
-    if declined:
-        report.declined_to_authoritative = [f"{g}/{t}" for g, t in declined]
-        declined_set = set(declined)
-        mask = [
-            (str(g), str(t)) not in declined_set
-            for g, t in zip(out["_game"], out["team_abbr"])
+    holders = [
+        _outranked(g, t, d)
+        for g, t, d in zip(out["_game"], out["team_abbr"], days)
+    ]
+    if any(holders):
+        report.declined_to_authoritative = [
+            f"{g}/{t} -> {h}"
+            for g, t, h in zip(out["_game"], out["team_abbr"], holders) if h
         ]
-        out = out.loc[pd.Series(mask, index=out.index)]
+        out = out.loc[pd.Series([h is None for h in holders], index=out.index)]
         logger.info(
-            "Left %d team-game(s) to %s, which already holds them.",
-            len(declined), AUTHORITATIVE_SOURCE,
+            "Left %d team-game(s) to a higher-precedence source: %s",
+            len(report.declined_to_authoritative),
+            ", ".join(sorted({h for h in holders if h})),
         )
 
     if out.empty:

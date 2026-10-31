@@ -143,19 +143,37 @@ REGULAR_SEASON_ID_DIGIT = "2"
 #: mistaken for an NBA id by anything, including a careless join.
 ESPN_ID_PREFIX = "espn:"
 
-#: An ``espn:`` row is REGULAR SEASON BY CONSTRUCTION, which is why a filter
-#: can accept the whole namespace without reading a digit out of it:
-#: `ingestion/espn_panel` refuses any game whose ESPN season type is not 2,
-#: so a preseason or playoff game never reaches the table wearing this prefix.
-#: The guarantee lives here, next to the prefix, because the SQL that relies
-#: on it is in `db/repository` and the code that enforces it is in
-#: `ingestion/` -- neither is a good home for a fact the other depends on.
-ESPN_IDS_ARE_REGULAR_SEASON = True
+# AN ``espn:`` ROW IS REGULAR SEASON BY CONSTRUCTION, which is why the filter
+# in `db/repository` can accept the whole namespace without reading a digit
+# out of it: `ingestion/espn_panel` refuses any game whose ESPN season type is
+# not 2, so a preseason or playoff game never reaches the table wearing this
+# prefix. That is enforced in the mapper and asserted by
+# `tests/test_espn_panel.py::test_a_preseason_game_is_refused`.
+#
+# Written as a comment, NOT as `ESPN_IDS_ARE_REGULAR_SEASON = True`. A
+# constant nothing reads cannot enforce an invariant; it only looks like it
+# does, which is worse than prose that admits to being prose. Flagged in
+# review 2026-10-31, having been exactly that for one commit.
 
 
 def is_espn_id(value: object) -> bool:
-    """Whether a game id is in the ESPN namespace rather than the NBA's."""
-    return str(value or "").startswith(ESPN_ID_PREFIX)
+    """
+    Whether a game id is in the ESPN namespace rather than the NBA's.
+
+    NULL-SAFE, because this is asked of panel columns. `value or ""` raises
+    on ``pd.NA`` -- its truthiness is ambiguous by design -- so a frame with
+    a nullable id column would crash the caller rather than answer it. A
+    missing id is not an ESPN id; it is a missing id. Found in review
+    2026-10-31.
+    """
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().startswith(ESPN_ID_PREFIX)
 
 
 def espn_game_id(event_id: object) -> str:

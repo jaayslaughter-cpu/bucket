@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
@@ -63,6 +63,7 @@ from src.ingestion.espn_client import EspnError, get_json, site_url
 from src.ingestion.espn_game import parse_box_score
 from src.ingestion.espn_schedule import normalize_team
 from src.utils.ids import ESPN_ID_PREFIX, espn_game_id
+from src.utils.timezones import to_pacific
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class EspnPanelReport:
     skipped_season_type: list[str] = field(default_factory=list)
     skipped_unmapped_team: list[str] = field(default_factory=list)
     skipped_one_sided: list[str] = field(default_factory=list)
+    skipped_no_date: list[str] = field(default_factory=list)
     dropped_no_athlete_id: int = 0
     dnp_rows: int = 0
     notes: list[str] = field(default_factory=list)
@@ -132,6 +134,7 @@ class EspnPanelReport:
             ("not regular season", self.skipped_season_type),
             ("unmapped team code", self.skipped_unmapped_team),
             ("only one team in the payload", self.skipped_one_sided),
+            ("no usable tip-off date", self.skipped_no_date),
         ):
             if items:
                 out.append(
@@ -188,17 +191,26 @@ def _competition(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tipoff_date(comp: dict[str, Any]) -> date | None:
+    """
+    The game's PACIFIC calendar date, which is the panel's unit.
+
+    NOT THE UTC DATE, and the difference is not an edge case. A slate date in
+    this project is a Pacific calendar day (`AGENTS.md` §Conventions). ESPN
+    stamps the tip in UTC, and a 19:30 PT West Coast tip is 02:30Z THE NEXT
+    DAY -- so taking the UTC date files roughly every late game one day
+    forward. That shifts it into the wrong rolling window and breaks the
+    (date, home, away) tuple `espn_schedule.slate_join_keys` exists to join
+    on. Found in review 2026-10-31, after the fixture's single 23:00Z game
+    happened to agree in both zones and hid it.
+    """
     raw = comp.get("date")
     if not raw:
         return None
     try:
-        return (
-            datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            .astimezone(timezone.utc)
-            .date()
-        )
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
         return None
+    return to_pacific(parsed).date()
 
 
 def parse_summary_payload(
@@ -260,6 +272,14 @@ def parse_summary_payload(
 
     opponent_of = {tid: abbrs[other] for tid in abbrs for other in abbrs if other != tid}
     game_day = _tipoff_date(comp)
+    if game_day is None:
+        # EVERY CONSUMER IS DATE-KEYED. `player_game_logs.game_date` is NOT
+        # NULL, rolling windows order by it and the slate joins on it, so a
+        # row with no date is one the write rejects or the features silently
+        # misplace. Refused here, where the reason can be named. Found in
+        # review 2026-10-31.
+        rep.skipped_no_date.append(str(event_id))
+        return []
     season_label = _season_label(season.get("year"), game_day)
     game_id = espn_game_id(event_id)
 
@@ -364,6 +384,19 @@ def fetch_player_rows(
         except EspnPanelError as exc:
             report.notes.append(f"{event_id}: {exc}")
             logger.warning("ESPN summary %s unusable: %s", event_id, exc)
+        except Exception as exc:  # noqa: BLE001 — one bad game, not the night
+            # A nested shape this mapper does not expect raises AttributeError
+            # or TypeError, neither of which is an EspnPanelError. Letting one
+            # past here would abandon every later game in the window -- the
+            # failure-isolation rule `espn_client`'s retry budget already
+            # follows. Found in review 2026-10-31.
+            report.notes.append(
+                f"{event_id}: unreadable payload -- {type(exc).__name__}: {exc}"
+            )
+            logger.warning(
+                "ESPN summary %s raised %s; the other games continue.",
+                event_id, type(exc).__name__,
+            )
     return pd.DataFrame(rows), report
 
 

@@ -51,11 +51,16 @@ datacenter IP (403 and a read timeout respectively, on an honest User-Agent,
 re-tested the same day). What it does not give is an NBA game id: an ESPN
 event id is 401909881, and ``team_game_stats``'s season filter reads character
 3 of ``nba_game_id`` and wants ``2`` (``repository.py:709``, ``utils/ids.py``).
-ESPN's id has ``1`` there. So ESPN can fill the PLAYER panel, which is not
-filtered on the id, and cannot fill ``team_game_stats`` under that query
-without either a real NBA id or an explicit second id namespace. Nothing here
-synthesises one: an id that looks like the NBA's and is not would collide with
-the real game the moment a licensed or scraped ingest covers the same night.
+ESPN's id has ``1`` there, so the row is not misclassified by that filter --
+it is INVISIBLE to it. `db/repository`'s regular-season condition therefore
+carries an explicit second branch for the ``espn:`` namespace, which is what
+lets these rows fill ``team_game_stats`` as well as the player panel. The
+namespace is regular season by construction because `ingestion/espn_panel`
+refuses any game whose ESPN season type is not 2.
+
+Nothing anywhere synthesises an NBA id: one that looks like the NBA's and is
+not would collide with the real game the moment a licensed or scraped ingest
+covers the same night.
 """
 
 from __future__ import annotations
@@ -236,8 +241,15 @@ class SlateGame:
         """
         True / False / **None for not reported**, which is not the same as no.
 
-        The name is consulted before the number because the number is the one
-        thing no test in this repository can verify against the live endpoint.
+        The name is consulted before the number because the number was, when
+        this was written, the one thing no test here could verify against the
+        live endpoint. THAT IS NO LONGER TRUE: the live summary for event
+        401909881 carries ``header.season.type == 2`` for a regular-season
+        game, confirmed 2026-10-30, and `ingestion/espn_panel` now refuses on
+        that field -- the whole `espn:` id namespace is regular season
+        because of it. The name is still consulted first because it is the
+        more legible of the two and costs nothing, not because the number is
+        unverified. Corrected in review 2026-10-31.
         """
         name = _letters(self.season_type_name)
         if name and name in PRESEASON_NAMES:

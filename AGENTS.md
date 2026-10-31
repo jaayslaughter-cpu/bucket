@@ -377,8 +377,10 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   `features/builder.py:518` groups every rolling feature by `PLAYER_ID`, so a
   panel holding both namespaces gives any player in both a SPLIT history and
   a confident mean over half a season, with no error anywhere. One namespace
-  per panel: `repository.player_id_namespaces()` measures it and the loader
-  refuses to add to a panel that holds the other one.
+  per panel: `repository.player_id_namespaces()` measures it, the CLI
+  refuses by default with `--allow-mixed-ids` as a documented override, and
+  the SCHEDULED job has no override at all — an unattended process must not
+  be able to decide at 2am that a split history is acceptable.
 
   What it cannot do is a betting line. `game_market_lines` stays empty, and
   the five `MKT_*` columns and two `BLOWOUT_*` hinges stay unbuilt — the same

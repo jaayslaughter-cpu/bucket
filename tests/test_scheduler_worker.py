@@ -73,10 +73,17 @@ def test_the_panel_is_filled_before_either_half_reads_it():
     jobs = _jobs()
     assert "espn_ingest" in jobs
     assert jobs["espn_ingest"]["func"] is worker.run_espn_ingest
-    assert jobs["espn_ingest"]["hour"] < jobs["settlement"]["hour"], (
-        "the ingest must finish before settlement reads the panel"
+    # (hour, minute), not hour alone: the minutes are independently
+    # configurable, so an hour-only comparison rejects a perfectly good
+    # 02:00 / 02:30 pair and accepts nothing it should. Flagged in review
+    # 2026-10-31.
+    def at(job_id: str) -> tuple[int, int]:
+        return (jobs[job_id]["hour"], jobs[job_id]["minute"])
+
+    assert at("espn_ingest") < at("settlement"), (
+        "the ingest must finish before the jobs that read the panel"
     )
-    assert jobs["settlement"]["hour"] < jobs["slate"]["hour"]
+    assert at("settlement") < at("slate")
 
 
 def test_the_schedule_is_anchored_to_pacific_not_utc():
