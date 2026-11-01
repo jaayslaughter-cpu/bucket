@@ -71,16 +71,21 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 2387, "job_defaults"),
-    ("scheduler_worker.py", 2388, "max_instances"),
+    ("scheduler_worker.py", 2897, "job_defaults"),
+    ("scheduler_worker.py", 2898, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1544, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1649, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
-    ("src/db/repository.py", 724, "def newest_team_game_date"),
+    ("src/db/repository.py", 767, "def newest_team_game_date"),
+    # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
+    # configured. Anchored so the correction cannot rot the same way the
+    # line it replaced did -- that row named `logging.basicConfig` for
+    # months after the two basicConfig calls were deleted.
+    ("src/utils/logstreams.py", 57, "def configure_logging("),
     ("main.py", 183, "Deliberately NOT read"),
     # README.md, rewritten 2026-10-29. Its predecessor named `TZ_DISPLAY` as a
     # variable nothing reads, `PROPIQ_SLATE_HOUR` without the `_PT` suffix the
@@ -280,6 +285,15 @@ README_ENV_VARS = (
     "PROPIQ_SLATE_MINUTE_PT",
     "PROPIQ_SETTLE_HOUR_PT",
     "PROPIQ_SETTLE_MINUTE_PT",
+    "PROPIQ_ESPN_HOUR_PT",
+    "PROPIQ_ESPN_MINUTE_PT",
+    "PROPIQ_ESPN_INGEST",
+    "PROPIQ_ESPN_LOOKBACK_DAYS",
+    "PROPIQ_ESPN_BACKFILL_DAYS",
+    "PROPIQ_ESPN_HISTORY_SEASONS",
+    "PROPIQ_ESPN_HISTORY_CHUNK_DAYS",
+    "PROPIQ_ESPN_HISTORY_HOUR_PT",
+    "PROPIQ_ESPN_HISTORY_MINUTE_PT",
     "PROPIQ_MAX_MARKET_LAG_DAYS",
     "PROPIQ_MAX_PANEL_LAG_DAYS",
     "LOG_LEVEL",

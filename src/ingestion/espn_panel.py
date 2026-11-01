@@ -59,7 +59,7 @@ from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
-from src.ingestion.espn_client import EspnError, get_json, site_url
+from src.ingestion.espn_client import CORE_API_BASE, EspnError, get_json, site_url
 from src.ingestion.espn_game import parse_box_score
 from src.ingestion.espn_schedule import normalize_team
 from src.utils.ids import ESPN_ID_PREFIX, espn_game_id
@@ -120,6 +120,11 @@ class EspnPanelReport:
     skipped_no_date: list[str] = field(default_factory=list)
     dropped_no_athlete_id: int = 0
     dnp_rows: int = 0
+    #: Events the panel already holds, so no summary was fetched for them.
+    #: Counted rather than silent: it is the difference between "this date
+    #: was already complete" and "this date produced nothing", and the
+    #: history backfill's whole progress report rests on telling them apart.
+    skipped_already_held: int = 0
     notes: list[str] = field(default_factory=list)
 
     def lines(self) -> list[str]:
@@ -141,6 +146,11 @@ class EspnPanelReport:
                     f"SKIPPED, {label}: {', '.join(items[:6])}"
                     + (" ..." if len(items) > 6 else "")
                 )
+        if self.skipped_already_held:
+            out.append(
+                f"already in the panel   {self.skipped_already_held} "
+                f"event(s), not re-fetched"
+            )
         if self.dropped_no_athlete_id:
             out.append(
                 f"DROPPED, no athlete id: {self.dropped_no_athlete_id} row(s) "
@@ -334,6 +344,174 @@ def parse_summary_payload(
     return out
 
 
+def fetch_season_calendar(
+    season_year: int, *, session: Any = None, config: Any = None
+) -> list[date]:
+    """
+    Every date ESPN lists as having an NBA game in one season, Pacific.
+
+    WHY A CALENDAR AND NOT A DATE RANGE. Backfilling history by walking
+    calendar days asks ESPN about roughly 260 days per season to find the
+    ~170 that had basketball, and it cannot tell "there was no game" from
+    "the panel has not ingested this day yet" -- so a resumable backfill
+    keyed on what the database holds would re-ask every gameless day on
+    every run, for ever. ESPN answers the question directly: the scoreboard
+    payload carries `leagues[0].calendar`, every date in the season with a
+    game, for ONE call. Measured 2026-11-01: `dates=2026` returns 229 dates
+    spanning 2025-10-02 to 2026-06-13.
+
+    THE CALENDAR IS NOT REGULAR-SEASON-ONLY, and `seasontype=2` does not
+    narrow it -- both forms return the same 229 dates, which include
+    preseason in October and the playoffs through June. Passing `seasontype`
+    would therefore be a parameter that reads as a filter and filters
+    nothing. The per-event guard in `_player_rows_for_event` is what keeps
+    non-regular-season games out of the panel, as it already did; the cost
+    of the wider calendar is wasted calls on those days, which is why the
+    backfill that uses this is operator-triggered rather than unconditional.
+
+    PACIFIC, like every other date in this module. ESPN renders each calendar
+    entry as UTC midnight Pacific (`2025-10-02T07:00Z`), so reading the UTC
+    date is right by luck for exactly as long as the offset stays at -7;
+    across the November DST change it is -8 and `08:00Z` would still be the
+    2nd. `to_pacific` makes that explicit rather than lucky.
+
+    SEASON_YEAR IS ESPN'S, which is the season's ENDING year: 2026 is the
+    2025-26 season. That is the number its own payload reports in
+    `leagues[0].season.year`, and inventing a different convention here
+    would be one more thing a caller has to know.
+    """
+    payload = get_json(
+        site_url("scoreboard"),
+        params={"dates": str(int(season_year))},
+        config=config,
+        session=session,
+    )
+    leagues = payload.get("leagues") if isinstance(payload, dict) else None
+    first = (leagues or [{}])[0] if isinstance(leagues, list) and leagues else {}
+    entries = first.get("calendar") if isinstance(first, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise EspnError(
+            f"ESPN returned no season calendar for {season_year}: "
+            f"leagues[0].calendar was {type(entries).__name__}. Without it "
+            f"there is no list of game dates to back-fill, and walking the "
+            f"calendar by hand would re-ask every gameless day for ever."
+        )
+    days: list[date] = []
+    seen: set[date] = set()
+    unreadable: list[str] = []
+    for entry in entries:
+        # A nested calendar (ESPN uses one for week-based sports) is not the
+        # flat day list this reads, and a dict's str() would parse as nothing.
+        parsed = None
+        if isinstance(entry, str):
+            try:
+                parsed = datetime.fromisoformat(entry.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            unreadable.append(repr(entry)[:60])
+            continue
+        day = to_pacific(parsed).date()
+        if day not in seen:
+            seen.add(day)
+            days.append(day)
+    # ANY UNREADABLE ENTRY IS A REFUSAL, not a skipped day, and the
+    # asymmetry is deliberate. A date dropped here never enters the
+    # backfill's work list, so it is never fetched -- and because the
+    # planner reports what is MISSING, a calendar quietly short by 29 dates
+    # produces `remaining: 0` with 29 nights that have no rows. That is the
+    # one failure mode of this whole job that looks like success. A calendar
+    # is a short machine-generated list, so an entry that will not parse
+    # means the payload shape changed, which is exactly when to stop rather
+    # than proceed on a partial reading. Raised by review on #31.
+    if unreadable:
+        raise EspnError(
+            f"ESPN's season calendar for {season_year} held {len(entries)} "
+            f"entr(ies) and {len(unreadable)} did not parse as a date (e.g. "
+            f"{unreadable[0]}). Refusing a PARTIAL calendar: the dates it "
+            f"dropped would never be fetched, and the backfill would report "
+            f"itself complete with those nights empty."
+        )
+    # NO "nothing parsed" BRANCH. `entries` is already known non-empty, and
+    # every entry either parses (so `days` grew) or was recorded above (so
+    # the refusal fired), which leaves `days` empty unreachable. The first
+    # version had that branch and it was dead the moment the partial refusal
+    # went in; unreachable code that looks like a guard is worse than none,
+    # because a reader counts it as one.
+    return sorted(days)
+
+
+def fetch_regular_season_window(
+    season_year: int, *, session: Any = None, config: Any = None
+) -> tuple[date, date]:
+    """
+    The first and last PACIFIC date of one season's regular season.
+
+    WHY THE BACKFILL CANNOT WORK WITHOUT THIS. `fetch_season_calendar`
+    returns every date with any NBA game in a season -- preseason from
+    early October and the playoffs through June included -- and the
+    per-event guard refuses both, so those dates never get panel rows. A
+    work list built from the calendar alone therefore reports them missing
+    on every run: the backfill never reports itself complete, re-fetches
+    them nightly for ever, and the operator is told to wait for a signal
+    that cannot arrive. Found in review on #31, against exactly that claim
+    in the job's own docstring.
+
+    ESPN ANSWERS IT DIRECTLY rather than being guessed at. The core API's
+    season/type resource carries the regular season's own bounds, and one
+    call settles a question no heuristic should be deciding. Measured
+    2026-11-01: 2026 -> 2025-10-21 to 2026-04-13Z, and 2025 -> 2024-10-22
+    to 2025-04-14Z.
+
+    BOTH BOUNDS READ AS PACIFIC DATES, like the calendar. ESPN renders the
+    end as 06:59Z, which is 23:59 the previous evening Pacific -- so the
+    Pacific end date is the last day games are played, which is what an
+    intersection with the calendar wants. Reading the UTC date there would
+    extend the window one day past the season.
+    """
+    year = int(season_year)
+    payload = get_json(
+        f"{CORE_API_BASE}/v2/sports/basketball/leagues/nba/seasons/"
+        f"{year}/types/{SEASON_TYPE_REGULAR}",
+        config=config,
+        session=session,
+    )
+    if not isinstance(payload, dict):
+        raise EspnError(
+            f"ESPN returned {type(payload).__name__} for the {year} regular "
+            f"season, not an object."
+        )
+    reported = payload.get("type")
+    if reported is not None and int(reported) != SEASON_TYPE_REGULAR:
+        # A payload describing the PRESEASON would hand back a window from
+        # early October, which is the exact set of dates this exists to
+        # exclude. Checked rather than trusted.
+        raise EspnError(
+            f"ESPN described season type {reported!r} for the {year} regular "
+            f"season; expected {SEASON_TYPE_REGULAR}."
+        )
+    bounds: list[date] = []
+    for key in ("startDate", "endDate"):
+        raw = payload.get(key)
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise EspnError(
+                f"ESPN's {year} regular season has no readable {key} "
+                f"({raw!r}). Without both bounds the backfill cannot tell a "
+                f"preseason date from a regular-season one, and would report "
+                f"itself complete while re-fetching preseason for ever."
+            ) from exc
+        bounds.append(to_pacific(parsed).date())
+    start, end = bounds
+    if end < start:
+        raise EspnError(
+            f"ESPN's {year} regular season ends ({end}) before it starts "
+            f"({start}); the window would select nothing."
+        )
+    return start, end
+
+
 def fetch_event_ids(
     day: date, *, session: Any = None, config: Any = None
 ) -> list[str]:
@@ -356,6 +534,7 @@ def fetch_player_rows(
     *,
     session: Any = None,
     config: Any = None,
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> tuple[pd.DataFrame, EspnPanelReport]:
     """
     Canonical player rows for these events, and what was refused.
@@ -364,10 +543,23 @@ def fetch_player_rows(
     recorded and the rest are fetched -- a slate that loses twelve games
     because the first one 404s is the failure mode `espn_client`'s own retry
     budget exists to avoid, and it would be reintroduced here by a bare loop.
+
+    ``skip_game_ids`` IS THE UNIT OF WORK, AND IT IS THE EVENT. The history
+    backfill used to decide a DATE was done because the panel held any row
+    for it, and the two guarantees above make that wrong in both
+    directions: this loop records a failed event and keeps the others, so a
+    night that lost one game to a 404 was written, marked done, and never
+    retried -- a silent hole in a rolling window. Asking by event id heals
+    that on the next pass and costs nothing for a night already complete,
+    because the summary is never fetched. Found in review on #31.
     """
     report = EspnPanelReport()
     rows: list[dict[str, Any]] = []
+    skip = {str(g) for g in skip_game_ids}
     for event_id in event_ids:
+        if skip and espn_game_id(event_id) in skip:
+            report.skipped_already_held += 1
+            continue
         try:
             payload = get_json(
                 site_url("summary"),
@@ -405,8 +597,14 @@ def fetch_player_rows_for_dates(
     *,
     session: Any = None,
     config: Any = None,
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> tuple[pd.DataFrame, EspnPanelReport]:
-    """Every final regular-season game across these dates, as one frame."""
+    """
+    Every final regular-season game across these dates, as one frame.
+
+    ``skip_game_ids`` is passed straight through to `fetch_player_rows`,
+    where the reasoning is: the unit of work is the event, not the date.
+    """
     frames: list[pd.DataFrame] = []
     combined = EspnPanelReport()
     for day in days:
@@ -416,13 +614,16 @@ def fetch_player_rows_for_dates(
             combined.notes.append(f"{day}: scoreboard failed -- {exc}")
             logger.warning("ESPN scoreboard %s failed: %s", day, exc)
             continue
-        frame, report = fetch_player_rows(ids, session=session, config=config)
+        frame, report = fetch_player_rows(
+            ids, session=session, config=config, skip_game_ids=skip_game_ids,
+        )
         frames.append(frame)
         combined.games_seen += report.games_seen
         combined.games_parsed += report.games_parsed
         combined.rows_out += report.rows_out
         combined.dropped_no_athlete_id += report.dropped_no_athlete_id
         combined.dnp_rows += report.dnp_rows
+        combined.skipped_already_held += report.skipped_already_held
         for name in ("skipped_not_final", "skipped_season_type",
                      "skipped_unmapped_team", "skipped_one_sided", "notes"):
             getattr(combined, name).extend(getattr(report, name))

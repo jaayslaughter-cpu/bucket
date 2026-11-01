@@ -216,6 +216,49 @@ def team_game_owners_by_date() -> dict[tuple[str, str], str]:
     return out
 
 
+def panel_game_ids_by_date(source: str) -> dict[str, set[str]]:
+    """
+    Which GAME IDS the panel holds per ``game_date``, for one source.
+
+    THE RESUME POINT, AND THE UNIT IS THE GAME. An earlier version returned
+    dates alone, which made "the panel has a row for this night" mean "this
+    night is done" -- and `fetch_player_rows` records a failed event and
+    keeps the others, so a night that lost one game to a 404 was written,
+    marked done and never retried. A silent hole in a rolling window, which
+    is the one thing the panel must not have. Keyed by game id, a later pass
+    sees exactly which events are absent and asks for only those. Found in
+    review on #31.
+
+    THE PANEL AND NOT `team_game_stats`, which an earlier version read and
+    which has a hole of its own. `aggregate_team_games` DECLINES a (date,
+    team) a higher-precedence source already owns -- BigDataBall outranks
+    `espn_agg` -- so a night the licensed workbook holds gets no `espn_agg`
+    team row however many times ESPN is read for it.
+    `upsert_player_game_logs` has no such guard: it writes every row it is
+    handed. The panel is also the thing a backfill exists to fill, so it is
+    the honest place to ask what is already in.
+
+    KEYED ON SOURCE, because "ingested" is not a property of the date. A
+    night the licensed workbook owns is not a night ESPN has read.
+
+    Dates are ISO strings, matching `team_game_owners_by_date`'s keys, so a
+    caller comparing the two is not comparing a `date` with a `str`.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(PlayerGameLog.game_date, PlayerGameLog.nba_game_id)
+            .where(PlayerGameLog.source == str(source))
+            .distinct()
+        ).all()
+    out: dict[str, set[str]] = {}
+    for day, game_id in rows:
+        if day is None or game_id is None:
+            continue
+        key = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        out.setdefault(key, set()).add(str(game_id))
+    return out
+
+
 def player_id_namespaces() -> dict[str, int]:
     """
     How many panel rows carry each player-id namespace.

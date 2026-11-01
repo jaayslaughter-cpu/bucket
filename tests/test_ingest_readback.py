@@ -253,3 +253,182 @@ def test_an_nba_id_with_a_playoff_digit_is_still_excluded(monkeypatch):
     a playoff NBA id must still be filtered out."""
     _bind(monkeypatch, team_keys=[("0042600123", "LAL")])
     assert repository.newest_team_game_date() is None
+
+
+# --- the history backfill's resume point ----------------------------------
+
+
+def _bind_panel(monkeypatch, rows):
+    """
+    `session_scope` bound to a database holding these panel rows.
+
+    Each row is ``(date, player, source)`` or ``(date, player, source,
+    game_id)``. THE GAME ID IS EXPLICIT where it matters: the three-tuple
+    form derives a unique one per row, which made the "same night, two
+    players" case in `test_the_backfill_resume_point_is_read_from_the
+    _database` two separate GAMES -- so nothing asserted that two players
+    from ONE game collapse to one id. Raised by review on #31.
+    """
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(JSONB, "sqlite")
+    def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
+        return "JSON"
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(bind=engine, tables=[PlayerGameLog.__table__])
+    factory = sessionmaker(bind=engine)
+    with factory() as seed:
+        for index, row in enumerate(rows):
+            day, player, source = row[0], row[1], row[2]
+            game_id = row[3] if len(row) > 3 else f"espn:{40000 + index}"
+            seed.add(PlayerGameLog(
+                nba_game_id=game_id, nba_player_id=player,
+                player_name=f"HARNESS {player}", game_date=day,
+                season="2024-25", team_abbr="LAL", opponent_abbr="XXX",
+                is_home=True, pts=20, source=source,
+            ))
+        seed.commit()
+
+    @contextlib.contextmanager
+    def _scope():
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(repository, "session_scope", _scope)
+
+
+def test_the_backfill_resume_point_is_read_from_the_database(monkeypatch):
+    """
+    The dates ESPN has already supplied, as ISO strings.
+
+    THE RESUME POINT HAS TO COME FROM HERE. A state file beside the database
+    is a second source of truth about what is ingested, and a high-water mark
+    cannot express a hole in the middle left by a night ESPN was down for.
+    """
+    _bind_panel(monkeypatch, [
+        # One night, TWO GAMES, with two players sharing the first. Both
+        # distinctions matter: the two games must stay two ids, and the two
+        # players in one game must collapse to one. The first version of
+        # this test gave every row its own game id, so it only ever
+        # exercised the second half of that.
+        (date(2024, 10, 22), "espn:1", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:2", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:3", "espn", "espn:40001"),
+        (date(2024, 10, 24), "espn:4", "espn", "espn:40002"),
+    ])
+    assert repository.panel_game_ids_by_date("espn") == {
+        "2024-10-22": {"espn:40000", "espn:40001"},
+        "2024-10-24": {"espn:40002"},
+    }, "the resume point is keyed by GAME, not by row and not by date"
+
+
+def test_the_resume_point_reads_the_panel_not_the_team_table(monkeypatch):
+    """
+    THE HOLE THE FIRST VERSION HAD. It read `team_game_stats`, and
+    `aggregate_team_games` DECLINES a (date, team) a higher-precedence
+    source already owns — BigDataBall outranks `espn_agg`. So a night the
+    licensed workbook holds gets no `espn_agg` team row however many times
+    ESPN is read for it, and the backfill would re-fetch that night for
+    ever while never reporting itself complete.
+
+    `upsert_player_game_logs` has no precedence guard: it writes every row
+    it is handed. The panel is also the thing the backfill exists to fill,
+    so it is the honest place to ask what is already in. Raised by review
+    on #31.
+    """
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(JSONB, "sqlite")
+    def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
+        return "JSON"
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(
+        bind=engine, tables=[PlayerGameLog.__table__, TeamGameStat.__table__],
+    )
+    factory = sessionmaker(bind=engine)
+    day = date(2024, 10, 22)
+    with factory() as seed:
+        # ESPN supplied the panel for this night...
+        seed.add(PlayerGameLog(
+            nba_game_id="espn:40001", nba_player_id="espn:1",
+            player_name="HARNESS ONE", game_date=day, season="2024-25",
+            team_abbr="LAL", opponent_abbr="GSW", is_home=True, pts=20,
+            source="espn",
+        ))
+        # ...while the team row for it belongs to the licensed workbook,
+        # which outranks espn_agg, so no espn_agg team row exists.
+        seed.add(TeamGameStat(
+            nba_game_id="0022400001", game_date=day, team_abbr="LAL",
+            opponent_abbr="GSW", is_home=True, points=100.0,
+            source="bigdataball",
+        ))
+        seed.commit()
+
+    @contextlib.contextmanager
+    def _scope():
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(repository, "session_scope", _scope)
+
+    assert repository.panel_game_ids_by_date("espn") == {
+        "2024-10-22": {"espn:40001"},
+    }, (
+        "the night is in the panel but the team table has no espn_agg row "
+        "for it; keyed on the team table the backfill would re-fetch it for "
+        "ever"
+    )
+
+
+def test_another_sources_night_is_not_a_night_espn_has_read(monkeypatch):
+    """
+    KEYED ON SOURCE, and this is the assertion that pins it. A night the
+    licensed workbook owns is NOT a night ESPN has supplied: counting it
+    would leave the backfill a hole it believes it has filled.
+    """
+    _bind_panel(monkeypatch, [
+        (date(2024, 10, 22), "espn:1", "espn"),
+        (date(2024, 10, 23), "2544", "bigdataball"),
+        (date(2024, 10, 24), "201939", "scraper"),
+    ])
+    assert set(repository.panel_game_ids_by_date("espn")) == {"2024-10-22"}
+    assert set(repository.panel_game_ids_by_date("bigdataball")) == {"2024-10-23"}
+
+
+def test_a_source_with_no_rows_reports_no_dates_rather_than_raising(monkeypatch):
+    """The first run's state. An exception here would fail the backfill
+    before it read a single night."""
+    _bind_panel(monkeypatch, [(date(2024, 10, 22), "2544", "bigdataball")])
+    assert repository.panel_game_ids_by_date("espn") == {}
+
+
+def test_a_partially_ingested_night_is_visible_as_the_games_it_holds(
+    monkeypatch,
+):
+    """
+    THE DEFECT A DATE-LEVEL MARKER HID, raised by review on #31.
+
+    `fetch_player_rows` records a failed event and keeps the others, so a
+    night that lost one game to a 404 is written and INCOMPLETE. Returning
+    dates alone made that night indistinguishable from a complete one, so
+    the backfill skipped it for ever and the missing game's players carried
+    a rolling window short one game, silently.
+
+    Keyed by game id, the gap is visible: the caller subtracts what it holds
+    from what ESPN lists for that date and asks for the difference.
+    """
+    _bind_panel(monkeypatch, [
+        (date(2024, 10, 22), "espn:1", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:2", "espn", "espn:40001"),
+    ])
+    held = repository.panel_game_ids_by_date("espn")
+    assert held == {"2024-10-22": {"espn:40000", "espn:40001"}}
+    # ESPN listed three games that night; the third never landed.
+    listed = {"espn:40000", "espn:40001", "espn:40002"}
+    assert listed - held["2024-10-22"] == {"espn:40002"}, (
+        "the missing game must be derivable from what the panel holds"
+    )

@@ -120,7 +120,16 @@ def test_the_ingest_runs_before_settlement_and_before_the_slate():
     jobs = {j["id"]: j for j in worker.describe(
         worker.build_scheduler(BackgroundScheduler())
     )}
-    assert set(jobs) == {"espn_ingest", "settlement", "slate"}
+    # ASSERTED AS "NONE OF THESE IS MISSING", not as set equality. The
+    # equality held until `espn_history_backfill` was added on 2026-11-01 and
+    # then failed for a job that was supposed to be there -- the same way the
+    # worker's own `test_both_halves_of_the_loop_are_scheduled` failed when
+    # `espn_ingest` was added, and for the same reason. A test that breaks on
+    # every addition teaches people to edit the test rather than read it.
+    # What must never happen is one of these three going absent, or the order
+    # between them inverting, and that is what this now says.
+    for required in ("espn_ingest", "settlement", "slate"):
+        assert required in jobs, f"{required} is not on the schedule"
 
     def hour(job_id: str) -> int:
         trigger = jobs[job_id]["trigger"]
@@ -130,6 +139,17 @@ def test_the_ingest_runs_before_settlement_and_before_the_slate():
         f"ingest {hour('espn_ingest')}, settle {hour('settlement')}, "
         f"slate {hour('slate')} — the readers must come after the writer"
     )
+    # The history backfill is a WRITER of the same table, so it belongs on
+    # the same side of the slate. It is allowed to sit after settlement --
+    # settlement grades box scores and does not read seasons-old panel rows
+    # -- but a backfill still writing `player_game_logs` at 09:00 would be
+    # writing while the slate reads.
+    if "espn_history_backfill" in jobs:
+        assert hour("espn_history_backfill") < hour("slate"), (
+            f"the history backfill is at {hour('espn_history_backfill')}, "
+            f"the slate at {hour('slate')}: it would write the panel while "
+            f"the slate reads it"
+        )
 
 
 def test_the_ingest_survives_a_worker_that_was_down(monkeypatch):
