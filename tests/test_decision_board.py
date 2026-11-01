@@ -512,3 +512,110 @@ def test_recommending_is_still_not_promising():
 def test_the_disclaimer_says_it_recommends_but_does_not_place():
     assert "recommend" in BOARD_DISCLAIMER.lower()
     assert "does not place" in BOARD_DISCLAIMER.lower()
+
+
+# --- a board built from persisted projections -----------------------------
+
+
+def _projection_frame(**overrides):
+    """One persisted projection row, in `load_projections`' shape."""
+    import pandas as pd
+
+    row = {
+        "run_id": "run_harness",
+        "nba_player_id": "espn:1",
+        "player_name": "HARNESS ONE",
+        "nba_game_id": "espn:401909903",
+        "game_date": pd.Timestamp("2026-11-01").date(),
+        "market": "PTS",
+        "final_projection": 24.5,
+        "baseline_projection": 23.0,
+        "line": 21.5,
+        "prob_over": None,
+        "prob_under": None,
+        "prob_push": None,
+        "market_status": "DATA_NOT_AVAILABLE",
+        "market_status_reason": None,
+        "ev_per_dollar": None,
+        "model_version": None,
+    }
+    row.update(overrides)
+    return pd.DataFrame([row])
+
+
+def test_projection_rows_are_renamed_not_recomputed():
+    """
+    A RENAME AND NOTHING MORE. Every value the board reads is one `main.py`
+    already wrote; this path must not compute a probability, attach a line
+    or adjust a projection, because the slate job did that at 09:00 and a
+    second answer to the same question is the defect this repo removes.
+    """
+    from src.pipeline.slate_board import (
+        PROJECTION_MODEL_NAME,
+        projection_detail_rows,
+    )
+
+    rows = projection_detail_rows(_projection_frame())
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_id"] == "espn:401909903"
+    assert row["player_id"] == "espn:1"
+    assert row["target_market"] == "PTS"
+    assert row["prop_line"] == 21.5
+    assert row["prediction_mean"] == 24.5
+    assert row["model_name"] == PROJECTION_MODEL_NAME
+    assert row["probability_over_raw"] is None
+
+
+def test_a_missing_sigma_is_left_none_rather_than_invented():
+    """
+    THE PROJECTIONS TABLE STORES NO DISPERSION. `edge_grades` documents its
+    own fallback order and drops from the `(mean - line) / σ` z to the
+    `|P(over) - 0.5|` proxy, or to `grade_basis="unavailable"`. A
+    fabricated σ — a league average, a fraction of the mean — would turn
+    that honest degradation into a confident-looking grade resting on a
+    number nobody measured.
+    """
+    from src.pipeline.slate_board import projection_detail_rows
+
+    row = projection_detail_rows(_projection_frame())[0]
+    assert row["prediction_std_or_dispersion"] is None, (
+        "a dispersion appeared from somewhere; the table does not store one"
+    )
+
+
+def test_a_frame_that_is_not_the_projections_frame_is_refused():
+    """
+    Assembled elsewhere, it is not interchangeable. Refusing names the
+    missing columns; proceeding would put None in a board cell and let an
+    operator read it as a measurement.
+    """
+    import pandas as pd
+    import pytest
+
+    from src.pipeline.slate_board import projection_detail_rows
+
+    with pytest.raises(ValueError, match="DATA_NOT_AVAILABLE"):
+        projection_detail_rows(pd.DataFrame({"PLAYER_ID": ["1"], "MARKET": ["PTS"]}))
+
+
+def test_the_board_filters_markets_without_inventing_them(tmp_path):
+    """`markets` selects from what was projected. A market with no row
+    contributes nothing, rather than an empty placeholder row that would
+    read as a projection of zero."""
+    import pandas as pd
+
+    from src.pipeline.slate_board import build_board_from_projections
+
+    frame = pd.concat([
+        _projection_frame(market="PTS"),
+        _projection_frame(market="REB", nba_player_id="espn:2"),
+    ], ignore_index=True)
+
+    result = build_board_from_projections(
+        frame, out=tmp_path / "board.csv", slate_date="2026-11-01",
+        markets=("PTS",),
+    )
+    assert result.slate_date == "2026-11-01"
+    markets = {getattr(r, "target_market", None) for r in result.board}
+    assert markets <= {"PTS"}, f"a market nobody asked for reached the board: {markets}"

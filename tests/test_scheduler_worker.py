@@ -68,6 +68,42 @@ def board_panel(rows: int = 12, start: str = "2026-10-01"):
     })
 
 
+def board_projections(slate_date="2026-11-01", rows=3, with_probability=False):
+    """
+    Persisted projection rows, in `repository.load_projections`' shape.
+
+    ONE COPY, because the board tests need it and it is the board's real
+    input now. `prob_over` is null by default, which is production's state
+    with no model artifact: the board still writes a row and says so per
+    row, rather than writing nothing.
+    """
+    import pandas as pd
+
+    return pd.DataFrame([
+        {
+            "run_id": "run_harness",
+            "nba_player_id": f"espn:{i}",
+            "player_name": f"HARNESS {i}",
+            "nba_game_id": "espn:401909903",
+            "game_date": pd.Timestamp(slate_date).date(),
+            "market": ["PTS", "REB", "AST"][i % 3],
+            "final_projection": 20.0 + i,
+            "baseline_projection": 19.0 + i,
+            "line": 19.5 + i,
+            "prob_over": 0.55 if with_probability else None,
+            "prob_under": 0.45 if with_probability else None,
+            "prob_push": None,
+            "market_status": (
+                "READY_FOR_EVALUATION" if with_probability else "DATA_NOT_AVAILABLE"
+            ),
+            "market_status_reason": None,
+            "ev_per_dollar": None,
+            "model_version": None,
+        }
+        for i in range(rows)
+    ])
+
+
 def _jobs() -> dict[str, dict]:
     scheduler = FakeScheduler()
     worker.build_scheduler(scheduler)
@@ -1099,10 +1135,15 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
     this file had exactly that gap, and replacing run_board's call with the two
     hardcoded 2025 dates left it green.
 
-    So this captures what build_slate_board is actually handed.
+    So this captures what the board path is actually handed. It reads the
+    PROJECTIONS path now: a live slate no longer goes through
+    `compare_models_on_panel`, because that function scores a window of
+    games with known outcomes and tonight's have none. The window still
+    decides which day is asked for, which is what this asserts.
     """
     from datetime import date, timedelta
 
+    import src.db.repository as repo
     import src.pipeline.slate_board as slate_board_module
     from src.utils import timezones
 
@@ -1118,27 +1159,35 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
         def as_dict(self):
             return {"written_rows": 0}
 
-    def _fake_build(panel, **kwargs):
+    def _fake_build(projections, **kwargs):
         seen.update(kwargs)
+        seen["rows"] = len(projections)
         return _Result()
 
-    monkeypatch.setattr(slate_board_module, "build_slate_board", _fake_build)
+    monkeypatch.setattr(
+        slate_board_module, "build_board_from_projections", _fake_build,
+    )
+    monkeypatch.setattr(
+        repo, "load_projections", lambda slate, **k: board_projections(slate),
+    )
 
-    import src.db.repository as repo
-    # Dated so the newest game is `today`: the window assertions below are
-    # about which days were scored, and the builder needs real stat columns.
-    panel = board_panel(start=str(today - timedelta(days=11)))
-    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: panel)
+    # The comparison path must not be reached for a live slate at all.
+    def _must_not_compare(*a, **k):
+        raise AssertionError("a live board went through compare_models_on_panel")
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _must_not_compare)
 
     out = worker.run_board()
     assert out["status"] == "OK"
-    assert seen["validation_end"] == str(today)
-    assert seen["train_end"] == str(today - timedelta(days=1))
-    assert seen["train_end"] != "2025-01-15"
-    assert seen["validation_end"] != "2025-02-15"
+    assert seen["slate_date"] == str(today), (
+        f"the board asked for the wrong day: {seen.get('slate_date')}"
+    )
+    assert seen["slate_date"] != "2025-02-15"
+    assert out["source"] == "projections"
     # And the window travels with the result, so a log line says WHICH days
     # were scored rather than only how many rows came back.
     assert out["window"]["validation_end"] == str(today)
+    assert out["window"]["train_end"] == str(today - timedelta(days=1))
     assert out["window"]["is_backtest"] is False
 
 
@@ -1569,10 +1618,11 @@ def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
             return {"written_rows": 3}
 
     monkeypatch.setattr(
-        slate_board_module, "build_slate_board", lambda panel, **k: _Result()
+        slate_board_module, "build_board_from_projections",
+        lambda projections, **k: _Result(),
     )
     monkeypatch.setattr(
-        repo, "load_player_panel", lambda *a, **k: board_panel(),
+        repo, "load_projections", lambda slate, **k: board_projections(slate),
     )
 
     def _boom(*a, **k):
@@ -1655,11 +1705,18 @@ def test_the_healthcheck_certifies_the_file_settlement_actually_writes():
 # --- the board job must hand over a FEATURE MATRIX, not the raw panel ----
 
 
-def test_run_board_builds_features_before_handing_the_panel_over(
+def test_the_backtest_board_builds_features_before_handing_the_panel_over(
     monkeypatch, tmp_path,
 ):
     """
     THE BUG AN EMPTY DATABASE HID FOR THE WHOLE PROJECT'S LIFE.
+
+    MOVED TO THE BACKTEST WINDOW, where the assertion still holds and the
+    path still exists. A live board no longer goes through
+    `compare_models_on_panel` at all -- it reads `main.py`'s persisted
+    projections, which were scored from a matrix main already built. The
+    comparison path remains for an override into the past, and it still
+    needs the feature build in front of it for exactly the reason below.
 
     `run_board` loaded `load_player_panel()` and passed it straight to
     `build_slate_board`, which hands it to `compare_models_on_panel` ->
@@ -1685,6 +1742,9 @@ def test_run_board_builds_features_before_handing_the_panel_over(
     monkeypatch.setattr(
         repo, "load_player_panel", lambda *a, **k: board_panel(),
     )
+    # A WINDOW IN THE PAST, so the comparison path is the one taken.
+    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2026-10-25")
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-28")
 
     handed: dict = {}
 
@@ -2469,33 +2529,30 @@ def test_a_mixed_window_is_unavailable_rather_than_a_clean_no_op(monkeypatch):
     assert out["games_seen"] == 1
 
 
-# --- the board's scored window needs rows that have not been played ------
+# --- a live board reads what the slate already projected -------------------
 
 
-def test_the_board_attaches_the_forward_slate_before_building_features(
+def test_a_live_board_reads_projections_and_never_compares_models(
     monkeypatch, tmp_path,
 ):
     """
-    THE SECOND HALF OF THE BOARD FIX, and only the first half could reveal it.
+    THE WALL THREE FIXES WALKED INTO.
 
-    `board_window` scores `(train_end, validation_end]` = `(yesterday,
-    today]`, and its own docstring says why that works: "forward_slate
-    writes one row per (player, scheduled game) for today, so today IS the
-    slate." The panel this job loads is COMPLETED box scores, newest
-    yesterday — so without the forward rows the validation half is empty BY
-    CONSTRUCTION and `walk_forward.fixed_cutoff_split` raises `empty train
-    or validation after cutoff`.
+    `compare_models_on_panel` drops every row whose `over_hit` is null
+    before it splits (`compare.py`), so a game with no outcome yet is
+    dropped and the function cannot describe tonight. #31 gave it the
+    feature matrix it needed; #32 attached the forward slate and the
+    forward rows were dropped at that same label filter — a fix that could
+    not work, caught in review.
 
-    Measured in production on 2026-11-01 at 09:03 PT, once the PTS_L10 fix
-    let the job get that far: 1,991 panel rows, newest 2026-10-31, scoring
-    (2026-10-31, 2026-11-01]. The slate job's own matrix was 2,106 rows —
-    the same 1,991 plus 115 forward rows — and that difference was the
-    whole failure.
+    The numbers already existed: `main.py` persists one row per (player,
+    game, market) with the line attached and the EV gate applied, and
+    nothing had ever read that table back. So a live board reads those and
+    does not compare models at all.
     """
     from datetime import date as _d
 
     import src.db.repository as repo
-    import src.pipeline.forward_slate as forward_module
     import src.pipeline.slate_board as slate_board_module
     from src.utils import timezones
 
@@ -2503,167 +2560,125 @@ def test_the_board_attaches_the_forward_slate_before_building_features(
     monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: today)
     monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
     monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
-    monkeypatch.setenv("PROPIQ_FORWARD_SLATE", "true")
-
-    # A panel whose newest completed game is YESTERDAY, like production's.
-    # 12 rows from 10-20 ends on 10-31; starting a day later ends ON the
-    # slate, and `builder.assert_no_lookahead` then rejects the forward row
-    # for including a game on its own GAME_DATE -- the repository's first
-    # rule catching the fixture, which is the guard working.
-    panel = board_panel(start="2026-10-20")
-    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: panel)
-    monkeypatch.setattr(
-        worker, "_board_market_frames",
-        lambda: {"team_games": None, "market_lines": None},
-    )
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
 
     asked: dict = {}
 
-    def _attach(frame, *, slate_date, **kwargs):
-        import pandas as pd
-        asked["slate_date"] = str(slate_date)
-        asked["rows_in"] = len(frame)
-        # One forward row dated ON the slate, carrying identity and no stats,
-        # which is what the real one does.
-        row = frame.iloc[-1].copy()
-        row["GAME_DATE"] = pd.Timestamp(slate_date)
-        row["GAME_ID"] = "espn:forward"
-        for stat in ("PTS", "REB", "AST"):
-            row[stat] = None
-        grown = pd.concat([frame, row.to_frame().T], ignore_index=True)
-        return type("R", (), {
-            "panel": grown,
-            "as_dict": lambda self: {"status": "OK", "rows_added": 1},
-        })()
+    def _load(slate=None, **kwargs):
+        asked["slate"] = slate
+        return board_projections(str(today))
 
-    monkeypatch.setattr(forward_module, "attach_forward_slate", _attach)
+    monkeypatch.setattr(repo, "load_projections", _load)
 
-    handed: dict = {}
+    def _must_not_compare(*a, **k):
+        raise AssertionError(
+            "a live board reached compare_models_on_panel, which drops "
+            "unlabelled rows and so cannot describe an unplayed game"
+        )
 
-    class _Result:
-        written_rows = 1
-        out = None
-        slate_date = "2026-11-01"
-        summary: dict = {}
-
-        def as_dict(self):
-            return {"written_rows": 1}
-
-    def _capture(frame, **kwargs):
-        handed["dates"] = sorted({str(d)[:10] for d in frame["GAME_DATE"]})
-        handed["rows"] = len(frame)
-        return _Result()
-
-    monkeypatch.setattr(slate_board_module, "build_slate_board", _capture)
-    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _must_not_compare)
+    # The panel loader belongs to the backtest path; a live board must not
+    # need it at all.
+    monkeypatch.setattr(
+        repo, "load_player_panel",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("a live board loaded the player panel")
+        ),
+    )
 
     out = worker.run_board()
 
-    assert asked.get("slate_date") == "2026-11-01", (
-        f"the forward slate was not attached for the scored day: {asked}"
+    assert out["status"] == "OK", out
+    assert out["source"] == "projections"
+    assert asked["slate"] == str(today), (
+        f"the board read the wrong slate date: {asked}"
     )
-    assert "2026-11-01" in handed["dates"], (
-        "no row dated on the slate reached build_slate_board, so the "
-        f"validation half of (yesterday, today] is empty. Dates: {handed['dates']}"
-    )
-    assert out["forward_slate"]["status"] == "OK"
+    # The CSV is the durable output, and it exists even with no probability.
+    assert (tmp_path / "board.csv").exists(), "no board CSV was written"
 
 
-def test_a_backtest_board_gets_no_forward_slate(monkeypatch, tmp_path):
+def test_a_backtest_window_still_uses_the_comparison_path(monkeypatch, tmp_path):
     """
-    AN OVERRIDE INTO THE PAST SCORES GAMES ALREADY PLAYED, and those rows are
-    already in the panel. Attaching forward rows for that date would
-    duplicate them — a second row for one (player, game), which the rolling
-    features would read as two games.
-
-    `board_window` already computes `is_backtest`, so this reads that rather
-    than deciding it again.
+    KEPT, NOT DELETED. An override into the past asks exactly what
+    `compare_models_on_panel` is for — fit on history, score a labelled
+    window — and those games have outcomes, so it works there. Replacing it
+    with the projections path would mean a backtest could only ever
+    describe days `main.py` happened to have run.
     """
     from datetime import date as _d
 
     import src.db.repository as repo
-    import src.pipeline.forward_slate as forward_module
     import src.pipeline.slate_board as slate_board_module
     from src.utils import timezones
 
     monkeypatch.setattr(
         timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
     )
-    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2026-10-20")
-    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-25")
-    monkeypatch.setenv("PROPIQ_FORWARD_SLATE", "true")
+    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2026-10-25")
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-28")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
 
-    monkeypatch.setattr(
-        repo, "load_player_panel", lambda *a, **k: board_panel(start="2026-10-15"),
-    )
+    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: board_panel())
     monkeypatch.setattr(
         worker, "_board_market_frames",
         lambda: {"team_games": None, "market_lines": None},
     )
 
-    def _must_not_attach(*a, **k):
-        raise AssertionError("a backtest board attached a forward slate")
+    def _must_not_read_projections(*a, **k):
+        raise AssertionError("a backtest board read tonight's projections")
 
-    monkeypatch.setattr(forward_module, "attach_forward_slate", _must_not_attach)
+    monkeypatch.setattr(repo, "load_projections", _must_not_read_projections)
+
+    seen: dict = {}
 
     class _Result:
         def as_dict(self):
             return {"written_rows": 0}
 
-    monkeypatch.setattr(
-        slate_board_module, "build_slate_board", lambda frame, **k: _Result(),
-    )
-    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+    def _capture(frame, **kwargs):
+        seen["train_end"] = kwargs.get("train_end")
+        seen["validation_end"] = kwargs.get("validation_end")
+        return _Result()
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _capture)
 
     out = worker.run_board()
     assert out["window"]["is_backtest"] is True
-    assert out["forward_slate"]["reason"] == "backtest window"
+    assert out["source"] == "model comparison (backtest)"
+    assert seen == {"train_end": "2026-10-25", "validation_end": "2026-10-28"}
 
 
-def test_the_board_obeys_mains_own_forward_slate_switch(monkeypatch, tmp_path):
+def test_no_projections_for_the_slate_is_reported_not_crashed(monkeypatch, tmp_path):
     """
-    ONE SWITCH, READ FROM main.py. Both jobs must agree on whether forward
-    rows are on; a second spelling of `PROPIQ_FORWARD_SLATE` in this module
-    is how they would stop agreeing.
+    A board asked for before the slate has run, or after a slate that
+    refused, has no input. That is the pipeline reporting its own state —
+    and it must name the day, because "no projections" with no date sends
+    an operator looking at the wrong one.
     """
     from datetime import date as _d
 
-    import main as orchestrator
-    import src.db.repository as repo
-    import src.pipeline.forward_slate as forward_module
-    import src.pipeline.slate_board as slate_board_module
-    from src.utils import timezones
+    import pandas as pd
 
-    assert orchestrator.ENV_FORWARD_SLATE == "PROPIQ_FORWARD_SLATE"
+    import src.db.repository as repo
+    from src.utils import timezones
 
     monkeypatch.setattr(
         timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
     )
     monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
     monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
-    monkeypatch.setenv(orchestrator.ENV_FORWARD_SLATE, "false")
-
-    monkeypatch.setattr(
-        repo, "load_player_panel", lambda *a, **k: board_panel(start="2026-10-21"),
-    )
-    monkeypatch.setattr(
-        worker, "_board_market_frames",
-        lambda: {"team_games": None, "market_lines": None},
-    )
-
-    def _must_not_attach(*a, **k):
-        raise AssertionError("the forward slate ran with its switch off")
-
-    monkeypatch.setattr(forward_module, "attach_forward_slate", _must_not_attach)
-
-    class _Result:
-        def as_dict(self):
-            return {"written_rows": 0}
-
-    monkeypatch.setattr(
-        slate_board_module, "build_slate_board", lambda frame, **k: _Result(),
-    )
     monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+    monkeypatch.setattr(
+        repo, "load_projections",
+        lambda slate, **k: pd.DataFrame(columns=list(repo.PROJECTION_BOARD_COLS)),
+    )
 
     out = worker.run_board()
-    assert orchestrator.ENV_FORWARD_SLATE in out["forward_slate"]["reason"]
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert "2026-11-01" in out["reason"], (
+        f"the refusal does not name the day it asked for: {out['reason']}"
+    )
+    assert not (tmp_path / "board.csv").exists(), (
+        "an empty board CSV was written, which dispatch would read as a slate "
+        "with no value in it"
+    )

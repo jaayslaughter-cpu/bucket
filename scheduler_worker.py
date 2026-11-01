@@ -1351,6 +1351,58 @@ def _board_market_frames() -> dict[str, Any]:
         return empty
 
 
+def _backtest_board(
+    board_csv: Any, *, markets: Any, train_end: str, validation_end: str,
+    min_ev: float,
+) -> tuple[Any, str]:
+    """
+    The comparison board, for a window whose games have been played.
+
+    KEPT, NOT DELETED. `compare_models_on_panel` is the right tool for a
+    backtest: it fits on history and scores a labelled window, which is
+    exactly what an override into the past asks for. What it cannot do is
+    describe a game with no outcome yet, which is why the live path reads
+    `main.py`'s persisted projections instead.
+
+    The feature build stays here because this path needs it -- the research
+    line is built from `{MARKET}_L10`, which only `build_feature_matrix`
+    adds (#31). The live path needs none of it: those rows were scored at
+    09:00 from a matrix `main.py` already built.
+    """
+    from src.db.repository import load_player_panel
+    from src.features.builder import build_feature_matrix
+    from src.pipeline.slate_board import build_slate_board
+
+    panel = load_player_panel()
+    if panel is None or panel.empty:
+        raise ValueError(
+            "DATA_NOT_AVAILABLE: empty player panel, so a backtest board has "
+            "no history to fit on."
+        )
+    frames = _board_market_frames()
+    features = build_feature_matrix(
+        panel,
+        team_games=frames["team_games"],
+        market_lines=frames["market_lines"],
+    )
+    logger.info(
+        "Backtest board matrix: %d row(s) x %d col(s) from a %d-row panel "
+        "(team_games=%d, market_lines=%d).",
+        len(features), len(features.columns), len(panel),
+        0 if frames["team_games"] is None else len(frames["team_games"]),
+        0 if frames["market_lines"] is None else len(frames["market_lines"]),
+    )
+    result = build_slate_board(
+        features,
+        out=board_csv,
+        markets=markets,
+        train_end=train_end,
+        validation_end=validation_end,
+        min_ev=min_ev,
+    )
+    return result, "model comparison (backtest)"
+
+
 def run_board() -> dict[str, Any]:
     """
     Build the recommendation board CSV that dispatch reads.
@@ -1369,8 +1421,6 @@ def run_board() -> dict[str, Any]:
     """
     board_csv = os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV
     try:
-        from src.pipeline.slate_board import build_slate_board
-
         markets = list(board_markets())
         window = board_window()
         train_end = window["train_end"]
@@ -1380,105 +1430,62 @@ def run_board() -> dict[str, Any]:
         except ValueError:
             min_ev = 0.0
 
-        from src.db.repository import load_player_panel
-
-        panel = load_player_panel()
-        if panel is None or panel.empty:
-            logger.warning("No player panel available — no board built.")
-            return {"status": "DATA_NOT_AVAILABLE", "reason": "empty player panel"}
-
-        # THE RAW PANEL IS NOT WHAT THE BOARD NEEDS, and for the whole life of
-        # this project the guard above hid that. `build_slate_board` hands its
-        # frame to `compare_models_on_panel` -> `attach_research_over_labels`,
-        # which needs `{MARKET}_L10` to build a research line. The panel
-        # carries PTS; only `build_feature_matrix` adds PTS_L10.
+        # A LIVE BOARD AND A BACKTEST BOARD ARE TWO DIFFERENT QUESTIONS, and
+        # for the project's whole life this job asked the backtest one and
+        # stamped tonight's date on the answer.
         #
-        # Every run until 2026-10-31 returned at the empty-panel guard above,
-        # so this line had never once executed against real rows. The night
-        # the ESPN ingest seeded 1,830 of them, the guard passed and the job
-        # raised `DATA_NOT_AVAILABLE: PTS_L10 missing` -- a latent bug that
-        # only an ingest could expose.
+        # `build_slate_board` routes through `compare_models_on_panel`, which
+        # fits models on labelled history and scores a window of games with
+        # KNOWN OUTCOMES -- `compare.py` drops every row whose `over_hit` is
+        # null before it splits. A game that has not been played has no
+        # outcome, so no label, so it is dropped. That function structurally
+        # cannot describe tonight, and three fixes in two days each got one
+        # step closer to that wall: #31 supplied the feature matrix it needed,
+        # #32 attached the forward slate, and the forward rows were dropped at
+        # the label filter. The second of those could not work and was caught
+        # in review before it merged.
         #
-        # `scripts/nba_model_cli.py` has always done this correctly: its
-        # `_load_real_or_demo` builds the matrix before calling the same
-        # function, and its comment says the two paths must not drift because
-        # "the drifting one would be the unattended one". They shared
-        # `build_slate_board` and not the build in front of it. This is that
-        # missing half.
+        # THE NUMBERS FOR TONIGHT ALREADY EXIST. `main.py` scored the slate at
+        # 09:00 PT and persisted one row per (player, game, market) with the
+        # prop line attached and the EV gate applied -- 460 rows on
+        # 2026-11-01, visible only in Postgres because nothing read the table
+        # back. Ranking and formatting those IS the board.
         #
-        # AND SO IS THIS, which the half above had to land before anything
-        # could see. `board_window` scores `(train_end, validation_end]` =
-        # `(yesterday, today]`, and its own docstring says why that works:
-        # "forward_slate writes one row per (player, scheduled game) for
-        # today, so today IS the slate". The panel this job loads is
-        # COMPLETED box scores, newest yesterday -- so without the forward
-        # rows the validation half is empty BY CONSTRUCTION and
-        # `walk_forward.fixed_cutoff_split` raises `empty train or
-        # validation after cutoff`. Measured in production 2026-11-01
-        # 09:03 PT: 1,991 panel rows, newest 2026-10-31, scoring
-        # (2026-10-31, 2026-11-01]. The slate job's own matrix was 2,106 --
-        # the same 1,991 plus 115 forward rows -- which is the difference.
-        #
-        # NOT FOR A BACKTEST. An override whose validation_end is in the past
-        # scores games already played and already in the panel; attaching
-        # forward rows for that date would duplicate them. `board_window`
-        # already computes exactly this distinction, so it is read rather
-        # than re-derived.
-        #
-        # BEST-EFFORT, like main.py's: a denied or unreachable schedule
-        # returns the panel untouched with a named reason, so the board
-        # degrades to the failure above rather than a new one.
-        # main.py's OWN name for the switch, not a second copy of the
-        # string: the two jobs must agree on whether forward rows are on,
-        # and a second spelling is how they would stop agreeing.
-        from main import ENV_FORWARD_SLATE
-
-        forward_note: dict[str, Any] = {"status": "SKIPPED"}
+        # So: a live slate reads the projections; a backtest window keeps the
+        # comparison path, which is the thing it is actually for and which
+        # works there, because those games have outcomes.
         if window.get("is_backtest"):
-            logger.info(
-                "Board: no forward slate -- validation_end=%s is a backtest, "
-                "so those games are already in the panel.", validation_end,
+            result, source = _backtest_board(
+                board_csv, markets=markets, train_end=train_end,
+                validation_end=validation_end, min_ev=min_ev,
             )
-            forward_note = {"status": "SKIPPED", "reason": "backtest window"}
-        elif not _flag(ENV_FORWARD_SLATE, True):
-            logger.info(
-                "Board: forward slate off (%s). The scored window is "
-                "(%s, %s], which completed games cannot fill.",
-                ENV_FORWARD_SLATE, train_end, validation_end,
-            )
-            forward_note = {"status": "SKIPPED", "reason": f"{ENV_FORWARD_SLATE} off"}
         else:
-            from src.pipeline.forward_slate import attach_forward_slate
+            from src.db.repository import load_projections
+            from src.pipeline.slate_board import build_board_from_projections
 
-            forward = attach_forward_slate(panel, slate_date=validation_end)
-            panel = forward.panel
-            forward_note = forward.as_dict()
-            logger.info("Board forward slate: %s", forward_note)
-
-        from src.features.builder import build_feature_matrix
-
-        frames = _board_market_frames()
-        features = build_feature_matrix(
-            panel,
-            team_games=frames["team_games"],
-            market_lines=frames["market_lines"],
-        )
-        logger.info(
-            "Board matrix: %d row(s) x %d col(s) from a %d-row panel "
-            "(team_games=%d, market_lines=%d).",
-            len(features), len(features.columns), len(panel),
-            0 if frames["team_games"] is None else len(frames["team_games"]),
-            0 if frames["market_lines"] is None else len(frames["market_lines"]),
-        )
-
-        result = build_slate_board(
-            features,
-            out=board_csv,
-            markets=markets,
-            train_end=train_end,
-            validation_end=validation_end,
-            min_ev=min_ev,
-        )
+            projections = load_projections(validation_end)
+            if projections.empty:
+                logger.warning(
+                    "No projections persisted for %s, so there is nothing to "
+                    "rank. The slate job writes them at %02d:00 PT; a board "
+                    "asked for before it has run, or after a slate that "
+                    "refused, has no input. This is the pipeline reporting "
+                    "its own state.",
+                    validation_end,
+                    _int_env(ENV_SLATE_HOUR, DEFAULT_SLATE_HOUR, low=0, high=23),
+                )
+                return {"status": "DATA_NOT_AVAILABLE",
+                        "reason": f"no projections persisted for {validation_end}",
+                        "window": window}
+            result = build_board_from_projections(
+                projections,
+                out=board_csv,
+                slate_date=validation_end,
+                markets=markets,
+                min_ev=min_ev,
+            )
+            source = "projections"
+        logger.info("Board source: %s", source)
         logger.info("Board: %s", result.as_dict())
         # ADVISORY SIZING, attached by this caller rather than by the ranking
         # layer -- see attach_board_sizing for the two guards that require it.
@@ -1512,7 +1519,7 @@ def run_board() -> dict[str, Any]:
         # back. A board of 40 rows is the same shape whether it describes
         # tonight or a fortnight in 2025.
         return {"status": "OK", **result.as_dict(), "window": window,
-                "forward_slate": forward_note, "sizing": sizing}
+                "source": source, "sizing": sizing}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Board build raised; the scheduler stays up.")
         notify_failure("board", f"The board build raised: {exc}")
