@@ -1280,6 +1280,48 @@ def board_window(today: Any | None = None) -> dict[str, Any]:
     }
 
 
+def _board_market_frames() -> dict[str, Any]:
+    """
+    The team-game and market-line frames for the board, or empty ones.
+
+    THE SAME TWO FRAMES THE SLATE USES. Without `team_games` the matrix has
+    no Elo and no `DEF_*`; without `market_lines` no `MKT_*` or `BLOWOUT_*`.
+    A board built from a narrower matrix than the slate scored on would be a
+    second, quieter answer to the same question.
+
+    NEVER RAISES. `main.resolve_market_frames` raises
+    `MarketFramesUnavailable` when BOTH are empty, which is correct for the
+    slate -- it has nothing to project. The board is downstream of a slate
+    that already decided that, so here an absent frame is a narrower matrix
+    and a logged warning, not a dead job.
+    """
+    empty: dict[str, Any] = {"team_games": None, "market_lines": None}
+    try:
+        import main as orchestrator
+
+        # The orchestrator's OWN two names for the workbook, not a third
+        # copy of the path -- main.py's argparse default is exactly this
+        # pair, and a literal here would be a second definition of where
+        # the licensed export lives. `persist=False`: the board reads, the
+        # slate job ingests.
+        xlsx = Path(
+            os.environ.get(orchestrator.ENV_BIGDATABALL)
+            or orchestrator.DEFAULT_BIGDATABALL_XLSX
+        )
+        frames = orchestrator.resolve_market_frames(xlsx, persist=False)
+        return {
+            "team_games": frames.get("team_games"),
+            "market_lines": frames.get("market_lines"),
+        }
+    except Exception as exc:  # noqa: BLE001 — a narrower board beats no board
+        logger.warning(
+            "Board: no team-game or market-line frames (%s: %s). The matrix "
+            "will carry no Elo, DEF_*, MKT_* or BLOWOUT_* columns.",
+            type(exc).__name__, exc,
+        )
+        return empty
+
+
 def run_board() -> dict[str, Any]:
     """
     Build the recommendation board CSV that dispatch reads.
@@ -1316,8 +1358,42 @@ def run_board() -> dict[str, Any]:
             logger.warning("No player panel available — no board built.")
             return {"status": "DATA_NOT_AVAILABLE", "reason": "empty player panel"}
 
-        result = build_slate_board(
+        # THE RAW PANEL IS NOT WHAT THE BOARD NEEDS, and for the whole life of
+        # this project the guard above hid that. `build_slate_board` hands its
+        # frame to `compare_models_on_panel` -> `attach_research_over_labels`,
+        # which needs `{MARKET}_L10` to build a research line. The panel
+        # carries PTS; only `build_feature_matrix` adds PTS_L10.
+        #
+        # Every run until 2026-10-31 returned at the empty-panel guard above,
+        # so this line had never once executed against real rows. The night
+        # the ESPN ingest seeded 1,830 of them, the guard passed and the job
+        # raised `DATA_NOT_AVAILABLE: PTS_L10 missing` -- a latent bug that
+        # only an ingest could expose.
+        #
+        # `scripts/nba_model_cli.py` has always done this correctly: its
+        # `_load_real_or_demo` builds the matrix before calling the same
+        # function, and its comment says the two paths must not drift because
+        # "the drifting one would be the unattended one". They shared
+        # `build_slate_board` and not the build in front of it. This is that
+        # missing half.
+        from src.features.builder import build_feature_matrix
+
+        frames = _board_market_frames()
+        features = build_feature_matrix(
             panel,
+            team_games=frames["team_games"],
+            market_lines=frames["market_lines"],
+        )
+        logger.info(
+            "Board matrix: %d row(s) x %d col(s) from a %d-row panel "
+            "(team_games=%d, market_lines=%d).",
+            len(features), len(features.columns), len(panel),
+            0 if frames["team_games"] is None else len(frames["team_games"]),
+            0 if frames["market_lines"] is None else len(frames["market_lines"]),
+        )
+
+        result = build_slate_board(
+            features,
             out=board_csv,
             markets=markets,
             train_end=train_end,

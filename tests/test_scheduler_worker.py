@@ -38,6 +38,36 @@ class FakeScheduler:
         ]
 
 
+def board_panel(rows: int = 12, start: str = "2026-10-01"):
+    """
+    A panel ``build_feature_matrix`` accepts, for the board tests.
+
+    ONE COPY, because three tests need it. `run_board` builds the feature
+    matrix before handing anything to `build_slate_board` (the research line
+    needs `{MARKET}_L10`, which only the builder adds), so a stub panel of
+    `PLAYER_ID` and `GAME_DATE` alone now fails the board at the builder
+    rather than travelling through it. These are the columns the builder
+    reads, with enough rows for a ten-game window to exist.
+    """
+    import pandas as pd
+
+    return pd.DataFrame({
+        "PLAYER_ID": ["1"] * rows,
+        "PLAYER_NAME": ["HARNESS ONE"] * rows,
+        "GAME_ID": [f"espn:{i}" for i in range(rows)],
+        "GAME_DATE": pd.date_range(start, periods=rows),
+        "SEASON": ["2026-27"] * rows,
+        "TEAM_ABBREVIATION": ["LAL"] * rows,
+        "OPPONENT_ABBREVIATION": ["GSW"] * rows,
+        "IS_HOME": [True] * rows,
+        "PTS": [20.0 + i for i in range(rows)],
+        "REB": [5.0] * rows, "AST": [4.0] * rows, "FG3M": [1.0] * rows,
+        "STL": [1.0] * rows, "BLK": [0.5] * rows, "MIN": [30.0] * rows,
+        "FGA": [15.0] * rows, "FTA": [4.0] * rows, "TOV": [2.0] * rows,
+        "PF": [2.0] * rows,
+    })
+
+
 def _jobs() -> dict[str, dict]:
     scheduler = FakeScheduler()
     worker.build_scheduler(scheduler)
@@ -1094,13 +1124,11 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
 
     monkeypatch.setattr(slate_board_module, "build_slate_board", _fake_build)
 
-    import pandas as pd
-
     import src.db.repository as repo
-    monkeypatch.setattr(
-        repo, "load_player_panel",
-        lambda *a, **k: pd.DataFrame({"PLAYER_ID": ["1"], "GAME_DATE": [today]}),
-    )
+    # Dated so the newest game is `today`: the window assertions below are
+    # about which days were scored, and the builder needs real stat columns.
+    panel = board_panel(start=str(today - timedelta(days=11)))
+    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: panel)
 
     out = worker.run_board()
     assert out["status"] == "OK"
@@ -1530,8 +1558,6 @@ def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
     """
     import logging
 
-    import pandas as pd
-
     import src.db.repository as repo
     import src.pipeline.slate_board as slate_board_module
 
@@ -1546,8 +1572,7 @@ def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
         slate_board_module, "build_slate_board", lambda panel, **k: _Result()
     )
     monkeypatch.setattr(
-        repo, "load_player_panel",
-        lambda *a, **k: pd.DataFrame({"PLAYER_ID": ["1"], "GAME_DATE": ["2026-10-05"]}),
+        repo, "load_player_panel", lambda *a, **k: board_panel(),
     )
 
     def _boom(*a, **k):
@@ -1625,3 +1650,124 @@ def test_the_healthcheck_certifies_the_file_settlement_actually_writes():
     assert "DEFAULT_CALIBRATION_REPORT" not in source, (
         "the healthcheck grew its own copy of the default back"
     )
+
+
+# --- the board job must hand over a FEATURE MATRIX, not the raw panel ----
+
+
+def test_run_board_builds_features_before_handing_the_panel_over(
+    monkeypatch, tmp_path,
+):
+    """
+    THE BUG AN EMPTY DATABASE HID FOR THE WHOLE PROJECT'S LIFE.
+
+    `run_board` loaded `load_player_panel()` and passed it straight to
+    `build_slate_board`, which hands it to `compare_models_on_panel` ->
+    `attach_research_over_labels`, and that needs `{MARKET}_L10` to build a
+    research line. The raw panel carries PTS; only `build_feature_matrix`
+    adds PTS_L10.
+
+    It never surfaced because the guard above it -- "no player panel
+    available" -- returned early on every single run while the panel was
+    empty. The first night real rows existed (2026-10-31, 1,830 of them from
+    the ESPN ingest), the guard passed and the job raised
+    `DATA_NOT_AVAILABLE: PTS_L10 missing`.
+
+    `scripts/nba_model_cli.py` gets this right -- its `_load_real_or_demo`
+    builds the matrix -- and its comment says the two must not drift because
+    "the drifting one would be the unattended one". They shared
+    `build_slate_board` and not the feature build in front of it, and the
+    unattended one is exactly the one that drifted.
+    """
+    import src.db.repository as repo
+    import src.pipeline.slate_board as slate_board_module
+
+    monkeypatch.setattr(
+        repo, "load_player_panel", lambda *a, **k: board_panel(),
+    )
+
+    handed: dict = {}
+
+    class _Result:
+        written_rows = 0
+        out = None
+        slate_date = "2026-10-31"
+        summary: dict = {}
+
+        def as_dict(self):
+            return {}
+
+    def _capture(frame, **kwargs):
+        handed["cols"] = list(frame.columns)
+        return _Result()
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _capture)
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+
+    worker.run_board()
+
+    assert handed, "build_slate_board was never called"
+    # The exact column `attach_research_over_labels` raised on.
+    assert "PTS_L10" in handed["cols"], (
+        "run_board handed over the raw panel; the research line needs the "
+        f"rolling features. Got: {sorted(handed['cols'])[:12]}"
+    )
+    for col in ("REB_L10", "AST_L10"):
+        assert col in handed["cols"], f"{col} missing from the board's matrix"
+
+
+def test_board_market_frames_calls_the_orchestrator_that_actually_exists(
+    monkeypatch, tmp_path,
+):
+    """
+    A HELPER THAT ALWAYS TAKES ITS EXCEPT BRANCH IS NOT A FALLBACK.
+
+    `_board_market_frames` wraps `main.resolve_market_frames` in a broad
+    `except Exception` so a board can still be built from a narrower matrix
+    when there are no team-game or market-line rows. That handler also
+    swallows an `AttributeError` for a name on `main` that does not exist --
+    the first version called `main.bigdataball_path()`, which main.py has
+    never defined. Every board would have logged "no team-game or
+    market-line frames" and built without Elo, `DEF_*`, `MKT_*` or
+    `BLOWOUT_*`, and the warning would have read like an empty database.
+
+    So this asserts the happy path: the orchestrator is really called, with
+    the workbook path the orchestrator itself names, and its frames come
+    back to the caller rather than the empty pair.
+    """
+    import pandas as pd
+
+    import main as orchestrator
+
+    team_games = pd.DataFrame({"game_date": ["2026-10-30"], "team": ["LAL"]})
+    market_lines = pd.DataFrame({"game_date": ["2026-10-30"], "total": [223.5]})
+    calls: list[dict] = []
+
+    def _frames(xlsx_path, **kwargs):
+        calls.append({"path": xlsx_path, **kwargs})
+        return {
+            "team_games": team_games,
+            "market_lines": market_lines,
+            "source": "database",
+            "note": "harness",
+        }
+
+    monkeypatch.setattr(orchestrator, "resolve_market_frames", _frames)
+
+    workbook = tmp_path / "harness_team_stats.xlsx"
+    monkeypatch.setenv(orchestrator.ENV_BIGDATABALL, str(workbook))
+
+    got = worker._board_market_frames()
+
+    assert calls, (
+        "the orchestrator was never called -- _board_market_frames took its "
+        "except branch, which means the name it asks main for does not exist"
+    )
+    assert str(calls[0]["path"]) == str(workbook), (
+        "the board read a different workbook path than $"
+        f"{orchestrator.ENV_BIGDATABALL} names: {calls[0]['path']!r}"
+    )
+    # The board reads. The slate job is what ingests.
+    assert calls[0].get("persist") is False, "the board must not persist"
+    assert got["team_games"] is team_games
+    assert got["market_lines"] is market_lines
