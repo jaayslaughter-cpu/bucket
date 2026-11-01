@@ -157,6 +157,13 @@ variables that matter most:
 | `PROPIQ_MIGRATE_ON_BOOT` | no | `true` | Set `false` where a separate release step owns the schema. |
 | `PROPIQ_SLATE_HOUR_PT` / `PROPIQ_SLATE_MINUTE_PT` | no | `09:00` | Slate job time, 24h Pacific. |
 | `PROPIQ_SETTLE_HOUR_PT` / `PROPIQ_SETTLE_MINUTE_PT` | no | `03:30` | Settlement job time, 24h Pacific. |
+| `PROPIQ_ESPN_HOUR_PT` / `PROPIQ_ESPN_MINUTE_PT` | no | `02:00` | ESPN panel ingest time, 24h Pacific. Before settlement (03:30) and the slate (09:00), both of which read what it writes. |
+| `PROPIQ_ESPN_INGEST` | no | `true` | The ESPN path's master switch. `false` turns off both the nightly ingest and the history backfill. |
+| `PROPIQ_ESPN_LOOKBACK_DAYS` | no | `3` | How many days back a nightly ingest re-reads. ESPN corrects box scores for a day or two; the upsert is idempotent. |
+| `PROPIQ_ESPN_BACKFILL_DAYS` | no | `30` | How far back the FIRST run reads when the panel is empty. Three days would leave every rolling feature null. |
+| `PROPIQ_ESPN_HISTORY_SEASONS` | no | unset (backfill off) | Comma-separated ESPN season years to back-fill, ENDING year (`2025,2026` = the 2024-25 and 2025-26 seasons). Switch it on to deepen the panel, watch the job log `HISTORY BACKFILL COMPLETE`, then unset it — ESPN's season calendar includes preseason and playoff dates the panel refuses by design, so a backfill left on re-asks them nightly for ever. |
+| `PROPIQ_ESPN_HISTORY_CHUNK_DAYS` | no | `60` | Game dates per backfill run. One scoreboard call per date plus one summary call per game, so ~780 calls and roughly twenty minutes. |
+| `PROPIQ_ESPN_HISTORY_HOUR_PT` / `PROPIQ_ESPN_HISTORY_MINUTE_PT` | no | `04:30` | History backfill time, 24h Pacific. After settlement, well before the slate — it must not still be writing `player_game_logs` when the slate reads it. |
 | `PROPIQ_MAX_MARKET_LAG_DAYS` | no | `10` | How stale the Elo/market frames may be before the slate logs `MARKET DATA IS STALE` (`main.py:683`). |
 | `PROPIQ_MAX_PANEL_LAG_DAYS` | no | `3` | The separate check on the PLAYER panel's newest completed game (`main.py:118-119`). Not the same variable as the one above, and a much tighter default. |
 | `LOG_LEVEL` | no | `INFO` | INFO on stdout is deliberate — a red line in Railway means something went wrong. |

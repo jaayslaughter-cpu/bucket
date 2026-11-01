@@ -216,6 +216,42 @@ def team_game_owners_by_date() -> dict[tuple[str, str], str]:
     return out
 
 
+def ingested_dates_for_source(source: str) -> set[str]:
+    """
+    Which ``game_date``s already hold a team-game row written by ``source``.
+
+    THE BACKFILL'S RESUME POINT, and it is read from the database rather
+    than remembered anywhere. A history backfill has to know which nights it
+    has already done, and the two obvious alternatives are both worse: a
+    state file beside the database is a second source of truth about what is
+    ingested, which is the defect this repository keeps removing, and a
+    high-water mark cannot express a hole in the middle left by a night ESPN
+    was down for.
+
+    DISTINCT IN SQL rather than a set() over every row: `team_game_owners_by_date`
+    already pulls the whole table to answer a different question, and a
+    backfill that walked three seasons would pull it again on every chunk.
+
+    KEYED ON SOURCE, because "ingested" is not a property of the date. A
+    night the licensed workbook owns is not a night ESPN has read, and a
+    backfill told otherwise would leave exactly the gaps it exists to fill.
+    Returned as ISO strings, matching `team_game_owners_by_date`'s keys, so a
+    caller comparing the two is not comparing a `date` with a `str`.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(TeamGameStat.game_date)
+            .where(TeamGameStat.source == str(source))
+            .distinct()
+        ).all()
+    out: set[str] = set()
+    for (day,) in rows:
+        if day is None:
+            continue
+        out.add(day.isoformat() if hasattr(day, "isoformat") else str(day))
+    return out
+
+
 def player_id_namespaces() -> dict[str, int]:
     """
     How many panel rows carry each player-id namespace.

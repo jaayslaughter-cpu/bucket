@@ -383,3 +383,130 @@ def test_one_unreadable_payload_does_not_end_the_night(monkeypatch):
     assert len(frame) == 27, "the good game was lost with the bad one"
     assert any("unreadable payload" in n or "DATA_NOT_AVAILABLE" in n
                for n in report.notes)
+
+
+# --- the season calendar: the backfill's work list ------------------------
+
+
+def _calendar_payload(entries) -> dict:
+    """The scoreboard's shape, cut down to what fetch_season_calendar reads."""
+    return {
+        "leagues": [{
+            "calendar": entries,
+            "calendarType": "day",
+            "season": {"year": 2026, "displayName": "2025-26"},
+        }],
+        "events": [],
+    }
+
+
+def test_the_season_calendar_comes_back_as_pacific_dates(monkeypatch):
+    """
+    ESPN renders each calendar entry as UTC midnight PACIFIC —
+    `2025-10-02T07:00Z` is the 2nd at 00:00 PT. Reading the UTC date is right
+    by luck while the offset is -7 and wrong the moment it is -8, which it is
+    from November. Measured against the live payload on 2026-11-01: 229 dates,
+    2025-10-02 through 2026-06-13.
+    """
+    from datetime import date
+
+    from src.ingestion import espn_panel
+
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: _calendar_payload([
+            "2025-10-02T07:00Z",   # PDT, -7
+            "2025-12-25T08:00Z",   # PST, -8 — the same trick an hour later
+            # THE ENTRY THAT MAKES THIS TEST ABLE TO FAIL. Every stamp above
+            # is UTC midnight Pacific, where the UTC date and the Pacific
+            # date agree, so truncating `parsed.date()` passes on all of
+            # them — the mutation survived the first version of this test.
+            # 03:00Z is 19:00 the PREVIOUS evening Pacific, which is what a
+            # real tip time looks like and what `_tipoff_date` was already
+            # caught filing a day forward.
+            "2026-01-16T03:00Z",
+        ]),
+    )
+    days = espn_panel.fetch_season_calendar(2026)
+    assert days == [
+        date(2025, 10, 2), date(2025, 12, 25), date(2026, 1, 15),
+    ], "a stamp that is not UTC midnight Pacific was filed a day forward"
+
+
+def test_the_calendar_is_sorted_and_deduplicated(monkeypatch):
+    """The backfill plans oldest-first off this list, and ESPN's order is not
+    a contract. A duplicate would make one night cost two fetches."""
+    from datetime import date
+
+    from src.ingestion import espn_panel
+
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: _calendar_payload([
+            "2026-01-15T08:00Z", "2025-10-02T07:00Z", "2026-01-15T08:00Z",
+        ]),
+    )
+    assert espn_panel.fetch_season_calendar(2026) == [
+        date(2025, 10, 2), date(2026, 1, 15),
+    ]
+
+
+def test_an_absent_calendar_is_refused_not_treated_as_a_finished_backfill(
+    monkeypatch,
+):
+    """
+    THE FAILURE THAT WOULD LOOK LIKE SUCCESS. An empty list back from here
+    makes the planner report nothing missing, which the backfill job prints
+    as HISTORY BACKFILL COMPLETE — telling an operator to switch off a job
+    that never read a single night. So a missing calendar raises.
+    """
+    from src.ingestion import espn_panel
+    from src.ingestion.espn_client import EspnError
+
+    for payload in (
+        {"leagues": [{}]},                      # no calendar key
+        {"leagues": []},                        # no league
+        {},                                     # not the scoreboard at all
+        {"leagues": [{"calendar": []}]},        # present and empty
+    ):
+        monkeypatch.setattr(
+            espn_panel, "get_json", lambda url, params=None, _p=payload, **kw: _p,
+        )
+        with pytest.raises(EspnError, match="season calendar"):
+            espn_panel.fetch_season_calendar(2026)
+
+
+def test_a_calendar_of_unparseable_entries_is_refused(monkeypatch):
+    """ESPN uses a NESTED calendar for week-based sports. Coercing a dict with
+    str() parses as nothing and would silently shorten the window to zero,
+    which again reads as a finished backfill."""
+    from src.ingestion import espn_panel
+    from src.ingestion.espn_client import EspnError
+
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: _calendar_payload([
+            {"label": "Week 1", "entries": []}, "not-a-date",
+        ]),
+    )
+    with pytest.raises(EspnError, match="none parsed"):
+        espn_panel.fetch_season_calendar(2026)
+
+
+def test_the_season_year_is_sent_as_espns_own_dates_parameter(monkeypatch):
+    """`dates=2026` is what returns the whole season's calendar. A date-shaped
+    value returns one day's events and the calendar of whichever season that
+    day falls in, which is the same thing by accident and not by contract."""
+    from src.ingestion import espn_panel
+
+    seen: dict = {}
+
+    def _get(url, params=None, **kw):
+        seen["url"] = url
+        seen["params"] = dict(params or {})
+        return _calendar_payload(["2025-10-02T07:00Z"])
+
+    monkeypatch.setattr(espn_panel, "get_json", _get)
+    espn_panel.fetch_season_calendar(2026)
+    assert seen["params"] == {"dates": "2026"}
+    assert seen["url"].endswith("/scoreboard")

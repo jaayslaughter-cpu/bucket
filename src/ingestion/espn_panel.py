@@ -334,6 +334,82 @@ def parse_summary_payload(
     return out
 
 
+def fetch_season_calendar(
+    season_year: int, *, session: Any = None, config: Any = None
+) -> list[date]:
+    """
+    Every date ESPN lists as having an NBA game in one season, Pacific.
+
+    WHY A CALENDAR AND NOT A DATE RANGE. Backfilling history by walking
+    calendar days asks ESPN about roughly 260 days per season to find the
+    ~170 that had basketball, and it cannot tell "there was no game" from
+    "the panel has not ingested this day yet" -- so a resumable backfill
+    keyed on what the database holds would re-ask every gameless day on
+    every run, for ever. ESPN answers the question directly: the scoreboard
+    payload carries `leagues[0].calendar`, every date in the season with a
+    game, for ONE call. Measured 2026-11-01: `dates=2026` returns 229 dates
+    spanning 2025-10-02 to 2026-06-13.
+
+    THE CALENDAR IS NOT REGULAR-SEASON-ONLY, and `seasontype=2` does not
+    narrow it -- both forms return the same 229 dates, which include
+    preseason in October and the playoffs through June. Passing `seasontype`
+    would therefore be a parameter that reads as a filter and filters
+    nothing. The per-event guard in `_player_rows_for_event` is what keeps
+    non-regular-season games out of the panel, as it already did; the cost
+    of the wider calendar is wasted calls on those days, which is why the
+    backfill that uses this is operator-triggered rather than unconditional.
+
+    PACIFIC, like every other date in this module. ESPN renders each calendar
+    entry as UTC midnight Pacific (`2025-10-02T07:00Z`), so reading the UTC
+    date is right by luck for exactly as long as the offset stays at -7;
+    across the November DST change it is -8 and `08:00Z` would still be the
+    2nd. `to_pacific` makes that explicit rather than lucky.
+
+    SEASON_YEAR IS ESPN'S, which is the season's ENDING year: 2026 is the
+    2025-26 season. That is the number its own payload reports in
+    `leagues[0].season.year`, and inventing a different convention here
+    would be one more thing a caller has to know.
+    """
+    payload = get_json(
+        site_url("scoreboard"),
+        params={"dates": str(int(season_year))},
+        config=config,
+        session=session,
+    )
+    leagues = payload.get("leagues") if isinstance(payload, dict) else None
+    first = (leagues or [{}])[0] if isinstance(leagues, list) and leagues else {}
+    entries = first.get("calendar") if isinstance(first, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise EspnError(
+            f"ESPN returned no season calendar for {season_year}: "
+            f"leagues[0].calendar was {type(entries).__name__}. Without it "
+            f"there is no list of game dates to back-fill, and walking the "
+            f"calendar by hand would re-ask every gameless day for ever."
+        )
+    days: list[date] = []
+    seen: set[date] = set()
+    for entry in entries:
+        # A nested calendar (ESPN uses one for week-based sports) is not the
+        # flat day list this reads. Skipped rather than coerced: a dict's
+        # str() would parse as nothing and silently shorten the window.
+        if not isinstance(entry, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(entry.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        day = to_pacific(parsed).date()
+        if day not in seen:
+            seen.add(day)
+            days.append(day)
+    if not days:
+        raise EspnError(
+            f"ESPN's season calendar for {season_year} held {len(entries)} "
+            f"entr(ies) and none parsed as a date. The payload shape changed."
+        )
+    return sorted(days)
+
+
 def fetch_event_ids(
     day: date, *, session: Any = None, config: Any = None
 ) -> list[str]:

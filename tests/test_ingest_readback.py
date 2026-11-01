@@ -253,3 +253,77 @@ def test_an_nba_id_with_a_playoff_digit_is_still_excluded(monkeypatch):
     a playoff NBA id must still be filtered out."""
     _bind(monkeypatch, team_keys=[("0042600123", "LAL")])
     assert repository.newest_team_game_date() is None
+
+
+# --- the history backfill's resume point ----------------------------------
+
+
+def _bind_dated(monkeypatch, rows):
+    """`session_scope` bound to a database holding these (date, team, source)."""
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.ext.compiler import compiles
+
+    @compiles(JSONB, "sqlite")
+    def _jsonb_as_json(type_, compiler, **kw):  # noqa: ARG001
+        return "JSON"
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(bind=engine, tables=[TeamGameStat.__table__])
+    factory = sessionmaker(bind=engine)
+    with factory() as seed:
+        for index, (day, team, source) in enumerate(rows):
+            seed.add(TeamGameStat(
+                nba_game_id=f"espn:{40000 + index}", game_date=day,
+                team_abbr=team, opponent_abbr="XXX", is_home=True,
+                points=100.0, source=source,
+            ))
+        seed.commit()
+
+    @contextlib.contextmanager
+    def _scope():
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(repository, "session_scope", _scope)
+
+
+def test_the_backfill_resume_point_is_read_from_the_database(monkeypatch):
+    """
+    The dates ESPN has already supplied, as ISO strings.
+
+    THE RESUME POINT HAS TO COME FROM HERE. A state file beside the database
+    is a second source of truth about what is ingested, and a high-water mark
+    cannot express a hole in the middle left by a night ESPN was down for.
+    """
+    _bind_dated(monkeypatch, [
+        (date(2024, 10, 22), "LAL", "espn_agg"),
+        (date(2024, 10, 22), "GSW", "espn_agg"),   # same night, both teams
+        (date(2024, 10, 24), "BOS", "espn_agg"),
+    ])
+    assert repository.ingested_dates_for_source("espn_agg") == {
+        "2024-10-22", "2024-10-24",
+    }
+
+
+def test_another_sources_night_is_not_a_night_espn_has_read(monkeypatch):
+    """
+    KEYED ON SOURCE, and this is the assertion that pins it. A night the
+    licensed workbook owns is NOT a night ESPN has supplied: counting it
+    would leave the backfill a hole it believes it has filled, and the
+    player rows for that night — which the workbook does not carry — would
+    never arrive.
+    """
+    _bind_dated(monkeypatch, [
+        (date(2024, 10, 22), "LAL", "espn_agg"),
+        (date(2024, 10, 23), "BOS", "bigdataball"),
+        (date(2024, 10, 24), "NYK", "scraper_agg"),
+    ])
+    assert repository.ingested_dates_for_source("espn_agg") == {"2024-10-22"}
+    assert repository.ingested_dates_for_source("bigdataball") == {"2024-10-23"}
+
+
+def test_a_source_with_no_rows_reports_no_dates_rather_than_raising(monkeypatch):
+    """The first run's state. An exception here would fail the backfill
+    before it read a single night."""
+    _bind_dated(monkeypatch, [(date(2024, 10, 22), "LAL", "bigdataball")])
+    assert repository.ingested_dates_for_source("espn_agg") == set()

@@ -53,8 +53,8 @@ import os
 import re
 import signal
 import sys
-from collections.abc import Mapping
-from datetime import datetime, timezone
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +81,10 @@ ENV_ESPN_HOUR = "PROPIQ_ESPN_HOUR_PT"
 ENV_ESPN_MINUTE = "PROPIQ_ESPN_MINUTE_PT"
 ENV_ESPN_LOOKBACK = "PROPIQ_ESPN_LOOKBACK_DAYS"
 ENV_ESPN_BACKFILL = "PROPIQ_ESPN_BACKFILL_DAYS"
+ENV_ESPN_HISTORY_SEASONS = "PROPIQ_ESPN_HISTORY_SEASONS"
+ENV_ESPN_HISTORY_CHUNK = "PROPIQ_ESPN_HISTORY_CHUNK_DAYS"
+ENV_ESPN_HISTORY_HOUR = "PROPIQ_ESPN_HISTORY_HOUR_PT"
+ENV_ESPN_HISTORY_MINUTE = "PROPIQ_ESPN_HISTORY_MINUTE_PT"
 ENV_SETTLE_HOUR = "PROPIQ_SETTLE_HOUR_PT"
 ENV_SETTLE_MINUTE = "PROPIQ_SETTLE_MINUTE_PT"
 ENV_MAX_THREADS = "PROPIQ_MAX_THREADS"
@@ -150,6 +154,17 @@ DEFAULT_ESPN_LOOKBACK_DAYS = 3
 #: games -- so an empty panel is seeded properly rather than left in a state
 #: that looks ingested and scores nothing.
 DEFAULT_ESPN_BACKFILL_DAYS = 30
+#: How many game DATES one history-backfill run reads. Sixty, because a run
+#: costs one scoreboard call per date plus one summary call per game on it --
+#: roughly 12 games a night, so ~780 calls and on the order of twenty minutes.
+#: A whole season in one run would be ~1,400 calls held open against a service
+#: that owes this project nothing; sixty dates finishes a season in three
+#: nights and leaves a failed chunk cheap to repeat.
+DEFAULT_ESPN_HISTORY_CHUNK_DAYS = 60
+#: 04:30 PT: after the 02:00 ingest and the 03:30 settlement, and done well
+#: before the 09:00 slate. The backfill is the longest-running job here and it
+#: must not still be writing to `player_game_logs` when the slate reads it.
+DEFAULT_ESPN_HISTORY_HOUR, DEFAULT_ESPN_HISTORY_MINUTE = 4, 30
 
 # A job that misses its window by less than this still runs; past it, the slate
 # has moved on and running late would project games that have already tipped.
@@ -164,6 +179,12 @@ SETTLE_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 #: Six hours, same as settlement: a worker that was down at 02:00 should still
 #: fill the panel when it comes back, because the 09:00 slate reads it.
 ESPN_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+#: THIRTY MINUTES, deliberately the shortest grace here. Every other job
+#: catches up because something downstream reads what it writes today. The
+#: history backfill writes seasons-old box scores: a chunk missed at 04:30 is
+#: no more urgent at 11:00, and firing it late would have it reading
+#: `player_game_logs` while the 09:00 slate does.
+ESPN_HISTORY_MISFIRE_GRACE_SECONDS = 30 * 60
 
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
@@ -2099,9 +2120,20 @@ def _flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def run_espn_ingest() -> dict[str, Any]:
+def run_espn_ingest(
+    days: Sequence[date] | None = None, *, label: str = "nightly",
+) -> dict[str, Any]:
     """
     Fill the panel from ESPN box scores. The only ingest that needs no laptop.
+
+    ONE WRITE PATH, TWO CALLERS. ``days`` is the only thing the history
+    backfill needs to vary: every guard below it -- the namespace preflight,
+    the two ownership views, the by-key read-back, the post-write namespace
+    re-check -- applies identically to a night in 2024 and to last night. A
+    backfill with its own copy of that sequence would be a second, quieter
+    writer, and the quiet one is the one that would drift. So the backfill
+    passes a date list and inherits all of it. ``None`` keeps the nightly
+    behaviour exactly: the self-seeding window below.
 
     WHY THIS JOB EXISTS. The other two paths cannot run here: the BigDataBall
     workbook is a licensed file a human downloads, and the scraper's parquet
@@ -2174,25 +2206,37 @@ def run_espn_ingest() -> dict[str, Any]:
                     "namespaces": namespaces}
 
         empty_panel = not namespaces
-        days_back = _int_env(
-            ENV_ESPN_BACKFILL if empty_panel else ENV_ESPN_LOOKBACK,
-            DEFAULT_ESPN_BACKFILL_DAYS if empty_panel else DEFAULT_ESPN_LOOKBACK_DAYS,
-            low=1, high=400,
-        )
-        end = pacific_calendar_date()
-        days = [end - timedelta(days=offset) for offset in range(days_back)]
+        if days is None:
+            days_back = _int_env(
+                ENV_ESPN_BACKFILL if empty_panel else ENV_ESPN_LOOKBACK,
+                DEFAULT_ESPN_BACKFILL_DAYS
+                if empty_panel else DEFAULT_ESPN_LOOKBACK_DAYS,
+                low=1, high=400,
+            )
+            end = pacific_calendar_date()
+            days = [end - timedelta(days=offset) for offset in range(days_back)]
+            label = "empty panel, seeding" if empty_panel else label
+        days = list(days)
+        if not days:
+            logger.info("ESPN ingest (%s): no dates to read.", label)
+            return {"status": "SKIPPED", "reason": "no dates requested",
+                    "label": label}
         logger.info(
-            "ESPN ingest: reading %d day(s) back from %s (%s).",
-            days_back, end, "empty panel, seeding" if empty_panel else "nightly",
+            "ESPN ingest (%s): reading %d day(s), %s -> %s.",
+            label, len(days), min(days), max(days),
         )
 
         frame, report = fetch_player_rows_for_dates(days)
         for line in report.lines():
             logger.info("  %s", line)
         if frame.empty:
-            logger.warning("ESPN ingest: no player rows in the window.")
+            logger.warning(
+                "ESPN ingest (%s): no player rows in the window.", label,
+            )
             return {"status": "DATA_NOT_AVAILABLE",
                     "reason": "no finished game in the window",
+                    "label": label,
+                    "days": len(days),
                     "games_seen": report.games_seen}
 
         panel, _ = to_player_panel(frame)
@@ -2219,7 +2263,11 @@ def run_espn_ingest() -> dict[str, Any]:
 
         out = {
             "status": "OK",
-            "days": days_back,
+            # len(days), not the env number: the backfill passes an explicit
+            # list and there is no `days_back` behind it. Two definitions of
+            # "how many days did this read" is how a summary starts lying.
+            "days": len(days),
+            "label": label,
             "games_parsed": report.games_parsed,
             "panel_rows": int(len(panel)),
             "team_games": int(len(teams)),
@@ -2305,6 +2353,202 @@ def run_espn_ingest() -> dict[str, Any]:
         logger.exception("ESPN ingest raised; the scheduler stays up.")
         notify_failure("espn-ingest", f"The ESPN ingest raised: {exc}")
         return {"status": "FAILED", "error": str(exc)}
+
+
+def _history_seasons() -> list[int]:
+    """
+    Which ESPN season years the backfill is allowed to read, oldest first.
+
+    OFF BY DEFAULT, and that is the design rather than caution. ESPN's season
+    calendar is not regular-season-only (`espn_panel.fetch_season_calendar`
+    says why), so preseason and playoff dates stay permanently absent from a
+    panel that refuses them per event. They would therefore read as "not yet
+    ingested" on every run, for ever, and an unconditional nightly backfill
+    would spend a few hundred calls re-asking them every night and never
+    finish. An operator switches this on, watches it report `remaining: 0`,
+    and switches it off; the job says so in its own log when it gets there.
+
+    ESPN'S SEASON YEAR IS THE ENDING ONE: 2026 is the 2025-26 season.
+    """
+    raw = (os.environ.get(ENV_ESPN_HISTORY_SEASONS) or "").strip()
+    if not raw:
+        return []
+    years: list[int] = []
+    for token in re.split(r"[,\s]+", raw):
+        if not token:
+            continue
+        try:
+            year = int(token)
+        except ValueError:
+            logger.warning(
+                "%s: %r is not a season year; ignoring it. Use ESPN's ending "
+                "year, e.g. 2026 for the 2025-26 season.",
+                ENV_ESPN_HISTORY_SEASONS, token,
+            )
+            continue
+        # A bare "26" or a typo'd "20226" would otherwise be fetched and come
+        # back as an empty calendar, which reads as "ESPN changed shape".
+        if not 1947 <= year <= 2100:
+            logger.warning(
+                "%s: %d is not a plausible NBA season year; ignoring it.",
+                ENV_ESPN_HISTORY_SEASONS, year,
+            )
+            continue
+        if year not in years:
+            years.append(year)
+    return sorted(years)
+
+
+def plan_history_dates(
+    seasons: Sequence[int],
+    already: set[str],
+    *,
+    chunk: int,
+    calendar_for: Any,
+) -> dict[str, Any]:
+    """
+    The oldest ``chunk`` game dates in ``seasons`` that ESPN has not supplied.
+
+    SEPARATED FROM THE JOB so the plan can be asserted without a network
+    call or a database: which dates get picked, in which order, and what is
+    left over is the whole behaviour worth testing, and it is unreachable
+    through a function that fetches and writes.
+
+    OLDEST FIRST. The rolling features need a player's history to be
+    contiguous BEFORE the games being predicted, so filling 2024-10 before
+    2025-01 means every intermediate state of the panel is one whose newest
+    rows have real windows behind them. Newest-first would spend the whole
+    backfill with a panel whose oldest rows are the ones with null windows,
+    which is the half that gets scored.
+
+    ``calendar_for`` is passed in rather than imported for the same reason:
+    the planner is pure, and the fetch is the caller's.
+    """
+    seen: set[date] = set()
+    wanted: list[date] = []
+    season_notes: list[str] = []
+    for year in sorted({int(y) for y in seasons}):
+        days = list(calendar_for(year))
+        missing = [d for d in days if d.isoformat() not in already]
+        season_notes.append(
+            f"{year}: {len(days)} game date(s), {len(missing)} not ingested"
+        )
+        for day in missing:
+            if day not in seen:
+                seen.add(day)
+                wanted.append(day)
+    wanted.sort()
+    take = wanted[: max(int(chunk), 0)]
+    return {
+        "dates": take,
+        "remaining": len(wanted) - len(take),
+        "missing_total": len(wanted),
+        "seasons": season_notes,
+    }
+
+
+def run_history_backfill() -> dict[str, Any]:
+    """
+    Extend the panel BACKWARDS, one bounded chunk of game dates per run.
+
+    WHY THE PANEL NEEDS THIS AT ALL. The 02:00 ESPN ingest reads three days
+    and seeds thirty, which is this season to date -- about 1,830 player-game
+    rows on 2026-11-01. A per-market over/under model fitted on one season
+    of a league that has nine on record is the thinnest version of itself,
+    and `models/labels.py` measured the direction: the calibrated Brier
+    degrades monotonically as the training window's start date moves
+    forward. More history is better, and nothing in this deployment could
+    reach any. The licensed workbook is a file a human downloads and
+    stats.nba.com does not answer this container, so ESPN is the only path
+    to history that runs unattended -- which is the same argument that put
+    the nightly ingest here.
+
+    WHAT IT DOES NOT DO. It does not train, score, or publish anything, and
+    it writes nothing a nightly ingest would not write: the same mapper, the
+    same ownership guards, the same by-key read-back, through
+    `run_espn_ingest`. It is strictly historical, so there is no as-of
+    hazard in it -- every date it reads is before every date the model will
+    be asked to predict.
+
+    BOUNDED AND RESUMABLE. One chunk per run, oldest first, and the resume
+    point is read from the database (`ingested_dates_for_source`) rather than
+    remembered anywhere, so a run that dies half way costs its chunk and
+    nothing else.
+
+    RESEARCH_ONLY. Finished box scores from games already played.
+    """
+    seasons = _history_seasons()
+    if not seasons:
+        logger.debug(
+            "History backfill not configured (%s unset).", ENV_ESPN_HISTORY_SEASONS,
+        )
+        return {"status": "SKIPPED", "reason": f"{ENV_ESPN_HISTORY_SEASONS} unset"}
+    if not _flag(ENV_ESPN_INGEST, True):
+        # The same switch the nightly reads. An operator who turned the ESPN
+        # path off has turned OFF the ESPN path, and a backfill that kept
+        # reading it would be the one job that ignored them.
+        logger.info(
+            "History backfill skipped: the ESPN path is disabled (%s).",
+            ENV_ESPN_INGEST,
+        )
+        return {"status": "SKIPPED", "reason": "espn ingest disabled"}
+
+    chunk = _int_env(
+        ENV_ESPN_HISTORY_CHUNK, DEFAULT_ESPN_HISTORY_CHUNK_DAYS, low=1, high=400,
+    )
+    try:
+        from src.db.repository import ingested_dates_for_source
+        from src.ingestion.espn_panel import ESPN_TEAM_SOURCE, fetch_season_calendar
+
+        already = ingested_dates_for_source(ESPN_TEAM_SOURCE)
+        plan = plan_history_dates(
+            seasons, already, chunk=chunk, calendar_for=fetch_season_calendar,
+        )
+    except Exception as exc:  # noqa: BLE001 — the scheduler stays up
+        logger.exception("History backfill could not plan; the scheduler stays up.")
+        notify_failure("espn-backfill", f"The history backfill could not plan: {exc}")
+        return {"status": "FAILED", "error": str(exc), "seasons": seasons}
+
+    for line in plan["seasons"]:
+        logger.info("  season %s", line)
+
+    if not plan["dates"]:
+        # THE RETIREMENT MESSAGE, and it is the point of the whole env-var
+        # design. Nothing else tells an operator the job's work is done, and
+        # a backfill left switched on re-asks the preseason and playoff dates
+        # it can never ingest every night, for ever.
+        logger.info(
+            "HISTORY BACKFILL COMPLETE for season(s) %s: every game date ESPN "
+            "lists that this panel can hold is ingested. What remains absent "
+            "is preseason and postseason, which the per-event guard refuses "
+            "by design and which will therefore never be 'done'. UNSET $%s so "
+            "this job stops re-asking them nightly.",
+            ", ".join(str(y) for y in seasons), ENV_ESPN_HISTORY_SEASONS,
+        )
+        return {"status": "COMPLETE", "seasons": seasons,
+                "ingested_dates": len(already), "remaining": 0}
+
+    first, last = plan["dates"][0], plan["dates"][-1]
+    logger.info(
+        "History backfill: %d date(s) this run (%s -> %s), %d still to go "
+        "across season(s) %s.",
+        len(plan["dates"]), first, last, plan["remaining"],
+        ", ".join(str(y) for y in seasons),
+    )
+    # THE WRITE IS run_espn_ingest's, not a second copy of it. Its own broad
+    # handler owns a failure here, and it alerts with the same `espn-ingest`
+    # key the nightly uses -- a backfill chunk failing for the reason a
+    # nightly would is not a different incident.
+    out = run_espn_ingest(days=plan["dates"], label="history backfill")
+    out["backfill"] = {
+        "seasons": seasons,
+        "chunk": chunk,
+        "dates_this_run": len(plan["dates"]),
+        "first": first.isoformat(),
+        "last": last.isoformat(),
+        "remaining": plan["remaining"],
+    }
+    return out
 
 
 def run_settlement() -> dict[str, Any]:
@@ -2496,6 +2740,23 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=ESPN_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_history_backfill,
+        trigger="cron",
+        hour=_int_env(
+            ENV_ESPN_HISTORY_HOUR, DEFAULT_ESPN_HISTORY_HOUR, low=0, high=23,
+        ),
+        minute=_int_env(
+            ENV_ESPN_HISTORY_MINUTE, DEFAULT_ESPN_HISTORY_MINUTE, low=0, high=59,
+        ),
+        timezone=DISPLAY_TZ,
+        id="espn_history_backfill",
+        name="Extend the panel backwards from ESPN (off unless configured)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=ESPN_HISTORY_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
     scheduler.add_job(

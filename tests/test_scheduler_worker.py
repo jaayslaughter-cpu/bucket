@@ -1771,3 +1771,289 @@ def test_board_market_frames_calls_the_orchestrator_that_actually_exists(
     assert calls[0].get("persist") is False, "the board must not persist"
     assert got["team_games"] is team_games
     assert got["market_lines"] is market_lines
+
+
+# --- the history backfill: a bounded, resumable walk backwards ------------
+
+
+def test_the_backfill_job_is_on_the_schedule_after_settlement():
+    """
+    A job nothing registers cannot deepen a panel. And the TIME matters: the
+    backfill is the longest-running job here, and firing it inside the 09:00
+    slate's window would have it writing `player_game_logs` while the slate
+    reads them.
+    """
+    jobs = _jobs()
+    assert "espn_history_backfill" in jobs, (
+        "the history backfill is not registered; the panel can only ever "
+        "hold the nightly ingest's 30-day seed"
+    )
+    job = jobs["espn_history_backfill"]
+    assert job["func"] is worker.run_history_backfill
+    assert job["max_instances"] == 1, "two concurrent backfills would interleave writes"
+    assert (job["hour"], job["minute"]) == (4, 30), (
+        "the backfill must sit after settlement (03:30) and clear of the "
+        f"slate (09:00); it is at {job['hour']}:{job['minute']:02d}"
+    )
+    # Thirty minutes, not the six hours the other ingests get: a chunk of
+    # seasons-old box scores is no more urgent late, and a late fire would
+    # land in the slate's window.
+    assert job["misfire_grace_time"] == 30 * 60
+
+
+def test_the_backfill_is_off_unless_a_season_is_named(monkeypatch):
+    """
+    OFF BY DEFAULT IS THE DESIGN, not timidity. ESPN's season calendar
+    includes preseason and playoff dates, which the per-event guard refuses,
+    so those dates are permanently absent from the panel and read as "not
+    yet ingested" on every run. An unconditional nightly backfill would
+    re-ask them for ever and never finish.
+    """
+    monkeypatch.delenv(worker.ENV_ESPN_HISTORY_SEASONS, raising=False)
+    out = worker.run_history_backfill()
+    assert out["status"] == "SKIPPED"
+    assert worker.ENV_ESPN_HISTORY_SEASONS in out["reason"]
+
+
+def test_the_backfill_obeys_the_same_switch_as_the_nightly_ingest(monkeypatch):
+    """One ESPN path, one off switch. An operator who disabled the ESPN
+    ingest disabled the ESPN ingest; a backfill that kept fetching would be
+    the one job that ignored them."""
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2026")
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "false")
+    out = worker.run_history_backfill()
+    assert out["status"] == "SKIPPED"
+    assert "disabled" in out["reason"]
+
+
+def test_history_seasons_parses_years_and_refuses_nonsense(monkeypatch):
+    """A typo must not reach `fetch_season_calendar`, where it comes back as
+    an empty calendar and reads as "ESPN changed shape"."""
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2026, 2025 2026,, 26, twenty")
+    assert worker._history_seasons() == [2025, 2026], "oldest first, deduplicated"
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "20226")
+    assert worker._history_seasons() == [], "an implausible year is not a season"
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "   ")
+    assert worker._history_seasons() == []
+
+
+def test_the_plan_takes_the_oldest_missing_dates_and_reports_the_rest():
+    """
+    OLDEST FIRST, and this is the assertion that pins it.
+
+    The rolling features need a player's history to sit BEFORE the games
+    being predicted. Filling 2024-10 before 2025-01 means every intermediate
+    state of the panel is one whose newest rows have real windows behind
+    them. Newest-first would spend the whole backfill with the null windows
+    on the rows that get scored.
+    """
+    from datetime import date as _d
+
+    calendar = {
+        2025: [_d(2024, 10, 22), _d(2024, 10, 23), _d(2024, 10, 24)],
+        2026: [_d(2025, 10, 21), _d(2025, 10, 22)],
+    }
+    already = {"2024-10-23"}  # a night the panel already holds
+
+    plan = worker.plan_history_dates(
+        [2026, 2025], already, chunk=2, calendar_for=calendar.__getitem__,
+    )
+    assert plan["dates"] == [_d(2024, 10, 22), _d(2024, 10, 24)], (
+        "the plan must skip the ingested night and take the two OLDEST of "
+        f"what is left; got {plan['dates']}"
+    )
+    assert plan["missing_total"] == 4
+    assert plan["remaining"] == 2, "what the next run picks up"
+    assert any("2025: 3 game date(s), 2 not ingested" in n for n in plan["seasons"])
+
+
+def test_the_plan_goes_empty_once_every_holdable_date_is_in(monkeypatch):
+    """The retirement signal. Without a COMPLETE status an operator has
+    nothing telling them to switch the job off, and a backfill left on
+    re-asks the preseason dates nightly for ever."""
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2026")
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(
+        espn, "fetch_season_calendar", lambda year, **k: [_d(2025, 10, 21)],
+    )
+    monkeypatch.setattr(
+        repo, "ingested_dates_for_source", lambda source: {"2025-10-21"},
+    )
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("the backfill fetched with nothing left to fetch")
+
+    monkeypatch.setattr(worker, "run_espn_ingest", _must_not_run)
+
+    out = worker.run_history_backfill()
+    assert out["status"] == "COMPLETE"
+    assert out["remaining"] == 0
+
+
+def test_the_backfill_writes_through_the_nightly_ingest_not_its_own_copy(
+    monkeypatch,
+):
+    """
+    ONE WRITE PATH. Every guard that makes the nightly ingest safe -- the
+    id-namespace preflight, the two ownership views, the by-key read-back,
+    the post-write namespace re-check -- applies identically to a night in
+    2024. A backfill with its own copy of that sequence would be a second,
+    quieter writer, and the quiet one is the one that drifts.
+
+    So this asserts the backfill calls `run_espn_ingest` with its planned
+    dates, rather than reaching for the mapper itself.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2026")
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_CHUNK, "2")
+
+    season = [_d(2025, 10, 21), _d(2025, 10, 22), _d(2025, 10, 23)]
+    monkeypatch.setattr(espn, "fetch_season_calendar", lambda year, **k: season)
+    monkeypatch.setattr(repo, "ingested_dates_for_source", lambda source: set())
+
+    seen: dict = {}
+
+    def _capture(days=None, **kwargs):
+        seen["days"] = list(days or [])
+        seen["kwargs"] = kwargs
+        return {"status": "OK", "panel_rows": 11}
+
+    monkeypatch.setattr(worker, "run_espn_ingest", _capture)
+
+    out = worker.run_history_backfill()
+
+    assert seen.get("days") == season[:2], (
+        f"the chunk bound was not honoured or the order was wrong: {seen.get('days')}"
+    )
+    assert out["status"] == "OK"
+    assert out["backfill"]["remaining"] == 1
+    assert out["backfill"]["first"] == "2025-10-21"
+    assert out["backfill"]["last"] == "2025-10-22"
+
+
+def test_the_nightly_window_is_unchanged_when_no_dates_are_passed(monkeypatch):
+    """
+    The parameter must not move the nightly. `run_espn_ingest()` with no
+    argument still reads `PROPIQ_ESPN_LOOKBACK_DAYS` back from today, and a
+    regression here would quietly stop the panel tracking last night.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+    from src.utils import timezones
+
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1))
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setenv(worker.ENV_ESPN_LOOKBACK, "3")
+    # A non-empty panel, so the nightly window is used rather than the seed.
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    asked: dict = {}
+
+    def _fetch(days, **kwargs):
+        import pandas as pd
+        asked["days"] = list(days)
+        return pd.DataFrame(), type("R", (), {
+            "games_seen": 0, "games_parsed": 0, "rows_out": 0,
+            "lines": lambda self: [],
+        })()
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
+
+    worker.run_espn_ingest()
+
+    assert asked.get("days") == [_d(2026, 11, 1), _d(2026, 10, 31), _d(2026, 10, 30)], (
+        f"the nightly window changed: {asked.get('days')}"
+    )
+
+
+def test_explicit_days_reach_the_fetch_instead_of_the_nightly_window(monkeypatch):
+    """
+    THE MUTATION THAT SURVIVED THE FIRST ROUND OF THESE TESTS.
+
+    `run_espn_ingest` computes the nightly window only `if days is None`.
+    Change that to an unconditional branch and the backfill's planned dates
+    are discarded and replaced with the last three days -- every chunk
+    re-reads this week, `remaining` never falls, and the job reports OK for
+    ever while the panel never deepens by a single night.
+
+    Nothing caught it, because the test that asserts the plan reaches
+    `run_espn_ingest` stubs `run_espn_ingest` out, and the test that pins the
+    nightly window passes no days, so both branches agree. This one calls the
+    REAL function with explicit dates and watches what the fetch is handed.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    # FOUR dates, not three. The first version of this test used three and
+    # asserted `out["days"] == 3`, which a mutation hardcoding the nightly
+    # lookback (also 3) satisfied exactly. The length has to differ from
+    # every default in play for the assertion to be able to fail.
+    wanted = [_d(2024, 10, 22), _d(2024, 10, 24), _d(2024, 11, 3), _d(2024, 11, 9)]
+    asked: dict = {}
+
+    def _fetch(days, **kwargs):
+        import pandas as pd
+        asked["days"] = list(days)
+        return pd.DataFrame(), type("R", (), {
+            "games_seen": 0, "games_parsed": 0, "rows_out": 0,
+            "lines": lambda self: [],
+        })()
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
+
+    out = worker.run_espn_ingest(days=wanted, label="history backfill")
+
+    assert asked.get("days") == wanted, (
+        "the dates the caller asked for did not reach the fetch; the nightly "
+        f"window replaced them. Got {asked.get('days')}"
+    )
+    # The fetch returns an empty frame, so this lands on the
+    # DATA_NOT_AVAILABLE return -- NAMED, because that is the branch whose
+    # day count is asserted here. It counts what was read rather than the
+    # env lookback, which is what makes a backfill chunk's summary legible.
+    # The OK branch's count is the same expression and is NOT covered by
+    # this test: reaching it needs a database write.
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert out["days"] == len(wanted)
+    assert out["label"] == "history backfill"
+
+
+def test_an_empty_date_list_is_not_silently_turned_into_the_nightly_window(
+    monkeypatch,
+):
+    """`days=[]` means "nothing to read", which is what a finished backfill
+    hands over. Falling through to the nightly window there would make the
+    completion case re-read this week every night."""
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    def _must_not_fetch(*a, **k):
+        raise AssertionError("fetched ESPN for an empty date list")
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _must_not_fetch)
+
+    out = worker.run_espn_ingest(days=[], label="history backfill")
+    assert out["status"] == "SKIPPED"
+    assert out["reason"] == "no dates requested"
