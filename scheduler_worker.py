@@ -185,6 +185,14 @@ ESPN_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 #: no more urgent at 11:00, and firing it late would have it reading
 #: `player_game_logs` while the 09:00 slate does.
 ESPN_HISTORY_MISFIRE_GRACE_SECONDS = 30 * 60
+#: How long before the slate the history backfill must be scheduled. A chunk
+#: of 60 dates is on the order of twenty minutes, so an hour leaves room for a
+#: slow night without the two overlapping. Enforced rather than documented:
+#: `PROPIQ_ESPN_HISTORY_HOUR_PT=9` against a 09:00 slate would have this
+#: writing `player_game_logs` while the slate reads them, and the result is a
+#: slate that scores a partially-written panel with nothing saying so. Raised
+#: by review on #31.
+ESPN_HISTORY_MIN_LEAD_MINUTES = 60
 
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
@@ -2405,6 +2413,8 @@ def plan_history_dates(
     *,
     chunk: int,
     calendar_for: Any,
+    window_for: Any,
+    not_after: date,
 ) -> dict[str, Any]:
     """
     The oldest ``chunk`` game dates in ``seasons`` that ESPN has not supplied.
@@ -2414,6 +2424,27 @@ def plan_history_dates(
     left over is the whole behaviour worth testing, and it is unreachable
     through a function that fetches and writes.
 
+    THREE FILTERS, AND TWO OF THEM EXIST SO THE JOB CAN FINISH. Review on
+    #31 established that the first version could not: `calendar_for` lists
+    every date with any NBA game in a season, so preseason and the playoffs
+    are in it, and the per-event guard refuses both -- those dates never get
+    panel rows, so a work list built from the calendar alone reports them
+    missing on every run, for ever. `remaining` never reached 0 and the
+    COMPLETE branch was unreachable, while the docstring told operators to
+    wait for exactly that. So:
+
+      * ``window_for(year)`` gives the regular season's own first and last
+        Pacific date, from ESPN, and dates outside it are not this job's to
+        fetch.
+      * ``not_after`` drops dates not yet played. A game today is not final,
+        and tomorrow's is not played at all; both would be permanently
+        missing for the current season. The nightly ingest owns recent days.
+      * ``already`` drops what the panel holds.
+
+    What is left is dates that HAD regular-season games, have been played,
+    and are absent -- every one of which an ingest can actually fill, which
+    is what makes `remaining: 0` a reachable state rather than a promise.
+
     OLDEST FIRST. The rolling features need a player's history to be
     contiguous BEFORE the games being predicted, so filling 2024-10 before
     2025-01 means every intermediate state of the panel is one whose newest
@@ -2421,17 +2452,23 @@ def plan_history_dates(
     backfill with a panel whose oldest rows are the ones with null windows,
     which is the half that gets scored.
 
-    ``calendar_for`` is passed in rather than imported for the same reason:
-    the planner is pure, and the fetch is the caller's.
+    ``calendar_for`` and ``window_for`` are passed in rather than imported
+    for the same reason: the planner is pure, and the fetching is the
+    caller's.
     """
     seen: set[date] = set()
     wanted: list[date] = []
     season_notes: list[str] = []
     for year in sorted({int(y) for y in seasons}):
+        start, end = window_for(year)
         days = list(calendar_for(year))
-        missing = [d for d in days if d.isoformat() not in already]
+        in_season = [d for d in days if start <= d <= end]
+        played = [d for d in in_season if d <= not_after]
+        missing = [d for d in played if d.isoformat() not in already]
         season_notes.append(
-            f"{year}: {len(days)} game date(s), {len(missing)} not ingested"
+            f"{year}: regular season {start} to {end}, {len(days)} game "
+            f"date(s) in the calendar, {len(in_season)} in season, "
+            f"{len(played)} played, {len(missing)} not ingested"
         )
         for day in missing:
             if day not in seen:
@@ -2497,12 +2534,26 @@ def run_history_backfill() -> dict[str, Any]:
         ENV_ESPN_HISTORY_CHUNK, DEFAULT_ESPN_HISTORY_CHUNK_DAYS, low=1, high=400,
     )
     try:
-        from src.db.repository import ingested_dates_for_source
-        from src.ingestion.espn_panel import ESPN_TEAM_SOURCE, fetch_season_calendar
+        from datetime import timedelta
 
-        already = ingested_dates_for_source(ESPN_TEAM_SOURCE)
+        from src.db.repository import panel_dates_for_source
+        from src.ingestion.espn_panel import (
+            ESPN_SOURCE,
+            fetch_regular_season_window,
+            fetch_season_calendar,
+        )
+        from src.utils.timezones import pacific_calendar_date
+
+        already = panel_dates_for_source(ESPN_SOURCE)
+        # YESTERDAY, not today. Tonight's games are not final, and the
+        # nightly ingest already re-reads the last three days -- so the
+        # backfill stopping here costs nothing and keeps it from queueing a
+        # date that cannot be filled yet.
         plan = plan_history_dates(
-            seasons, already, chunk=chunk, calendar_for=fetch_season_calendar,
+            seasons, already, chunk=chunk,
+            calendar_for=fetch_season_calendar,
+            window_for=fetch_regular_season_window,
+            not_after=pacific_calendar_date() - timedelta(days=1),
         )
     except Exception as exc:  # noqa: BLE001 — the scheduler stays up
         logger.exception("History backfill could not plan; the scheduler stays up.")
@@ -2513,17 +2564,19 @@ def run_history_backfill() -> dict[str, Any]:
         logger.info("  season %s", line)
 
     if not plan["dates"]:
-        # THE RETIREMENT MESSAGE, and it is the point of the whole env-var
-        # design. Nothing else tells an operator the job's work is done, and
-        # a backfill left switched on re-asks the preseason and playoff dates
-        # it can never ingest every night, for ever.
+        # THE RETIREMENT MESSAGE, and it is reachable BECAUSE the planner
+        # counts only dates an ingest can actually fill -- played,
+        # regular-season, absent. The first version counted every calendar
+        # date, which included preseason and the playoffs that the
+        # per-event guard refuses, so this branch could never run and the
+        # instruction below was advice an operator could not follow.
         logger.info(
-            "HISTORY BACKFILL COMPLETE for season(s) %s: every game date ESPN "
-            "lists that this panel can hold is ingested. What remains absent "
-            "is preseason and postseason, which the per-event guard refuses "
-            "by design and which will therefore never be 'done'. UNSET $%s so "
-            "this job stops re-asking them nightly.",
-            ", ".join(str(y) for y in seasons), ENV_ESPN_HISTORY_SEASONS,
+            "HISTORY BACKFILL COMPLETE for season(s) %s: every played "
+            "regular-season date in those seasons is in the panel (%d date(s) "
+            "from ESPN). UNSET $%s; left on, this job re-reads the calendar "
+            "every night to learn the same thing.",
+            ", ".join(str(y) for y in seasons), len(already),
+            ENV_ESPN_HISTORY_SEASONS,
         )
         return {"status": "COMPLETE", "seasons": seasons,
                 "ingested_dates": len(already), "remaining": 0}
@@ -2672,6 +2725,61 @@ def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
         return {"status": "FAILED", "error": str(exc), "out": str(target)}
 
 
+def history_backfill_time(slate_hour: int, slate_minute: int) -> tuple[int, int]:
+    """
+    When the history backfill runs, REFUSING a time that races the slate.
+
+    THE OVERRIDE COULD PUT A WRITER ON TOP OF A READER. `_int_env` bounds
+    each field to a legal clock value and nothing compared the result with
+    the slate's: `PROPIQ_ESPN_HISTORY_HOUR_PT=9` against a 09:00 slate
+    scheduled a job that walks seasons of box scores into
+    `player_game_logs` at the moment the slate starts reading them. The
+    slate would score a partially written panel, exit 0, and say nothing --
+    `max_instances` is per job, so it does not help here. Found in review
+    on #31, where the only thing standing between an operator and that was
+    a comment.
+
+    REFUSED BACK TO THE DEFAULT rather than raised, following `_int_env`:
+    a worker that will not boot over a schedule setting is worse than one
+    that boots on the documented time and says loudly what it ignored. If
+    the DEFAULT is itself unsafe -- an operator moved the slate to 05:00 --
+    the backfill is moved to keep its lead, because the slate is the job
+    with the deadline.
+    """
+    minutes = _int_env(
+        ENV_ESPN_HISTORY_HOUR, DEFAULT_ESPN_HISTORY_HOUR, low=0, high=23,
+    ) * 60 + _int_env(
+        ENV_ESPN_HISTORY_MINUTE, DEFAULT_ESPN_HISTORY_MINUTE, low=0, high=59,
+    )
+    slate_minutes = slate_hour * 60 + slate_minute
+    latest = slate_minutes - ESPN_HISTORY_MIN_LEAD_MINUTES
+    if minutes <= latest:
+        return minutes // 60, minutes % 60
+
+    if latest >= 0:
+        # The slate leaves room earlier in the same day; take it.
+        fallback = min(
+            DEFAULT_ESPN_HISTORY_HOUR * 60 + DEFAULT_ESPN_HISTORY_MINUTE, latest
+        )
+    else:
+        # A slate inside the first hour of the day leaves no room before it,
+        # so the backfill goes AFTER it instead -- still the longest gap
+        # available, and never overlapping.
+        fallback = (slate_minutes + ESPN_HISTORY_MIN_LEAD_MINUTES) % (24 * 60)
+    logger.error(
+        "HISTORY BACKFILL TIME REFUSED: %02d:%02d PT is not at least %d "
+        "minute(s) before the slate at %02d:%02d PT. A backfill chunk takes "
+        "about twenty minutes and writes player_game_logs, which the slate "
+        "READS -- overlapping them scores a partially written panel and exits "
+        "0. Using %02d:%02d PT instead; set $%s / $%s to a time that clears "
+        "the slate.",
+        minutes // 60, minutes % 60, ESPN_HISTORY_MIN_LEAD_MINUTES,
+        slate_hour, slate_minute, fallback // 60, fallback % 60,
+        ENV_ESPN_HISTORY_HOUR, ENV_ESPN_HISTORY_MINUTE,
+    )
+    return fallback // 60, fallback % 60
+
+
 def build_scheduler(scheduler: Any | None = None) -> Any:
     """
     Wire the two jobs onto a scheduler. Separated so it can be tested.
@@ -2742,15 +2850,12 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         misfire_grace_time=ESPN_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
+    history_hour, history_minute = history_backfill_time(slate_hour, slate_minute)
     scheduler.add_job(
         run_history_backfill,
         trigger="cron",
-        hour=_int_env(
-            ENV_ESPN_HISTORY_HOUR, DEFAULT_ESPN_HISTORY_HOUR, low=0, high=23,
-        ),
-        minute=_int_env(
-            ENV_ESPN_HISTORY_MINUTE, DEFAULT_ESPN_HISTORY_MINUTE, low=0, high=59,
-        ),
+        hour=history_hour,
+        minute=history_minute,
         timezone=DISPLAY_TZ,
         id="espn_history_backfill",
         name="Extend the panel backwards from ESPN (off unless configured)",

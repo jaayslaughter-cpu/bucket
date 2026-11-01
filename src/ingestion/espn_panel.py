@@ -59,7 +59,7 @@ from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
-from src.ingestion.espn_client import EspnError, get_json, site_url
+from src.ingestion.espn_client import CORE_API_BASE, EspnError, get_json, site_url
 from src.ingestion.espn_game import parse_box_score
 from src.ingestion.espn_schedule import normalize_team
 from src.utils.ids import ESPN_ID_PREFIX, espn_game_id
@@ -388,26 +388,118 @@ def fetch_season_calendar(
         )
     days: list[date] = []
     seen: set[date] = set()
+    unreadable: list[str] = []
     for entry in entries:
         # A nested calendar (ESPN uses one for week-based sports) is not the
-        # flat day list this reads. Skipped rather than coerced: a dict's
-        # str() would parse as nothing and silently shorten the window.
-        if not isinstance(entry, str):
-            continue
-        try:
-            parsed = datetime.fromisoformat(entry.replace("Z", "+00:00"))
-        except ValueError:
+        # flat day list this reads, and a dict's str() would parse as nothing.
+        parsed = None
+        if isinstance(entry, str):
+            try:
+                parsed = datetime.fromisoformat(entry.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            unreadable.append(repr(entry)[:60])
             continue
         day = to_pacific(parsed).date()
         if day not in seen:
             seen.add(day)
             days.append(day)
-    if not days:
+    # ANY UNREADABLE ENTRY IS A REFUSAL, not a skipped day, and the
+    # asymmetry is deliberate. A date dropped here never enters the
+    # backfill's work list, so it is never fetched -- and because the
+    # planner reports what is MISSING, a calendar quietly short by 29 dates
+    # produces `remaining: 0` with 29 nights that have no rows. That is the
+    # one failure mode of this whole job that looks like success. A calendar
+    # is a short machine-generated list, so an entry that will not parse
+    # means the payload shape changed, which is exactly when to stop rather
+    # than proceed on a partial reading. Raised by review on #31.
+    if unreadable:
         raise EspnError(
             f"ESPN's season calendar for {season_year} held {len(entries)} "
-            f"entr(ies) and none parsed as a date. The payload shape changed."
+            f"entr(ies) and {len(unreadable)} did not parse as a date (e.g. "
+            f"{unreadable[0]}). Refusing a PARTIAL calendar: the dates it "
+            f"dropped would never be fetched, and the backfill would report "
+            f"itself complete with those nights empty."
         )
+    # NO "nothing parsed" BRANCH. `entries` is already known non-empty, and
+    # every entry either parses (so `days` grew) or was recorded above (so
+    # the refusal fired), which leaves `days` empty unreachable. The first
+    # version had that branch and it was dead the moment the partial refusal
+    # went in; unreachable code that looks like a guard is worse than none,
+    # because a reader counts it as one.
     return sorted(days)
+
+
+def fetch_regular_season_window(
+    season_year: int, *, session: Any = None, config: Any = None
+) -> tuple[date, date]:
+    """
+    The first and last PACIFIC date of one season's regular season.
+
+    WHY THE BACKFILL CANNOT WORK WITHOUT THIS. `fetch_season_calendar`
+    returns every date with any NBA game in a season -- preseason from
+    early October and the playoffs through June included -- and the
+    per-event guard refuses both, so those dates never get panel rows. A
+    work list built from the calendar alone therefore reports them missing
+    on every run: the backfill never reports itself complete, re-fetches
+    them nightly for ever, and the operator is told to wait for a signal
+    that cannot arrive. Found in review on #31, against exactly that claim
+    in the job's own docstring.
+
+    ESPN ANSWERS IT DIRECTLY rather than being guessed at. The core API's
+    season/type resource carries the regular season's own bounds, and one
+    call settles a question no heuristic should be deciding. Measured
+    2026-11-01: 2026 -> 2025-10-21 to 2026-04-13Z, and 2025 -> 2024-10-22
+    to 2025-04-14Z.
+
+    BOTH BOUNDS READ AS PACIFIC DATES, like the calendar. ESPN renders the
+    end as 06:59Z, which is 23:59 the previous evening Pacific -- so the
+    Pacific end date is the last day games are played, which is what an
+    intersection with the calendar wants. Reading the UTC date there would
+    extend the window one day past the season.
+    """
+    year = int(season_year)
+    payload = get_json(
+        f"{CORE_API_BASE}/v2/sports/basketball/leagues/nba/seasons/"
+        f"{year}/types/{SEASON_TYPE_REGULAR}",
+        config=config,
+        session=session,
+    )
+    if not isinstance(payload, dict):
+        raise EspnError(
+            f"ESPN returned {type(payload).__name__} for the {year} regular "
+            f"season, not an object."
+        )
+    reported = payload.get("type")
+    if reported is not None and int(reported) != SEASON_TYPE_REGULAR:
+        # A payload describing the PRESEASON would hand back a window from
+        # early October, which is the exact set of dates this exists to
+        # exclude. Checked rather than trusted.
+        raise EspnError(
+            f"ESPN described season type {reported!r} for the {year} regular "
+            f"season; expected {SEASON_TYPE_REGULAR}."
+        )
+    bounds: list[date] = []
+    for key in ("startDate", "endDate"):
+        raw = payload.get(key)
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise EspnError(
+                f"ESPN's {year} regular season has no readable {key} "
+                f"({raw!r}). Without both bounds the backfill cannot tell a "
+                f"preseason date from a regular-season one, and would report "
+                f"itself complete while re-fetching preseason for ever."
+            ) from exc
+        bounds.append(to_pacific(parsed).date())
+    start, end = bounds
+    if end < start:
+        raise EspnError(
+            f"ESPN's {year} regular season ends ({end}) before it starts "
+            f"({start}); the window would select nothing."
+        )
+    return start, end
 
 
 def fetch_event_ids(

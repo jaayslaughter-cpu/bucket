@@ -216,9 +216,9 @@ def team_game_owners_by_date() -> dict[tuple[str, str], str]:
     return out
 
 
-def ingested_dates_for_source(source: str) -> set[str]:
+def panel_dates_for_source(source: str) -> set[str]:
     """
-    Which ``game_date``s already hold a team-game row written by ``source``.
+    Which ``game_date``s already hold a PANEL row written by ``source``.
 
     THE BACKFILL'S RESUME POINT, and it is read from the database rather
     than remembered anywhere. A history backfill has to know which nights it
@@ -228,9 +228,19 @@ def ingested_dates_for_source(source: str) -> set[str]:
     high-water mark cannot express a hole in the middle left by a night ESPN
     was down for.
 
-    DISTINCT IN SQL rather than a set() over every row: `team_game_owners_by_date`
-    already pulls the whole table to answer a different question, and a
-    backfill that walked three seasons would pull it again on every chunk.
+    THE PANEL AND NOT `team_game_stats`, which the first version read and
+    which has a hole in it. `aggregate_team_games` DECLINES a (date, team)
+    a higher-precedence source already owns -- BigDataBall outranks
+    `espn_agg` -- so a night the licensed workbook holds gets no `espn_agg`
+    team row however many times ESPN is read for it, and a backfill keyed
+    on that table would re-fetch those nights for ever. `player_game_logs`
+    has no such precedence guard: `upsert_player_game_logs` writes every
+    row it is handed. The panel is also the thing the backfill exists to
+    fill, so it is the honest place to ask what is already in.
+
+    DISTINCT IN SQL rather than a set() over every row: a backfill that
+    walked three seasons would otherwise pull the whole table on every
+    chunk.
 
     KEYED ON SOURCE, because "ingested" is not a property of the date. A
     night the licensed workbook owns is not a night ESPN has read, and a
@@ -240,8 +250,8 @@ def ingested_dates_for_source(source: str) -> set[str]:
     """
     with session_scope() as session:
         rows = session.execute(
-            select(TeamGameStat.game_date)
-            .where(TeamGameStat.source == str(source))
+            select(PlayerGameLog.game_date)
+            .where(PlayerGameLog.source == str(source))
             .distinct()
         ).all()
     out: set[str] = set()

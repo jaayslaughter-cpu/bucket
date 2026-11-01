@@ -1866,10 +1866,17 @@ def test_the_plan_takes_the_oldest_missing_dates_and_reports_the_rest():
         2025: [_d(2024, 10, 22), _d(2024, 10, 23), _d(2024, 10, 24)],
         2026: [_d(2025, 10, 21), _d(2025, 10, 22)],
     }
+    windows = {
+        2025: (_d(2024, 10, 22), _d(2025, 4, 14)),
+        2026: (_d(2025, 10, 21), _d(2026, 4, 13)),
+    }
     already = {"2024-10-23"}  # a night the panel already holds
 
     plan = worker.plan_history_dates(
-        [2026, 2025], already, chunk=2, calendar_for=calendar.__getitem__,
+        [2026, 2025], already, chunk=2,
+        calendar_for=calendar.__getitem__,
+        window_for=windows.__getitem__,
+        not_after=_d(2026, 10, 31),
     )
     assert plan["dates"] == [_d(2024, 10, 22), _d(2024, 10, 24)], (
         "the plan must skip the ingested night and take the two OLDEST of "
@@ -1877,7 +1884,70 @@ def test_the_plan_takes_the_oldest_missing_dates_and_reports_the_rest():
     )
     assert plan["missing_total"] == 4
     assert plan["remaining"] == 2, "what the next run picks up"
-    assert any("2025: 3 game date(s), 2 not ingested" in n for n in plan["seasons"])
+    assert any("2025: regular season 2024-10-22 to 2025-04-14" in n
+               for n in plan["seasons"])
+
+
+def test_the_plan_excludes_preseason_playoffs_and_games_not_yet_played():
+    """
+    THE REASON THE FIRST VERSION OF THIS JOB COULD NEVER FINISH.
+
+    `fetch_season_calendar` lists every date with any NBA game in a season,
+    so preseason in early October and the playoffs through June are in it.
+    The per-event guard refuses both, so those dates never get panel rows --
+    and a work list built from the calendar alone reported them missing on
+    EVERY run. `remaining` never reached 0, the COMPLETE branch was
+    unreachable, and the job's own docstring told operators to wait for it.
+    Raised by review on #31.
+
+    Dates not yet played are the same defect for the current season: a game
+    tonight is not final and tomorrow's has not happened, so both would stay
+    permanently missing.
+    """
+    from datetime import date as _d
+
+    calendar = {
+        2026: [
+            _d(2025, 10, 6),    # preseason — before the regular season opens
+            _d(2025, 10, 21),   # opening night
+            _d(2025, 12, 25),
+            _d(2026, 4, 20),    # playoffs — after the regular season ends
+        ],
+        # THE CURRENT SEASON, which is where "not yet played" lives. The
+        # first version of this test put its unplayed date in the 2026
+        # season, where the regular-season window already excluded it — so
+        # dropping the played filter altogether left the test green. A date
+        # has to be IN SEASON and unplayed for the filter to be the only
+        # thing holding it out.
+        2027: [
+            _d(2026, 10, 21),   # played
+            _d(2026, 10, 31),   # played, the cutoff itself
+            _d(2026, 11, 1),    # TODAY — tonight's games are not final
+            _d(2026, 11, 5),    # not played at all
+        ],
+    }
+    windows = {
+        2026: (_d(2025, 10, 21), _d(2026, 4, 13)),
+        2027: (_d(2026, 10, 20), _d(2027, 4, 12)),
+    }
+
+    plan = worker.plan_history_dates(
+        [2026, 2027], set(), chunk=50,
+        calendar_for=calendar.__getitem__,
+        window_for=windows.__getitem__,
+        not_after=_d(2026, 10, 31),
+    )
+    assert plan["dates"] == [
+        _d(2025, 10, 21), _d(2025, 12, 25), _d(2026, 10, 21), _d(2026, 10, 31),
+    ], (
+        "only played regular-season dates are this job's to fetch; got "
+        f"{plan['dates']}"
+    )
+    assert plan["remaining"] == 0, (
+        "with every played in-season date taken, nothing is left -- this is "
+        "the state that makes the COMPLETE branch reachable"
+    )
+    assert plan["missing_total"] == 4
 
 
 def test_the_plan_goes_empty_once_every_holdable_date_is_in(monkeypatch):
@@ -1895,7 +1965,11 @@ def test_the_plan_goes_empty_once_every_holdable_date_is_in(monkeypatch):
         espn, "fetch_season_calendar", lambda year, **k: [_d(2025, 10, 21)],
     )
     monkeypatch.setattr(
-        repo, "ingested_dates_for_source", lambda source: {"2025-10-21"},
+        espn, "fetch_regular_season_window",
+        lambda year, **k: (_d(2025, 10, 21), _d(2026, 4, 13)),
+    )
+    monkeypatch.setattr(
+        repo, "panel_dates_for_source", lambda source: {"2025-10-21"},
     )
 
     def _must_not_run(*a, **k):
@@ -1932,7 +2006,11 @@ def test_the_backfill_writes_through_the_nightly_ingest_not_its_own_copy(
 
     season = [_d(2025, 10, 21), _d(2025, 10, 22), _d(2025, 10, 23)]
     monkeypatch.setattr(espn, "fetch_season_calendar", lambda year, **k: season)
-    monkeypatch.setattr(repo, "ingested_dates_for_source", lambda source: set())
+    monkeypatch.setattr(
+        espn, "fetch_regular_season_window",
+        lambda year, **k: (_d(2025, 10, 21), _d(2026, 4, 13)),
+    )
+    monkeypatch.setattr(repo, "panel_dates_for_source", lambda source: set())
 
     seen: dict = {}
 
@@ -2068,3 +2146,127 @@ def test_an_empty_date_list_is_not_silently_turned_into_the_nightly_window(
     out = worker.run_espn_ingest(days=[], label="history backfill")
     assert out["status"] == "SKIPPED"
     assert out["reason"] == "no dates requested"
+
+
+def test_the_backfill_stops_at_yesterday_not_today(monkeypatch):
+    """
+    TONIGHT'S GAMES ARE NOT FINAL. `espn_panel` refuses a game that is not
+    STATUS_FINAL, so today's date can never be filled by a backfill chunk
+    run this morning -- it would be queued, fetched, refused per event, and
+    queued again tomorrow. The nightly ingest re-reads the last three days
+    and owns that window.
+
+    Asserted at the JOB, because the cutoff is the job's to choose: the
+    planner takes `not_after` as a parameter, so a planner test cannot see
+    whether the caller passed today or yesterday.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+    from src.utils import timezones
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2027")
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_CHUNK, "50")
+    monkeypatch.setattr(
+        timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
+    )
+    monkeypatch.setattr(
+        espn, "fetch_season_calendar",
+        lambda year, **k: [_d(2026, 10, 30), _d(2026, 10, 31), _d(2026, 11, 1)],
+    )
+    monkeypatch.setattr(
+        espn, "fetch_regular_season_window",
+        lambda year, **k: (_d(2026, 10, 20), _d(2027, 4, 12)),
+    )
+    monkeypatch.setattr(repo, "panel_dates_for_source", lambda source: set())
+
+    seen: dict = {}
+
+    def _capture(days=None, **kwargs):
+        seen["days"] = list(days or [])
+        return {"status": "OK"}
+
+    monkeypatch.setattr(worker, "run_espn_ingest", _capture)
+    worker.run_history_backfill()
+
+    assert seen["days"] == [_d(2026, 10, 30), _d(2026, 10, 31)], (
+        f"today reached the backfill's work list: {seen['days']}"
+    )
+
+
+def test_the_backfill_is_refused_a_time_that_races_the_slate(monkeypatch):
+    """
+    AN OVERRIDE COULD PUT A WRITER ON TOP OF A READER.
+
+    `_int_env` bounds each field to a legal clock value and nothing compared
+    the result with the slate's, so `PROPIQ_ESPN_HISTORY_HOUR_PT=9` against a
+    09:00 slate scheduled a job that walks seasons of box scores into
+    `player_game_logs` at the moment the slate starts reading them. The slate
+    would score a partially written panel and exit 0. `max_instances` is per
+    job and does not help. Raised by review on #31, where a comment was the
+    only thing standing in the way.
+    """
+    monkeypatch.delenv(worker.ENV_SLATE_HOUR, raising=False)
+    monkeypatch.delenv(worker.ENV_SLATE_MINUTE, raising=False)
+
+    # Safe: the documented default, comfortably clear of a 09:00 slate.
+    monkeypatch.delenv(worker.ENV_ESPN_HISTORY_HOUR, raising=False)
+    monkeypatch.delenv(worker.ENV_ESPN_HISTORY_MINUTE, raising=False)
+    assert worker.history_backfill_time(9, 0) == (4, 30)
+
+    # An operator-chosen time that still clears the slate is honoured.
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_HOUR, "6")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_MINUTE, "15")
+    assert worker.history_backfill_time(9, 0) == (6, 15)
+
+    # ON TOP OF THE SLATE -> refused.
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_HOUR, "9")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_MINUTE, "0")
+    assert worker.history_backfill_time(9, 0) == (4, 30), "a collision stood"
+
+    # INSIDE THE LEAD -> refused too. 08:30 does not collide but a chunk
+    # takes about twenty minutes, so it can still be writing at 09:00.
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_HOUR, "8")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_MINUTE, "30")
+    assert worker.history_backfill_time(9, 0) == (4, 30)
+
+
+def test_an_early_slate_moves_the_backfill_rather_than_overlapping_it(
+    monkeypatch,
+):
+    """
+    THE DEFAULT ITSELF CAN BE UNSAFE. An operator who moves the slate to
+    05:00 leaves 04:30 inside the lead, and the slate is the job with the
+    deadline — so the backfill moves, not the slate.
+    """
+    monkeypatch.delenv(worker.ENV_ESPN_HISTORY_HOUR, raising=False)
+    monkeypatch.delenv(worker.ENV_ESPN_HISTORY_MINUTE, raising=False)
+
+    hour, minute = worker.history_backfill_time(5, 0)
+    assert (hour, minute) == (4, 0), (
+        f"the backfill stayed at {hour}:{minute:02d} against a 05:00 slate"
+    )
+
+    # A slate inside the first hour of the day leaves no room before it, so
+    # the backfill goes after it instead. Never overlapping is the invariant;
+    # being earlier is only how that is usually achieved.
+    hour, minute = worker.history_backfill_time(0, 30)
+    assert (hour, minute) == (1, 30)
+
+
+def test_the_registered_backfill_job_honours_the_refusal(monkeypatch):
+    """The resolver is not the wiring. `build_scheduler` must use it, or the
+    guard is a function nobody calls — the gap this repo keeps finding."""
+    monkeypatch.setenv(worker.ENV_SLATE_HOUR, "9")
+    monkeypatch.setenv(worker.ENV_SLATE_MINUTE, "0")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_HOUR, "9")
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_MINUTE, "0")
+
+    jobs = _jobs()
+    backfill = jobs["espn_history_backfill"]
+    assert (backfill["hour"], backfill["minute"]) != (9, 0), (
+        "the backfill was registered on top of the slate"
+    )
+    assert (backfill["hour"], backfill["minute"]) == (4, 30)
