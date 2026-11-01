@@ -1771,7 +1771,9 @@ def run_dispatch() -> dict[str, Any]:
 
         if not board_csv.exists():
             if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
-                return {"status": "SKIPPED", "reason": f"{board_csv} missing"}
+                return {"status": "SKIPPED",
+                        "reason": f"{board_csv} missing",
+                        "publication": verdict.as_dict()}
             embeds = [build_abstention_embed(
                 f"No board was written for this slate ({board_csv} absent), so "
                 "there is nothing to recommend. This is the pipeline reporting "
@@ -1813,7 +1815,8 @@ def run_dispatch() -> dict[str, Any]:
                 if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
                     return {"status": "SKIPPED",
                             "reason": f"board describes {sorted(board_slates)}, "
-                                      f"not {today_pt}"}
+                                      f"not {today_pt}",
+                            "publication": verdict.as_dict()}
                 embeds = [build_abstention_embed(
                     f"The board on disk describes {', '.join(sorted(board_slates))}, "
                     f"not {today_pt}, so it was not sent. A board is a "
@@ -1822,10 +1825,19 @@ def run_dispatch() -> dict[str, Any]:
                     title="No recommendations",
                 )]
                 sent = send_embeds(embeds, config=DiscordConfig(dry_run=False))
+                # `publication` ON EVERY RETURN, because a caller that reads
+                # `out["publication"]` cannot know which branch produced the
+                # dict it got. The calibration and freshness verdict is
+                # computed above and is true of this slate whether or not a
+                # board was dispatched -- withholding it here would make the
+                # gate's reason depend on why dispatch declined, which is a
+                # different question. Raised by review on #32; the two
+                # SKIPPED returns above carried the same gap.
                 return {"status": getattr(sent, "status", "OK"),
                         "reason": f"board describes {sorted(board_slates)}, "
                                   f"not {today_pt}",
-                        "embeds": len(embeds)}
+                        "embeds": len(embeds),
+                        "publication": verdict.as_dict()}
             rows = [
                 type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
                 for r in frame.to_dict("records")

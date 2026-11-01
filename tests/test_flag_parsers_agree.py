@@ -73,29 +73,90 @@ def test_an_unusable_value_defaults_rather_than_reading_as_off(monkeypatch):
     assert worker._flag("PROPIQ_FLAG_PARSER_HARNESS", False) is False
 
 
+def _env_names_referenced(path: str) -> set[str]:
+    """
+    `PROPIQ_*` names a module actually REFERENCES, excluding prose.
+
+    PARSED, NOT GREPPED, and the first version of this grepped raw source.
+    That counted the name inside `scheduler_worker._flag`'s own docstring --
+    which explains why the worker no longer reads `PROPIQ_FORWARD_SLATE` --
+    so the name looked shared and had to be exempted, and the exemption made
+    the test blind to the thing it exists to catch. Raised by review on #32.
+
+    An AST walk drops comments for free and drops the leading docstring of
+    every module, class and function explicitly. What is left is a string the
+    module evaluates: a constant, an argument, a dict key. That is a
+    reference.
+    """
+    import ast
+    import re
+    from pathlib import Path
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
+            found |= set(re.findall(r"PROPIQ_[A-Z0-9_]+", node.value))
+    return found
+
+
+def test_the_docstring_prose_is_not_what_this_test_reads():
+    """
+    THE SCANNER'S OWN BLIND SPOT, closed and then asserted closed.
+
+    `scheduler_worker._flag`'s docstring names `PROPIQ_FORWARD_SLATE` in
+    prose. If the scanner ever counts that as a reference again, the test
+    below needs an exemption for it, and an exemption is exactly what made
+    the previous version unable to see the name becoming shared.
+    """
+    worker_refs = _env_names_referenced("scheduler_worker.py")
+    assert "PROPIQ_FORWARD_SLATE" not in worker_refs, (
+        "the scanner is counting prose as a reference again; the test below "
+        "is now measuring the docstrings rather than the code"
+    )
+    # And it has not gone blind in the other direction: it still sees the
+    # switches the worker really does read.
+    assert {"PROPIQ_DISPATCH", "PROPIQ_ESPN_INGEST"} <= worker_refs, (
+        f"the scanner stopped seeing real references: {sorted(worker_refs)}"
+    )
+
+
 def test_no_boolean_switch_is_read_by_both_processes_through_two_parsers():
     """
     THE CLAIM ABOVE, ASSERTED. This file says no variable is currently read
     by both; if one appears, the parsers agreeing (above) is what keeps it
     safe -- and this test is the thing that notices, so the docstrings stop
     being true the loud way rather than the quiet way.
-
-    Reads both modules' source for `PROPIQ_*` literals rather than their
-    constants, because a shared switch could arrive as an inline string.
     """
-    import re
-    from pathlib import Path
-
-    def names(path: str) -> set[str]:
-        return set(re.findall(r"PROPIQ_[A-Z0-9_]+", Path(path).read_text()))
-
-    shared = names("scheduler_worker.py") & names("main.py")
-    # PROPIQ_MODEL is a PATH, not a flag, and PROPIQ_FORWARD_SLATE survives
-    # in the worker only inside prose explaining why it no longer reads it.
-    booleans = {
-        n for n in shared
-        if n not in {"PROPIQ_MODEL", "PROPIQ_FORWARD_SLATE"}
-    }
+    shared = (
+        _env_names_referenced("scheduler_worker.py")
+        & _env_names_referenced("main.py")
+    )
+    # ONE EXEMPTION, and it is not a flag: PROPIQ_MODEL names an artifact
+    # PATH. Both processes resolve it and neither parses it as a boolean, so
+    # it says nothing about the two parsers agreeing.
+    booleans = shared - {"PROPIQ_MODEL"}
     assert not booleans, (
         f"{sorted(booleans)} is now read by both processes. That is fine -- "
         f"the parsers agree -- but the docstrings here and on "

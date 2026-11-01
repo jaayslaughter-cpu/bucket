@@ -21,19 +21,29 @@ RESEARCH_ONLY. A displayed size is advisory metadata; `advisory_sizing` stamps
 from __future__ import annotations
 
 from src.notify.discord import build_decision_board_embed
-from src.utils.timezones import pacific_calendar_date
 
 
-def _today() -> str:
+def _frozen_pacific_day(monkeypatch, day: str = "2026-11-01") -> str:
     """
-    The Pacific calendar day, for the fixtures that go through the real
-    `run_dispatch`. It refuses a board whose rows describe another slate
-    before anything else in it runs, so a fixed date here would make these
-    tests pass or fail on the calendar rather than on the wire they test
-    (see `test_scheduler_worker.py::test_a_board_for_another_day_is_refused
-    _rather_than_dispatched`).
+    Pin the Pacific day for a test that goes through the real `run_dispatch`.
+
+    FROZEN, NOT READ TWICE. `run_dispatch` refuses a board whose rows describe
+    another slate and reads the Pacific day ITSELF, so a fixture that calls
+    `pacific_calendar_date()` on its own races the dispatch across Pacific
+    midnight: the board gets stamped yesterday, the guard refuses it, and the
+    test fails on the calendar rather than on the wire it is testing. Raised by
+    review on #32.
+
+    `run_dispatch` imports the function inside the call, so patching the module
+    attribute is what the call actually sees.
     """
-    return str(pacific_calendar_date())
+    from datetime import date as _date
+
+    from src.utils import timezones
+
+    frozen = _date.fromisoformat(day)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: frozen)
+    return str(frozen)
 
 
 def _row(**over):
@@ -325,9 +335,10 @@ def test_run_dispatch_puts_the_computed_size_on_the_card(monkeypatch, tmp_path):
 
     import scheduler_worker as worker
 
+    slate = _frozen_pacific_day(monkeypatch)
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": _today(), "game_date": _today(),
+        "slate_date": slate, "game_date": slate,
         "player_name": "HARNESS PLAYER", "target_market": "PTS",
         "side": "over", "line": 24.5,
         "model_prob": 0.58, "model_p_over": 0.58, "model_p_under": 0.42,

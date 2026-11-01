@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import scheduler_worker as worker
-from src.utils.timezones import DISPLAY_TZ_NAME, pacific_calendar_date
+from src.utils.timezones import DISPLAY_TZ_NAME
 
 
 class FakeScheduler:
@@ -66,6 +66,28 @@ def board_panel(rows: int = 12, start: str = "2026-10-01"):
         "FGA": [15.0] * rows, "FTA": [4.0] * rows, "TOV": [2.0] * rows,
         "PF": [2.0] * rows,
     })
+
+
+
+def _frozen_pacific_day(monkeypatch, day="2026-11-01"):
+    """
+    Pin the Pacific day for a test that goes through the real `run_dispatch`.
+
+    FROZEN, NOT READ TWICE. `run_dispatch` reads the Pacific day itself to
+    refuse a board describing another slate, so a fixture calling
+    `pacific_calendar_date()` separately races it across Pacific midnight and
+    fails in the staleness guard rather than on its own subject. Raised by
+    review on #32 against two other files; the same defect was in these.
+
+    Returns the frozen `date`; `str()` it for a CSV cell.
+    """
+    from datetime import date as _date
+
+    from src.utils import timezones
+
+    frozen = _date.fromisoformat(day)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: frozen)
+    return frozen
 
 
 def board_projections(slate_date="2026-11-01", rows=3, with_probability=False):
@@ -548,13 +570,13 @@ def test_a_board_with_no_calibration_report_is_dispatched_withheld(
         return type("R", (), {"status": "OK"})()
 
     board = tmp_path / "board.csv"
-    # TODAY's slate, deliberately: the subject here is the calibration gate,
-    # and dispatch refuses a board describing another day before it ever
-    # reaches that gate (see
-    # `test_a_board_for_another_day_is_refused_rather_than_dispatched`). A
-    # fixed date would make this test pass or fail on the calendar.
+    # The frozen Pacific day: the subject here is the calibration gate, and
+    # dispatch refuses a board describing another day before it ever reaches
+    # that gate (see
+    # `test_a_board_for_another_day_is_refused_rather_than_dispatched`).
+    slate = _frozen_pacific_day(monkeypatch)
     pd.DataFrame([{
-        "slate_date": str(pacific_calendar_date()),
+        "slate_date": str(slate),
         "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
@@ -599,7 +621,8 @@ def test_a_board_for_another_day_is_refused_rather_than_dispatched(
         sent["embeds"] = list(embeds)
         return type("R", (), {"status": "OK"})()
 
-    yesterday = str(pacific_calendar_date() - timedelta(days=1))
+    today = _frozen_pacific_day(monkeypatch)
+    yesterday = str(today - timedelta(days=1))
     board = tmp_path / "board.csv"
     pd.DataFrame([{
         "slate_date": yesterday, "decision_status": "RECOMMENDED",
@@ -624,10 +647,18 @@ def test_a_board_for_another_day_is_refused_rather_than_dispatched(
     assert sent["embeds"], "dispatch sent nothing at all"
     blob = str(sent["embeds"][0])
     assert yesterday in blob, f"the abstention does not name {yesterday}: {blob}"
-    assert str(pacific_calendar_date()) in blob
+    assert str(today) in blob
     # And the stale row never reached a person.
     assert "DEMO_STALE" not in blob
     assert yesterday in out["reason"]
+    # AND THE GATE'S VERDICT TRAVELS. A caller reading out["publication"]
+    # cannot know which branch produced its dict, so every return carries one:
+    # the calibration/freshness verdict is true of this slate whether or not a
+    # board went out. Raised by review on #32.
+    assert "publication" in out, (
+        f"the stale-board return dropped the publication verdict: {sorted(out)}"
+    )
+    assert "PUBLICATION_STATUS" in out["publication"]
 
 
 def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
@@ -644,9 +675,10 @@ def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
         sent["embeds"] = list(embeds)
         return type("R", (), {"status": "OK"})()
 
+    today = _frozen_pacific_day(monkeypatch)
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": str(pacific_calendar_date()),
+        "slate_date": str(today),
         "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_TODAY",
         "target_market": "PTS", "side": "over", "line": 24.5,
@@ -665,7 +697,7 @@ def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
     out = worker.run_dispatch()
 
     blob = str(sent.get("embeds"))
-    assert "not " + str(pacific_calendar_date()) not in blob
+    assert "not " + str(today) not in blob
     assert "describes" not in str(out.get("reason", ""))
 
 
