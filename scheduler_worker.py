@@ -1405,6 +1405,56 @@ def run_board() -> dict[str, Any]:
         # "the drifting one would be the unattended one". They shared
         # `build_slate_board` and not the build in front of it. This is that
         # missing half.
+        #
+        # AND SO IS THIS, which the half above had to land before anything
+        # could see. `board_window` scores `(train_end, validation_end]` =
+        # `(yesterday, today]`, and its own docstring says why that works:
+        # "forward_slate writes one row per (player, scheduled game) for
+        # today, so today IS the slate". The panel this job loads is
+        # COMPLETED box scores, newest yesterday -- so without the forward
+        # rows the validation half is empty BY CONSTRUCTION and
+        # `walk_forward.fixed_cutoff_split` raises `empty train or
+        # validation after cutoff`. Measured in production 2026-11-01
+        # 09:03 PT: 1,991 panel rows, newest 2026-10-31, scoring
+        # (2026-10-31, 2026-11-01]. The slate job's own matrix was 2,106 --
+        # the same 1,991 plus 115 forward rows -- which is the difference.
+        #
+        # NOT FOR A BACKTEST. An override whose validation_end is in the past
+        # scores games already played and already in the panel; attaching
+        # forward rows for that date would duplicate them. `board_window`
+        # already computes exactly this distinction, so it is read rather
+        # than re-derived.
+        #
+        # BEST-EFFORT, like main.py's: a denied or unreachable schedule
+        # returns the panel untouched with a named reason, so the board
+        # degrades to the failure above rather than a new one.
+        # main.py's OWN name for the switch, not a second copy of the
+        # string: the two jobs must agree on whether forward rows are on,
+        # and a second spelling is how they would stop agreeing.
+        from main import ENV_FORWARD_SLATE
+
+        forward_note: dict[str, Any] = {"status": "SKIPPED"}
+        if window.get("is_backtest"):
+            logger.info(
+                "Board: no forward slate -- validation_end=%s is a backtest, "
+                "so those games are already in the panel.", validation_end,
+            )
+            forward_note = {"status": "SKIPPED", "reason": "backtest window"}
+        elif not _flag(ENV_FORWARD_SLATE, True):
+            logger.info(
+                "Board: forward slate off (%s). The scored window is "
+                "(%s, %s], which completed games cannot fill.",
+                ENV_FORWARD_SLATE, train_end, validation_end,
+            )
+            forward_note = {"status": "SKIPPED", "reason": f"{ENV_FORWARD_SLATE} off"}
+        else:
+            from src.pipeline.forward_slate import attach_forward_slate
+
+            forward = attach_forward_slate(panel, slate_date=validation_end)
+            panel = forward.panel
+            forward_note = forward.as_dict()
+            logger.info("Board forward slate: %s", forward_note)
+
         from src.features.builder import build_feature_matrix
 
         frames = _board_market_frames()
@@ -1462,7 +1512,7 @@ def run_board() -> dict[str, Any]:
         # back. A board of 40 rows is the same shape whether it describes
         # tonight or a fortnight in 2025.
         return {"status": "OK", **result.as_dict(), "window": window,
-                "sizing": sizing}
+                "forward_slate": forward_note, "sizing": sizing}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Board build raised; the scheduler stays up.")
         notify_failure("board", f"The board build raised: {exc}")
