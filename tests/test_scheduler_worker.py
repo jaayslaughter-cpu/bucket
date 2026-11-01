@@ -1703,6 +1703,17 @@ def test_run_board_builds_features_before_handing_the_panel_over(
 
     monkeypatch.setattr(slate_board_module, "build_slate_board", _capture)
     monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+    # STUBBED, so this test asserts ONE thing. Left real, it reaches
+    # `main.resolve_market_frames` and its result depends on whether the
+    # machine happens to have the licensed workbook or a reachable database
+    # -- a test that reads a different matrix on CI than on a developer's
+    # laptop. The helper's own contract is asserted separately, in
+    # `test_board_market_frames_calls_the_orchestrator_that_actually_exists`.
+    # Raised by review on #31.
+    monkeypatch.setattr(
+        worker, "_board_market_frames",
+        lambda: {"team_games": None, "market_lines": None},
+    )
 
     worker.run_board()
 
