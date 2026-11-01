@@ -558,6 +558,30 @@ def test_projections_are_filtered_to_the_slate_date(monkeypatch):
     assert yesterday["run_id"].tolist() == ["run_yesterday"]
 
 
+def test_the_slate_date_has_no_default_because_there_is_no_honest_one(
+    monkeypatch,
+):
+    """
+    A board is a statement about ONE slate. For one commit `slate_date`
+    defaulted to None and the query then returned every projection the table
+    had ever held, which a caller would have ranked as tonight's. Raised by
+    review on #32: there is no honest default for "which day", so asking
+    without one is a TypeError rather than a silent full-table read.
+    """
+    import inspect
+
+    from src.db import repository
+
+    sig = inspect.signature(repository.load_projections)
+    param = sig.parameters["slate_date"]
+    assert param.default is inspect.Parameter.empty, (
+        "slate_date has a default again; load_projections() with no day "
+        "returns every slate ever persisted"
+    )
+    with pytest.raises(TypeError):
+        repository.load_projections()
+
+
 def test_no_run_returns_an_empty_frame_WITH_the_columns(monkeypatch):
     """
     So a caller's `[col]` access fails on a missing COLUMN rather than on a

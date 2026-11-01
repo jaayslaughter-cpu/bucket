@@ -1351,6 +1351,59 @@ def _board_market_frames() -> dict[str, Any]:
         return empty
 
 
+def _discard_stale_board(board_csv: Any, slate_date: str) -> bool:
+    """
+    Delete a board CSV that does not describe ``slate_date``. True if it did.
+
+    A BOARD IS A STATEMENT ABOUT ONE SLATE. `run_dispatch` reads the file
+    and sends it without consulting `run_board`'s status, so a file left
+    behind by a successful earlier run is indistinguishable, at the
+    dispatch surface, from tonight's. Removing it turns "stale
+    recommendations" into "no recommendations", and the abstention card
+    already says that honestly.
+
+    KEYED ON THE ROWS' OWN `slate_date`, not on the file's mtime: a board
+    rebuilt at 09:05 for the same slate is not stale, and a file written
+    yesterday at 09:00 is. The column is written by
+    `decision_board.board_to_dataframe` for exactly this kind of question.
+
+    A board that cannot be read is removed too. An unparseable file is not
+    evidence of anything, and leaving it would have dispatch fail on it
+    instead.
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(str(board_csv))
+    if not target.exists():
+        return False
+    try:
+        import pandas as pd
+
+        frame = pd.read_csv(target)
+        dates = {str(d) for d in frame.get("slate_date", pd.Series(dtype=str))}
+        if dates == {str(slate_date)}:
+            return False
+        reason = f"describes {sorted(dates) or 'no slate'}"
+    except Exception as exc:  # noqa: BLE001 — unreadable is not evidence
+        reason = f"could not be read ({type(exc).__name__})"
+
+    try:
+        target.unlink()
+    except OSError as exc:
+        logger.error(
+            "Could not remove the stale board %s (%s). DISPATCH MAY SEND IT: "
+            "it reads the file without checking which slate it describes.",
+            target, exc,
+        )
+        return False
+    logger.warning(
+        "Removed the board at %s: it %s, not %s. A board left in place would "
+        "be dispatched as tonight's, because dispatch reads the file and not "
+        "this job's status.", target, reason, slate_date,
+    )
+    return True
+
+
 def _backtest_board(
     board_csv: Any, *, markets: Any, train_end: str, validation_end: str,
     min_ev: float,
@@ -1474,8 +1527,18 @@ def run_board() -> dict[str, Any]:
                     validation_end,
                     _int_env(ENV_SLATE_HOUR, DEFAULT_SLATE_HOUR, low=0, high=23),
                 )
+                # THE REFUSAL MUST TAKE THE OLD BOARD WITH IT. `run_dispatch`
+                # reads whatever CSV is on disk and sends it; it does not
+                # look at `run_board`'s return value. So a refusal that
+                # leaves yesterday's file in place dispatches yesterday's
+                # recommendations as tonight's -- and this change is what
+                # makes that reachable, because until now no board had ever
+                # been written for the file to be stale. Raised by review
+                # on #32.
+                stale = _discard_stale_board(board_csv, validation_end)
                 return {"status": "DATA_NOT_AVAILABLE",
                         "reason": f"no projections persisted for {validation_end}",
+                        "discarded_stale_board": stale,
                         "window": window}
             result = build_board_from_projections(
                 projections,
@@ -1687,6 +1750,7 @@ def run_dispatch() -> dict[str, Any]:
         )
         from src.quant.dfs_payouts import ProbabilitySource
         from src.quant.publication_gate import calibration_gate, first_refusal
+        from src.utils.timezones import pacific_calendar_date
 
         report = None
         if report_path.exists():
@@ -1716,6 +1780,52 @@ def run_dispatch() -> dict[str, Any]:
             )]
         else:
             frame = pd.read_csv(board_csv)
+            # THE SECOND HALF OF THE SAME GUARD, and the half that cannot be
+            # bypassed by a future code path. `run_board` removes a stale
+            # board when IT refuses, but dispatch reads this file without
+            # consulting that status at all -- so anything else that leaves a
+            # board behind (a crash between write and dispatch, an operator's
+            # hand-run CLI, a path that does not exist yet) would send it as
+            # tonight's. Checked here, where the number reaches a person.
+            #
+            # The rows carry their own `slate_date` from
+            # `decision_board.board_to_dataframe`; a board for another day is
+            # refused with the day it actually describes, because "withheld"
+            # without the reason reads as a broken pipeline.
+            #
+            # A FILE WITH NO `slate_date` COLUMN AT ALL IS LET THROUGH, and
+            # that is a deliberate limit rather than an oversight: it cannot
+            # be dated, so there is nothing to compare, and every writer in
+            # this repository emits the column. Refusing it would only ever
+            # block a hand-assembled CSV an operator meant to send.
+            board_slates = {
+                str(d) for d in frame.get("slate_date", pd.Series(dtype=str))
+            }
+            today_pt = str(pacific_calendar_date())
+            if board_slates and board_slates != {today_pt}:
+                logger.error(
+                    "BOARD AT %s DESCRIBES %s, NOT %s. Not dispatching it: a "
+                    "board is a statement about one slate, and sending "
+                    "another day's rows under tonight's heading is the one "
+                    "failure worse than sending nothing.",
+                    board_csv, sorted(board_slates), today_pt,
+                )
+                if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+                    return {"status": "SKIPPED",
+                            "reason": f"board describes {sorted(board_slates)}, "
+                                      f"not {today_pt}"}
+                embeds = [build_abstention_embed(
+                    f"The board on disk describes {', '.join(sorted(board_slates))}, "
+                    f"not {today_pt}, so it was not sent. A board is a "
+                    f"statement about one slate. This is the pipeline "
+                    f"reporting its own state.",
+                    title="No recommendations",
+                )]
+                sent = send_embeds(embeds, config=DiscordConfig(dry_run=False))
+                return {"status": getattr(sent, "status", "OK"),
+                        "reason": f"board describes {sorted(board_slates)}, "
+                                  f"not {today_pt}",
+                        "embeds": len(embeds)}
             rows = [
                 type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
                 for r in frame.to_dict("records")
@@ -2179,10 +2289,40 @@ def _tipoff_display(tipoff_iso: str | None) -> str | None:
 
 
 def _flag(name: str, default: bool) -> bool:
+    """
+    An env flag, DEFAULTING rather than reading as off on an unusable value.
+
+    ONE CONVENTION FOR ONE KIND OF VALUE, in two processes. `main._flag_env`
+    recognises the off words as well as the on words and returns the DEFAULT
+    for anything it recognises as neither; this function returned
+    `raw in {on words}` -- i.e. **False** -- for the same input. So
+    `...=maybe` meant "use the default" to the orchestrator and "off" to the
+    worker.
+
+    HOW FAR THAT ACTUALLY REACHED, stated honestly because the first version
+    of this docstring overstated it: no variable is read by BOTH processes
+    today. Review on #32 raised it against `PROPIQ_FORWARD_SLATE`, which the
+    board branch it guarded read -- and that branch is gone, replaced by the
+    projections path, so the live disagreement went with it.
+    `PROPIQ_ESPN_INGEST`, `PROPIQ_DISPATCH` and
+    `PROPIQ_DISPATCH_ABSTENTIONS` are this worker's alone; `main.py` never
+    reads them. What remains is a trap rather than a bug: two parsers with
+    the same job and different answers, one of which the next shared switch
+    would be read by. Fixed here, where the next one lands, rather than left
+    for it.
+
+    A SECOND IMPLEMENTATION rather than an import, for the same reason
+    `_int_env` is: `main.py` is the orchestrator and must not come to need
+    APScheduler in order to read a boolean.
+    `tests/test_flag_parsers_agree.py` holds the two to the same answer on
+    every input, which is what makes two copies safe.
+    """
     raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def run_espn_ingest(

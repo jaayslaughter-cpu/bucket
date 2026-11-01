@@ -1050,7 +1050,7 @@ PROJECTION_BOARD_COLS: tuple[str, ...] = (
 )
 
 
-def load_projections(slate_date: str | None = None) -> pd.DataFrame:
+def load_projections(slate_date: str) -> pd.DataFrame:
     """
     One slate's persisted projections, as a frame.
 
@@ -1081,20 +1081,28 @@ def load_projections(slate_date: str | None = None) -> pd.DataFrame:
     WHAT IT DOES NOT DO: no projection is computed, scored or adjusted here.
     These are the rows `main.py` already wrote, read back by key.
 
+    `slate_date` IS REQUIRED, and was optional for one commit. A board is a
+    statement about ONE slate; defaulted to None this returned every
+    projection the table has ever held, and the caller would have ranked
+    last month's games beside tonight's with nothing in the frame to say
+    which was which. There is no honest default for "which day", so there
+    is no default. Raised by review on #32.
+
     An absent slate or an empty table returns an EMPTY FRAME WITH THE
     COLUMNS, so a caller's `[col]` access fails on a missing column rather
     than on a missing frame -- the same contract `load_game_market_lines`
-    keeps, and `slate_board.projection_detail_rows` reads nine of them by
+    keeps, and `slate_board.projection_detail_rows` reads ten of them by
     name.
     """
-    with session_scope() as session:
-        stmt = select(Projection).order_by(
-            Projection.market, Projection.player_name
-        )
-        if slate_date:
-            from datetime import date as _date
+    from datetime import date as _date
 
-            stmt = stmt.where(Projection.game_date == _date.fromisoformat(slate_date))
+    day = _date.fromisoformat(str(slate_date))
+    with session_scope() as session:
+        stmt = (
+            select(Projection)
+            .where(Projection.game_date == day)
+            .order_by(Projection.market, Projection.player_name)
+        )
         rows = session.execute(stmt).scalars().all()
 
     out = (
@@ -1105,8 +1113,8 @@ def load_projections(slate_date: str | None = None) -> pd.DataFrame:
     )
     if out.empty:
         logger.info(
-            "No projections found%s — nothing to build a board from.",
-            f" for {slate_date}" if slate_date else "",
+            "No projections found for %s — nothing to build a board from.",
+            slate_date,
         )
         return out
 

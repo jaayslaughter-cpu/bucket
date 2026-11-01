@@ -29,6 +29,7 @@ from src.quant.publication_gate import (
     artifact_freshness_gate,
     first_refusal,
 )
+from src.utils.timezones import pacific_calendar_date
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -408,7 +409,8 @@ def test_the_worker_withholds_a_board_scored_by_a_stale_artifact(
 
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": "2026-10-11", "decision_status": "RECOMMENDED",
+        "slate_date": str(pacific_calendar_date()),
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,
@@ -454,7 +456,8 @@ def test_the_worker_publishes_when_the_artifact_is_current(monkeypatch, tmp_path
 
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": "2026-10-11", "decision_status": "RECOMMENDED",
+        "slate_date": str(pacific_calendar_date()),
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,

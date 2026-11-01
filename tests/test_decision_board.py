@@ -565,6 +565,56 @@ def test_projection_rows_are_renamed_not_recomputed():
     assert row["prediction_mean"] == 24.5
     assert row["model_name"] == PROJECTION_MODEL_NAME
     assert row["probability_over_raw"] is None
+    # GAME_DATE, which this adapter dropped for one commit. Raised by review
+    # on #32: `paper_research.py`'s `elif not game_date:` branch then warns
+    # once PER ROW that it cannot say which game the row describes, which
+    # `tests/test_board_game_date.py` calls the most misleading defect in the
+    # project. The backtest path has always carried it; the live path has to.
+    assert str(row["game_date"]) == "2026-11-01", (
+        f"the persisted game date did not survive the rename: {row.get('game_date')!r}"
+    )
+
+
+def test_a_row_with_no_player_id_falls_back_to_the_name_it_is_keyed_on():
+    """
+    `nba_player_id` IS NULLABLE; `player_name` is not, and the table's own
+    UNIQUE key is `(nba_game_id, player_name, market)`. The board groups
+    candidates on `(event_id, player_id, target_market)`, so passing a null
+    `player_id` straight through would group every id-less player on this
+    slate into ONE row -- different people merged under one projection.
+
+    Raised by review on #32. The fallback is the name the database already
+    treats as the identity, so two players cannot collide: within a game and
+    market their names are unique by constraint.
+    """
+    from src.pipeline.slate_board import projection_detail_rows
+
+    frame = _projection_frame(nba_player_id=None)
+    row = projection_detail_rows(frame)[0]
+    assert row["player_id"] == "HARNESS ONE", (
+        f"a null player id reached the grouping key as {row['player_id']!r}"
+    )
+
+
+def test_two_id_less_players_stay_two_rows_rather_than_merging():
+    """
+    The head that matters: the fallback is only worth anything if it keeps
+    distinct people distinct. Two id-less players in the same game and market
+    must produce two identities, not one.
+    """
+    import pandas as pd
+
+    from src.pipeline.slate_board import projection_detail_rows
+
+    frame = pd.concat([
+        _projection_frame(nba_player_id=None, player_name="HARNESS ONE"),
+        _projection_frame(nba_player_id=None, player_name="HARNESS TWO"),
+    ], ignore_index=True)
+
+    ids = [r["player_id"] for r in projection_detail_rows(frame)]
+    assert len(set(ids)) == 2, (
+        f"two different players share one board identity: {ids}"
+    )
 
 
 def test_a_missing_sigma_is_left_none_rather_than_invented():
@@ -618,4 +668,14 @@ def test_the_board_filters_markets_without_inventing_them(tmp_path):
     )
     assert result.slate_date == "2026-11-01"
     markets = {getattr(r, "target_market", None) for r in result.board}
-    assert markets <= {"PTS"}, f"a market nobody asked for reached the board: {markets}"
+    # `==`, not `<=`: a subset assertion is satisfied by an empty board, so it
+    # would pass if the filter dropped EVERYTHING. The asked-for market has to
+    # be there and the other one has not to be.
+    assert markets == {"PTS"}, (
+        f"expected exactly the asked-for market on the board, got: {markets}"
+    )
+    players = {getattr(r, "player_id", None) for r in result.board}
+    assert "espn:2" not in players, (
+        "the REB-only player reached a PTS board, so the filter is selecting "
+        "rows by something other than market"
+    )

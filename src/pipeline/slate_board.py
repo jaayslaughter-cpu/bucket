@@ -172,6 +172,12 @@ def projection_detail_rows(projections: pd.DataFrame) -> list[dict[str, Any]]:
     stored. That is the point of this path -- the slate job did the
     modelling at 09:00, and the board's job is to rank and format it.
 
+    ``game_date`` TRAVELS, and the first version of this dropped it. A board
+    row must say which game it describes -- see
+    `tests/test_board_game_date.py`, whose subject is a board that stamped
+    every row with the day it was BUILT while saying nothing about the day
+    the game is played.
+
     ``prediction_std_or_dispersion`` IS LEFT NONE, DELIBERATELY. The
     projections table stores a mean (`final_projection`) and no dispersion,
     so there is no σ to pass. `edge_grades.research_edge_letter_grade`
@@ -183,7 +189,7 @@ def projection_detail_rows(projections: pd.DataFrame) -> list[dict[str, Any]]:
     repository refuses to do with a missing input.
     """
     wanted = (
-        "nba_game_id", "nba_player_id", "player_name", "market",
+        "nba_game_id", "nba_player_id", "player_name", "market", "game_date",
         "final_projection", "line", "prob_over", "prob_under", "prob_push",
     )
     missing = [c for c in wanted if c not in projections.columns]
@@ -199,9 +205,27 @@ def projection_detail_rows(projections: pd.DataFrame) -> list[dict[str, Any]]:
         market = record.get("market")
         if not market:
             continue
+        # THE GAME'S OWN DATE, and dropping it reintroduced the symptom of
+        # what `tests/test_board_game_date.py` calls "the most misleading
+        # [defect] in the project": a row that cannot say which game it
+        # describes, next to a `slate_date` that reads as today.
+        # `research_slate_from_predictions` reads `game_date` off the detail
+        # row and warns per row when it is absent -- so every live board row
+        # carried that warning while the date sat unread in the frame.
+        # Raised by review on #32.
+        #
+        # THE PLAYER IDENTITY FALLS BACK TO THE NAME, because
+        # `research_slate_from_predictions` groups on
+        # `(event_id, player_id, target_market)` and `nba_player_id` is
+        # NULLABLE. Two players in one game and market with no id would
+        # group as one board row -- two people collapsed into a single
+        # recommendation. `player_name` is NOT NULL on the model, so it is
+        # the identity to fall back to rather than None.
+        player_id = record.get("nba_player_id") or record.get("player_name")
         rows.append({
             "event_id": record.get("nba_game_id"),
-            "player_id": record.get("nba_player_id"),
+            "game_date": record.get("game_date"),
+            "player_id": player_id,
             "player_name": record.get("player_name"),
             "target_market": str(market).upper(),
             "model_name": PROJECTION_MODEL_NAME,

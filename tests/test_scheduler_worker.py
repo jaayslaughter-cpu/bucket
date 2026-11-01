@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import scheduler_worker as worker
-from src.utils.timezones import DISPLAY_TZ_NAME
+from src.utils.timezones import DISPLAY_TZ_NAME, pacific_calendar_date
 
 
 class FakeScheduler:
@@ -548,8 +548,14 @@ def test_a_board_with_no_calibration_report_is_dispatched_withheld(
         return type("R", (), {"status": "OK"})()
 
     board = tmp_path / "board.csv"
+    # TODAY's slate, deliberately: the subject here is the calibration gate,
+    # and dispatch refuses a board describing another day before it ever
+    # reaches that gate (see
+    # `test_a_board_for_another_day_is_refused_rather_than_dispatched`). A
+    # fixed date would make this test pass or fail on the calendar.
     pd.DataFrame([{
-        "slate_date": "2026-09-29", "decision_status": "RECOMMENDED",
+        "slate_date": str(pacific_calendar_date()),
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,
@@ -571,6 +577,96 @@ def test_a_board_with_no_calibration_report_is_dispatched_withheld(
     body = sent["embeds"][0]["description"]
     assert "withheld from publication" in body
     assert "DEMO_A" not in str(sent["embeds"][0])
+
+
+def test_a_board_for_another_day_is_refused_rather_than_dispatched(
+    monkeypatch, tmp_path
+):
+    """
+    The 9:03 failure on 2026-11-01 left no board on disk, which is why nothing
+    went out. The worse shape is the one where a board IS on disk and it
+    describes yesterday: dispatch reads the CSV without consulting the status
+    `run_board` returned, so a crash between write and dispatch, or an
+    operator's hand-run CLI, would publish last night's lines under tonight's
+    heading. The row carries its own `slate_date`; dispatch compares it to the
+    Pacific calendar day and names the day it actually describes.
+    """
+    import pandas as pd
+
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    yesterday = str(pacific_calendar_date() - timedelta(days=1))
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": yesterday, "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_STALE",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    # An abstention went out, and it names the day the file describes rather
+    # than reading as a broken pipeline.
+    assert sent["embeds"], "dispatch sent nothing at all"
+    blob = str(sent["embeds"][0])
+    assert yesterday in blob, f"the abstention does not name {yesterday}: {blob}"
+    assert str(pacific_calendar_date()) in blob
+    # And the stale row never reached a person.
+    assert "DEMO_STALE" not in blob
+    assert yesterday in out["reason"]
+
+
+def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
+    """
+    The other head of the same guard: the comparison is to TODAY, not to a
+    constant, so a board written for tonight passes through to the rest of
+    dispatch. Without this, refusing every board would satisfy the test above.
+    """
+    import pandas as pd
+
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": str(pacific_calendar_date()),
+        "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_TODAY",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    blob = str(sent.get("embeds"))
+    assert "not " + str(pacific_calendar_date()) not in blob
+    assert "describes" not in str(out.get("reason", ""))
 
 
 def test_settlement_rebuilds_the_calibration_report(monkeypatch, tmp_path):
@@ -2593,8 +2689,50 @@ def test_a_live_board_reads_projections_and_never_compares_models(
     assert asked["slate"] == str(today), (
         f"the board read the wrong slate date: {asked}"
     )
-    # The CSV is the durable output, and it exists even with no probability.
+    # THE CSV IS THE DELIVERABLE, so read it. That the file EXISTS says
+    # nothing: an empty frame with a header satisfies that, and so would a
+    # board built from some other source. What matters is that the persisted
+    # projections arrived in it unchanged.
+    import pandas as pd
+
     assert (tmp_path / "board.csv").exists(), "no board CSV was written"
+    written = pd.read_csv(tmp_path / "board.csv")
+    assert not written.empty, "the board CSV is a header with no rows"
+
+    # Every projected player reached the board, under the market it was
+    # projected for.
+    pairs = set(zip(written["player_name"], written["target_market"]))
+    assert pairs == {
+        ("HARNESS 0", "PTS"), ("HARNESS 1", "REB"), ("HARNESS 2", "AST"),
+    }, f"the projections did not survive into the board: {sorted(pairs)}"
+
+    # The numbers are CARRIED, not recomputed. `final_projection` 20.0 and
+    # `line` 19.5 came from the projections row for HARNESS 0; a board that
+    # had quietly re-derived them would not match.
+    first = written.loc[written["player_name"] == "HARNESS 0"].iloc[0]
+    assert float(first["prediction_mean"]) == 20.0, (
+        f"the projection was altered on the way through: {first['prediction_mean']}"
+    )
+    assert float(first["line"]) == 19.5
+    assert str(first["slate_date"]) == str(today)
+    assert str(first["game_date"]) == str(today), (
+        "the board lost game_date, which paper_research warns about per row"
+    )
+    assert str(first["event_id"]) == "espn:401909903"
+
+    # AND THE NULL PROBABILITY SURVIVES AS NULL. This is production's state
+    # with no model artifact: the row is written and says per row that it
+    # cannot resolve P(over), rather than a fabricated 0.5 that would read as
+    # a coin-flip opinion the model never formed.
+    assert written["model_prob"].isna().all(), (
+        "a probability appeared on a board built from projections that had "
+        f"none: {written['model_prob'].tolist()}"
+    )
+    assert set(written["decision_status"]) == {"ABSTAIN"}
+    assert (written["book_status"] == "DATA_NOT_AVAILABLE").all()
+    assert written["why"].str.contains("cannot resolve P").all(), (
+        f"no row says why it abstained: {written['why'].tolist()}"
+    )
 
 
 def test_a_backtest_window_still_uses_the_comparison_path(monkeypatch, tmp_path):
@@ -2682,3 +2820,83 @@ def test_no_projections_for_the_slate_is_reported_not_crashed(monkeypatch, tmp_p
         "an empty board CSV was written, which dispatch would read as a slate "
         "with no value in it"
     )
+
+
+def test_a_refused_board_removes_yesterdays_file_rather_than_leaving_it(
+    monkeypatch, tmp_path
+):
+    """
+    The version of the 9:03 failure that would have been worse. `run_board`
+    refused and wrote nothing — but a board from a PREVIOUS successful run is
+    still on disk, and `run_dispatch` reads that file without consulting the
+    status `run_board` returned. Left in place, yesterday's lines go out under
+    tonight's heading. The refusal removes it, so the operator sees "no
+    recommendations" instead of wrong ones.
+    """
+    from datetime import date as _d
+
+    import pandas as pd
+
+    import src.db.repository as repo
+    from src.utils import timezones
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-10-31", "player_name": "YESTERDAY_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "decision_status": "RECOMMENDED",
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setattr(
+        timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
+    )
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+    monkeypatch.setattr(
+        repo, "load_projections",
+        lambda slate, **k: pd.DataFrame(columns=list(repo.PROJECTION_BOARD_COLS)),
+    )
+
+    out = worker.run_board()
+
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert out["discarded_stale_board"] is True, (
+        "the refusal did not report removing the stale file, so nothing "
+        "tells an operator why dispatch went quiet"
+    )
+    assert not board.exists(), (
+        "yesterday's board survived a refusal; dispatch reads this file and "
+        "would have published 2026-10-31 as tonight's slate"
+    )
+
+
+def test_a_board_already_written_for_this_slate_is_not_discarded(tmp_path):
+    """
+    The other head: the key is the rows' own `slate_date`, not the file's
+    age. A board rebuilt at 09:05 for tonight is not stale, and deleting it
+    would throw away the run that succeeded.
+    """
+    import pandas as pd
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-11-01", "player_name": "TONIGHT_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+    }]).to_csv(board, index=False)
+
+    assert worker._discard_stale_board(board, "2026-11-01") is False
+    assert board.exists(), "tonight's own board was deleted"
+
+
+def test_an_unreadable_board_is_removed_rather_than_left_for_dispatch(tmp_path):
+    """
+    An unparseable file is not evidence of anything. Leaving it would move
+    the failure to `run_dispatch`, which reads the CSV with no guard of its
+    own against a parse error.
+    """
+    board = tmp_path / "board.csv"
+    board.write_bytes(b"\x00\x01 not,a,csv\n\"unterminated")
+
+    assert worker._discard_stale_board(board, "2026-11-01") is True
+    assert not board.exists()

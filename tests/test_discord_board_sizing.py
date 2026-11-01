@@ -21,6 +21,19 @@ RESEARCH_ONLY. A displayed size is advisory metadata; `advisory_sizing` stamps
 from __future__ import annotations
 
 from src.notify.discord import build_decision_board_embed
+from src.utils.timezones import pacific_calendar_date
+
+
+def _today() -> str:
+    """
+    The Pacific calendar day, for the fixtures that go through the real
+    `run_dispatch`. It refuses a board whose rows describe another slate
+    before anything else in it runs, so a fixed date here would make these
+    tests pass or fail on the calendar rather than on the wire they test
+    (see `test_scheduler_worker.py::test_a_board_for_another_day_is_refused
+    _rather_than_dispatched`).
+    """
+    return str(pacific_calendar_date())
 
 
 def _row(**over):
@@ -314,7 +327,7 @@ def test_run_dispatch_puts_the_computed_size_on_the_card(monkeypatch, tmp_path):
 
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": "2026-10-29", "game_date": "2026-10-29",
+        "slate_date": _today(), "game_date": _today(),
         "player_name": "HARNESS PLAYER", "target_market": "PTS",
         "side": "over", "line": 24.5,
         "model_prob": 0.58, "model_p_over": 0.58, "model_p_under": 0.42,
