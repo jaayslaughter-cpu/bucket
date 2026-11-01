@@ -216,49 +216,46 @@ def team_game_owners_by_date() -> dict[tuple[str, str], str]:
     return out
 
 
-def panel_dates_for_source(source: str) -> set[str]:
+def panel_game_ids_by_date(source: str) -> dict[str, set[str]]:
     """
-    Which ``game_date``s already hold a PANEL row written by ``source``.
+    Which GAME IDS the panel holds per ``game_date``, for one source.
 
-    THE BACKFILL'S RESUME POINT, and it is read from the database rather
-    than remembered anywhere. A history backfill has to know which nights it
-    has already done, and the two obvious alternatives are both worse: a
-    state file beside the database is a second source of truth about what is
-    ingested, which is the defect this repository keeps removing, and a
-    high-water mark cannot express a hole in the middle left by a night ESPN
-    was down for.
+    THE RESUME POINT, AND THE UNIT IS THE GAME. An earlier version returned
+    dates alone, which made "the panel has a row for this night" mean "this
+    night is done" -- and `fetch_player_rows` records a failed event and
+    keeps the others, so a night that lost one game to a 404 was written,
+    marked done and never retried. A silent hole in a rolling window, which
+    is the one thing the panel must not have. Keyed by game id, a later pass
+    sees exactly which events are absent and asks for only those. Found in
+    review on #31.
 
-    THE PANEL AND NOT `team_game_stats`, which the first version read and
-    which has a hole in it. `aggregate_team_games` DECLINES a (date, team)
-    a higher-precedence source already owns -- BigDataBall outranks
+    THE PANEL AND NOT `team_game_stats`, which an earlier version read and
+    which has a hole of its own. `aggregate_team_games` DECLINES a (date,
+    team) a higher-precedence source already owns -- BigDataBall outranks
     `espn_agg` -- so a night the licensed workbook holds gets no `espn_agg`
-    team row however many times ESPN is read for it, and a backfill keyed
-    on that table would re-fetch those nights for ever. `player_game_logs`
-    has no such precedence guard: `upsert_player_game_logs` writes every
-    row it is handed. The panel is also the thing the backfill exists to
-    fill, so it is the honest place to ask what is already in.
-
-    DISTINCT IN SQL rather than a set() over every row: a backfill that
-    walked three seasons would otherwise pull the whole table on every
-    chunk.
+    team row however many times ESPN is read for it.
+    `upsert_player_game_logs` has no such guard: it writes every row it is
+    handed. The panel is also the thing a backfill exists to fill, so it is
+    the honest place to ask what is already in.
 
     KEYED ON SOURCE, because "ingested" is not a property of the date. A
-    night the licensed workbook owns is not a night ESPN has read, and a
-    backfill told otherwise would leave exactly the gaps it exists to fill.
-    Returned as ISO strings, matching `team_game_owners_by_date`'s keys, so a
+    night the licensed workbook owns is not a night ESPN has read.
+
+    Dates are ISO strings, matching `team_game_owners_by_date`'s keys, so a
     caller comparing the two is not comparing a `date` with a `str`.
     """
     with session_scope() as session:
         rows = session.execute(
-            select(PlayerGameLog.game_date)
+            select(PlayerGameLog.game_date, PlayerGameLog.nba_game_id)
             .where(PlayerGameLog.source == str(source))
             .distinct()
         ).all()
-    out: set[str] = set()
-    for (day,) in rows:
-        if day is None:
+    out: dict[str, set[str]] = {}
+    for day, game_id in rows:
+        if day is None or game_id is None:
             continue
-        out.add(day.isoformat() if hasattr(day, "isoformat") else str(day))
+        key = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        out.setdefault(key, set()).add(str(game_id))
     return out
 
 

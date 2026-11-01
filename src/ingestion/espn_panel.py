@@ -120,6 +120,11 @@ class EspnPanelReport:
     skipped_no_date: list[str] = field(default_factory=list)
     dropped_no_athlete_id: int = 0
     dnp_rows: int = 0
+    #: Events the panel already holds, so no summary was fetched for them.
+    #: Counted rather than silent: it is the difference between "this date
+    #: was already complete" and "this date produced nothing", and the
+    #: history backfill's whole progress report rests on telling them apart.
+    skipped_already_held: int = 0
     notes: list[str] = field(default_factory=list)
 
     def lines(self) -> list[str]:
@@ -141,6 +146,11 @@ class EspnPanelReport:
                     f"SKIPPED, {label}: {', '.join(items[:6])}"
                     + (" ..." if len(items) > 6 else "")
                 )
+        if self.skipped_already_held:
+            out.append(
+                f"already in the panel   {self.skipped_already_held} "
+                f"event(s), not re-fetched"
+            )
         if self.dropped_no_athlete_id:
             out.append(
                 f"DROPPED, no athlete id: {self.dropped_no_athlete_id} row(s) "
@@ -524,6 +534,7 @@ def fetch_player_rows(
     *,
     session: Any = None,
     config: Any = None,
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> tuple[pd.DataFrame, EspnPanelReport]:
     """
     Canonical player rows for these events, and what was refused.
@@ -532,10 +543,23 @@ def fetch_player_rows(
     recorded and the rest are fetched -- a slate that loses twelve games
     because the first one 404s is the failure mode `espn_client`'s own retry
     budget exists to avoid, and it would be reintroduced here by a bare loop.
+
+    ``skip_game_ids`` IS THE UNIT OF WORK, AND IT IS THE EVENT. The history
+    backfill used to decide a DATE was done because the panel held any row
+    for it, and the two guarantees above make that wrong in both
+    directions: this loop records a failed event and keeps the others, so a
+    night that lost one game to a 404 was written, marked done, and never
+    retried -- a silent hole in a rolling window. Asking by event id heals
+    that on the next pass and costs nothing for a night already complete,
+    because the summary is never fetched. Found in review on #31.
     """
     report = EspnPanelReport()
     rows: list[dict[str, Any]] = []
+    skip = {str(g) for g in skip_game_ids}
     for event_id in event_ids:
+        if skip and espn_game_id(event_id) in skip:
+            report.skipped_already_held += 1
+            continue
         try:
             payload = get_json(
                 site_url("summary"),
@@ -573,8 +597,14 @@ def fetch_player_rows_for_dates(
     *,
     session: Any = None,
     config: Any = None,
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> tuple[pd.DataFrame, EspnPanelReport]:
-    """Every final regular-season game across these dates, as one frame."""
+    """
+    Every final regular-season game across these dates, as one frame.
+
+    ``skip_game_ids`` is passed straight through to `fetch_player_rows`,
+    where the reasoning is: the unit of work is the event, not the date.
+    """
     frames: list[pd.DataFrame] = []
     combined = EspnPanelReport()
     for day in days:
@@ -584,13 +614,16 @@ def fetch_player_rows_for_dates(
             combined.notes.append(f"{day}: scoreboard failed -- {exc}")
             logger.warning("ESPN scoreboard %s failed: %s", day, exc)
             continue
-        frame, report = fetch_player_rows(ids, session=session, config=config)
+        frame, report = fetch_player_rows(
+            ids, session=session, config=config, skip_game_ids=skip_game_ids,
+        )
         frames.append(frame)
         combined.games_seen += report.games_seen
         combined.games_parsed += report.games_parsed
         combined.rows_out += report.rows_out
         combined.dropped_no_athlete_id += report.dropped_no_athlete_id
         combined.dnp_rows += report.dnp_rows
+        combined.skipped_already_held += report.skipped_already_held
         for name in ("skipped_not_final", "skipped_season_type",
                      "skipped_unmapped_team", "skipped_one_sided", "notes"):
             getattr(combined, name).extend(getattr(report, name))

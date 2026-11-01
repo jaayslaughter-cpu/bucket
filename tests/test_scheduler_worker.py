@@ -1870,22 +1870,63 @@ def test_the_plan_takes_the_oldest_missing_dates_and_reports_the_rest():
         2025: (_d(2024, 10, 22), _d(2025, 4, 14)),
         2026: (_d(2025, 10, 21), _d(2026, 4, 13)),
     }
-    already = {"2024-10-23"}  # a night the panel already holds
+    held = {"2024-10-23": {"espn:1"}}  # a night the panel already holds
 
     plan = worker.plan_history_dates(
-        [2026, 2025], already, chunk=2,
+        [2026, 2025], held, chunk=2,
         calendar_for=calendar.__getitem__,
         window_for=windows.__getitem__,
         not_after=_d(2026, 10, 31),
     )
     assert plan["dates"] == [_d(2024, 10, 22), _d(2024, 10, 24)], (
-        "the plan must skip the ingested night and take the two OLDEST of "
-        f"what is left; got {plan['dates']}"
+        "dates with NO rows come first, oldest first; the night with rows "
+        f"waits behind them. Got {plan['dates']}"
     )
-    assert plan["missing_total"] == 4
-    assert plan["remaining"] == 2, "what the next run picks up"
+    assert plan["candidates"] == 5
+    assert plan["absent"] == 4
+    assert plan["present"] == 1
     assert any("2025: regular season 2024-10-22 to 2025-04-14" in n
                for n in plan["seasons"])
+
+
+def test_a_date_with_rows_is_re_examined_rather_than_skipped_for_ever():
+    """
+    THE HOLE A DATE-LEVEL RESUME MARKER LEAVES, raised by review on #31.
+
+    `fetch_player_rows` records a failed event and keeps the others -- that
+    isolation is deliberate, so one 404 does not cost the night. The
+    consequence is that a night which lost one game to a 404 IS WRITTEN and
+    is incomplete. Two earlier versions treated "the panel has a row for
+    this date" as "this date is done", so that night was skipped for ever:
+    a silent hole in a rolling window, which is the one thing the panel
+    must not have.
+
+    Dates with rows are therefore re-examined, after the ones with none.
+    The caller passes the game ids it already holds, so a date that turns
+    out to be complete costs one scoreboard call and no summaries.
+    """
+    from datetime import date as _d
+
+    calendar = {2026: [_d(2025, 10, 21), _d(2025, 10, 22), _d(2025, 10, 23)]}
+    windows = {2026: (_d(2025, 10, 21), _d(2026, 4, 13))}
+    held = {
+        "2025-10-21": {"espn:1", "espn:2"},
+        "2025-10-22": {"espn:3"},
+        "2025-10-23": {"espn:4"},
+    }
+
+    plan = worker.plan_history_dates(
+        [2026], held, chunk=10,
+        calendar_for=calendar.__getitem__,
+        window_for=windows.__getitem__,
+        not_after=_d(2026, 10, 31),
+    )
+    assert plan["dates"] == calendar[2026], (
+        "every date with rows must still be offered for re-examination; a "
+        f"partial night is otherwise never retried. Got {plan['dates']}"
+    )
+    assert plan["absent"] == 0
+    assert plan["present"] == 3
 
 
 def test_the_plan_excludes_preseason_playoffs_and_games_not_yet_played():
@@ -1932,7 +1973,7 @@ def test_the_plan_excludes_preseason_playoffs_and_games_not_yet_played():
     }
 
     plan = worker.plan_history_dates(
-        [2026, 2027], set(), chunk=50,
+        [2026, 2027], {}, chunk=50,
         calendar_for=calendar.__getitem__,
         window_for=windows.__getitem__,
         not_after=_d(2026, 10, 31),
@@ -1943,17 +1984,31 @@ def test_the_plan_excludes_preseason_playoffs_and_games_not_yet_played():
         "only played regular-season dates are this job's to fetch; got "
         f"{plan['dates']}"
     )
-    assert plan["remaining"] == 0, (
-        "with every played in-season date taken, nothing is left -- this is "
-        "the state that makes the COMPLETE branch reachable"
-    )
-    assert plan["missing_total"] == 4
+    assert plan["candidates"] == 4
+    assert plan["absent"] == 4
 
 
-def test_the_plan_goes_empty_once_every_holdable_date_is_in(monkeypatch):
-    """The retirement signal. Without a COMPLETE status an operator has
-    nothing telling them to switch the job off, and a backfill left on
-    re-asks the preseason dates nightly for ever."""
+def test_the_backfill_reports_coverage_and_never_claims_to_be_finished(
+    monkeypatch, caplog,
+):
+    """
+    NO COMPLETION CLAIM, and that is the third version of this decision.
+
+    Two earlier ones logged HISTORY BACKFILL COMPLETE and in both the
+    branch was unreachable: the first counted preseason and playoff dates
+    as missing, the second still counted dates that can never produce rows.
+    All-Star Sunday is the measured example -- 2026-02-15 carries four
+    events ESPN labels season type 2, played by WORLD, STARS and STRIPES,
+    which `normalize_team` refuses because they are not NBA teams. That
+    date is in the calendar, inside the regular-season window, played, and
+    permanently unfillable, and it cannot be told apart from a date never
+    read without recording every attempt.
+
+    Telling an operator to wait for a signal that cannot arrive is worse
+    than telling them the number. So the job reports coverage, says some
+    dates may never fill, and asks them to decide.
+    """
+    import logging
     from datetime import date as _d
 
     import src.db.repository as repo
@@ -1969,17 +2024,39 @@ def test_the_plan_goes_empty_once_every_holdable_date_is_in(monkeypatch):
         lambda year, **k: (_d(2025, 10, 21), _d(2026, 4, 13)),
     )
     monkeypatch.setattr(
-        repo, "panel_dates_for_source", lambda source: {"2025-10-21"},
+        repo, "panel_game_ids_by_date",
+        lambda source: {"2025-10-21": {"espn:401", "espn:402"}},
     )
 
-    def _must_not_run(*a, **k):
-        raise AssertionError("the backfill fetched with nothing left to fetch")
+    seen: dict = {}
 
-    monkeypatch.setattr(worker, "run_espn_ingest", _must_not_run)
+    def _capture(days=None, **kwargs):
+        seen["days"] = list(days or [])
+        seen["skip"] = set(kwargs.get("skip_game_ids") or ())
+        return {"status": "OK"}
 
-    out = worker.run_history_backfill()
-    assert out["status"] == "COMPLETE"
-    assert out["remaining"] == 0
+    monkeypatch.setattr(worker, "run_espn_ingest", _capture)
+
+    with caplog.at_level(logging.INFO):
+        out = worker.run_history_backfill()
+
+    assert out["status"] != "COMPLETE", (
+        "the job must not claim to be finished; a permanently unfillable "
+        "date cannot be told apart from one never read"
+    )
+    assert out["backfill"]["without_rows"] == 0
+    assert out["backfill"]["with_rows"] == 1
+    # THE DATE IS STILL RE-EXAMINED, and the ids it already holds travel
+    # with the request so it costs one scoreboard call and no summaries.
+    assert seen["days"] == [_d(2025, 10, 21)]
+    assert seen["skip"] == {"espn:401", "espn:402"}, (
+        f"the held game ids did not reach the fetch: {seen['skip']}"
+    )
+    # EVERY held id travels, not just this chunk's dates: ESPN event ids are
+    # globally unique, so an id from another night can never match an event
+    # this chunk fetches, and narrowing by date bought nothing.
+    assert out["backfill"]["already_held_events"] == 2
+    assert "UNSET $" in caplog.text, "nothing told the operator to switch it off"
 
 
 def test_the_backfill_writes_through_the_nightly_ingest_not_its_own_copy(
@@ -2010,7 +2087,7 @@ def test_the_backfill_writes_through_the_nightly_ingest_not_its_own_copy(
         espn, "fetch_regular_season_window",
         lambda year, **k: (_d(2025, 10, 21), _d(2026, 4, 13)),
     )
-    monkeypatch.setattr(repo, "panel_dates_for_source", lambda source: set())
+    monkeypatch.setattr(repo, "panel_game_ids_by_date", lambda source: {})
 
     seen: dict = {}
 
@@ -2027,7 +2104,8 @@ def test_the_backfill_writes_through_the_nightly_ingest_not_its_own_copy(
         f"the chunk bound was not honoured or the order was wrong: {seen.get('days')}"
     )
     assert out["status"] == "OK"
-    assert out["backfill"]["remaining"] == 1
+    assert out["backfill"]["candidates"] == 3, "the third date waits its turn"
+    assert out["backfill"]["dates_this_run"] == 2
     assert out["backfill"]["first"] == "2025-10-21"
     assert out["backfill"]["last"] == "2025-10-22"
 
@@ -2180,7 +2258,7 @@ def test_the_backfill_stops_at_yesterday_not_today(monkeypatch):
         espn, "fetch_regular_season_window",
         lambda year, **k: (_d(2026, 10, 20), _d(2027, 4, 12)),
     )
-    monkeypatch.setattr(repo, "panel_dates_for_source", lambda source: set())
+    monkeypatch.setattr(repo, "panel_game_ids_by_date", lambda source: {})
 
     seen: dict = {}
 

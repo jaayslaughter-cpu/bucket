@@ -646,3 +646,84 @@ def test_a_window_that_ends_before_it_starts_is_refused(monkeypatch):
     )
     with pytest.raises(EspnError, match="before it starts"):
         espn_panel.fetch_regular_season_window(2026)
+
+
+# --- the event-level resume marker ----------------------------------------
+
+
+def test_an_event_the_panel_already_holds_is_not_re_fetched(monkeypatch):
+    """
+    THE UNIT OF WORK IS THE EVENT, NOT THE DATE. Raised by review on #31.
+
+    This loop records a failed event and keeps the others — deliberate, so
+    one 404 does not cost the night — which means a night that lost one
+    game IS written and incomplete. A resume marker that reads "the panel
+    has a row for this date" skips it for ever, leaving a rolling window
+    short one game with nothing saying so.
+
+    Asking by event id heals that on the next pass, and costs nothing for a
+    night already complete: no summary is fetched for a held event.
+    """
+    from src.ingestion import espn_panel
+
+    asked: list[str] = []
+
+    def _get(url, params=None, **kw):
+        asked.append(str((params or {}).get("event")))
+        return _payload()
+
+    monkeypatch.setattr(espn_panel, "get_json", _get)
+
+    frame, report = espn_panel.fetch_player_rows(
+        ["401909881", "401909882"], skip_game_ids={"espn:401909882"},
+    )
+    assert asked == ["401909881"], (
+        f"a held event was re-fetched anyway: {asked}"
+    )
+    assert report.skipped_already_held == 1
+    assert len(frame) == 27, "the event that was NOT held still came through"
+
+
+def test_the_skip_set_is_matched_on_the_namespaced_id_not_the_raw_one(
+    monkeypatch,
+):
+    """
+    The panel stores `espn:401909881`; ESPN's scoreboard hands back
+    `401909881`. Comparing the raw id against the panel's set matches
+    nothing, so every event would be re-fetched and the marker would do
+    nothing at all — silently, since re-fetching is merely wasteful.
+    """
+    from src.ingestion import espn_panel
+
+    asked: list[str] = []
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: asked.append(
+            str((params or {}).get("event"))
+        ) or _payload(),
+    )
+
+    # The RAW id in the skip set must NOT match, and the namespaced one must.
+    espn_panel.fetch_player_rows(["401909881"], skip_game_ids={"401909881"})
+    assert asked == ["401909881"], "a raw id matched; the namespace was dropped"
+
+    asked.clear()
+    espn_panel.fetch_player_rows(["401909881"], skip_game_ids={"espn:401909881"})
+    assert asked == [], "the namespaced id did not match"
+
+
+def test_an_empty_skip_set_fetches_everything(monkeypatch):
+    """The nightly ingest passes nothing, and must be unchanged by this."""
+    from src.ingestion import espn_panel
+
+    asked: list[str] = []
+    monkeypatch.setattr(
+        espn_panel, "get_json",
+        lambda url, params=None, **kw: asked.append(
+            str((params or {}).get("event"))
+        ) or _payload(),
+    )
+    frame, report = espn_panel.fetch_player_rows(["401909881"])
+    assert asked == ["401909881"]
+    assert report.skipped_already_held == 0
+    assert len(frame) == 27

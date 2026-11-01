@@ -301,9 +301,10 @@ def test_the_backfill_resume_point_is_read_from_the_database(monkeypatch):
         (date(2024, 10, 22), "espn:2", "espn"),    # same night, two players
         (date(2024, 10, 24), "espn:3", "espn"),
     ])
-    assert repository.panel_dates_for_source("espn") == {
-        "2024-10-22", "2024-10-24",
-    }
+    assert repository.panel_game_ids_by_date("espn") == {
+        "2024-10-22": {"espn:40000", "espn:40001"},
+        "2024-10-24": {"espn:40002"},
+    }, "the resume point is keyed by GAME, not just by date"
 
 
 def test_the_resume_point_reads_the_panel_not_the_team_table(monkeypatch):
@@ -357,10 +358,12 @@ def test_the_resume_point_reads_the_panel_not_the_team_table(monkeypatch):
 
     monkeypatch.setattr(repository, "session_scope", _scope)
 
-    assert repository.panel_dates_for_source("espn") == {"2024-10-22"}, (
+    assert repository.panel_game_ids_by_date("espn") == {
+        "2024-10-22": {"espn:40001"},
+    }, (
         "the night is in the panel but the team table has no espn_agg row "
         "for it; keyed on the team table the backfill would re-fetch it for "
-        "ever and never report complete"
+        "ever"
     )
 
 
@@ -375,12 +378,40 @@ def test_another_sources_night_is_not_a_night_espn_has_read(monkeypatch):
         (date(2024, 10, 23), "2544", "bigdataball"),
         (date(2024, 10, 24), "201939", "scraper"),
     ])
-    assert repository.panel_dates_for_source("espn") == {"2024-10-22"}
-    assert repository.panel_dates_for_source("bigdataball") == {"2024-10-23"}
+    assert set(repository.panel_game_ids_by_date("espn")) == {"2024-10-22"}
+    assert set(repository.panel_game_ids_by_date("bigdataball")) == {"2024-10-23"}
 
 
 def test_a_source_with_no_rows_reports_no_dates_rather_than_raising(monkeypatch):
     """The first run's state. An exception here would fail the backfill
     before it read a single night."""
     _bind_panel(monkeypatch, [(date(2024, 10, 22), "2544", "bigdataball")])
-    assert repository.panel_dates_for_source("espn") == set()
+    assert repository.panel_game_ids_by_date("espn") == {}
+
+
+def test_a_partially_ingested_night_is_visible_as_the_games_it_holds(
+    monkeypatch,
+):
+    """
+    THE DEFECT A DATE-LEVEL MARKER HID, raised by review on #31.
+
+    `fetch_player_rows` records a failed event and keeps the others, so a
+    night that lost one game to a 404 is written and INCOMPLETE. Returning
+    dates alone made that night indistinguishable from a complete one, so
+    the backfill skipped it for ever and the missing game's players carried
+    a rolling window short one game, silently.
+
+    Keyed by game id, the gap is visible: the caller subtracts what it holds
+    from what ESPN lists for that date and asks for the difference.
+    """
+    _bind_panel(monkeypatch, [
+        (date(2024, 10, 22), "espn:1", "espn"),   # game espn:40000
+        (date(2024, 10, 22), "espn:2", "espn"),   # game espn:40001
+    ])
+    held = repository.panel_game_ids_by_date("espn")
+    assert held == {"2024-10-22": {"espn:40000", "espn:40001"}}
+    # ESPN listed three games that night; the third never landed.
+    listed = {"espn:40000", "espn:40001", "espn:40002"}
+    assert listed - held["2024-10-22"] == {"espn:40002"}, (
+        "the missing game must be derivable from what the panel holds"
+    )

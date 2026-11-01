@@ -2130,12 +2130,13 @@ def _flag(name: str, default: bool) -> bool:
 
 def run_espn_ingest(
     days: Sequence[date] | None = None, *, label: str = "nightly",
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> dict[str, Any]:
     """
     Fill the panel from ESPN box scores. The only ingest that needs no laptop.
 
-    ONE WRITE PATH, TWO CALLERS. ``days`` is the only thing the history
-    backfill needs to vary: every guard below it -- the namespace preflight,
+    ONE WRITE PATH, TWO CALLERS. ``days`` and ``skip_game_ids`` are the
+    only things the history backfill needs to vary: every guard below it -- the namespace preflight,
     the two ownership views, the by-key read-back, the post-write namespace
     re-check -- applies identically to a night in 2024 and to last night. A
     backfill with its own copy of that sequence would be a second, quieter
@@ -2234,7 +2235,9 @@ def run_espn_ingest(
             label, len(days), min(days), max(days),
         )
 
-        frame, report = fetch_player_rows_for_dates(days)
+        frame, report = fetch_player_rows_for_dates(
+            days, skip_game_ids=skip_game_ids,
+        )
         for line in report.lines():
             logger.info("  %s", line)
         if frame.empty:
@@ -2409,7 +2412,7 @@ def _history_seasons() -> list[int]:
 
 def plan_history_dates(
     seasons: Sequence[int],
-    already: set[str],
+    held: Mapping[str, set[str]],
     *,
     chunk: int,
     calendar_for: Any,
@@ -2417,69 +2420,79 @@ def plan_history_dates(
     not_after: date,
 ) -> dict[str, Any]:
     """
-    The oldest ``chunk`` game dates in ``seasons`` that ESPN has not supplied.
+    The next ``chunk`` game dates to read, absent ones before present ones.
 
     SEPARATED FROM THE JOB so the plan can be asserted without a network
     call or a database: which dates get picked, in which order, and what is
     left over is the whole behaviour worth testing, and it is unreachable
     through a function that fetches and writes.
 
-    THREE FILTERS, AND TWO OF THEM EXIST SO THE JOB CAN FINISH. Review on
-    #31 established that the first version could not: `calendar_for` lists
-    every date with any NBA game in a season, so preseason and the playoffs
-    are in it, and the per-event guard refuses both -- those dates never get
-    panel rows, so a work list built from the calendar alone reports them
-    missing on every run, for ever. `remaining` never reached 0 and the
-    COMPLETE branch was unreachable, while the docstring told operators to
-    wait for exactly that. So:
+    TWO FILTERS, AND THEY EXIST SO THE JOB DOES NOT CHASE DATES IT CANNOT
+    FILL. `calendar_for` lists every date with any NBA game in a season, so
+    preseason and the playoffs are in it and the per-event guard refuses
+    both.
 
       * ``window_for(year)`` gives the regular season's own first and last
-        Pacific date, from ESPN, and dates outside it are not this job's to
-        fetch.
-      * ``not_after`` drops dates not yet played. A game today is not final,
-        and tomorrow's is not played at all; both would be permanently
-        missing for the current season. The nightly ingest owns recent days.
-      * ``already`` drops what the panel holds.
+        Pacific date, from ESPN. Outside it is not this job's to fetch.
+      * ``not_after`` drops dates not yet played. A game today is not final
+        and tomorrow's is not played at all.
 
-    What is left is dates that HAD regular-season games, have been played,
-    and are absent -- every one of which an ingest can actually fill, which
-    is what makes `remaining: 0` a reachable state rather than a promise.
+    THEN TWO BUCKETS, NOT A FILTER, and this is the part review on #31
+    changed twice. A date is NOT skipped because the panel holds a row for
+    it: `fetch_player_rows` records a failed event and keeps the others, so
+    a night that lost one game to a 404 is in the panel and incomplete. The
+    old version skipped it for ever, leaving a silent hole in a rolling
+    window.
 
-    OLDEST FIRST. The rolling features need a player's history to be
-    contiguous BEFORE the games being predicted, so filling 2024-10 before
-    2025-01 means every intermediate state of the panel is one whose newest
-    rows have real windows behind them. Newest-first would spend the whole
-    backfill with a panel whose oldest rows are the ones with null windows,
-    which is the half that gets scored.
+    So dates with NO rows come first -- they are certainly incomplete --
+    and dates that already have rows follow, to be re-examined. A
+    re-examined date that is complete costs ONE scoreboard call and no
+    summaries, because the caller passes the game ids it already holds and
+    `fetch_player_rows` skips them.
 
-    ``calendar_for`` and ``window_for`` are passed in rather than imported
-    for the same reason: the planner is pure, and the fetching is the
-    caller's.
+    WHY THERE IS NO "COMPLETE" VERDICT HERE ANY MORE. Some dates can never
+    produce rows and cannot be distinguished from unread ones without
+    recording every attempt: All-Star Sunday is the measured example --
+    2026-02-15 carries four events that ESPN labels season type 2, whose
+    team codes are WORLD, STARS and STRIPES, which `normalize_team` refuses
+    because they are not NBA teams. That date is in the calendar, inside the
+    regular-season window, played, and permanently unfillable. A planner
+    that promised `remaining: 0` would be lying about it, as two earlier
+    versions of this one did. What the caller gets instead is coverage it
+    can report honestly.
     """
     seen: set[date] = set()
-    wanted: list[date] = []
+    absent: list[date] = []
+    present: list[date] = []
     season_notes: list[str] = []
     for year in sorted({int(y) for y in seasons}):
         start, end = window_for(year)
         days = list(calendar_for(year))
-        in_season = [d for d in days if start <= d <= end]
-        played = [d for d in in_season if d <= not_after]
-        missing = [d for d in played if d.isoformat() not in already]
+        candidates = [d for d in days if start <= d <= end and d <= not_after]
+        n_absent = 0
+        for day in candidates:
+            if day in seen:
+                continue
+            seen.add(day)
+            if held.get(day.isoformat()):
+                present.append(day)
+            else:
+                absent.append(day)
+                n_absent += 1
         season_notes.append(
             f"{year}: regular season {start} to {end}, {len(days)} game "
-            f"date(s) in the calendar, {len(in_season)} in season, "
-            f"{len(played)} played, {len(missing)} not ingested"
+            f"date(s) in the calendar, {len(candidates)} played in season, "
+            f"{len(candidates) - n_absent} with panel rows, {n_absent} with none"
         )
-        for day in missing:
-            if day not in seen:
-                seen.add(day)
-                wanted.append(day)
-    wanted.sort()
-    take = wanted[: max(int(chunk), 0)]
+    absent.sort()
+    present.sort()
+    ordered = absent + present
+    take = ordered[: max(int(chunk), 0)]
     return {
         "dates": take,
-        "remaining": len(wanted) - len(take),
-        "missing_total": len(wanted),
+        "absent": len(absent),
+        "present": len(present),
+        "candidates": len(ordered),
         "seasons": season_notes,
     }
 
@@ -2489,16 +2502,16 @@ def run_history_backfill() -> dict[str, Any]:
     Extend the panel BACKWARDS, one bounded chunk of game dates per run.
 
     WHY THE PANEL NEEDS THIS AT ALL. The 02:00 ESPN ingest reads three days
-    and seeds thirty, which is this season to date -- about 1,830 player-game
-    rows on 2026-11-01. A per-market over/under model fitted on one season
-    of a league that has nine on record is the thinnest version of itself,
-    and `models/labels.py` measured the direction: the calibrated Brier
-    degrades monotonically as the training window's start date moves
+    and seeds thirty, which is this season to date -- about 1,830
+    player-game rows on 2026-11-01. A per-market over/under model fitted on
+    one season of a league that has nine on record is the thinnest version
+    of itself, and `models/labels.py` measured the direction: the calibrated
+    Brier degrades monotonically as the training window's start date moves
     forward. More history is better, and nothing in this deployment could
     reach any. The licensed workbook is a file a human downloads and
     stats.nba.com does not answer this container, so ESPN is the only path
-    to history that runs unattended -- which is the same argument that put
-    the nightly ingest here.
+    to history that runs unattended -- the same argument that put the
+    nightly ingest here.
 
     WHAT IT DOES NOT DO. It does not train, score, or publish anything, and
     it writes nothing a nightly ingest would not write: the same mapper, the
@@ -2507,10 +2520,23 @@ def run_history_backfill() -> dict[str, Any]:
     hazard in it -- every date it reads is before every date the model will
     be asked to predict.
 
-    BOUNDED AND RESUMABLE. One chunk per run, oldest first, and the resume
-    point is read from the database (`ingested_dates_for_source`) rather than
-    remembered anywhere, so a run that dies half way costs its chunk and
-    nothing else.
+    BOUNDED AND RESUMABLE, BY GAME RATHER THAN BY DATE. The resume point is
+    `panel_game_ids_by_date`, read from the database rather than remembered
+    anywhere, and the ids travel to the fetch so an event already held
+    costs nothing. A run that dies half way costs its chunk and nothing
+    else.
+
+    IT REPORTS COVERAGE AND NEVER CLAIMS TO BE FINISHED. Two earlier
+    versions logged HISTORY BACKFILL COMPLETE, and in both the branch was
+    unreachable -- the first counted preseason and playoff dates as
+    missing, the second still counted dates that can never produce rows at
+    all (All-Star Sunday: four events ESPN labels regular season, played by
+    WORLD, STARS and STRIPES, which `normalize_team` refuses). Telling an
+    operator to wait for a signal that cannot arrive is worse than telling
+    them the number and letting them decide. So this logs how many dates
+    have rows and how many do not, says plainly that some of the latter may
+    never fill, and asks them to switch the job off once the figure stops
+    moving.
 
     RESEARCH_ONLY. Finished box scores from games already played.
     """
@@ -2536,7 +2562,7 @@ def run_history_backfill() -> dict[str, Any]:
     try:
         from datetime import timedelta
 
-        from src.db.repository import panel_dates_for_source
+        from src.db.repository import panel_game_ids_by_date
         from src.ingestion.espn_panel import (
             ESPN_SOURCE,
             fetch_regular_season_window,
@@ -2544,13 +2570,13 @@ def run_history_backfill() -> dict[str, Any]:
         )
         from src.utils.timezones import pacific_calendar_date
 
-        already = panel_dates_for_source(ESPN_SOURCE)
+        held = panel_game_ids_by_date(ESPN_SOURCE)
         # YESTERDAY, not today. Tonight's games are not final, and the
         # nightly ingest already re-reads the last three days -- so the
         # backfill stopping here costs nothing and keeps it from queueing a
         # date that cannot be filled yet.
         plan = plan_history_dates(
-            seasons, already, chunk=chunk,
+            seasons, held, chunk=chunk,
             calendar_for=fetch_season_calendar,
             window_for=fetch_regular_season_window,
             not_after=pacific_calendar_date() - timedelta(days=1),
@@ -2564,43 +2590,71 @@ def run_history_backfill() -> dict[str, Any]:
         logger.info("  season %s", line)
 
     if not plan["dates"]:
-        # THE RETIREMENT MESSAGE, and it is reachable BECAUSE the planner
-        # counts only dates an ingest can actually fill -- played,
-        # regular-season, absent. The first version counted every calendar
-        # date, which included preseason and the playoffs that the
-        # per-event guard refuses, so this branch could never run and the
-        # instruction below was advice an operator could not follow.
         logger.info(
-            "HISTORY BACKFILL COMPLETE for season(s) %s: every played "
-            "regular-season date in those seasons is in the panel (%d date(s) "
-            "from ESPN). UNSET $%s; left on, this job re-reads the calendar "
-            "every night to learn the same thing.",
-            ", ".join(str(y) for y in seasons), len(already),
-            ENV_ESPN_HISTORY_SEASONS,
+            "History backfill: no played regular-season date in season(s) %s "
+            "to read. Nothing to do.",
+            ", ".join(str(y) for y in seasons),
         )
-        return {"status": "COMPLETE", "seasons": seasons,
-                "ingested_dates": len(already), "remaining": 0}
+        return {"status": "SKIPPED", "reason": "no candidate dates",
+                "seasons": seasons, "absent": plan["absent"],
+                "present": plan["present"]}
 
     first, last = plan["dates"][0], plan["dates"][-1]
     logger.info(
-        "History backfill: %d date(s) this run (%s -> %s), %d still to go "
-        "across season(s) %s.",
-        len(plan["dates"]), first, last, plan["remaining"],
+        "History backfill: %d date(s) this run (%s -> %s). Across season(s) "
+        "%s: %d candidate date(s), %d with panel rows, %d with none.",
+        len(plan["dates"]), first, last,
         ", ".join(str(y) for y in seasons),
+        plan["candidates"], plan["present"], plan["absent"],
     )
+    # THE GAME IDS TRAVEL WITH THE REQUEST, which is what makes a
+    # re-examined date cheap: one scoreboard call, and no summary for an
+    # event the panel already holds.
+    #
+    # EVERY HELD ID, not just this chunk's dates. The first version
+    # narrowed the set by date, and that narrowing was unobservable: ESPN
+    # event ids are globally unique, so an id belonging to another night
+    # can never match an event this chunk fetches. A mutation removing the
+    # narrowing changed no test, which is the signal that it was not
+    # earning its lines -- so it is gone rather than left looking load-
+    # bearing.
+    skip_game_ids: set[str] = set()
+    for ids in held.values():
+        skip_game_ids |= ids
     # THE WRITE IS run_espn_ingest's, not a second copy of it. Its own broad
     # handler owns a failure here, and it alerts with the same `espn-ingest`
     # key the nightly uses -- a backfill chunk failing for the reason a
     # nightly would is not a different incident.
-    out = run_espn_ingest(days=plan["dates"], label="history backfill")
+    out = run_espn_ingest(
+        days=plan["dates"], label="history backfill",
+        skip_game_ids=skip_game_ids,
+    )
     out["backfill"] = {
         "seasons": seasons,
         "chunk": chunk,
         "dates_this_run": len(plan["dates"]),
         "first": first.isoformat(),
         "last": last.isoformat(),
-        "remaining": plan["remaining"],
+        "candidates": plan["candidates"],
+        "with_rows": plan["present"],
+        "without_rows": plan["absent"],
+        "already_held_events": len(skip_game_ids),
     }
+    if not plan["absent"]:
+        # COVERAGE, NOT COMPLETION. Every candidate date has rows; what is
+        # left is whether any of them is short a game, which this run's
+        # re-examination answers for its own chunk and not for the rest.
+        logger.info(
+            "History backfill: every one of the %d candidate date(s) in "
+            "season(s) %s has panel rows. The job is now only re-examining "
+            "them for gaps, a scoreboard call each. UNSET $%s when you are "
+            "satisfied -- it will not announce itself finished, because a "
+            "date that can never produce rows (All-Star Sunday, whose teams "
+            "are WORLD/STARS/STRIPES) is indistinguishable from one never "
+            "read without recording every attempt.",
+            plan["candidates"], ", ".join(str(y) for y in seasons),
+            ENV_ESPN_HISTORY_SEASONS,
+        )
     return out
 
 
