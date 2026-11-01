@@ -1,9 +1,18 @@
 # Why zero plays reach Discord — early-season audit, 2026-11-01
 
 **Verdict: the cause is not a filter, a sample-size guardrail, or model
-conservatism. There is no model probability to filter.** Every threshold named
-in the brief sits *downstream* of a value that is null on 460 of 460 rows, so
-none of them is ever evaluated. Relaxing them changes nothing.
+conservatism. There is no model probability to filter.** None of the three
+thresholds named in the brief is ever evaluated — but for **two different
+reasons**, and collapsing them into one would misstate the chain:
+
+| Threshold | Why it never runs |
+|---|---|
+| `min_ev` | gated on the probability: `p_side is None` on 460 of 460 rows, so control never reaches the comparison |
+| `min_lean` | same — and its live value is **0.0**, not the 0.03 default, so there is nothing to relax even once it does run |
+| `min_prior_games` | **nothing to do with the probability.** It is skipped because the live projections adapter emits no `eligibility_warnings` column at all, so the cold-start gate is not wired into this path |
+
+The first two are starved. The third is disconnected. Relaxing any of them
+changes nothing, and the third is not even a filter that is firing.
 
 This document corrects three premises in the brief, because the remedies they
 imply would not have worked and two of them would have weakened guardrails for
@@ -78,15 +87,25 @@ gate grants permission, it does not price anything."*
 
 The real thresholds, and their actual values:
 
-| Threshold | Where | Value | Effect |
+| Threshold | Tested at | Live value | Effect |
 |---|---|---|---|
-| `min_ev` | `decision_board.py:448`, default at `slate_board.py:63` and `scheduler_worker.py:1484` | **0.0** | any EV strictly above zero recommends |
-| `min_lean` | `decision_board.py:471`, `DEFAULT_MIN_LEAN` at `:124` | **0.03** | needs P ≥ 0.53 with no price behind it |
+| `min_ev` | `decision_board.py:448` | **0.0** (`slate_board.py:248`, `scheduler_worker.py:1484`) | any EV strictly above zero recommends |
+| `min_lean` | `decision_board.py:471` | **0.0** (`slate_board.py:249`) | any lean above zero recommends — P(over) > 0.500 |
 
-`min_ev` is already **zero**. There is nothing to relax. A board built the
-moment a model lands would recommend on an edge of +0.0001, which is the
-*opposite* problem and worth fixing in the other direction once probabilities
-are calibrated.
+**`min_lean` on the live path is 0.0, not 0.03**, and the first version of this
+document said 0.03. `DEFAULT_MIN_LEAN = 0.03` at `decision_board.py:124` is
+that module's own default, reached only by a caller that does not override it.
+`build_board_from_projections` declares `min_lean: float = 0.0`
+(`slate_board.py:249`) and `run_board` passes only `min_ev`
+(`scheduler_worker.py:1543-1548`), so the scheduled board takes the 0.0.
+Corrected after review on #32; the bootstrap values in §4 are set against the
+real numbers.
+
+So **both** live thresholds are already zero. There is nothing to relax, and
+the moment an artifact lands this board recommends on an edge of +0.0001, or on
+a model lean of half a basis point **with no price behind it at all**. That is
+the opposite problem, it is worse than the one in the brief, and §4 Step 3
+addresses it in the other direction.
 
 ### (b) The shrinkage has no prior-season prior to over-weight
 
@@ -219,7 +238,7 @@ be revisited against observed ECE rather than assumed:
 | Parameter | Now | Early-season bootstrap | Why |
 |---|---|---|---|
 | `min_ev` | 0.0 | **0.02** | an uncalibrated model's +0.5% edge is indistinguishable from noise; 2% survives a plausible calibration error |
-| `min_lean` | 0.03 | **0.05**, or disable the `model_lean` path entirely | a lean recommendation has *no price behind it*; with calibration unmeasured it is an opinion, not an edge |
+| `min_lean` | **0.0** on the live path | **0.05**, or disable the `model_lean` path entirely | a lean recommendation has *no price behind it*, and at 0.0 any P(over) > 0.500 qualifies; with calibration unmeasured that is an opinion, not an edge. This is the most permissive gate in the pipeline and the one to close first |
 | `min_prior_games` | 10 | **keep 10** | satisfy it with step 1, do not lower it |
 | `shrink_k` | 8 | **8**, and point the target at a prior-season mean | see below |
 | Kelly multiplier | n/a — advisory only | leave advisory | `advisory_sizing` stamps `AUTO_PLACED: False`; nothing sizes or places |
@@ -246,8 +265,11 @@ step 2.
 
 **Patch A — the "bootstrap mode" as specified: not written, because it is a
 no-op.** Relaxing `min_ev`, `min_lean` or `min_prior_games` cannot produce a
-play tonight: the first two are never evaluated (§1), `min_ev` is already 0.0,
-and the third is not in the live path (§2c). Shipping it would look like the fix
+play tonight, and for the two distinct reasons set out at the top: the first two
+are never *reached*, because they are gated on a probability that is null on
+every row — and both are already **0.0** on the live path, so there is no slack
+in them to take up. The third is not relaxable at all here, because it is not
+*connected* to this path (§2c). Shipping it would look like the fix
 and change nothing — the same failure as the withdrawn forward-slate patch on
 #32. The only way such a patch could emit plays is by fabricating a probability
 where the model produced none, which is both forbidden and would put
