@@ -79,7 +79,7 @@ that trap demonstrated rather than documented.
 | **O3** | `.dockerignore` | `tests/` and `docs/` are not excluded, so they ship in the image. Harmless and mildly useful (the deploy doc is readable inside the container); listed so it is a decision | low |
 | **O4** | `Dockerfile` | No `HEALTHCHECK` instruction. **Deliberate**: Railway does not consume Docker's healthcheck for a worker, and a probe running every 30s would hit the database and the filesystem for nothing. `scripts/railway_healthcheck.py` is run once at boot and on demand instead | none — decision |
 | **O5** | `railway.json` `restartPolicyMaxRetries: 3` | After three failed starts the service stays down until someone looks. For a *migration* failure that is right — looping forever would hide the deploy failure. For a transient database outage at boot it means manual intervention. `ALWAYS` would trade one for the other; 3 is the chosen trade | low — decision |
-| **O6** | `scheduler_worker.py:2987` | `logging.basicConfig` with a human format, not structured JSON. **Recommended against**, with a drop-in in §3 if wanted anyway: every log line in this worker is deliberately prose that explains a decision ("STATE DIRECTORY … IS NOT WRITABLE … most likely owned by root while this process runs as uid 10001"), and JSON-wrapping them makes the thing an operator actually reads worse in exchange for machine parsing nothing currently consumes | low — decision |
+| **O6** | `src/utils/logstreams.py:57` — `configure_logging`, called from `scheduler_worker.py:2987` | A human format, partitioned across streams rather than JSON: INFO and DEBUG to stdout, WARNING and above to stderr, because Railway renders anything a container writes to stderr as `severity: "error"`. It is NOT `logging.basicConfig`, which this row said until 2026-11-01 — the two `basicConfig` calls in `main.py` and `scheduler_worker.py` were removed precisely because `basicConfig` is a silent no-op once the root logger has handlers, so which one took effect depended on import order. **JSON recommended against**, with a drop-in in §3 if wanted anyway: every log line in this worker is deliberately prose that explains a decision ("STATE DIRECTORY … IS NOT WRITABLE … most likely owned by root while this process runs as uid 10001"), and JSON-wrapping them makes the thing an operator actually reads worse in exchange for machine parsing nothing currently consumes | low — decision |
 | **O7** | across ~40 `PROPIQ_*` variables | No central `pydantic-settings` model. **Recommended against.** The existing pattern is a bounded reader at each use site that logs and falls back; a settings model centralises validation and changes the failure mode to *refuse to start*, which for an unattended worker is strictly worse — a worker that will not boot cannot tell you why | low — decision |
 | **O8** | `railway.json` `numReplicas: 1` | A single point of failure: a container that dies at 08:55 PT misses the slate, since the one-hour grace only helps if it returns inside it. Cannot be raised — two schedulers double-dispatch, and there is no distributed lock. Accepted | medium — accepted |
 | ~~**O9**~~ | the whole of P1 | ~~**The image has never been built.**~~ **CLEARED 2026-10-10**: built, and all 15 `validate_docker` checks pass against it, including the two that demonstrate the volume-permission trap. The container boots through `scripts/start.sh` and schedules both jobs in Pacific. Caveat in `docs/deploy_railway.md` §2: the copy that was built carried two extra pip-trust instructions, because this session's egress re-terminates TLS | ~~high~~ **closed** |
@@ -105,16 +105,21 @@ FROM python:3.11-slim@sha256:<digest from that build>
 ### R2 — structured JSON logs (O6), if machine parsing ever has a consumer
 
 ```python
-# Replaces scheduler_worker.py:2987. Opt-in, so the human format stays
-# the default and the prose log lines keep working.
-def _configure_logging() -> None:
-    fmt = (os.environ.get("PROPIQ_LOG_FORMAT") or "text").strip().lower()
-    level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    if fmt != "json":
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
-        )
+# Runs AFTER src.utils.logstreams.configure_logging, never instead of it.
+#
+# THE EARLIER VERSION OF THIS SNIPPET WAS A TRAP, and it sat here until
+# 2026-11-01. It called `logging.basicConfig(..., force=True)` with a bare
+# `logging.StreamHandler()` -- no `stream=`, which means STDERR -- so
+# applying it would have replaced the stdout/stderr partition with a single
+# stderr handler and put every INFO line back in Railway's log pane as
+# `severity: "error"`. That is the exact defect `src/utils/logstreams.py`
+# was written to remove. Swapping the FORMATTER on the handlers it
+# installed keeps the partition and changes only the rendering.
+#
+# The level is already resolved by `configure_logging` from $LOG_LEVEL, so
+# this does not set it a second time.
+def apply_json_log_format() -> None:
+    if (os.environ.get("PROPIQ_LOG_FORMAT") or "text").strip().lower() != "json":
         return
 
     import json as _json
@@ -131,9 +136,9 @@ def _configure_logging() -> None:
                 payload["exc"] = self.formatException(record.exc_info)
             return _json.dumps(payload)
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(_JsonFormatter())
-    logging.basicConfig(level=level, handlers=[handler], force=True)
+    formatter = _JsonFormatter()
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
 ```
 
 **Why it is not applied.** Nothing consumes JSON logs today, and the lines it

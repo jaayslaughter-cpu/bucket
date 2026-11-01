@@ -81,6 +81,11 @@ ANCHORS = [
     ("scheduler_worker.py", 1649, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 767, "def newest_team_game_date"),
+    # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
+    # configured. Anchored so the correction cannot rot the same way the
+    # line it replaced did -- that row named `logging.basicConfig` for
+    # months after the two basicConfig calls were deleted.
+    ("src/utils/logstreams.py", 57, "def configure_logging("),
     ("main.py", 183, "Deliberately NOT read"),
     # README.md, rewritten 2026-10-29. Its predecessor named `TZ_DISPLAY` as a
     # variable nothing reads, `PROPIQ_SLATE_HOUR` without the `_PT` suffix the
