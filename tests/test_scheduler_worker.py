@@ -2132,11 +2132,17 @@ def test_the_nightly_window_is_unchanged_when_no_dates_are_passed(monkeypatch):
 
     def _fetch(days, **kwargs):
         import pandas as pd
+
+        # THE REAL REPORT, not a hand-rolled stand-in. The stub version
+        # carried only the three fields this test happened to reach, so when
+        # `skipped_already_held` was added the production code read an
+        # attribute the stub did not have and this test failed for a reason
+        # that had nothing to do with its subject. A fake that has to be
+        # kept in step with the thing it fakes is a second definition of it.
+        from src.ingestion.espn_panel import EspnPanelReport
+
         asked["days"] = list(days)
-        return pd.DataFrame(), type("R", (), {
-            "games_seen": 0, "games_parsed": 0, "rows_out": 0,
-            "lines": lambda self: [],
-        })()
+        return pd.DataFrame(), EspnPanelReport()
 
     monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
 
@@ -2179,11 +2185,17 @@ def test_explicit_days_reach_the_fetch_instead_of_the_nightly_window(monkeypatch
 
     def _fetch(days, **kwargs):
         import pandas as pd
+
+        # THE REAL REPORT, not a hand-rolled stand-in. The stub version
+        # carried only the three fields this test happened to reach, so when
+        # `skipped_already_held` was added the production code read an
+        # attribute the stub did not have and this test failed for a reason
+        # that had nothing to do with its subject. A fake that has to be
+        # kept in step with the thing it fakes is a second definition of it.
+        from src.ingestion.espn_panel import EspnPanelReport
+
         asked["days"] = list(days)
-        return pd.DataFrame(), type("R", (), {
-            "games_seen": 0, "games_parsed": 0, "rows_out": 0,
-            "lines": lambda self: [],
-        })()
+        return pd.DataFrame(), EspnPanelReport()
 
     monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
 
@@ -2348,3 +2360,110 @@ def test_the_registered_backfill_job_honours_the_refusal(monkeypatch):
         "the backfill was registered on top of the slate"
     )
     assert (backfill["hour"], backfill["minute"]) == (4, 30)
+
+
+def test_a_chunk_already_in_the_panel_is_a_no_op_not_missing_data(monkeypatch):
+    """
+    THE BACKFILL'S BEST OUTCOME MUST NOT READ AS ITS WORST.
+
+    With `skip_game_ids`, a chunk whose every event is already in the panel
+    fetches nothing BY DESIGN and comes back with an empty frame — full
+    coverage, no work to do. `run_espn_ingest` reported that as
+    `DATA_NOT_AVAILABLE: no finished game in the window`, which is simply
+    false: there were games, and they are already ingested. An operator
+    watching coverage rise would see the completion state reported as
+    missing data. Found in review on #31, in code this PR had just added.
+
+    `games_seen` counts parsed summary payloads only, so a held event never
+    increments it — nothing fetched AND something held is the no-op.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    def _fetch(days, **kwargs):
+        import pandas as pd
+        held = set(kwargs.get("skip_game_ids") or ())
+        report = espn.EspnPanelReport()
+        report.skipped_already_held = len(held)
+        return pd.DataFrame(), report
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
+
+    out = worker.run_espn_ingest(
+        days=[_d(2024, 10, 22)], label="history backfill",
+        skip_game_ids={"espn:1", "espn:2"},
+    )
+    assert out["status"] == "SKIPPED", (
+        f"a fully-covered chunk was reported as {out['status']}: "
+        f"{out.get('reason')}"
+    )
+    assert "already in the panel" in out["reason"]
+    assert out["already_held"] == 2
+
+
+def test_a_window_with_nothing_held_and_nothing_fetched_is_still_unavailable(
+    monkeypatch,
+):
+    """
+    THE OTHER SIDE OF THAT BRANCH. A window ESPN has no finished game for is
+    genuinely DATA_NOT_AVAILABLE, and softening it would hide a night the
+    ingest truly failed to read — which is what the nightly path depends on
+    this status for.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    def _fetch(days, **kwargs):
+        import pandas as pd
+        return pd.DataFrame(), espn.EspnPanelReport()
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
+
+    out = worker.run_espn_ingest(days=[_d(2024, 10, 22)], label="nightly")
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert out["already_held"] == 0
+
+
+def test_a_mixed_window_is_unavailable_rather_than_a_clean_no_op(monkeypatch):
+    """
+    SOME HELD, SOME FETCHED AND REFUSED. Something was wanted and not
+    obtained, so this is not full coverage — but the held count travels with
+    the status so the number is not a mystery.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.ingestion.espn_panel as espn
+
+    monkeypatch.setenv(worker.ENV_ESPN_INGEST, "true")
+    monkeypatch.setattr(repo, "player_id_namespaces", lambda: {"espn": 1830})
+
+    def _fetch(days, **kwargs):
+        import pandas as pd
+        report = espn.EspnPanelReport()
+        report.skipped_already_held = 3
+        report.games_seen = 1               # one was fetched...
+        report.skipped_not_final.append("401909999")   # ...and refused
+        return pd.DataFrame(), report
+
+    monkeypatch.setattr(espn, "fetch_player_rows_for_dates", _fetch)
+
+    out = worker.run_espn_ingest(
+        days=[_d(2024, 10, 22)], label="history backfill",
+        skip_game_ids={"espn:1", "espn:2", "espn:3"},
+    )
+    assert out["status"] == "DATA_NOT_AVAILABLE", (
+        "a window with a refused game is not full coverage"
+    )
+    assert out["already_held"] == 3
+    assert out["games_seen"] == 1

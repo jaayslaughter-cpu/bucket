@@ -259,7 +259,16 @@ def test_an_nba_id_with_a_playoff_digit_is_still_excluded(monkeypatch):
 
 
 def _bind_panel(monkeypatch, rows):
-    """`session_scope` bound to a database holding these (date, player, source)."""
+    """
+    `session_scope` bound to a database holding these panel rows.
+
+    Each row is ``(date, player, source)`` or ``(date, player, source,
+    game_id)``. THE GAME ID IS EXPLICIT where it matters: the three-tuple
+    form derives a unique one per row, which made the "same night, two
+    players" case in `test_the_backfill_resume_point_is_read_from_the
+    _database` two separate GAMES -- so nothing asserted that two players
+    from ONE game collapse to one id. Raised by review on #31.
+    """
     from sqlalchemy.dialects.postgresql import JSONB
     from sqlalchemy.ext.compiler import compiles
 
@@ -271,9 +280,11 @@ def _bind_panel(monkeypatch, rows):
     Base.metadata.create_all(bind=engine, tables=[PlayerGameLog.__table__])
     factory = sessionmaker(bind=engine)
     with factory() as seed:
-        for index, (day, player, source) in enumerate(rows):
+        for index, row in enumerate(rows):
+            day, player, source = row[0], row[1], row[2]
+            game_id = row[3] if len(row) > 3 else f"espn:{40000 + index}"
             seed.add(PlayerGameLog(
-                nba_game_id=f"espn:{40000 + index}", nba_player_id=player,
+                nba_game_id=game_id, nba_player_id=player,
                 player_name=f"HARNESS {player}", game_date=day,
                 season="2024-25", team_abbr="LAL", opponent_abbr="XXX",
                 is_home=True, pts=20, source=source,
@@ -297,14 +308,20 @@ def test_the_backfill_resume_point_is_read_from_the_database(monkeypatch):
     cannot express a hole in the middle left by a night ESPN was down for.
     """
     _bind_panel(monkeypatch, [
-        (date(2024, 10, 22), "espn:1", "espn"),
-        (date(2024, 10, 22), "espn:2", "espn"),    # same night, two players
-        (date(2024, 10, 24), "espn:3", "espn"),
+        # One night, TWO GAMES, with two players sharing the first. Both
+        # distinctions matter: the two games must stay two ids, and the two
+        # players in one game must collapse to one. The first version of
+        # this test gave every row its own game id, so it only ever
+        # exercised the second half of that.
+        (date(2024, 10, 22), "espn:1", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:2", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:3", "espn", "espn:40001"),
+        (date(2024, 10, 24), "espn:4", "espn", "espn:40002"),
     ])
     assert repository.panel_game_ids_by_date("espn") == {
         "2024-10-22": {"espn:40000", "espn:40001"},
         "2024-10-24": {"espn:40002"},
-    }, "the resume point is keyed by GAME, not just by date"
+    }, "the resume point is keyed by GAME, not by row and not by date"
 
 
 def test_the_resume_point_reads_the_panel_not_the_team_table(monkeypatch):
@@ -405,8 +422,8 @@ def test_a_partially_ingested_night_is_visible_as_the_games_it_holds(
     from what ESPN lists for that date and asks for the difference.
     """
     _bind_panel(monkeypatch, [
-        (date(2024, 10, 22), "espn:1", "espn"),   # game espn:40000
-        (date(2024, 10, 22), "espn:2", "espn"),   # game espn:40001
+        (date(2024, 10, 22), "espn:1", "espn", "espn:40000"),
+        (date(2024, 10, 22), "espn:2", "espn", "espn:40001"),
     ])
     held = repository.panel_game_ids_by_date("espn")
     assert held == {"2024-10-22": {"espn:40000", "espn:40001"}}

@@ -2241,6 +2241,33 @@ def run_espn_ingest(
         for line in report.lines():
             logger.info("  %s", line)
         if frame.empty:
+            # AN EMPTY FRAME IS NOW TWO DIFFERENT THINGS, and reporting them
+            # alike would make the history backfill's best outcome read as
+            # its worst. With `skip_game_ids`, a chunk whose every event is
+            # already in the panel fetches nothing BY DESIGN and comes back
+            # empty -- full coverage, no work to do. Reported as
+            # DATA_NOT_AVAILABLE "no finished game in the window" that is
+            # simply false: there were games, and they are already ingested.
+            # Found in review on #31, in code this PR had just added.
+            #
+            # `games_seen` counts parsed summary payloads only, so a held
+            # event never increments it: nothing fetched AND something held
+            # is the no-op. A mixed window -- some held, some fetched and
+            # refused -- still reports DATA_NOT_AVAILABLE, because something
+            # was wanted and not obtained, with the held count visible so
+            # the number is not a mystery.
+            if report.skipped_already_held and not report.games_seen:
+                logger.info(
+                    "ESPN ingest (%s): nothing to fetch -- all %d event(s) "
+                    "across %d date(s) are already in the panel.",
+                    label, report.skipped_already_held, len(days),
+                )
+                return {"status": "SKIPPED",
+                        "reason": "every event in the window is already in "
+                                  "the panel",
+                        "label": label,
+                        "days": len(days),
+                        "already_held": report.skipped_already_held}
             logger.warning(
                 "ESPN ingest (%s): no player rows in the window.", label,
             )
@@ -2248,6 +2275,7 @@ def run_espn_ingest(
                     "reason": "no finished game in the window",
                     "label": label,
                     "days": len(days),
+                    "already_held": report.skipped_already_held,
                     "games_seen": report.games_seen}
 
         panel, _ = to_player_panel(frame)
