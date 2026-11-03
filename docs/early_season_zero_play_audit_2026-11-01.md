@@ -87,10 +87,10 @@ gate grants permission, it does not price anything."*
 
 The real thresholds, and their actual values:
 
-| Threshold | Tested at | Default | Overridable? | Effect at the default |
-|---|---|---|---|---|
-| `min_ev` | `decision_board.py:448` | **0.0** (`slate_board.py:248`) | **yes** — `PROPIQ_MIN_EV`, parsed at `scheduler_worker.py:1482` | any EV strictly above zero recommends |
-| `min_lean` | `decision_board.py:471` | **0.0** (`slate_board.py:249`) | no — `run_board` never passes it | any lean above zero recommends — **P(side) > 0.500**, over or under |
+| Threshold | Tested at | Default | Overridable? | **Live value (2026-11-03)** | Effect |
+|---|---|---|---|---|---|
+| `min_ev` | `decision_board.py:448` | 0.0 (`slate_board.py:248`) | yes — `PROPIQ_MIN_EV`, parsed at `scheduler_worker.py:1482` | **0.0** — the override is unset | any EV strictly above zero recommends |
+| `min_lean` | `decision_board.py:471` | 0.0 (`slate_board.py:249`) | no — `run_board` never passes it | **0.0** | any lean above zero recommends — **P(side) > 0.500**, over or under |
 
 Two corrections to the first version of this table, both from review on #32.
 
@@ -101,31 +101,52 @@ that does not override it. `build_board_from_projections` declares
 `min_ev` (`scheduler_worker.py:1543-1548`), so the scheduled board takes the
 0.0. Nothing in the environment can raise it; closing it needs a code change.
 
-**`min_ev`'s 0.0 is a DEFAULT, not a measured live value**, and the first
-version of this table called it live. It is read from the environment:
+**`min_ev` is 0.0 LIVE, and this took two corrections to get right.** The
+first version of this table asserted 0.0 as the live value having read it out
+of a function signature; review on #32 pointed out that it is read from the
+environment —
 
 ```python
 min_ev = float(os.environ.get(ENV_MIN_EV) or 0.0)   # scheduler_worker.py:1482
 ```
 
-So `PROPIQ_MIN_EV` can raise it, and **I have not read the deployed
-environment to find out whether it is set** — Railway's variable listing is
-all-or-nothing and would print the database password and the PropLine API key
-into a transcript. Worth confirming before anyone acts on the §4 numbers.
+— so the second version downgraded it to "the default, and I have not read the
+deployed environment". That was honest but incomplete, and the reason given for
+not reading it was wrong: Railway's `list-variables` is indeed all-or-nothing
+and would print the database password and the PropLine API key into a
+transcript, but `describe-service` and `describe-environment` return variable
+**names without values**, which is all this question needed.
 
-It does not change this document's verdict, and here is why it cannot: an
-override can only move the floor **upward**, and `min_ev` is never evaluated at
-all (§1). A stricter floor cannot explain zero plays when the comparison does
-not run. What it would change is §4 Step 3's starting point — if
-`PROPIQ_MIN_EV` is already 0.02, that row is satisfied and only `min_lean`
-needs closing.
+Read that way on 2026-11-03:
 
-So the live `min_lean` is zero and the live `min_ev` is zero-or-higher. The
-moment an artifact lands, this board recommends on an edge of +0.0001 if the
-override is unset, and on a model lean of half a basis point **with no price
-behind it at all** regardless, because that path's floor is zero and not
-configurable. That is the opposite problem to the brief's, it is worse, and §4
+```
+service `bucket`   variableNames: [DATABASE_URL, DISCORD_WEBHOOK_URL, PGDATABASE,
+                   PGDATABASEf, PROPIQ_ESPN_HISTORY_SEASONS, PROPLINE_API_KEY,
+                   RAILWAY_RUN_UID, RAILWAY_VOLUME_MOUNT_PATH, discord]
+environment        sharedVariableNames: []
+```
+
+`PROPIQ_MIN_EV` appears at neither level, and there are no shared variables for
+it to hide in, so the override is unset and the live value is the 0.0 default.
+**Both live thresholds are therefore zero, confirmed rather than assumed**, and
+§4 Step 3's `min_ev` row is not already satisfied — it is the full distance from
+0.0 to whatever floor gets chosen.
+
+None of this moved the verdict, and it never could have: an override can only
+raise the floor, and `min_ev` is never evaluated at all (§1), so a stricter
+floor cannot explain zero plays when the comparison does not run.
+
+The moment an artifact lands, this board recommends on an edge of +0.0001, and
+on a model lean of half a basis point **with no price behind it at all**,
+because neither floor stops it and `min_lean`'s cannot even be raised from the
+environment. That is the opposite problem to the brief's, it is worse, and §4
 Step 3 addresses it in the other direction.
+
+Two variables in that listing are worth a second look while someone is in
+there: `PGDATABASEf` is a typo of `PGDATABASE` that nothing reads (`DATABASE_URL`
+takes precedence, so it is inert rather than harmful), and a lower-case
+`discord` sits beside `DISCORD_WEBHOOK_URL`. Neither affects anything in this
+document.
 
 ### (b) The shrinkage has no prior-season prior to over-weight
 
@@ -257,7 +278,7 @@ be revisited against observed ECE rather than assumed:
 
 | Parameter | Now | Early-season bootstrap | Why |
 |---|---|---|---|
-| `min_ev` | 0.0 **by default**; `PROPIQ_MIN_EV` may already raise it — check before changing | **0.02** | an uncalibrated model's +0.5% edge is indistinguishable from noise; 2% survives a plausible calibration error. Settable from the environment, no code change |
+| `min_ev` | **0.0 live** — `PROPIQ_MIN_EV` unset, confirmed 2026-11-03 (§2a) | **0.02** | an uncalibrated model's +0.5% edge is indistinguishable from noise; 2% survives a plausible calibration error. Settable from the environment, no code change |
 | `min_lean` | **0.0** on the live path, with no override | **0.05**, or disable the `model_lean` path entirely — needs a code change, `run_board` does not pass it | a lean recommendation has *no price behind it*, and at 0.0 any P(side) > 0.500 qualifies — over OR under; with calibration unmeasured that is an opinion, not an edge. This is the most permissive gate in the pipeline and the one to close first |
 | `min_prior_games` | 10 | **keep 10** | satisfy it with step 1, do not lower it |
 | `shrink_k` | 8 | **8**, and point the target at a prior-season mean | see below |
