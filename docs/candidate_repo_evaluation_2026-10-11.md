@@ -268,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap this described.** `scheduler_worker.py:3106-3109` sets
+- **The gap this described.** `scheduler_worker.py:3154-3157` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
