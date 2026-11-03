@@ -61,7 +61,7 @@ def test_the_builder_exists_and_the_set_of_builders_is_known():
     builders = set(re.findall(r"^def (build_\w+_embed)", body, re.M))
     assert "build_win_loss_embed" in builders, "the results card builder"
     assert "build_prelock_correction_embed" in builders, "the pre-lock retraction"
-    assert len(builders) == 6, sorted(builders)
+    assert len(builders) == 7, sorted(builders)
 
 
 def test_the_record_is_reported_as_w_l_p():

@@ -872,6 +872,111 @@ def build_prelock_correction_embed(
     }
 
 
+def build_research_preview_embed(
+    candidates: Sequence[Any],
+    *,
+    slate_date: str | None = None,
+    publication: Any = None,
+    max_rows: int = 15,
+) -> dict[str, Any]:
+    """
+    The slate's rows as RESEARCH, when the publication gate is still shut.
+
+    WHY THIS IS A SEPARATE RENDERER. `build_decision_board_embed` shows only
+    `RECOMMENDED` rows, and withholds everything when the gate refuses. Both
+    are right for a recommendation card. But with no model artifact every row
+    is ABSTAIN, so that card says "0 qualifying plays out of 8 line(s)
+    evaluated" and names nobody -- and an operator who wants to see WHICH
+    players and WHAT lines the slate is working with has nowhere to look but
+    the CSV. This renders exactly that, and nothing more.
+
+    IT IS NOT A WAY ROUND THE GATE. The gate's verdict and its reason are
+    carried onto the card verbatim, every row keeps its own
+    `decision_status`, and the heading says in words that none of this is a
+    recommendation. What the gate withholds is the CLAIM; these are the
+    inputs to a claim nobody is making yet.
+
+    NO EV AND NO PROBABILITY APPEAR HERE, because with no artifact there are
+    none -- and `AGENTS.md` section M forbids ranking by EV without valid
+    odds and a valid no-vig probability. Rows are ordered by |projection -
+    line|, which is a MODEL LEAN and is labelled as one. A lean is not an
+    edge: it says the model disagrees with the line, not that the
+    disagreement is worth anything, because nothing here has measured
+    whether this model is right.
+
+    ONE ROW PER (player, market). The board carries an over and an under row
+    for each, identical but for `side`; showing both would double the card
+    and say nothing twice. The side shown is the one the projection leans to.
+
+    OFF BY DEFAULT at the call site -- see `scheduler_worker.ENV_RESEARCH_PREVIEW`.
+    """
+    best: dict[tuple[str, str], tuple[float, Any]] = {}
+    for c in candidates:
+        player = str(getattr(c, "player_name", "") or "")
+        market = str(getattr(c, "target_market", "") or "")
+        if not player or not market:
+            continue
+        line = getattr(c, "line", None)
+        proj = getattr(c, "prediction_mean", None)
+        if line is None or proj is None:
+            continue
+        try:
+            lean = float(proj) - float(line)
+        except (TypeError, ValueError):
+            continue
+        side = str(getattr(c, "side", "") or "").lower()
+        # The leaning side only. A projection above the line leans over.
+        if (lean > 0 and side != "over") or (lean < 0 and side != "under"):
+            continue
+        key = (player, market)
+        if key not in best or abs(lean) > abs(best[key][0]):
+            best[key] = (lean, c)
+
+    ordered = sorted(best.items(), key=lambda kv: -abs(kv[1][0]))
+    lines: list[str] = []
+    for (player, market), (lean, c) in ordered[:max_rows]:
+        side = str(getattr(c, "side", "") or "").upper()
+        status = str(getattr(c, "decision_status", "") or "?")
+        line_v = getattr(c, "line", "?")
+        proj_v = float(getattr(c, "prediction_mean", 0.0) or 0.0)
+        lines.append(
+            f"`{lean:+.1f}` **{player}** {market} {side} "
+            f"{line_v} — proj {proj_v:.1f} "
+            f"· {status}"
+        )
+
+    verdict_line = ""
+    if publication is not None and not getattr(publication, "allowed", False):
+        verdict_line = (
+            f"\n\n**Still withheld from publication.** "
+            f"{getattr(publication, 'reason', None) or 'no reason given'}"
+        )
+
+    if not lines:
+        body = (
+            f"No row carried both a line and a projection, so there is "
+            f"nothing to preview.{verdict_line}"
+        )
+    else:
+        body = (
+            f"**RESEARCH PREVIEW — not recommendations.** "
+            f"{len(best)} prop(s) on this slate, ordered by model lean "
+            f"(projection − line). A lean is not an edge and not an EV: it "
+            f"says the model disagrees with the line, not that the "
+            f"disagreement is worth anything. No probability is shown "
+            f"because none was computed."
+            f"{verdict_line}\n\n" + "\n".join(lines)
+        )
+
+    return _fit_embed({
+        "title": _clip(f"Research preview — {slate_date or 'slate'}", MAX_TITLE),
+        "description": _clip(body, MAX_DESCRIPTION),
+        "color": COLOR_ABSTAIN,
+        "fields": [],
+        "footer": {"text": RESEARCH_FOOTER[:MAX_FOOTER]},
+    })
+
+
 def build_abstention_embed(reason: str, *, title: str = "No ticket") -> dict[str, Any]:
     """
     Post the refusal too.

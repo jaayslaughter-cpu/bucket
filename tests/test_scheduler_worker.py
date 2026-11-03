@@ -2932,3 +2932,123 @@ def test_an_unreadable_board_is_removed_rather_than_left_for_dispatch(tmp_path):
 
     assert worker._discard_stale_board(board, "2026-11-01") is True
     assert not board.exists()
+
+
+# --- the research preview: props visible without opening the gate ---------
+
+
+def _withheld_board(tmp_path, slate):
+    """A board in production's real state: rows, projections, NO probability."""
+    import pandas as pd
+
+    board = tmp_path / "board.csv"
+    # UNDER FIRST, DELIBERATELY. Both sides carry the same |projection -
+    # line|, so a preview that merely de-duplicated on (player, market)
+    # would keep whichever row it saw first and print UNDER against a
+    # projection ABOVE the line. Row order is the only thing that makes the
+    # leaning-side filter load-bearing, and with `over` first a mutation
+    # removing that filter survived. See
+    # `test_the_preview_shows_the_props_without_claiming_them`.
+    rows = [
+        {"slate_date": slate, "game_date": slate, "event_id": "espn:401",
+         "player_id": "espn:1", "player_name": "HARNESS JOKIC",
+         "target_market": "PTS", "side": side, "line": 27.5,
+         "prediction_mean": 29.1, "model_prob": None, "book_ev": None,
+         "american_odds": None, "book_source": None,
+         "decision_status": "ABSTAIN", "decision_basis": "unavailable"}
+        for side in ("under", "over")
+    ]
+    pd.DataFrame(rows).to_csv(board, index=False)
+    return board
+
+
+def test_the_preview_is_off_by_default_so_no_prop_reaches_the_card(
+    monkeypatch, tmp_path
+):
+    """
+    THE DEFAULT IS UNCHANGED. The publication gate strips every name from a
+    withheld board, and turning that off is an operator's decision, never a
+    side effect of this code existing.
+    """
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    slate = str(_frozen_pacific_day(monkeypatch))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+    monkeypatch.delenv(worker.ENV_RESEARCH_PREVIEW, raising=False)
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    assert out["publication"]["PUBLICATION_STATUS"] == "PUBLISH_WITHHELD"
+    assert len(sent["embeds"]) == 1, "the preview was appended without being asked for"
+    assert "HARNESS JOKIC" not in str(sent["embeds"]), (
+        "a player name reached the card with the preview OFF"
+    )
+
+
+def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path):
+    """
+    WITH THE FLAG ON, the props are visible AND the refusal still goes out.
+
+    The operator asked to see the slate; they did not ask to be told an
+    uncalibrated lean is a recommendation. So this asserts BOTH: the player
+    reaches the card, and the withheld verdict is still on it beside him.
+    """
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    slate = str(_frozen_pacific_day(monkeypatch))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+    monkeypatch.setenv(worker.ENV_RESEARCH_PREVIEW, "true")
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+    blob = str(sent["embeds"])
+
+    # THE GATE IS NOT OPENED. Its verdict is unchanged and its card still went.
+    assert out["publication"]["PUBLICATION_STATUS"] == "PUBLISH_WITHHELD"
+    assert len(sent["embeds"]) == 2, (
+        f"expected the gate's card AND the preview, got {len(sent['embeds'])}"
+    )
+    assert "withheld from publication" in blob
+
+    # AND THE PROP IS VISIBLE -- player, market, side, line and projection.
+    assert "HARNESS JOKIC" in blob, "the preview did not name the player"
+    assert "27.5" in blob and "29.1" in blob, (
+        "the preview showed the player without the line and projection, which "
+        "is the only content it exists to carry"
+    )
+    # ONE ROW PER (player, market): the board carries over AND under.
+    assert blob.count("HARNESS JOKIC") == 1, (
+        "both sides of the same prop were listed; the preview is meant to show "
+        "the leaning side only"
+    )
+    # THE LEANING SIDE, and the fixture lists UNDER first so this cannot pass
+    # by accident: a projection of 29.1 against a line of 27.5 leans OVER.
+    assert "OVER" in blob, "proj 29.1 above line 27.5 leans OVER, not UNDER"
+    assert "UNDER" not in blob, (
+        "the preview printed UNDER for a projection above the line -- it is "
+        "de-duplicating on (player, market) rather than picking the lean"
+    )
+    # NO FABRICATED NUMBER. There is no probability, so none may appear.
+    assert "ABSTAIN" in blob
+    assert "not recommendations" in blob.lower()

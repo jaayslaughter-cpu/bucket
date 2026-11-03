@@ -91,6 +91,24 @@ ENV_MAX_THREADS = "PROPIQ_MAX_THREADS"
 ENV_RUN_ON_START = "PROPIQ_RUN_ON_START"
 ENV_DISPATCH = "PROPIQ_DISPATCH"
 ENV_DISPATCH_ABSTENTIONS = "PROPIQ_DISPATCH_ABSTENTIONS"
+#: Append a RESEARCH PREVIEW embed listing the slate's props -- player,
+#: market, line, projection and model lean -- alongside whatever dispatch
+#: was already going to send. OFF BY DEFAULT.
+#:
+#: WHY IT EXISTS. With no model artifact every board row is ABSTAIN, so the
+#: recommendation card reads "0 qualifying plays out of N line(s)
+#: evaluated" and names nobody; withheld by the publication gate it names
+#: nobody either. Both are correct for a card that makes a CLAIM. An
+#: operator who wants to see which players and lines the slate is working
+#: with then has nowhere to look but the CSV on the volume.
+#:
+#: IT DOES NOT OPEN THE GATE, and it is not a way round it. The preview is
+#: APPENDED, never substituted: the gate's own card still goes out saying
+#: what is withheld and why, the preview repeats that verdict inline, and
+#: every row keeps its own ABSTAIN. What the gate withholds is the claim;
+#: this shows the inputs to a claim nobody is making yet. No probability
+#: and no EV appear, because with no artifact there are none.
+ENV_RESEARCH_PREVIEW = "PROPIQ_RESEARCH_PREVIEW"
 ENV_CALIBRATION_REPORT = "PROPIQ_CALIBRATION_REPORT"
 ENV_BOARD_CSV = "PROPIQ_BOARD_CSV"
 ENV_BOARD_MARKETS = "PROPIQ_BOARD_MARKETS"
@@ -1746,6 +1764,7 @@ def run_dispatch() -> dict[str, Any]:
             DiscordConfig,
             build_abstention_embed,
             build_decision_board_embed,
+            build_research_preview_embed,
             send_embeds,
         )
         from src.quant.dfs_payouts import ProbabilitySource
@@ -1859,6 +1878,13 @@ def run_dispatch() -> dict[str, Any]:
             embeds = [build_decision_board_embed(
                 rows, slate_date=slate, publication=verdict,
             )]
+            # APPENDED, NOT SUBSTITUTED. The gate's card goes out either way;
+            # this adds the slate's props as research beside it. See
+            # ENV_RESEARCH_PREVIEW for why that ordering is the honest one.
+            if _flag(ENV_RESEARCH_PREVIEW, False):
+                embeds.append(build_research_preview_embed(
+                    rows, slate_date=slate, publication=verdict,
+                ))
             if not verdict.allowed and not _flag(ENV_DISPATCH_ABSTENTIONS, True):
                 logger.info("Board withheld and abstentions muted — nothing sent.")
                 return {

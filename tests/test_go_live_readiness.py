@@ -282,8 +282,14 @@ def test_the_results_card_exists_and_the_page_says_how_it_is_sent():
     # The count is asserted rather than left open because a builder nobody
     # sends is how four of these sat unreachable before.
     assert "build_prelock_correction_embed" in builders
-    assert len(builders) == 6, (
-        f"the page says six builders; there are {len(builders)}: {builders}"
+    # SEVEN NOW. build_research_preview_embed is the seventh: the slate's
+    # props as RESEARCH, shown when the publication gate withholds the
+    # recommendation card and every row is ABSTAIN for want of a model. It is
+    # appended beside the gate's own card and never replaces it, so the
+    # refusal still goes out -- see scheduler_worker.ENV_RESEARCH_PREVIEW.
+    assert "build_research_preview_embed" in builders
+    assert len(builders) == 7, (
+        f"the page says seven builders; there are {len(builders)}: {builders}"
     )
     worker = (ROOT / "scheduler_worker.py").read_text(encoding="utf-8")
     settle = worker[worker.index("def run_settlement"):]
