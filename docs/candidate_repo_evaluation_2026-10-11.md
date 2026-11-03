@@ -255,12 +255,12 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/quant/publication_gate.py:378` as a second verdict beside
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
-  `scheduler_worker.py:1649` and into the deploy probe as a FAILURE at
+  `scheduler_worker.py:1770` and into the deploy probe as a FAILURE at
   `scripts/railway_healthcheck.py:269`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
 
-### A1 — Cross-process advisory lock on the write path *(real gap, small fix)*
+### A1 — Cross-process advisory lock on the write path *(IMPLEMENTED 2026-10-11)*
 
 - **Source.**
   `EdgarParra565/player-performance-forecaster @ nba_model/data/hourly_update.py:74-128`
@@ -268,16 +268,29 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap in our tree.** `scheduler_worker.py:2897-2899` sets
+- **The gap this described.** `scheduler_worker.py:3106-3109` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
   interleave writes to the artifact directory and the parlay ledger. We run
-  `numReplicas: 1`, so this is operator concurrency, not scaling — which is the
-  kind that happens once and is hard to diagnose afterwards.
-- **Shape of the fix.** A non-blocking lock around the artifact/ledger write
-  path, taken by both the scheduled job and the manual entry point, which
-  **declines** rather than waits and says so in the log.
+  `numReplicas: 1`, so this was operator concurrency, not scaling — which is
+  the kind that happens once and is hard to diagnose afterwards.
+- **CLOSED, and this entry said otherwise for three weeks.**
+  `src/utils/write_lock.py` landed in `89be638` on 2026-10-11 — the same day
+  this evaluation was written — and is taken by BOTH entry points: the
+  scheduled slate at `scheduler_worker.py:1112` and the manual
+  `python main.py` at `main.py:1898`. It **declines** rather than waits, and
+  says so: *"Another process holds the slate write lock, so the 09:00 PT run
+  is SKIPPED … A deliberate decline, not a failure."* The scope deliberately
+  covers the board write and the dispatch, not only the scoring, because a
+  half-written board is as bad as a half-written upsert. It is reentrant, so
+  nesting stays safe. `tests/test_write_lock.py` holds it.
+
+  Raised by review on #32, which read it as closed *by* that PR; it was not —
+  #32 does not touch the lock. The defect was this document, which described
+  a shipped guardrail as a gap, and §5 below which listed it as unimplemented.
+  Anyone working the backlog from §5 would have built a second lock beside
+  the one already there.
 - **Caveat on their exit codes.** `EX_TEMPFAIL`-and-relaunch works only because
   launchd retries. Our container must not treat a declined lock as a boot
   failure; it is a successful no-op.
@@ -379,8 +392,11 @@ Ordered by damage if ignored.
 - No candidate's model was *run*, and no claim here compares measured
   performance — only method and contract. M1 is explicitly gated on a
   measurement we have not taken.
-- **A2 is implemented** (see its entry above), with eight mutations each
-  failing a named test. **A1 and M1 are not** — they are scoped findings.
+- **A2 and A1 are both implemented** (see their entries above) — A2 with eight
+  mutations each failing a named test, A1 in `89be638` with
+  `tests/test_write_lock.py`. **M1 is not**; it is a scoped finding gated on a
+  measurement we have not taken. This line said A1 was unimplemented from
+  2026-10-11 until 2026-11-03; corrected after review on #32.
 - A2 refuses to publish; it does not refuse to *score*. A stale artifact still
   produces a board CSV, which is deliberate: the file is the record an operator
   inspects to see what was withheld and why.

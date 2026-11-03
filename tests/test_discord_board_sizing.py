@@ -23,6 +23,29 @@ from __future__ import annotations
 from src.notify.discord import build_decision_board_embed
 
 
+def _frozen_pacific_day(monkeypatch, day: str = "2026-11-01") -> str:
+    """
+    Pin the Pacific day for a test that goes through the real `run_dispatch`.
+
+    FROZEN, NOT READ TWICE. `run_dispatch` refuses a board whose rows describe
+    another slate and reads the Pacific day ITSELF, so a fixture that calls
+    `pacific_calendar_date()` on its own races the dispatch across Pacific
+    midnight: the board gets stamped yesterday, the guard refuses it, and the
+    test fails on the calendar rather than on the wire it is testing. Raised by
+    review on #32.
+
+    `run_dispatch` imports the function inside the call, so patching the module
+    attribute is what the call actually sees.
+    """
+    from datetime import date as _date
+
+    from src.utils import timezones
+
+    frozen = _date.fromisoformat(day)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: frozen)
+    return str(frozen)
+
+
 def _row(**over):
     """One board row, as the dispatcher builds it from the board CSV."""
     base = {
@@ -312,9 +335,10 @@ def test_run_dispatch_puts_the_computed_size_on_the_card(monkeypatch, tmp_path):
 
     import scheduler_worker as worker
 
+    slate = _frozen_pacific_day(monkeypatch)
     board = tmp_path / "board.csv"
     pd.DataFrame([{
-        "slate_date": "2026-10-29", "game_date": "2026-10-29",
+        "slate_date": slate, "game_date": slate,
         "player_name": "HARNESS PLAYER", "target_market": "PTS",
         "side": "over", "line": 24.5,
         "model_prob": 0.58, "model_p_over": 0.58, "model_p_under": 0.42,

@@ -1351,6 +1351,111 @@ def _board_market_frames() -> dict[str, Any]:
         return empty
 
 
+def _discard_stale_board(board_csv: Any, slate_date: str) -> bool:
+    """
+    Delete a board CSV that does not describe ``slate_date``. True if it did.
+
+    A BOARD IS A STATEMENT ABOUT ONE SLATE. `run_dispatch` reads the file
+    and sends it without consulting `run_board`'s status, so a file left
+    behind by a successful earlier run is indistinguishable, at the
+    dispatch surface, from tonight's. Removing it turns "stale
+    recommendations" into "no recommendations", and the abstention card
+    already says that honestly.
+
+    KEYED ON THE ROWS' OWN `slate_date`, not on the file's mtime: a board
+    rebuilt at 09:05 for the same slate is not stale, and a file written
+    yesterday at 09:00 is. The column is written by
+    `decision_board.board_to_dataframe` for exactly this kind of question.
+
+    A board that cannot be read is removed too. An unparseable file is not
+    evidence of anything, and leaving it would have dispatch fail on it
+    instead.
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(str(board_csv))
+    if not target.exists():
+        return False
+    try:
+        import pandas as pd
+
+        frame = pd.read_csv(target)
+        dates = {str(d) for d in frame.get("slate_date", pd.Series(dtype=str))}
+        if dates == {str(slate_date)}:
+            return False
+        reason = f"describes {sorted(dates) or 'no slate'}"
+    except Exception as exc:  # noqa: BLE001 — unreadable is not evidence
+        reason = f"could not be read ({type(exc).__name__})"
+
+    try:
+        target.unlink()
+    except OSError as exc:
+        logger.error(
+            "Could not remove the stale board %s (%s). DISPATCH MAY SEND IT: "
+            "it reads the file without checking which slate it describes.",
+            target, exc,
+        )
+        return False
+    logger.warning(
+        "Removed the board at %s: it %s, not %s. A board left in place would "
+        "be dispatched as tonight's, because dispatch reads the file and not "
+        "this job's status.", target, reason, slate_date,
+    )
+    return True
+
+
+def _backtest_board(
+    board_csv: Any, *, markets: Any, train_end: str, validation_end: str,
+    min_ev: float,
+) -> tuple[Any, str]:
+    """
+    The comparison board, for a window whose games have been played.
+
+    KEPT, NOT DELETED. `compare_models_on_panel` is the right tool for a
+    backtest: it fits on history and scores a labelled window, which is
+    exactly what an override into the past asks for. What it cannot do is
+    describe a game with no outcome yet, which is why the live path reads
+    `main.py`'s persisted projections instead.
+
+    The feature build stays here because this path needs it -- the research
+    line is built from `{MARKET}_L10`, which only `build_feature_matrix`
+    adds (#31). The live path needs none of it: those rows were scored at
+    09:00 from a matrix `main.py` already built.
+    """
+    from src.db.repository import load_player_panel
+    from src.features.builder import build_feature_matrix
+    from src.pipeline.slate_board import build_slate_board
+
+    panel = load_player_panel()
+    if panel is None or panel.empty:
+        raise ValueError(
+            "DATA_NOT_AVAILABLE: empty player panel, so a backtest board has "
+            "no history to fit on."
+        )
+    frames = _board_market_frames()
+    features = build_feature_matrix(
+        panel,
+        team_games=frames["team_games"],
+        market_lines=frames["market_lines"],
+    )
+    logger.info(
+        "Backtest board matrix: %d row(s) x %d col(s) from a %d-row panel "
+        "(team_games=%d, market_lines=%d).",
+        len(features), len(features.columns), len(panel),
+        0 if frames["team_games"] is None else len(frames["team_games"]),
+        0 if frames["market_lines"] is None else len(frames["market_lines"]),
+    )
+    result = build_slate_board(
+        features,
+        out=board_csv,
+        markets=markets,
+        train_end=train_end,
+        validation_end=validation_end,
+        min_ev=min_ev,
+    )
+    return result, "model comparison (backtest)"
+
+
 def run_board() -> dict[str, Any]:
     """
     Build the recommendation board CSV that dispatch reads.
@@ -1369,8 +1474,6 @@ def run_board() -> dict[str, Any]:
     """
     board_csv = os.environ.get(ENV_BOARD_CSV) or DEFAULT_BOARD_CSV
     try:
-        from src.pipeline.slate_board import build_slate_board
-
         markets = list(board_markets())
         window = board_window()
         train_end = window["train_end"]
@@ -1380,55 +1483,72 @@ def run_board() -> dict[str, Any]:
         except ValueError:
             min_ev = 0.0
 
-        from src.db.repository import load_player_panel
-
-        panel = load_player_panel()
-        if panel is None or panel.empty:
-            logger.warning("No player panel available — no board built.")
-            return {"status": "DATA_NOT_AVAILABLE", "reason": "empty player panel"}
-
-        # THE RAW PANEL IS NOT WHAT THE BOARD NEEDS, and for the whole life of
-        # this project the guard above hid that. `build_slate_board` hands its
-        # frame to `compare_models_on_panel` -> `attach_research_over_labels`,
-        # which needs `{MARKET}_L10` to build a research line. The panel
-        # carries PTS; only `build_feature_matrix` adds PTS_L10.
+        # A LIVE BOARD AND A BACKTEST BOARD ARE TWO DIFFERENT QUESTIONS, and
+        # for the project's whole life this job asked the backtest one and
+        # stamped tonight's date on the answer.
         #
-        # Every run until 2026-10-31 returned at the empty-panel guard above,
-        # so this line had never once executed against real rows. The night
-        # the ESPN ingest seeded 1,830 of them, the guard passed and the job
-        # raised `DATA_NOT_AVAILABLE: PTS_L10 missing` -- a latent bug that
-        # only an ingest could expose.
+        # `build_slate_board` routes through `compare_models_on_panel`, which
+        # fits models on labelled history and scores a window of games with
+        # KNOWN OUTCOMES -- `compare.py` drops every row whose `over_hit` is
+        # null before it splits. A game that has not been played has no
+        # outcome, so no label, so it is dropped. That function structurally
+        # cannot describe tonight, and three fixes in two days each got one
+        # step closer to that wall: #31 supplied the feature matrix it needed,
+        # #32 attached the forward slate, and the forward rows were dropped at
+        # the label filter. The second of those could not work and was caught
+        # in review before it merged.
         #
-        # `scripts/nba_model_cli.py` has always done this correctly: its
-        # `_load_real_or_demo` builds the matrix before calling the same
-        # function, and its comment says the two paths must not drift because
-        # "the drifting one would be the unattended one". They shared
-        # `build_slate_board` and not the build in front of it. This is that
-        # missing half.
-        from src.features.builder import build_feature_matrix
+        # THE NUMBERS FOR TONIGHT ALREADY EXIST. `main.py` scored the slate at
+        # 09:00 PT and persisted one row per (player, game, market) with the
+        # prop line attached and the EV gate applied -- 460 rows on
+        # 2026-11-01, visible only in Postgres because nothing read the table
+        # back. Ranking and formatting those IS the board.
+        #
+        # So: a live slate reads the projections; a backtest window keeps the
+        # comparison path, which is the thing it is actually for and which
+        # works there, because those games have outcomes.
+        if window.get("is_backtest"):
+            result, source = _backtest_board(
+                board_csv, markets=markets, train_end=train_end,
+                validation_end=validation_end, min_ev=min_ev,
+            )
+        else:
+            from src.db.repository import load_projections
+            from src.pipeline.slate_board import build_board_from_projections
 
-        frames = _board_market_frames()
-        features = build_feature_matrix(
-            panel,
-            team_games=frames["team_games"],
-            market_lines=frames["market_lines"],
-        )
-        logger.info(
-            "Board matrix: %d row(s) x %d col(s) from a %d-row panel "
-            "(team_games=%d, market_lines=%d).",
-            len(features), len(features.columns), len(panel),
-            0 if frames["team_games"] is None else len(frames["team_games"]),
-            0 if frames["market_lines"] is None else len(frames["market_lines"]),
-        )
-
-        result = build_slate_board(
-            features,
-            out=board_csv,
-            markets=markets,
-            train_end=train_end,
-            validation_end=validation_end,
-            min_ev=min_ev,
-        )
+            projections = load_projections(validation_end)
+            if projections.empty:
+                logger.warning(
+                    "No projections persisted for %s, so there is nothing to "
+                    "rank. The slate job writes them at %02d:00 PT; a board "
+                    "asked for before it has run, or after a slate that "
+                    "refused, has no input. This is the pipeline reporting "
+                    "its own state.",
+                    validation_end,
+                    _int_env(ENV_SLATE_HOUR, DEFAULT_SLATE_HOUR, low=0, high=23),
+                )
+                # THE REFUSAL MUST TAKE THE OLD BOARD WITH IT. `run_dispatch`
+                # reads whatever CSV is on disk and sends it; it does not
+                # look at `run_board`'s return value. So a refusal that
+                # leaves yesterday's file in place dispatches yesterday's
+                # recommendations as tonight's -- and this change is what
+                # makes that reachable, because until now no board had ever
+                # been written for the file to be stale. Raised by review
+                # on #32.
+                stale = _discard_stale_board(board_csv, validation_end)
+                return {"status": "DATA_NOT_AVAILABLE",
+                        "reason": f"no projections persisted for {validation_end}",
+                        "discarded_stale_board": stale,
+                        "window": window}
+            result = build_board_from_projections(
+                projections,
+                out=board_csv,
+                slate_date=validation_end,
+                markets=markets,
+                min_ev=min_ev,
+            )
+            source = "projections"
+        logger.info("Board source: %s", source)
         logger.info("Board: %s", result.as_dict())
         # ADVISORY SIZING, attached by this caller rather than by the ranking
         # layer -- see attach_board_sizing for the two guards that require it.
@@ -1462,7 +1582,7 @@ def run_board() -> dict[str, Any]:
         # back. A board of 40 rows is the same shape whether it describes
         # tonight or a fortnight in 2025.
         return {"status": "OK", **result.as_dict(), "window": window,
-                "sizing": sizing}
+                "source": source, "sizing": sizing}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Board build raised; the scheduler stays up.")
         notify_failure("board", f"The board build raised: {exc}")
@@ -1630,6 +1750,7 @@ def run_dispatch() -> dict[str, Any]:
         )
         from src.quant.dfs_payouts import ProbabilitySource
         from src.quant.publication_gate import calibration_gate, first_refusal
+        from src.utils.timezones import pacific_calendar_date
 
         report = None
         if report_path.exists():
@@ -1650,7 +1771,9 @@ def run_dispatch() -> dict[str, Any]:
 
         if not board_csv.exists():
             if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
-                return {"status": "SKIPPED", "reason": f"{board_csv} missing"}
+                return {"status": "SKIPPED",
+                        "reason": f"{board_csv} missing",
+                        "publication": verdict.as_dict()}
             embeds = [build_abstention_embed(
                 f"No board was written for this slate ({board_csv} absent), so "
                 "there is nothing to recommend. This is the pipeline reporting "
@@ -1659,6 +1782,62 @@ def run_dispatch() -> dict[str, Any]:
             )]
         else:
             frame = pd.read_csv(board_csv)
+            # THE SECOND HALF OF THE SAME GUARD, and the half that cannot be
+            # bypassed by a future code path. `run_board` removes a stale
+            # board when IT refuses, but dispatch reads this file without
+            # consulting that status at all -- so anything else that leaves a
+            # board behind (a crash between write and dispatch, an operator's
+            # hand-run CLI, a path that does not exist yet) would send it as
+            # tonight's. Checked here, where the number reaches a person.
+            #
+            # The rows carry their own `slate_date` from
+            # `decision_board.board_to_dataframe`; a board for another day is
+            # refused with the day it actually describes, because "withheld"
+            # without the reason reads as a broken pipeline.
+            #
+            # A FILE WITH NO `slate_date` COLUMN AT ALL IS LET THROUGH, and
+            # that is a deliberate limit rather than an oversight: it cannot
+            # be dated, so there is nothing to compare, and every writer in
+            # this repository emits the column. Refusing it would only ever
+            # block a hand-assembled CSV an operator meant to send.
+            board_slates = {
+                str(d) for d in frame.get("slate_date", pd.Series(dtype=str))
+            }
+            today_pt = str(pacific_calendar_date())
+            if board_slates and board_slates != {today_pt}:
+                logger.error(
+                    "BOARD AT %s DESCRIBES %s, NOT %s. Not dispatching it: a "
+                    "board is a statement about one slate, and sending "
+                    "another day's rows under tonight's heading is the one "
+                    "failure worse than sending nothing.",
+                    board_csv, sorted(board_slates), today_pt,
+                )
+                if not _flag(ENV_DISPATCH_ABSTENTIONS, True):
+                    return {"status": "SKIPPED",
+                            "reason": f"board describes {sorted(board_slates)}, "
+                                      f"not {today_pt}",
+                            "publication": verdict.as_dict()}
+                embeds = [build_abstention_embed(
+                    f"The board on disk describes {', '.join(sorted(board_slates))}, "
+                    f"not {today_pt}, so it was not sent. A board is a "
+                    f"statement about one slate. This is the pipeline "
+                    f"reporting its own state.",
+                    title="No recommendations",
+                )]
+                sent = send_embeds(embeds, config=DiscordConfig(dry_run=False))
+                # `publication` ON EVERY RETURN, because a caller that reads
+                # `out["publication"]` cannot know which branch produced the
+                # dict it got. The calibration and freshness verdict is
+                # computed above and is true of this slate whether or not a
+                # board was dispatched -- withholding it here would make the
+                # gate's reason depend on why dispatch declined, which is a
+                # different question. Raised by review on #32; the two
+                # SKIPPED returns above carried the same gap.
+                return {"status": getattr(sent, "status", "OK"),
+                        "reason": f"board describes {sorted(board_slates)}, "
+                                  f"not {today_pt}",
+                        "embeds": len(embeds),
+                        "publication": verdict.as_dict()}
             rows = [
                 type("Row", (), {k: (None if pd.isna(v) else v) for k, v in r.items()})()
                 for r in frame.to_dict("records")
@@ -2122,10 +2301,40 @@ def _tipoff_display(tipoff_iso: str | None) -> str | None:
 
 
 def _flag(name: str, default: bool) -> bool:
+    """
+    An env flag, DEFAULTING rather than reading as off on an unusable value.
+
+    ONE CONVENTION FOR ONE KIND OF VALUE, in two processes. `main._flag_env`
+    recognises the off words as well as the on words and returns the DEFAULT
+    for anything it recognises as neither; this function returned
+    `raw in {on words}` -- i.e. **False** -- for the same input. So
+    `...=maybe` meant "use the default" to the orchestrator and "off" to the
+    worker.
+
+    HOW FAR THAT ACTUALLY REACHED, stated honestly because the first version
+    of this docstring overstated it: no variable is read by BOTH processes
+    today. Review on #32 raised it against `PROPIQ_FORWARD_SLATE`, which the
+    board branch it guarded read -- and that branch is gone, replaced by the
+    projections path, so the live disagreement went with it.
+    `PROPIQ_ESPN_INGEST`, `PROPIQ_DISPATCH` and
+    `PROPIQ_DISPATCH_ABSTENTIONS` are this worker's alone; `main.py` never
+    reads them. What remains is a trap rather than a bug: two parsers with
+    the same job and different answers, one of which the next shared switch
+    would be read by. Fixed here, where the next one lands, rather than left
+    for it.
+
+    A SECOND IMPLEMENTATION rather than an import, for the same reason
+    `_int_env` is: `main.py` is the orchestrator and must not come to need
+    APScheduler in order to read a boolean.
+    `tests/test_flag_parsers_agree.py` holds the two to the same answer on
+    every input, which is what makes two copies safe.
+    """
     raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def run_espn_ingest(

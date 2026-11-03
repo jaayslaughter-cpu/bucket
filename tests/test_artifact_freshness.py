@@ -30,6 +30,23 @@ from src.quant.publication_gate import (
     first_refusal,
 )
 
+
+def _frozen_pacific_day(monkeypatch, day: str = "2026-11-01") -> str:
+    """
+    Pin `pacific_calendar_date` for the duration of a test and return the day.
+
+    `scheduler_worker.run_dispatch` imports the function INSIDE the call, so
+    patching the module attribute is what the call actually sees.
+    """
+    from datetime import date as _date
+
+    from src.utils import timezones
+
+    frozen = _date.fromisoformat(day)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: frozen)
+    return str(frozen)
+
+
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
 
 
@@ -407,8 +424,16 @@ def test_the_worker_withholds_a_board_scored_by_a_stale_artifact(
         return type("R", (), {"status": "OK"})()
 
     board = tmp_path / "board.csv"
+    # ONE CLOCK, READ ONCE. `run_dispatch` refuses a board whose rows describe
+    # another slate, and it reads the Pacific day itself -- so a fixture that
+    # calls `pacific_calendar_date()` separately races the dispatch across
+    # Pacific midnight and fails in the staleness guard instead of testing
+    # artifact freshness. Raised by review on #32. Freezing the clock makes the
+    # test independent of when it runs.
+    slate = _frozen_pacific_day(monkeypatch)
     pd.DataFrame([{
-        "slate_date": "2026-10-11", "decision_status": "RECOMMENDED",
+        "slate_date": slate,
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,
@@ -453,8 +478,16 @@ def test_the_worker_publishes_when_the_artifact_is_current(monkeypatch, tmp_path
         return type("R", (), {"status": "OK"})()
 
     board = tmp_path / "board.csv"
+    # ONE CLOCK, READ ONCE. `run_dispatch` refuses a board whose rows describe
+    # another slate, and it reads the Pacific day itself -- so a fixture that
+    # calls `pacific_calendar_date()` separately races the dispatch across
+    # Pacific midnight and fails in the staleness guard instead of testing
+    # artifact freshness. Raised by review on #32. Freezing the clock makes the
+    # test independent of when it runs.
+    slate = _frozen_pacific_day(monkeypatch)
     pd.DataFrame([{
-        "slate_date": "2026-10-11", "decision_status": "RECOMMENDED",
+        "slate_date": slate,
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,

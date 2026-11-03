@@ -432,3 +432,167 @@ def test_a_partially_ingested_night_is_visible_as_the_games_it_holds(
     assert listed - held["2024-10-22"] == {"espn:40002"}, (
         "the missing game must be derivable from what the panel holds"
     )
+
+
+# --- the projections read side, against a real database -------------------
+
+
+def _bind_projections(monkeypatch, runs):
+    """
+    `session_scope` bound to a database holding these projection runs.
+
+    ``runs`` is ``[(run_id, created_at, game_date, [(player, market, line,
+    prob_over), ...]), ...]``. Against real SQLite rather than a stub,
+    because what is asserted below is which rows a query RETURNS and in
+    which order — neither of which a monkeypatched loader can be wrong
+    about, and both of which the query can.
+    """
+    from src.db.models import Projection
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(bind=engine, tables=[Projection.__table__])
+    factory = sessionmaker(bind=engine)
+    with factory() as seed:
+        for run_id, created, game_date, rows in runs:
+            for player, market, line, prob in rows:
+                seed.add(Projection(
+                    run_id=run_id, created_at=created, game_date=game_date,
+                    nba_player_id=player, player_name=f"HARNESS {player}",
+                    nba_game_id="espn:401909903", market=market,
+                    final_projection=20.0, baseline_projection=19.0,
+                    line=line, prob_over=prob, market_status="DATA_NOT_AVAILABLE",
+                ))
+        seed.commit()
+
+    @contextlib.contextmanager
+    def _scope():
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(repository, "session_scope", _scope)
+
+
+def test_a_re_run_cannot_double_the_board_because_the_schema_forbids_it(
+    monkeypatch,
+):
+    """
+    THE DEFECT MY FIRST VERSION OF THIS LOADER GUARDED AGAINST DID NOT EXIST,
+    and the guard introduced one that did.
+
+    `projections` is UNIQUE on (nba_game_id, player_name, market) -- run_id
+    is NOT in the key -- and `persist_projections` upserts on that identity
+    while refreshing run_id. So one (game, player, market) has exactly one
+    row, ever, carrying whichever run last wrote it. A re-run OVERWRITES;
+    it cannot double.
+
+    This test asserts that from the database side: inserting the same key
+    twice is a conflict, not two rows.
+    """
+    from datetime import datetime, timezone
+
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    day = date(2026, 11, 1)
+    with pytest.raises(IntegrityError):
+        _bind_projections(monkeypatch, [
+            ("run_morning", datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc), day,
+             [("espn:1", "PTS", 21.5, None)]),
+            ("run_rerun", datetime(2026, 11, 1, 11, 0, tzinfo=timezone.utc), day,
+             [("espn:1", "PTS", 22.5, 0.56)]),
+        ])
+
+
+def test_a_partial_re_run_keeps_every_row_rather_than_the_newest_runs_only(
+    monkeypatch,
+):
+    """
+    THE DEFECT THE RUN FILTER WOULD HAVE CAUSED. A re-run that covers only
+    SOME rows -- fewer markets after a config change, fewer players after
+    some games tipped -- leaves the untouched rows carrying the PREVIOUS
+    run_id, because the upsert only refreshes the rows it writes.
+
+    Selecting `run_id == newest` would have dropped those rows, and the
+    board would have shown fewer than the slate projected with nothing
+    saying so. Filtering by DATE returns all of them, which is correct:
+    each is still the newest value for its own key.
+    """
+    from datetime import datetime, timezone
+
+    day = date(2026, 11, 1)
+    _bind_projections(monkeypatch, [
+        # PTS was re-scored at 11:00; REB and AST still carry the 09:00 run.
+        ("run_rerun", datetime(2026, 11, 1, 11, 0, tzinfo=timezone.utc), day,
+         [("espn:1", "PTS", 22.5, 0.56)]),
+        ("run_morning", datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc), day,
+         [("espn:2", "REB", 8.5, None), ("espn:3", "AST", 4.5, None)]),
+    ])
+
+    out = repository.load_projections("2026-11-01")
+    assert len(out) == 3, (
+        "a row the re-run did not touch was dropped; the board would be "
+        f"narrower than the slate with nothing saying so. Got:\n{out}"
+    )
+    assert set(out["market"]) == {"PTS", "REB", "AST"}
+    assert set(out["run_id"]) == {"run_rerun", "run_morning"}, (
+        "provenance is preserved, so a mixed-run slate is visible"
+    )
+
+
+def test_projections_are_filtered_to_the_slate_date(monkeypatch):
+    """A board for tonight must not rank yesterday's rows. The filter is an
+    ISO string parsed to a date -- a string compared against a Date column
+    matches nothing in some backends and everything in others."""
+    from datetime import datetime, timezone
+
+    _bind_projections(monkeypatch, [
+        ("run_yesterday", datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc),
+         date(2026, 10, 31), [("espn:1", "PTS", 20.5, None)]),
+        ("run_today", datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc),
+         date(2026, 11, 1), [("espn:2", "REB", 8.5, None)]),
+    ])
+
+    today = repository.load_projections("2026-11-01")
+    assert today["run_id"].tolist() == ["run_today"]
+    yesterday = repository.load_projections("2026-10-31")
+    assert yesterday["run_id"].tolist() == ["run_yesterday"]
+
+
+def test_the_slate_date_has_no_default_because_there_is_no_honest_one(
+    monkeypatch,
+):
+    """
+    A board is a statement about ONE slate. For one commit `slate_date`
+    defaulted to None and the query then returned every projection the table
+    had ever held, which a caller would have ranked as tonight's. Raised by
+    review on #32: there is no honest default for "which day", so asking
+    without one is a TypeError rather than a silent full-table read.
+    """
+    import inspect
+
+    from src.db import repository
+
+    sig = inspect.signature(repository.load_projections)
+    param = sig.parameters["slate_date"]
+    assert param.default is inspect.Parameter.empty, (
+        "slate_date has a default again; load_projections() with no day "
+        "returns every slate ever persisted"
+    )
+    with pytest.raises(TypeError):
+        repository.load_projections()
+
+
+def test_no_run_returns_an_empty_frame_WITH_the_columns(monkeypatch):
+    """
+    So a caller's `[col]` access fails on a missing COLUMN rather than on a
+    missing frame — the contract `load_game_market_lines` already keeps.
+    `slate_board.projection_detail_rows` reads nine of these by name and
+    would raise a bare KeyError on a shapeless empty frame.
+    """
+    _bind_projections(monkeypatch, [])
+
+    out = repository.load_projections("2026-11-01")
+    assert out.empty
+    assert list(out.columns) == list(repository.PROJECTION_BOARD_COLS)
+    for col in ("nba_game_id", "market", "line", "prob_over", "final_projection"):
+        assert col in out.columns

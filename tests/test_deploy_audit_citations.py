@@ -71,14 +71,14 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 2897, "job_defaults"),
-    ("scheduler_worker.py", 2898, "max_instances"),
+    ("scheduler_worker.py", 3106, "job_defaults"),
+    ("scheduler_worker.py", 3107, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1649, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1770, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 767, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
@@ -99,6 +99,73 @@ ANCHORS = [
     ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
     ("src/quant/publication_gate.py", 70, "DEFAULT_MIN_SCORED = 100"),
 ]
+
+#: AUDIT PROSE BOUND TO AN ANCHORED LINE, which `test_every_cited_line_exists`
+#: cannot do: that test only checks the number is IN RANGE, so a citation that
+#: slides off its subject onto an import three lines away still passes while
+#: reading as though it had evidence. This caught exactly that on 2026-11-01 --
+#: the candidate evaluation's dispatch citation was refreshed to the
+#: `publication_gate` import at 1752 while the anchor below pinned the actual
+#: refusal at 1770, so the audit and the test disagreed about one fact.
+#:
+#: (audit, prose leading up to the citation, (path, line, substring))
+BOUND_CITATIONS = [
+    (
+        "docs/candidate_repo_evaluation_2026-10-11.md",
+        "wired into the nightly dispatch at",
+        ("scheduler_worker.py", 1770, "artifact_freshness_verdict()"),
+    ),
+    # A1's two entry points. This entry described a SHIPPED guardrail as an
+    # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
+    # the evaluation was written -- and §5 listed it unimplemented alongside
+    # it, so anyone working that backlog would have built a second lock
+    # beside the one already there. Bound here because the claim "both entry
+    # points take it" is only worth anything if both lines still do.
+    (
+        "docs/candidate_repo_evaluation_2026-10-11.md",
+        "scheduled slate at",
+        ("scheduler_worker.py", 1112, "with write_lock() as acquired:"),
+    ),
+    (
+        "docs/candidate_repo_evaluation_2026-10-11.md",
+        "`python main.py` at",
+        ("main.py", 1898, "with write_lock() as _acquired:"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "audit,lead,anchor",
+    BOUND_CITATIONS,
+    ids=[f"{a.split('/')[-1]}:{x[0]}:{x[1]}" for a, _, x in BOUND_CITATIONS],
+)
+def test_the_prose_cites_the_anchored_line_and_not_merely_a_valid_one(
+    audit, lead, anchor
+):
+    path, line, needle = anchor
+    text = (REPO / audit).read_text(encoding="utf-8")
+    assert lead in text, (
+        f"{audit} no longer contains {lead!r}; this binding is stale and is "
+        f"now checking nothing"
+    )
+    tail = text[text.index(lead) + len(lead):]
+    match = CITATION.search(tail)
+    assert match, f"no citation follows {lead!r} in {audit}"
+    cited_path, cited_line = match.group(1), int(match.group(2))
+    assert cited_path == path, (
+        f"{audit} cites {cited_path} after {lead!r}; expected {path}"
+    )
+    assert cited_line == line, (
+        f"{audit} cites {cited_path}:{cited_line} after {lead!r}, but the "
+        f"anchor for this finding is {path}:{line}. One of the two moved and "
+        f"the other did not -- the prose and the anchor must name one line."
+    )
+    # And that line is still the finding, not just a line that exists.
+    body = (REPO / path).read_text(encoding="utf-8").splitlines()
+    assert needle in body[line - 1], (
+        f"{path}:{line} no longer contains {needle!r}: {body[line - 1]!r}"
+    )
+
 
 #: A citation into a CANDIDATE repository, which is not in this tree:
 #: `owner/repo @ path:line`. The space-at-space makes it unmatchable by

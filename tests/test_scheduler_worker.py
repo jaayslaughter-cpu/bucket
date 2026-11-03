@@ -68,6 +68,64 @@ def board_panel(rows: int = 12, start: str = "2026-10-01"):
     })
 
 
+
+def _frozen_pacific_day(monkeypatch, day="2026-11-01"):
+    """
+    Pin the Pacific day for a test that goes through the real `run_dispatch`.
+
+    FROZEN, NOT READ TWICE. `run_dispatch` reads the Pacific day itself to
+    refuse a board describing another slate, so a fixture calling
+    `pacific_calendar_date()` separately races it across Pacific midnight and
+    fails in the staleness guard rather than on its own subject. Raised by
+    review on #32 against two other files; the same defect was in these.
+
+    Returns the frozen `date`; `str()` it for a CSV cell.
+    """
+    from datetime import date as _date
+
+    from src.utils import timezones
+
+    frozen = _date.fromisoformat(day)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: frozen)
+    return frozen
+
+
+def board_projections(slate_date="2026-11-01", rows=3, with_probability=False):
+    """
+    Persisted projection rows, in `repository.load_projections`' shape.
+
+    ONE COPY, because the board tests need it and it is the board's real
+    input now. `prob_over` is null by default, which is production's state
+    with no model artifact: the board still writes a row and says so per
+    row, rather than writing nothing.
+    """
+    import pandas as pd
+
+    return pd.DataFrame([
+        {
+            "run_id": "run_harness",
+            "nba_player_id": f"espn:{i}",
+            "player_name": f"HARNESS {i}",
+            "nba_game_id": "espn:401909903",
+            "game_date": pd.Timestamp(slate_date).date(),
+            "market": ["PTS", "REB", "AST"][i % 3],
+            "final_projection": 20.0 + i,
+            "baseline_projection": 19.0 + i,
+            "line": 19.5 + i,
+            "prob_over": 0.55 if with_probability else None,
+            "prob_under": 0.45 if with_probability else None,
+            "prob_push": None,
+            "market_status": (
+                "READY_FOR_EVALUATION" if with_probability else "DATA_NOT_AVAILABLE"
+            ),
+            "market_status_reason": None,
+            "ev_per_dollar": None,
+            "model_version": None,
+        }
+        for i in range(rows)
+    ])
+
+
 def _jobs() -> dict[str, dict]:
     scheduler = FakeScheduler()
     worker.build_scheduler(scheduler)
@@ -512,8 +570,14 @@ def test_a_board_with_no_calibration_report_is_dispatched_withheld(
         return type("R", (), {"status": "OK"})()
 
     board = tmp_path / "board.csv"
+    # The frozen Pacific day: the subject here is the calibration gate, and
+    # dispatch refuses a board describing another day before it ever reaches
+    # that gate (see
+    # `test_a_board_for_another_day_is_refused_rather_than_dispatched`).
+    slate = _frozen_pacific_day(monkeypatch)
     pd.DataFrame([{
-        "slate_date": "2026-09-29", "decision_status": "RECOMMENDED",
+        "slate_date": str(slate),
+        "decision_status": "RECOMMENDED",
         "decision_basis": "model_lean", "player_name": "DEMO_A",
         "target_market": "PTS", "side": "over", "line": 24.5,
         "model_prob": 0.71, "book_ev": None, "american_odds": None,
@@ -535,6 +599,106 @@ def test_a_board_with_no_calibration_report_is_dispatched_withheld(
     body = sent["embeds"][0]["description"]
     assert "withheld from publication" in body
     assert "DEMO_A" not in str(sent["embeds"][0])
+
+
+def test_a_board_for_another_day_is_refused_rather_than_dispatched(
+    monkeypatch, tmp_path
+):
+    """
+    The 9:03 failure on 2026-11-01 left no board on disk, which is why nothing
+    went out. The worse shape is the one where a board IS on disk and it
+    describes yesterday: dispatch reads the CSV without consulting the status
+    `run_board` returned, so a crash between write and dispatch, or an
+    operator's hand-run CLI, would publish last night's lines under tonight's
+    heading. The row carries its own `slate_date`; dispatch compares it to the
+    Pacific calendar day and names the day it actually describes.
+    """
+    import pandas as pd
+
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    today = _frozen_pacific_day(monkeypatch)
+    yesterday = str(today - timedelta(days=1))
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": yesterday, "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_STALE",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    # An abstention went out, and it names the day the file describes rather
+    # than reading as a broken pipeline.
+    assert sent["embeds"], "dispatch sent nothing at all"
+    blob = str(sent["embeds"][0])
+    assert yesterday in blob, f"the abstention does not name {yesterday}: {blob}"
+    assert str(today) in blob
+    # And the stale row never reached a person.
+    assert "DEMO_STALE" not in blob
+    assert yesterday in out["reason"]
+    # AND THE GATE'S VERDICT TRAVELS. A caller reading out["publication"]
+    # cannot know which branch produced its dict, so every return carries one:
+    # the calibration/freshness verdict is true of this slate whether or not a
+    # board went out. Raised by review on #32.
+    assert "publication" in out, (
+        f"the stale-board return dropped the publication verdict: {sorted(out)}"
+    )
+    assert "PUBLICATION_STATUS" in out["publication"]
+
+
+def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
+    """
+    The other head of the same guard: the comparison is to TODAY, not to a
+    constant, so a board written for tonight passes through to the rest of
+    dispatch. Without this, refusing every board would satisfy the test above.
+    """
+    import pandas as pd
+
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    today = _frozen_pacific_day(monkeypatch)
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": str(today),
+        "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_TODAY",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    blob = str(sent.get("embeds"))
+    assert "not " + str(today) not in blob
+    assert "describes" not in str(out.get("reason", ""))
 
 
 def test_settlement_rebuilds_the_calibration_report(monkeypatch, tmp_path):
@@ -1099,10 +1263,15 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
     this file had exactly that gap, and replacing run_board's call with the two
     hardcoded 2025 dates left it green.
 
-    So this captures what build_slate_board is actually handed.
+    So this captures what the board path is actually handed. It reads the
+    PROJECTIONS path now: a live slate no longer goes through
+    `compare_models_on_panel`, because that function scores a window of
+    games with known outcomes and tonight's have none. The window still
+    decides which day is asked for, which is what this asserts.
     """
     from datetime import date, timedelta
 
+    import src.db.repository as repo
     import src.pipeline.slate_board as slate_board_module
     from src.utils import timezones
 
@@ -1118,27 +1287,35 @@ def test_run_board_actually_uses_the_rolling_window(monkeypatch):
         def as_dict(self):
             return {"written_rows": 0}
 
-    def _fake_build(panel, **kwargs):
+    def _fake_build(projections, **kwargs):
         seen.update(kwargs)
+        seen["rows"] = len(projections)
         return _Result()
 
-    monkeypatch.setattr(slate_board_module, "build_slate_board", _fake_build)
+    monkeypatch.setattr(
+        slate_board_module, "build_board_from_projections", _fake_build,
+    )
+    monkeypatch.setattr(
+        repo, "load_projections", lambda slate, **k: board_projections(slate),
+    )
 
-    import src.db.repository as repo
-    # Dated so the newest game is `today`: the window assertions below are
-    # about which days were scored, and the builder needs real stat columns.
-    panel = board_panel(start=str(today - timedelta(days=11)))
-    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: panel)
+    # The comparison path must not be reached for a live slate at all.
+    def _must_not_compare(*a, **k):
+        raise AssertionError("a live board went through compare_models_on_panel")
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _must_not_compare)
 
     out = worker.run_board()
     assert out["status"] == "OK"
-    assert seen["validation_end"] == str(today)
-    assert seen["train_end"] == str(today - timedelta(days=1))
-    assert seen["train_end"] != "2025-01-15"
-    assert seen["validation_end"] != "2025-02-15"
+    assert seen["slate_date"] == str(today), (
+        f"the board asked for the wrong day: {seen.get('slate_date')}"
+    )
+    assert seen["slate_date"] != "2025-02-15"
+    assert out["source"] == "projections"
     # And the window travels with the result, so a log line says WHICH days
     # were scored rather than only how many rows came back.
     assert out["window"]["validation_end"] == str(today)
+    assert out["window"]["train_end"] == str(today - timedelta(days=1))
     assert out["window"]["is_backtest"] is False
 
 
@@ -1569,10 +1746,11 @@ def test_a_failure_arming_prelock_does_not_report_the_board_as_failed(
             return {"written_rows": 3}
 
     monkeypatch.setattr(
-        slate_board_module, "build_slate_board", lambda panel, **k: _Result()
+        slate_board_module, "build_board_from_projections",
+        lambda projections, **k: _Result(),
     )
     monkeypatch.setattr(
-        repo, "load_player_panel", lambda *a, **k: board_panel(),
+        repo, "load_projections", lambda slate, **k: board_projections(slate),
     )
 
     def _boom(*a, **k):
@@ -1655,11 +1833,18 @@ def test_the_healthcheck_certifies_the_file_settlement_actually_writes():
 # --- the board job must hand over a FEATURE MATRIX, not the raw panel ----
 
 
-def test_run_board_builds_features_before_handing_the_panel_over(
+def test_the_backtest_board_builds_features_before_handing_the_panel_over(
     monkeypatch, tmp_path,
 ):
     """
     THE BUG AN EMPTY DATABASE HID FOR THE WHOLE PROJECT'S LIFE.
+
+    MOVED TO THE BACKTEST WINDOW, where the assertion still holds and the
+    path still exists. A live board no longer goes through
+    `compare_models_on_panel` at all -- it reads `main.py`'s persisted
+    projections, which were scored from a matrix main already built. The
+    comparison path remains for an override into the past, and it still
+    needs the feature build in front of it for exactly the reason below.
 
     `run_board` loaded `load_player_panel()` and passed it straight to
     `build_slate_board`, which hands it to `compare_models_on_panel` ->
@@ -1685,6 +1870,9 @@ def test_run_board_builds_features_before_handing_the_panel_over(
     monkeypatch.setattr(
         repo, "load_player_panel", lambda *a, **k: board_panel(),
     )
+    # A WINDOW IN THE PAST, so the comparison path is the one taken.
+    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2026-10-25")
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-28")
 
     handed: dict = {}
 
@@ -2467,3 +2655,280 @@ def test_a_mixed_window_is_unavailable_rather_than_a_clean_no_op(monkeypatch):
     )
     assert out["already_held"] == 3
     assert out["games_seen"] == 1
+
+
+# --- a live board reads what the slate already projected -------------------
+
+
+def test_a_live_board_reads_projections_and_never_compares_models(
+    monkeypatch, tmp_path,
+):
+    """
+    THE WALL THREE FIXES WALKED INTO.
+
+    `compare_models_on_panel` drops every row whose `over_hit` is null
+    before it splits (`compare.py`), so a game with no outcome yet is
+    dropped and the function cannot describe tonight. #31 gave it the
+    feature matrix it needed; #32 attached the forward slate and the
+    forward rows were dropped at that same label filter — a fix that could
+    not work, caught in review.
+
+    The numbers already existed: `main.py` persists one row per (player,
+    game, market) with the line attached and the EV gate applied, and
+    nothing had ever read that table back. So a live board reads those and
+    does not compare models at all.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.pipeline.slate_board as slate_board_module
+    from src.utils import timezones
+
+    today = _d(2026, 11, 1)
+    monkeypatch.setattr(timezones, "pacific_calendar_date", lambda *a, **k: today)
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+
+    asked: dict = {}
+
+    def _load(slate=None, **kwargs):
+        asked["slate"] = slate
+        return board_projections(str(today))
+
+    monkeypatch.setattr(repo, "load_projections", _load)
+
+    def _must_not_compare(*a, **k):
+        raise AssertionError(
+            "a live board reached compare_models_on_panel, which drops "
+            "unlabelled rows and so cannot describe an unplayed game"
+        )
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _must_not_compare)
+    # The panel loader belongs to the backtest path; a live board must not
+    # need it at all.
+    monkeypatch.setattr(
+        repo, "load_player_panel",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("a live board loaded the player panel")
+        ),
+    )
+
+    out = worker.run_board()
+
+    assert out["status"] == "OK", out
+    assert out["source"] == "projections"
+    assert asked["slate"] == str(today), (
+        f"the board read the wrong slate date: {asked}"
+    )
+    # THE CSV IS THE DELIVERABLE, so read it. That the file EXISTS says
+    # nothing: an empty frame with a header satisfies that, and so would a
+    # board built from some other source. What matters is that the persisted
+    # projections arrived in it unchanged.
+    import pandas as pd
+
+    assert (tmp_path / "board.csv").exists(), "no board CSV was written"
+    written = pd.read_csv(tmp_path / "board.csv")
+    assert not written.empty, "the board CSV is a header with no rows"
+
+    # Every projected player reached the board, under the market it was
+    # projected for.
+    pairs = set(zip(written["player_name"], written["target_market"]))
+    assert pairs == {
+        ("HARNESS 0", "PTS"), ("HARNESS 1", "REB"), ("HARNESS 2", "AST"),
+    }, f"the projections did not survive into the board: {sorted(pairs)}"
+
+    # The numbers are CARRIED, not recomputed. `final_projection` 20.0 and
+    # `line` 19.5 came from the projections row for HARNESS 0; a board that
+    # had quietly re-derived them would not match.
+    first = written.loc[written["player_name"] == "HARNESS 0"].iloc[0]
+    assert float(first["prediction_mean"]) == 20.0, (
+        f"the projection was altered on the way through: {first['prediction_mean']}"
+    )
+    assert float(first["line"]) == 19.5
+    assert str(first["slate_date"]) == str(today)
+    assert str(first["game_date"]) == str(today), (
+        "the board lost game_date, which paper_research warns about per row"
+    )
+    assert str(first["event_id"]) == "espn:401909903"
+
+    # AND THE NULL PROBABILITY SURVIVES AS NULL. This is production's state
+    # with no model artifact: the row is written and says per row that it
+    # cannot resolve P(over), rather than a fabricated 0.5 that would read as
+    # a coin-flip opinion the model never formed.
+    assert written["model_prob"].isna().all(), (
+        "a probability appeared on a board built from projections that had "
+        f"none: {written['model_prob'].tolist()}"
+    )
+    assert set(written["decision_status"]) == {"ABSTAIN"}
+    assert (written["book_status"] == "DATA_NOT_AVAILABLE").all()
+    assert written["why"].str.contains("cannot resolve P").all(), (
+        f"no row says why it abstained: {written['why'].tolist()}"
+    )
+
+
+def test_a_backtest_window_still_uses_the_comparison_path(monkeypatch, tmp_path):
+    """
+    KEPT, NOT DELETED. An override into the past asks exactly what
+    `compare_models_on_panel` is for — fit on history, score a labelled
+    window — and those games have outcomes, so it works there. Replacing it
+    with the projections path would mean a backtest could only ever
+    describe days `main.py` happened to have run.
+    """
+    from datetime import date as _d
+
+    import src.db.repository as repo
+    import src.pipeline.slate_board as slate_board_module
+    from src.utils import timezones
+
+    monkeypatch.setattr(
+        timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
+    )
+    monkeypatch.setenv("PROPIQ_BOARD_TRAIN_END", "2026-10-25")
+    monkeypatch.setenv("PROPIQ_BOARD_VALIDATION_END", "2026-10-28")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+
+    monkeypatch.setattr(repo, "load_player_panel", lambda *a, **k: board_panel())
+    monkeypatch.setattr(
+        worker, "_board_market_frames",
+        lambda: {"team_games": None, "market_lines": None},
+    )
+
+    def _must_not_read_projections(*a, **k):
+        raise AssertionError("a backtest board read tonight's projections")
+
+    monkeypatch.setattr(repo, "load_projections", _must_not_read_projections)
+
+    seen: dict = {}
+
+    class _Result:
+        def as_dict(self):
+            return {"written_rows": 0}
+
+    def _capture(frame, **kwargs):
+        seen["train_end"] = kwargs.get("train_end")
+        seen["validation_end"] = kwargs.get("validation_end")
+        return _Result()
+
+    monkeypatch.setattr(slate_board_module, "build_slate_board", _capture)
+
+    out = worker.run_board()
+    assert out["window"]["is_backtest"] is True
+    assert out["source"] == "model comparison (backtest)"
+    assert seen == {"train_end": "2026-10-25", "validation_end": "2026-10-28"}
+
+
+def test_no_projections_for_the_slate_is_reported_not_crashed(monkeypatch, tmp_path):
+    """
+    A board asked for before the slate has run, or after a slate that
+    refused, has no input. That is the pipeline reporting its own state —
+    and it must name the day, because "no projections" with no date sends
+    an operator looking at the wrong one.
+    """
+    from datetime import date as _d
+
+    import pandas as pd
+
+    import src.db.repository as repo
+    from src.utils import timezones
+
+    monkeypatch.setattr(
+        timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
+    )
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(tmp_path / "board.csv"))
+    monkeypatch.setattr(
+        repo, "load_projections",
+        lambda slate, **k: pd.DataFrame(columns=list(repo.PROJECTION_BOARD_COLS)),
+    )
+
+    out = worker.run_board()
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert "2026-11-01" in out["reason"], (
+        f"the refusal does not name the day it asked for: {out['reason']}"
+    )
+    assert not (tmp_path / "board.csv").exists(), (
+        "an empty board CSV was written, which dispatch would read as a slate "
+        "with no value in it"
+    )
+
+
+def test_a_refused_board_removes_yesterdays_file_rather_than_leaving_it(
+    monkeypatch, tmp_path
+):
+    """
+    The version of the 9:03 failure that would have been worse. `run_board`
+    refused and wrote nothing — but a board from a PREVIOUS successful run is
+    still on disk, and `run_dispatch` reads that file without consulting the
+    status `run_board` returned. Left in place, yesterday's lines go out under
+    tonight's heading. The refusal removes it, so the operator sees "no
+    recommendations" instead of wrong ones.
+    """
+    from datetime import date as _d
+
+    import pandas as pd
+
+    import src.db.repository as repo
+    from src.utils import timezones
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-10-31", "player_name": "YESTERDAY_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "decision_status": "RECOMMENDED",
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setattr(
+        timezones, "pacific_calendar_date", lambda *a, **k: _d(2026, 11, 1),
+    )
+    monkeypatch.delenv("PROPIQ_BOARD_TRAIN_END", raising=False)
+    monkeypatch.delenv("PROPIQ_BOARD_VALIDATION_END", raising=False)
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+    monkeypatch.setattr(
+        repo, "load_projections",
+        lambda slate, **k: pd.DataFrame(columns=list(repo.PROJECTION_BOARD_COLS)),
+    )
+
+    out = worker.run_board()
+
+    assert out["status"] == "DATA_NOT_AVAILABLE"
+    assert out["discarded_stale_board"] is True, (
+        "the refusal did not report removing the stale file, so nothing "
+        "tells an operator why dispatch went quiet"
+    )
+    assert not board.exists(), (
+        "yesterday's board survived a refusal; dispatch reads this file and "
+        "would have published 2026-10-31 as tonight's slate"
+    )
+
+
+def test_a_board_already_written_for_this_slate_is_not_discarded(tmp_path):
+    """
+    The other head: the key is the rows' own `slate_date`, not the file's
+    age. A board rebuilt at 09:05 for tonight is not stale, and deleting it
+    would throw away the run that succeeded.
+    """
+    import pandas as pd
+
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": "2026-11-01", "player_name": "TONIGHT_A",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+    }]).to_csv(board, index=False)
+
+    assert worker._discard_stale_board(board, "2026-11-01") is False
+    assert board.exists(), "tonight's own board was deleted"
+
+
+def test_an_unreadable_board_is_removed_rather_than_left_for_dispatch(tmp_path):
+    """
+    An unparseable file is not evidence of anything. Leaving it would move
+    the failure to `run_dispatch`, which reads the CSV with no guard of its
+    own against a parse error.
+    """
+    board = tmp_path / "board.csv"
+    board.write_bytes(b"\x00\x01 not,a,csv\n\"unterminated")
+
+    assert worker._discard_stale_board(board, "2026-11-01") is True
+    assert not board.exists()

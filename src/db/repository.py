@@ -1039,6 +1039,106 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
     return df
 
 
+#: The projection columns a board row is built from. Named here rather than
+#: `select(Projection)`-and-hope, so a column renamed in `db.models` breaks
+#: this list instead of silently arriving as None in a board cell.
+PROJECTION_BOARD_COLS: tuple[str, ...] = (
+    "run_id", "nba_player_id", "player_name", "nba_game_id", "game_date",
+    "market", "final_projection", "baseline_projection", "line",
+    "prob_over", "prob_under", "prob_push", "market_status",
+    "market_status_reason", "ev_per_dollar", "model_version",
+)
+
+
+def load_projections(slate_date: str) -> pd.DataFrame:
+    """
+    One slate's persisted projections, as a frame.
+
+    THE READ SIDE THAT DID NOT EXIST. `persist_projections` has written this
+    table since the project began and nothing ever read it back, so the
+    numbers `main.py` produces for tonight were visible only in Postgres.
+    That is why the board reached for `compare_models_on_panel` instead -- a
+    function that fits models on LABELLED history and scores a window of
+    games with known outcomes, which structurally cannot describe a game
+    that has not been played. Found 2026-11-01, in review on #32.
+
+    FILTERED BY DATE AND NOT BY RUN, and the first version of this had it
+    the other way round. `projections` is UNIQUE on
+    ``(nba_game_id, player_name, market)`` -- run_id is NOT in the key -- and
+    `persist_projections` upserts on that identity while refreshing run_id,
+    so there is exactly one row per (game, player, market) and two runs of
+    one slate cannot coexist. Selecting the newest run_id was therefore
+    guarding against a doubling the schema already prevents, and it
+    introduced a real defect of its own: a re-run that covers only SOME rows
+    -- fewer markets after a config change, fewer players after some games
+    tipped -- leaves the untouched rows carrying the previous run_id, and a
+    run_id filter drops them. The board would have shown fewer rows than the
+    slate projected with nothing saying so.
+
+    The distinct run ids ARE logged, because a slate whose rows were last
+    written by two different runs is worth seeing rather than averaging over.
+
+    WHAT IT DOES NOT DO: no projection is computed, scored or adjusted here.
+    These are the rows `main.py` already wrote, read back by key.
+
+    `slate_date` IS REQUIRED, and was optional for one commit. A board is a
+    statement about ONE slate; defaulted to None this returned every
+    projection the table has ever held, and the caller would have ranked
+    last month's games beside tonight's with nothing in the frame to say
+    which was which. There is no honest default for "which day", so there
+    is no default. Raised by review on #32.
+
+    An absent slate or an empty table returns an EMPTY FRAME WITH THE
+    COLUMNS, so a caller's `[col]` access fails on a missing column rather
+    than on a missing frame -- the same contract `load_game_market_lines`
+    keeps, and `slate_board.projection_detail_rows` reads ten of them by
+    name.
+    """
+    from datetime import date as _date
+
+    day = _date.fromisoformat(str(slate_date))
+    with session_scope() as session:
+        stmt = (
+            select(Projection)
+            .where(Projection.game_date == day)
+            .order_by(Projection.market, Projection.player_name)
+        )
+        rows = session.execute(stmt).scalars().all()
+
+    out = (
+        pd.DataFrame(columns=list(PROJECTION_BOARD_COLS)) if not rows
+        else pd.DataFrame([
+            {col: getattr(r, col) for col in PROJECTION_BOARD_COLS} for r in rows
+        ])
+    )
+    if out.empty:
+        logger.info(
+            "No projections found for %s — nothing to build a board from.",
+            slate_date,
+        )
+        return out
+
+    runs = sorted({str(r) for r in out["run_id"].dropna().unique()})
+    logger.info(
+        "Loaded %d projection row(s)%s from run(s) %s (%d market(s), %d with "
+        "a line, %d with a probability).",
+        len(out), f" for {slate_date}" if slate_date else "", ", ".join(runs),
+        out["market"].nunique(), int(out["line"].notna().sum()),
+        int(out["prob_over"].notna().sum()),
+    )
+    if len(runs) > 1:
+        logger.warning(
+            "These projections were last written by %d DIFFERENT runs (%s). "
+            "That is a slate re-run which covered only some rows: the upsert "
+            "keys on (game, player, market) and refreshes run_id, so an "
+            "untouched row keeps the older run's id. Every row is still the "
+            "newest value for its own key -- this is provenance, not a "
+            "duplicate -- but a board built from it mixes two scorings.",
+            len(runs), ", ".join(runs),
+        )
+    return out
+
+
 def persist_projections(df: pd.DataFrame, run_id: str) -> int:
     if df.empty:
         return 0
