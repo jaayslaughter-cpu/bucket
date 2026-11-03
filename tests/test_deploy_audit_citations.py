@@ -115,6 +115,22 @@ BOUND_CITATIONS = [
         "wired into the nightly dispatch at",
         ("scheduler_worker.py", 1770, "artifact_freshness_verdict()"),
     ),
+    # A1's two entry points. This entry described a SHIPPED guardrail as an
+    # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
+    # the evaluation was written -- and §5 listed it unimplemented alongside
+    # it, so anyone working that backlog would have built a second lock
+    # beside the one already there. Bound here because the claim "both entry
+    # points take it" is only worth anything if both lines still do.
+    (
+        "docs/candidate_repo_evaluation_2026-10-11.md",
+        "scheduled slate at",
+        ("scheduler_worker.py", 1112, "with write_lock() as acquired:"),
+    ),
+    (
+        "docs/candidate_repo_evaluation_2026-10-11.md",
+        "`python main.py` at",
+        ("main.py", 1898, "with write_lock() as _acquired:"),
+    ),
 ]
 
 
