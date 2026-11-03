@@ -2793,6 +2793,54 @@ def run_history_backfill() -> dict[str, Any]:
         )
         return {"status": "SKIPPED", "reason": "espn ingest disabled"}
 
+    # THE 60-MINUTE LEAD IS NOT A SUBSTITUTE FOR THE LOCK, and for one
+    # deploy it was the only thing standing here. `history_backfill_time`
+    # guarantees this job STARTS at least an hour before the slate; nothing
+    # made it FINISH. An overrun writes seasons of box scores into
+    # `player_game_logs` while the slate reads them, and that function's own
+    # docstring already named the cost: "the slate would score a partially
+    # written panel, exit 0, and say nothing -- `max_instances` is per job,
+    # so it does not help here." A schedule is a prediction; a lock is a
+    # guarantee.
+    #
+    # THE SAME LOCK THE SLATE TAKES (`src/utils/write_lock.py`, A1), so the
+    # two cannot interleave whatever either one's duration turns out to be.
+    # Taken AFTER the config guards on purpose: a backfill that is switched
+    # off should not touch the lock at all, and this job runs every night
+    # whether or not it is configured.
+    #
+    # DECLINING IS THE POINT, and it is the direction that trades a silent
+    # wrong answer for a loud missing one. If the slate holds the lock, this
+    # run is skipped and tomorrow's picks up the same dates -- the plan is
+    # derived from what the panel holds, so nothing is lost by waiting. The
+    # reverse (the slate declining) costs one morning's board, which is
+    # visible in the channel. Neither is a failure, so neither alerts.
+    from src.utils.write_lock import write_lock
+
+    with write_lock() as acquired:
+        if not acquired:
+            logger.warning(
+                "History backfill SKIPPED: another process holds the slate "
+                "write lock. Nothing was read and nothing was written. "
+                "Tomorrow's run plans from the panel again and picks up the "
+                "same dates. A deliberate decline, not a failure."
+            )
+            return {
+                "status": "SKIPPED",
+                "reason": "another process holds the slate write lock",
+                "seasons": seasons,
+            }
+        return _run_history_backfill_locked(seasons)
+
+
+def _run_history_backfill_locked(seasons: list[int]) -> dict[str, Any]:
+    """
+    The backfill body, with the slate write lock already held.
+
+    Split out for the reason `_run_slate_locked` is: the acquisition stays
+    one short, readable block instead of indenting the whole job, and the
+    decline path is impossible to miss when reading the caller.
+    """
     chunk = _int_env(
         ENV_ESPN_HISTORY_CHUNK, DEFAULT_ESPN_HISTORY_CHUNK_DAYS, low=1, high=400,
     )

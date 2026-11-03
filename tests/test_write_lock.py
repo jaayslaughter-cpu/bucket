@@ -187,6 +187,20 @@ def test_both_entry_points_take_the_lock():
         "interleave with a manual run"
     )
 
+    # the THIRD writer: the ESPN history backfill. It walks seasons of box
+    # scores into `player_game_logs`, and for one deploy the only thing
+    # between it and the slate was `history_backfill_time`'s 60-minute lead
+    # -- which guarantees when it STARTS, not when it finishes.
+    backfill = next(
+        n for n in ast.walk(worker_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "run_history_backfill"
+    )
+    assert takes_lock(backfill), (
+        "run_history_backfill does not take the write lock, so an overrunning "
+        "backfill can write the panel while the 09:00 slate reads it -- and "
+        "the slate would score a partially written panel and exit 0"
+    )
+
 
 def test_main_itself_still_holds_the_pipeline_body():
     """
@@ -217,4 +231,90 @@ def test_main_itself_still_holds_the_pipeline_body():
         "moved into a helper to wrap it in something, four other AST tests are "
         "about to fail too -- take the wrapper at main's CALL SITES instead "
         "(main.py's __main__ block and scheduler_worker.run_slate)."
+    )
+
+
+def test_the_backfill_declines_rather_than_writing_under_a_held_lock(monkeypatch):
+    """
+    A HELD LOCK MUST STOP IT BEFORE IT READS, not merely before it writes.
+
+    The plan is derived from `panel_game_ids_by_date` -- the same panel the
+    slate is writing -- so a backfill that planned under a held lock would
+    decide which dates to fetch from a half-written table. Both the read and
+    the write are asserted absent.
+
+    Declining costs nothing: tomorrow's run plans from the panel again and
+    picks up the same dates.
+    """
+    import contextlib
+
+    import scheduler_worker as worker
+    import src.db.repository as repo
+    from src.utils import write_lock as wl
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2025,2026")
+
+    @contextlib.contextmanager
+    def _held(*a, **k):
+        yield False
+
+    # `run_history_backfill` imports write_lock INSIDE the call, so the module
+    # attribute is what it resolves.
+    monkeypatch.setattr(wl, "write_lock", _held)
+    monkeypatch.setattr(
+        worker, "run_espn_ingest",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the backfill WROTE to the panel under a held lock")
+        ),
+    )
+    monkeypatch.setattr(
+        repo, "panel_game_ids_by_date",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the backfill READ the panel under a held lock")
+        ),
+    )
+
+    out = worker.run_history_backfill()
+
+    assert out["status"] == "SKIPPED", out
+    assert "write lock" in out["reason"], (
+        f"the decline does not say why: {out.get('reason')!r}"
+    )
+    # A decline is not a failure, so it must not look like one.
+    assert "error" not in out, out
+
+
+def test_the_backfill_proceeds_when_the_lock_is_free(monkeypatch):
+    """
+    THE OTHER HEAD. Without this, a backfill that declined unconditionally
+    would satisfy the test above and never ingest anything again -- which is
+    the quiet version of the failure the lock exists to prevent.
+    """
+    import contextlib
+
+    import scheduler_worker as worker
+    import src.db.repository as repo
+    from src.utils import write_lock as wl
+
+    monkeypatch.setenv(worker.ENV_ESPN_HISTORY_SEASONS, "2025,2026")
+
+    @contextlib.contextmanager
+    def _free(*a, **k):
+        yield True
+
+    monkeypatch.setattr(wl, "write_lock", _free)
+
+    reached = {}
+
+    def _planned(source, *a, **k):
+        reached["panel_read"] = True
+        raise RuntimeError("stop here -- getting this far is the assertion")
+
+    monkeypatch.setattr(repo, "panel_game_ids_by_date", _planned)
+
+    out = worker.run_history_backfill()
+
+    assert reached.get("panel_read"), (
+        "a FREE lock did not let the backfill reach its planning read, so it "
+        f"is declining unconditionally: {out}"
     )
