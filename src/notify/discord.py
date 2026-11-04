@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -921,9 +922,24 @@ def build_research_preview_embed(
         if line is None or proj is None:
             continue
         try:
-            lean = float(proj) - float(line)
+            line_f = float(line)
+            proj_f = float(proj)
         except (TypeError, ValueError):
             continue
+        # NaN IS NOT None, AND IT DEFEATS THE FILTER BELOW. Over half of
+        # 2026-11-04's rows carried no posted line (754 of 1620 matched one;
+        # the settlement recorder named the other 866 "no posted line"). A
+        # row like that reaches a pandas frame as NaN, and `nan - 27.5` is
+        # `nan`, which is neither `> 0` nor `< 0` -- so the leaning-side
+        # filter rejects nothing, `abs(nan) > abs(x)` is false against
+        # everything so it never loses a tie, and it renders literally as
+        # "`+nan` PLAYER PTS OVER nan". `scheduler_worker.run_dispatch`
+        # happens to convert NaN to None when it builds its rows, which is
+        # why no such line has reached a card; a renderer that is only safe
+        # because of what its caller did is one caller away from not being.
+        if not (math.isfinite(line_f) and math.isfinite(proj_f)):
+            continue
+        lean = proj_f - line_f
         side = str(getattr(c, "side", "") or "").lower()
         # The leaning side only. A projection above the line leans over.
         if (lean > 0 and side != "over") or (lean < 0 and side != "under"):
@@ -960,7 +976,7 @@ def build_research_preview_embed(
     else:
         body = (
             f"**RESEARCH PREVIEW — not recommendations.** "
-            f"{len(best)} prop(s) on this slate, ordered by model lean "
+            f"{len(best)} prop(s) with a posted line, ordered by model lean "
             f"(projection − line). A lean is not an edge and not an EV: it "
             f"says the model disagrees with the line, not that the "
             f"disagreement is worth anything. No probability is shown "

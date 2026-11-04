@@ -49,8 +49,8 @@ first slate run fails at inference rather than at build.
 
 **Secrets: clean.** No credential literals. The two grep hits for
 key-shaped names are env var *names*, not values:
-`discord.py:44 ENV_WEBHOOK_URL = "DISCORD_WEBHOOK_URL"` and
-`propline.py:47 ENV_API_KEY = "PROPLINE_API_KEY"`. `.env.example` documents
+`discord.py:53 ENV_WEBHOOK_URL = "DISCORD_WEBHOOK_URL"` and
+`propline.py:51 ENV_API_KEY = "PROPLINE_API_KEY"`. `.env.example` documents
 `DATABASE_URL`, `PROPLINE_API_KEY`, `DISCORD_WEBHOOK_URL`,
 `PROPIQ_MASTER_GUIDELINE`, `BIGDATABALL_XLSX`, `TZ_DISPLAY`, `LOG_LEVEL`.
 
