@@ -74,6 +74,49 @@ UNMATCHED = "DATA_NOT_AVAILABLE"
 _STRIP = re.compile(r"[.'‘’ʼ]")
 _TO_SPACE = re.compile(r"[-_/,]")
 
+# WHERE THE NORMALISER STOPS AND A HUMAN STARTS.
+#
+# Everything above this line is derivable: a diacritic, a dot, an apostrophe,
+# a hyphen. "Alexandre" -> "Alex" is not. It is a different given name for the
+# same person, and no deterministic rule produces one from the other -- while
+# the fuzzy score that would is precisely the score that also accepts Jalen
+# Williams as Jaylen Williams (see the table at the top of this module). So
+# the remaining cases are NAMED, one at a time, and each one is a claim about
+# a specific person that someone checked.
+#
+# PROVENANCE IS THE WHOLE POINT. The panel stores ESPN's
+# ``athlete.displayName`` (``src/ingestion/espn_game.py:282``), so an entry is
+# only admissible if ESPN's own roster carries the value spelling and carries
+# no player under the key spelling. Every entry below was checked against
+# ESPN's NBA rosters on 2026-11-05 and was logged unmatched by the 2026-11-04
+# slate -- which is also the bar for adding one: a name production actually
+# missed, verified against the source the panel is built from, never a
+# plausible-looking pair.
+#
+#   board "Alexandre Sarr" -> ESPN "Alex Sarr"        (WSH; the only Sarr)
+#   board "Joshua Giddey"  -> ESPN "Josh Giddey"      (CHI; the only Giddey)
+#   board "Jaime Jaquez"   -> ESPN "Jaime Jaquez Jr." (MIL; the only Jaquez)
+#
+# THE JAQUEZ ENTRY IS NOT A SUFFIX RULE. Suffixes stay part of the key on
+# purpose, because ``Gary Payton II`` and ``Gary Payton`` are two people. This
+# names one player whose book spelling drops his suffix; it does not make
+# ``Jr``/``II`` optional for anyone else, and
+# ``test_suffix_stripping_is_still_not_a_rule`` fails if it ever does.
+#
+# Keys and values are in canonical (normalised) form, because that is what
+# they are compared against. Lookup is ONE HOP: a value may not itself be a
+# key, so resolution cannot depend on dict order.
+# How many unmatched names the warning spells out. High enough that a real
+# slate's misses all appear (2026-11-04 had 23), bounded so a board describing
+# an entirely different slate cannot write a thousand names into the log.
+_UNMATCHED_LOG_CAP = 60
+
+BOARD_NAME_ALIASES: dict[str, str] = {
+    "alexandre sarr": "alex sarr",
+    "joshua giddey": "josh giddey",
+    "jaime jaquez": "jaime jaquez jr",
+}
+
 
 def normalise_player_name(name: Any) -> str:
     """
@@ -209,12 +252,24 @@ class PlayerIdCrosswalk:
             )
 
         candidates = self._by_key.get(key, [])
+        # EXACT FIRST, ALWAYS. The alias table exists to reach a name the
+        # panel HAS under a spelling the book uses; it must never rewrite a
+        # name the panel already carries, or a future panel gaining the
+        # board's own spelling would start resolving to somebody else.
+        alias_key: str | None = None
+        if not candidates:
+            aliased = BOARD_NAME_ALIASES.get(key)
+            if aliased:
+                candidates = self._by_key.get(aliased, [])
+                if candidates:
+                    alias_key = aliased
         if not candidates:
             return CrosswalkMatch(
                 query_name=raw,
                 status=UNMATCHED,
                 reason=(
-                    "no panel player normalises to this name. Deliberately not "
+                    "no panel player normalises to this name, and no entry in "
+                    "BOARD_NAME_ALIASES reaches one. Deliberately not "
                     "fuzzy-matched: on real NBA names a score high enough to "
                     "catch a diacritic also catches Jalen/Jaylen."
                 ),
@@ -224,6 +279,10 @@ class PlayerIdCrosswalk:
             return CrosswalkMatch(
                 query_name=raw, status=MATCHED, matched_name=hit.name,
                 player_id=hit.player_id, team=hit.team,
+                reason=(
+                    f"book spelling aliased to {alias_key!r}"
+                    if alias_key else None
+                ),
             )
 
         wanted_team = normalise_player_name(team)
@@ -250,6 +309,28 @@ class PlayerIdCrosswalk:
                 "a price is a wrong record, not a near miss."
             ),
         )
+
+    def names_sharing_surname(self, query_name: Any) -> list[str]:
+        """
+        Panel names whose last token equals this one's, for DIAGNOSIS ONLY.
+
+        This is not a matching rule and nothing resolves through it. It
+        answers the one question an unmatched name raises and the warning
+        could not previously distinguish: is the panel carrying this player
+        under another spelling, or not carrying them at all? Those have
+        different fixes -- an alias entry versus a missing game -- and
+        guessing between them is how a day gets spent on the wrong one.
+        """
+        key = normalise_player_name(query_name)
+        if not key:
+            return []
+        surname = key.split()[-1]
+        return sorted({
+            record.name
+            for panel_key, records in self._by_key.items()
+            if panel_key.split()[-1] == surname
+            for record in records
+        })
 
     def match_many(
         self,
@@ -357,10 +438,31 @@ def resolve_board_names(
             list(rewrites.items())[:3],
         )
     if report.unmatched:
+        # EVERY NAME, NOT FIVE OF THEM. This warning used to print
+        # `report.unmatched[:5]`, which is how 2026-11-04's 23 misses stayed
+        # undiagnosable: the five shown happened to include two players the
+        # panel did not carry at all, so the list read as a spelling problem
+        # when half of it was not one. A warning you cannot act on is a
+        # warning that gets ignored.
+        #
+        # Each name is classified by whether the panel holds anyone with the
+        # same surname. "Alexandre Sarr -> has Alex Sarr" is an alias to add
+        # (see BOARD_NAME_ALIASES); "Kon Knueppel -> none" is this slate not
+        # carrying him, which no name table can fix.
+        detail = []
+        for name in report.unmatched[:_UNMATCHED_LOG_CAP]:
+            near = crosswalk.names_sharing_surname(name)
+            detail.append(f"{name} -> {near if near else 'no such surname in panel'}")
+        elided = max(0, len(report.unmatched) - _UNMATCHED_LOG_CAP)
         logger.warning(
-            "Name crosswalk: %d board name(s) match no panel player: %s. These "
-            "rows will carry no line.",
-            len(report.unmatched), report.unmatched[:5],
+            "Name crosswalk: %d board name(s) match no panel player, so those "
+            "rows carry no line. Each is shown with the panel name(s) sharing "
+            "its surname: a name beside a candidate is a spelling to add to "
+            "BOARD_NAME_ALIASES, a name beside none is a player this slate's "
+            "panel does not carry. %s%s",
+            len(report.unmatched),
+            "; ".join(detail),
+            f" (+{elided} more)" if elided else "",
         )
     if report.ambiguous:
         logger.warning(

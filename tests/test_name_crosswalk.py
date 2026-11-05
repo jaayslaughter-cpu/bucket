@@ -280,3 +280,166 @@ def test_an_unresolved_name_is_left_alone_rather_than_dropped():
     assert name_map == {}
     assert report.unmatched == ["Nobody Here"]
     assert list(apply_name_map(board, name_map)["player_name"]) == ["Nobody Here"]
+
+
+# --- the explicit alias table: book spellings the normaliser cannot reach ---
+
+
+def _panel(names_and_teams):
+    import pandas as pd
+
+    return pd.DataFrame(
+        [{"PLAYER_NAME": n, "TEAM_ABBREVIATION": t} for n, t in names_and_teams]
+    )
+
+
+def _board(names):
+    import pandas as pd
+
+    return pd.DataFrame([{"player_name": n} for n in names])
+
+
+# VERIFIED AGAINST THE PANEL'S OWN NAME SOURCE, not guessed. The panel stores
+# ESPN's `athlete.displayName` (src/ingestion/espn_game.py:282), and these are
+# the spellings ESPN's own NBA rosters carried on 2026-11-05:
+#
+#   board "Alexandre Sarr"  -> ESPN "Alex Sarr"        (WSH, sole Sarr)
+#   board "Joshua Giddey"   -> ESPN "Josh Giddey"      (CHI, sole Giddey)
+#   board "Jaime Jaquez"    -> ESPN "Jaime Jaquez Jr." (MIL, sole Jaquez)
+#
+# All three were logged unmatched by the 2026-11-04 slate.
+VERIFIED_ALIAS_CASES = [
+    ("Alexandre Sarr", "Alex Sarr", "WSH"),
+    ("Joshua Giddey", "Josh Giddey", "CHI"),
+    ("Jaime Jaquez", "Jaime Jaquez Jr.", "MIL"),
+]
+
+
+@pytest.mark.parametrize("board_name,panel_name,team", VERIFIED_ALIAS_CASES)
+def test_a_known_book_spelling_resolves_to_the_panel_name(board_name, panel_name, team):
+    """
+    THE NORMALISER CANNOT REACH THESE, and it should not try.
+
+    "Alexandre" -> "Alex" is not a diacritic, a dot or a hyphen; it is a
+    different given name for the same person. No deterministic rule derives
+    one from the other, and the fuzzy score that would is the same score that
+    accepts Jalen Williams as Jaylen Williams. So they are named, one by one,
+    from the panel's own source.
+    """
+    name_map, report = resolve_board_names(
+        _board([board_name]), _panel([(panel_name, team)])
+    )
+    assert name_map.get(board_name) == panel_name, (
+        f"{board_name!r} did not resolve to {panel_name!r}: {report.as_dict()}"
+    )
+    assert not report.unmatched
+
+
+def test_an_alias_never_overrides_a_real_panel_player_of_that_name():
+    """
+    EXACT FIRST, ALWAYS. If the panel ever carries the board's own spelling --
+    a second Sarr, or ESPN changing its mind -- that player wins, because the
+    alias exists to reach a name the panel has, not to rewrite one it has.
+    """
+    name_map, report = resolve_board_names(
+        _board(["Alexandre Sarr"]),
+        _panel([("Alexandre Sarr", "WSH"), ("Alex Sarr", "CHA")]),
+    )
+    assert name_map.get("Alexandre Sarr") == "Alexandre Sarr"
+    assert not report.unmatched
+
+
+def test_an_alias_that_lands_on_two_players_is_still_refused():
+    """
+    The alias is a spelling, not a licence to guess. Landing on two people is
+    the same refusal as any other ambiguous key.
+    """
+    name_map, report = resolve_board_names(
+        _board(["Joshua Giddey"]),
+        _panel([("Josh Giddey", "CHI"), ("Josh Giddey", "OKC")]),
+    )
+    assert "Joshua Giddey" not in name_map
+    assert report.ambiguous, report.as_dict()
+
+
+def test_the_alias_table_is_normalised_and_does_not_chain():
+    """
+    AN INVARIANT, not a behaviour: every key and value is already in canonical
+    form, and no value is itself a key. A chain would make resolution depend
+    on dict order, which is how a crosswalk starts guessing.
+    """
+    from src.ingestion.id_crosswalk import BOARD_NAME_ALIASES
+
+    for key, value in BOARD_NAME_ALIASES.items():
+        assert key == normalise_player_name(key), f"{key!r} is not normalised"
+        assert value == normalise_player_name(value), f"{value!r} is not normalised"
+        assert key != value, f"{key!r} aliases itself"
+        assert value not in BOARD_NAME_ALIASES, (
+            f"{key!r} -> {value!r} -> {BOARD_NAME_ALIASES[value]!r} is a chain"
+        )
+
+
+def test_suffix_stripping_is_still_not_a_rule(caplog):
+    """
+    THE FATHER/SON GUARD IS UNCHANGED, and this is the test that would catch
+    an alias table quietly growing into one. "Jaime Jaquez" is aliased
+    BY NAME; "Gary Payton" is not, so it must not reach "Gary Payton II".
+    """
+    name_map, report = resolve_board_names(
+        _board(["Gary Payton"]), _panel([("Gary Payton II", "GS")])
+    )
+    assert "Gary Payton" not in name_map
+    assert report.unmatched == ["Gary Payton"]
+
+
+def test_every_unmatched_name_is_logged_and_says_which_kind_of_miss_it_is(caplog):
+    """
+    THE WARNING IS THE ONLY DIAGNOSIS THERE IS, so it has to be complete.
+
+    On 2026-11-04 production logged "23 board name(s) match no panel player"
+    and then showed five of them, two of which (Kon Knueppel, Ivica Zubac)
+    the panel did not carry under ANY spelling. So the sample read as a
+    spelling problem when half of it was a coverage problem, and the other
+    eighteen names were never visible at all.
+
+    A miss beside a same-surname candidate is an alias to add. A miss beside
+    nothing is a player the slate's panel does not hold. The warning must
+    name every miss and tell the two apart.
+    """
+    import logging
+
+    board = _board([
+        "Alexandre Sarr",   # aliased, so NOT a miss at all
+        "Joshua Giddey",    # ditto
+        "Jaylen Nowell",    # panel has a different Nowell -> spelling candidate
+        "Kon Knueppel",     # panel holds no Knueppel -> coverage, not spelling
+        "Ivica Zubac",      # ditto
+        "Not A Player",     # ditto
+    ])
+    panel = _panel([
+        ("Alex Sarr", "WSH"),
+        ("Josh Giddey", "CHI"),
+        ("Jalen Nowell", "MEM"),
+    ])
+
+    with caplog.at_level(logging.WARNING, logger="src.ingestion.id_crosswalk"):
+        _name_map, report = resolve_board_names(board, panel)
+
+    assert len(report.unmatched) == 4, report.unmatched
+    blob = caplog.text
+
+    # EVERY miss by name, not a sample.
+    for missed in ("Jaylen Nowell", "Kon Knueppel", "Ivica Zubac", "Not A Player"):
+        assert missed in blob, f"{missed!r} was not named in the warning: {blob}"
+
+    # AND THE TWO KINDS ARE DISTINGUISHABLE.
+    assert "Jaylen Nowell -> ['Jalen Nowell']" in blob, (
+        "a miss with a same-surname candidate must show it, because that is "
+        f"the one that an alias entry fixes: {blob}"
+    )
+    assert "Kon Knueppel -> no such surname in panel" in blob, (
+        f"a coverage miss must say so rather than looking like a typo: {blob}"
+    )
+
+    # THE ALIASED NAMES ARE NOT IN THE MISS LIST.
+    assert "Alexandre Sarr" not in blob and "Joshua Giddey" not in blob
