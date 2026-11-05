@@ -106,6 +106,19 @@ _TO_SPACE = re.compile(r"[-_/,]")
 # Keys and values are in canonical (normalised) form, because that is what
 # they are compared against. Lookup is ONE HOP: a value may not itself be a
 # key, so resolution cannot depend on dict order.
+# GENERATIONAL SUFFIXES, FOR THE DIAGNOSTIC HINT ONLY.
+#
+# These are NOT stripped from a matching key -- `Gary Payton II` and `Gary
+# Payton` stay two different people, which is the whole point of the module
+# docstring's last paragraph. They are listed here because
+# `names_sharing_surname` needs to know which trailing token is a suffix
+# rather than a surname. Its first version compared the last token outright,
+# so the 2026-11-05 slate logged "Jase Richardson Jr. -> ['Tim Hardaway Jr.',
+# 'Wendell Carter Jr.']" (three unrelated people whose names end in "Jr.")
+# and "Wendell Carter -> ['Jevon Carter']", omitting the panel's own "Wendell
+# Carter Jr." -- the one name that was the answer.
+_GENERATIONAL_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
 # How many unmatched names the warning spells out. High enough that a real
 # slate's misses all appear (2026-11-04 had 23), bounded so a board describing
 # an entirely different slate cannot write a thousand names into the log.
@@ -115,6 +128,18 @@ BOARD_NAME_ALIASES: dict[str, str] = {
     "alexandre sarr": "alex sarr",
     "joshua giddey": "josh giddey",
     "jaime jaquez": "jaime jaquez jr",
+    # Both logged unmatched by the 2026-11-05 slate (ORL at PHX), both
+    # checked the same way, and note they MISMATCH IN OPPOSITE DIRECTIONS --
+    # which is the argument against a blanket suffix rule as much as for one:
+    #
+    #   board "Wendell Carter"      -> ESPN "Wendell Carter Jr." (ORL)
+    #       ESPN has no bare Wendell Carter; the other Carters are Jevon
+    #       (ORL), Devin (BOS) and Carter Bryant (SA), none of them him.
+    #   board "Jase Richardson Jr." -> ESPN "Jase Richardson"    (ORL)
+    #       ESPN has no Jase Richardson Jr.; the book adds a suffix the
+    #       panel does not carry.
+    "wendell carter": "wendell carter jr",
+    "jase richardson jr": "jase richardson",
 }
 
 
@@ -136,6 +161,23 @@ def normalise_player_name(name: Any) -> str:
     stripped = _STRIP.sub("", lowered)
     spaced = _TO_SPACE.sub(" ", stripped)
     return " ".join(spaced.split())
+
+
+def _surname_for_hint(name: Any) -> str:
+    """
+    The surname to compare NAMES BY EYE, suffix set aside. Diagnosis only.
+
+    Nothing resolves through this. It exists so the unmatched-name warning
+    can point at "Wendell Carter Jr." when the board says "Wendell Carter",
+    instead of at everyone else whose name ends in the same suffix.
+
+    A name that is nothing but a suffix keeps it, because dropping it would
+    leave no surname at all to compare.
+    """
+    tokens = normalise_player_name(name).split()
+    while len(tokens) > 1 and tokens[-1] in _GENERATIONAL_SUFFIXES:
+        tokens.pop()
+    return tokens[-1] if tokens else ""
 
 
 @dataclass(frozen=True)
@@ -321,14 +363,13 @@ class PlayerIdCrosswalk:
         different fixes -- an alias entry versus a missing game -- and
         guessing between them is how a day gets spent on the wrong one.
         """
-        key = normalise_player_name(query_name)
-        if not key:
+        surname = _surname_for_hint(query_name)
+        if not surname:
             return []
-        surname = key.split()[-1]
         return sorted({
             record.name
             for panel_key, records in self._by_key.items()
-            if panel_key.split()[-1] == surname
+            if _surname_for_hint(panel_key) == surname
             for record in records
         })
 

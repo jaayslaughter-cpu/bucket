@@ -308,10 +308,18 @@ def _board(names):
 #   board "Jaime Jaquez"    -> ESPN "Jaime Jaquez Jr." (MIL, sole Jaquez)
 #
 # All three were logged unmatched by the 2026-11-04 slate.
+# The 2026-11-05 slate (ORL at PHX) added two more, checked the same way and
+# mismatching in OPPOSITE directions: one book drops the suffix, the other
+# adds one the panel does not carry.
+#
+#   board "Wendell Carter"      -> ESPN "Wendell Carter Jr." (ORL)
+#   board "Jase Richardson Jr." -> ESPN "Jase Richardson"    (ORL)
 VERIFIED_ALIAS_CASES = [
     ("Alexandre Sarr", "Alex Sarr", "WSH"),
     ("Joshua Giddey", "Josh Giddey", "CHI"),
     ("Jaime Jaquez", "Jaime Jaquez Jr.", "MIL"),
+    ("Wendell Carter", "Wendell Carter Jr.", "ORL"),
+    ("Jase Richardson Jr.", "Jase Richardson", "ORL"),
 ]
 
 
@@ -443,3 +451,46 @@ def test_every_unmatched_name_is_logged_and_says_which_kind_of_miss_it_is(caplog
 
     # THE ALIASED NAMES ARE NOT IN THE MISS LIST.
     assert "Alexandre Sarr" not in blob and "Joshua Giddey" not in blob
+
+
+def test_the_surname_hint_ignores_a_generational_suffix():
+    """
+    THE DIAGNOSTIC'S OWN BUG, found by the first slate that ran with it.
+
+    `names_sharing_surname` compared the LAST TOKEN, and for a suffixed name
+    the last token is "jr", not the surname. So the 2026-11-05 slate logged:
+
+        Jase Richardson Jr. -> ['Tim Hardaway Jr.', 'Wendell Carter Jr.']
+        Wendell Carter      -> ['Jevon Carter']
+
+    Both are wrong in the way that matters. The first offers two unrelated
+    players because all three names end in "Jr."; the second omits the one
+    name that is actually the answer -- the panel's "Wendell Carter Jr." --
+    because ITS last token is "jr" too. The hint pointed away from the fix
+    on the very row the fix was for.
+
+    Suffixes still belong to the matching key (see
+    `test_suffix_stripping_is_still_not_a_rule`). This is the hint only.
+    """
+    crosswalk = PlayerIdCrosswalk([
+        PlayerRecord(name="Wendell Carter Jr.", team="ORL"),
+        PlayerRecord(name="Jevon Carter", team="ORL"),
+        PlayerRecord(name="Tim Hardaway Jr.", team="DET"),
+    ])
+
+    # The board drops the suffix: the panel's suffixed Carter is the answer,
+    # and the unrelated Jevon Carter is a legitimate same-surname neighbour.
+    assert crosswalk.names_sharing_surname("Wendell Carter") == [
+        "Jevon Carter", "Wendell Carter Jr.",
+    ]
+
+    # The board adds one: no panel Richardson at all, and emphatically not
+    # every player whose name happens to end in "Jr.".
+    assert crosswalk.names_sharing_surname("Jase Richardson Jr.") == []
+
+
+def test_a_suffix_only_name_does_not_crash_the_hint():
+    """A degenerate name must not raise inside a warning path."""
+    crosswalk = PlayerIdCrosswalk([PlayerRecord(name="Jr.", team="XXX")])
+    assert crosswalk.names_sharing_surname("Jr.") == ["Jr."]
+    assert crosswalk.names_sharing_surname("") == []
