@@ -255,7 +255,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/quant/publication_gate.py:378` as a second verdict beside
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
-  `scheduler_worker.py:1789` and into the deploy probe as a FAILURE at
+  `scheduler_worker.py:1811` and into the deploy probe as a FAILURE at
   `scripts/railway_healthcheck.py:269`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
@@ -268,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap this described.** `scheduler_worker.py:3180-3183` sets
+- **The gap this described.** `scheduler_worker.py:3413-3420` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
@@ -278,7 +278,7 @@ most of what looks like autonomy is a laptop — but these two are real.
 - **CLOSED, and this entry said otherwise for three weeks.**
   `src/utils/write_lock.py` landed in `89be638` on 2026-10-11 — the same day
   this evaluation was written — and is taken by BOTH entry points: the
-  scheduled slate at `scheduler_worker.py:1130` and the manual
+  scheduled slate at `scheduler_worker.py:1152` and the manual
   `python main.py` at `main.py:1898`. It **declines** rather than waits, and
   says so: *"Another process holds the slate write lock, so the 09:00 PT run
   is SKIPPED … A deliberate decline, not a failure."* The scope deliberately

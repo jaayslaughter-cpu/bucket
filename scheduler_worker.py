@@ -212,6 +212,28 @@ ESPN_HISTORY_MISFIRE_GRACE_SECONDS = 30 * 60
 #: by review on #31.
 ESPN_HISTORY_MIN_LEAD_MINUTES = 60
 
+#: Markets to fit, comma separated (e.g. "PTS,REB,AST"). UNSET MEANS OFF, the
+#: same shape as the history backfill: the job is registered either way and
+#: declines when it is not configured, so turning it on is a variable and not
+#: a deploy.
+ENV_TRAIN_MARKETS = "PROPIQ_TRAIN_MARKETS"
+#: How many of the newest days to hold OUT of the fit. The holdout is the most
+#: recent slice on purpose: a model is asked about tomorrow, so the only
+#: honest check is on games after everything it learned from.
+ENV_TRAIN_HOLDOUT_DAYS = "PROPIQ_TRAIN_HOLDOUT_DAYS"
+DEFAULT_TRAIN_HOLDOUT_DAYS = 30
+#: How far back the training panel reaches. NOT 0: `load_player_panel`
+#: HONOURS this now and computes `lower = upper - days`, so 0 would load a
+#: single day. 1200 reaches 2023-07 from a 2026-11 slate, which covers every
+#: season the ESPN backfill can fill.
+ENV_TRAIN_LOOKBACK_DAYS = "PROPIQ_TRAIN_LOOKBACK_DAYS"
+DEFAULT_TRAIN_LOOKBACK_DAYS = 1200
+TRAINING_MISFIRE_GRACE_SECONDS = 30 * 60
+#: Training holds the slate's write lock, so it must be finished long before
+#: 09:00. Measured on the demo panel a market fits in seconds; on the real
+#: panel it is minutes. Two hours is not a tuned number, it is a margin.
+TRAINING_MIN_LEAD_MINUTES = 120
+
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
 # enough that a withdrawal is still actionable. Bounded 5..180 -- below 5 the
@@ -3090,6 +3112,219 @@ def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
         return {"status": "FAILED", "error": str(exc), "out": str(target)}
 
 
+def _training_markets() -> list[str]:
+    """The markets to fit, or an empty list when the job is not configured."""
+    from src.models.training import MARKETS
+
+    raw = (os.environ.get(ENV_TRAIN_MARKETS) or "").strip()
+    if not raw:
+        return []
+    wanted: list[str] = []
+    unknown: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        name = part.strip().upper()
+        if not name:
+            continue
+        if name == "ALL":
+            wanted = list(MARKETS)
+            continue
+        if name in MARKETS:
+            if name not in wanted:
+                wanted.append(name)
+        else:
+            unknown.append(name)
+    if unknown:
+        # NAMED AND DROPPED, never silently ignored: "PTS,POINTS" fitting one
+        # market while the operator believes two were fitted is the shape of
+        # defect this project keeps finding.
+        logger.error(
+            "%s names %s, which %s not a launch market; fitting %s. The launch "
+            "markets are %s, or ALL.",
+            ENV_TRAIN_MARKETS, unknown, "is" if len(unknown) == 1 else "are",
+            wanted or "nothing", ", ".join(MARKETS),
+        )
+    return wanted
+
+
+def training_time(slate_hour: int, slate_minute: int) -> tuple[int, int]:
+    """
+    When training runs: a fixed lead before the slate, with no override.
+
+    DELIBERATELY NOT CONFIGURABLE, unlike the backfill's time. Training takes
+    the same write lock the slate takes, so a time an operator could move on
+    top of the slate would cost the morning's board -- and the backfill
+    already needed `history_backfill_time` to refuse exactly that. One fewer
+    knob is one fewer way to lose a card.
+
+    It lands after the backfill (which runs at a 60-minute minimum lead) and
+    before the slate, so the fit sees the rows the backfill just wrote.
+    """
+    slate_minutes = slate_hour * 60 + slate_minute
+    return divmod((slate_minutes - TRAINING_MIN_LEAD_MINUTES) % (24 * 60), 60)
+
+
+def run_training() -> dict[str, Any]:
+    """
+    Fit the scoring artifacts, from the panel in THIS database.
+
+    WHY THE WORKER TRAINS AT ALL. Every row of every board has read
+    "DATA_NOT_AVAILABLE: cannot resolve P(over)" since this deployment
+    started, for one reason: no artifact exists. `resolve_model_artifact`
+    looks in the comparison config's `artifacts_dir`, nothing had ever
+    written there, and the only command that writes there --
+    `nba_model_cli train-stats` -- needs a feature matrix. The matrix needs
+    the panel, the panel is in this database, and the two paths that reach a
+    panel from outside both need something this container does not have: a
+    licensed workbook a human downloads, or stats.nba.com, which times out
+    here. So the remedy was always "run something on your own machine", and
+    the artifact could not get back onto the volume if you did.
+
+    TRAINING WHERE THE DATA IS ALSO FIXES THE CONTRACT. `artifacts_dir` is
+    relative, so it resolves under the mounted volume and survives a
+    redeploy. More importantly the matrix is built here by
+    `main.build_features_and_verify_fatigue` -- the SAME function, over the
+    same frames, that the slate scores against -- so the artifact's
+    feature contract cannot name a column the live matrix lacks. That
+    mismatch is not hypothetical: `market_lines` is empty in this
+    deployment, so MKT_* and BLOWOUT_* are absent from both, and an
+    artifact trained elsewhere with a workbook would abstain on every row
+    while looking perfectly healthy.
+
+    THE HOLDOUT IS THE NEWEST SLICE, not a random sample and not the oldest
+    two thirds. A model is asked about tomorrow; the only honest check is on
+    games played after everything it learned from. `assert_no_lookahead`
+    runs inside the matrix build, every rolling feature is already
+    `.shift(1)`-ed by the builder, and the split is by date -- so there is
+    no path by which a fitted row sees its own game.
+
+    WHAT IT IS NOT. It is not a claim that the result is profitable, or even
+    useful. The label is `over_hit` against `{MARKET}_L10`, a research stand-
+    in, because historical book lines do not exist for these seasons; the
+    `line_aware` component augments across line offsets to make serving at a
+    posted line meaningful, and that is a mitigation, not a measurement. The
+    publication gate still holds every number back until 100 graded
+    predictions clear its calibration bar. Training only lets that counter
+    start moving.
+
+    OFF UNLESS CONFIGURED ($PROPIQ_TRAIN_MARKETS), like the backfill.
+
+    RESEARCH_ONLY. Fits a classifier, writes files. Prices nothing.
+    """
+    markets = _training_markets()
+    if not markets:
+        logger.debug("Training not configured (%s unset).", ENV_TRAIN_MARKETS)
+        return {"status": "SKIPPED", "reason": f"{ENV_TRAIN_MARKETS} unset"}
+
+    # THE LOCK, AFTER THE CONFIG GUARD, for the backfill's reasons exactly: a
+    # job that is switched off should not touch the lock, and this one runs
+    # every night whether or not it is configured. Training READS the panel
+    # the slate reads and WRITES the artifacts the slate loads, so an overlap
+    # could hand the slate a half-written model file. Declining is the safe
+    # direction -- a day without a new fit costs nothing, because yesterday's
+    # artifact is still there and still resolves.
+    from src.utils.write_lock import write_lock
+
+    with write_lock() as acquired:
+        if not acquired:
+            logger.warning(
+                "Training SKIPPED: another process holds the slate write lock. "
+                "Yesterday's artifact still resolves, so nothing is lost but a "
+                "refit; tomorrow's run picks up the same panel plus a day.",
+            )
+            return {"status": "SKIPPED",
+                    "reason": "another process holds the slate write lock",
+                    "markets": markets}
+        return _run_training_locked(markets)
+
+
+def _run_training_locked(markets: list[str]) -> dict[str, Any]:
+    """The body of `run_training`, with the write lock already held."""
+    import pandas as pd
+
+    import main as propiq_main
+    from src.db.repository import (
+        load_game_market_lines,
+        load_player_panel,
+        load_team_game_stats,
+    )
+    from src.models.compare import load_comparison_config
+    from src.models.training import TrainingDataError, fit_market_artifacts
+    from src.utils.timezones import pacific_calendar_date
+
+    slate_date = str(pacific_calendar_date())
+    lookback = _int_env(
+        ENV_TRAIN_LOOKBACK_DAYS, DEFAULT_TRAIN_LOOKBACK_DAYS, low=1, high=4000,
+    )
+    holdout_days = _int_env(
+        ENV_TRAIN_HOLDOUT_DAYS, DEFAULT_TRAIN_HOLDOUT_DAYS, low=1, high=365,
+    )
+
+    panel = load_player_panel(slate_date=slate_date, lookback_days=lookback)
+    if panel is None or panel.empty:
+        logger.error(
+            "TRAINING FOUND NO PANEL in the %d day(s) before %s. The ESPN "
+            "ingest and the history backfill are what fill it; this job only "
+            "reads it.", lookback, slate_date,
+        )
+        return {"status": "FAILED", "reason": "empty panel", "markets": markets}
+
+    team_games = load_team_game_stats(slate_date=slate_date, lookback_days=lookback)
+    market_lines = load_game_market_lines(slate_date=slate_date, lookback_days=lookback)
+    features = propiq_main.build_features_and_verify_fatigue(
+        panel, team_games=team_games, market_lines=market_lines,
+    )
+
+    # THE CUTOFF IS COMPUTED FROM THE PANEL, not from today. A panel whose
+    # newest game is a week old would otherwise lose a week of its holdout to
+    # days with no games in them, and in the off-season the holdout would be
+    # empty while the fit set looked fine.
+    newest = pd.to_datetime(features["GAME_DATE"]).max()
+    train_end = (newest - pd.Timedelta(days=holdout_days)).date().isoformat()
+    artifacts_dir = Path(str(
+        (load_comparison_config() or {}).get(
+            "artifacts_dir", "data/external/model_runs/comparison"
+        )
+    ))
+
+    reports: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for market in markets:
+        try:
+            reports[market] = fit_market_artifacts(
+                features, market, train_end=train_end, artifacts_dir=artifacts_dir,
+            )
+        except TrainingDataError as exc:
+            # ONE MARKET'S DATA PROBLEM IS NOT THE RUN'S. REB can fit while
+            # PTS cannot: PTS needs FGA and FTA for its efficiency features
+            # and the other two do not, so a panel missing those columns
+            # fails exactly one market -- which is worth seeing by name.
+            logger.error("Training %s: %s", market, exc)
+            failures[market] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — one market, not the run
+            logger.exception("Training %s raised", market)
+            failures[market] = f"{type(exc).__name__}: {exc}"
+
+    status = "OK" if reports and not failures else ("PARTIAL" if reports else "FAILED")
+    out = {
+        "status": status,
+        "panel_rows": int(len(panel)),
+        "feature_rows": int(len(features)),
+        "newest_game": str(newest.date()),
+        "train_end": train_end,
+        "holdout_days": holdout_days,
+        "artifacts_dir": str(artifacts_dir),
+        "markets": reports,
+        "failed": failures,
+    }
+    logger.info("Training: %s", out)
+    if status != "OK":
+        logger.error(
+            "TRAINING DID NOT FIT EVERY MARKET: %s. Every unfitted market "
+            "still scores nothing, so its rows keep abstaining.", failures,
+        )
+    return out
+
+
 def history_backfill_time(slate_hour: int, slate_minute: int) -> tuple[int, int]:
     """
     When the history backfill runs, REFUSING a time that races the slate.
@@ -3227,6 +3462,20 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=ESPN_HISTORY_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    training_hour, training_minute = training_time(slate_hour, slate_minute)
+    scheduler.add_job(
+        run_training,
+        trigger="cron",
+        hour=training_hour,
+        minute=training_minute,
+        timezone=DISPLAY_TZ,
+        id="training",
+        name="Fit the scoring artifacts from the panel (off unless configured)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=TRAINING_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
     scheduler.add_job(

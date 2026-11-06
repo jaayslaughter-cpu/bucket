@@ -511,91 +511,52 @@ def train_stats(
     produces the artifact the whole pipeline needs could not be run at all.
     """
     _setup_logging(verbose)
-    from src.models.compare import (
-        build_components,
-        load_comparison_config,
-        prepare_market_panel,
-        resolve_feature_cols,
-    )
-    from src.models.labels import default_feature_cols
+    from src.models.training import TrainingDataError, fit_market_artifacts
 
     market = market.upper()
     if market not in {"PTS", "REB", "AST"}:
         typer.echo("Launch markets are PTS/REB/AST only", err=True)
         raise SystemExit(1)
     frame, is_demo = _load_real_or_demo(demo, seasons, season_type, panel)
-    work = prepare_market_panel(frame, market)
-    work = work[(work["GAME_DATE"] >= start_date) & (work["GAME_DATE"] <= end_date)]
-    cols, _dropped = resolve_feature_cols(work, list(default_feature_cols(market)))  # type: ignore[arg-type]
-    if not cols:
-        typer.echo(f"No usable features for {market} in this panel", err=True)
-        raise SystemExit(2)
-    # CatBoost handles these natively; XGBoost rejects non-numerics outright,
-    # so it keeps the numeric list. Passing the combined list to both made
-    # every train-stats run fail XGBoost with a DATA_NOT_AVAILABLE and write
-    # only two of the three artifacts — quietly, since the loop logs and
-    # continues.
-    numeric_cols = list(cols)
-    for c in ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON"):
-        if c in work.columns and c not in cols:
-            cols = list(cols) + [c]
+
+    # THE FIT LOOP LIVES IN `src/models/training.py` AND NOT HERE.
+    #
+    # It used to live in this function, which was the only place that trained
+    # anything -- fine while a human with a laptop was the only one who ever
+    # did. The deployed worker now has to train too, because the panel is in
+    # the deployed database and nowhere else, and a second loop over there
+    # would be a second definition of what training is. The flags, the demo
+    # path and the echoes below are this command's; the decisions are not.
+    #
+    # `--demo` still redirects the artifacts, because synthetic metrics must
+    # not be resolvable by anything that scores a real slate.
+    from src.models.compare import load_comparison_config
+
     cfg = load_comparison_config()
-    comps = build_components(market, cols, cfg, xgb_feature_cols=numeric_cols)
     art = Path(cfg.get("artifacts_dir", "data/external/model_runs/comparison"))
     if is_demo:
         art = art / "demo"
-    art.mkdir(parents=True, exist_ok=True)
-    # WHERE THE FIT STOPS AND THE HOLDOUT BEGINS.
-    #
-    # The 2/3-by-row-count split is the fallback, and it couples two unrelated
-    # things: how much HISTORY you train on, and how much of it is held out.
-    # A 2018-01-01 -> 2026-04-12 run fits only to 2023-12-13 and holds out
-    # 71,357 rows -- 2.4 seasons that never reach the model at all.
-    #
-    # MEASURED, because the obvious reading of that is wrong. Narrowing the
-    # window to recent seasons does NOT help: on one common validation window
-    # (2026-01-15 -> 2026-04-12, 13,248 scored rows) the ensemble's calibrated
-    # Brier degrades monotonically as the start date moves forward -- 0.24098
-    # for the full window, 0.24133 from 2022-10, 0.24191 from 2023-10, 0.24268
-    # from 2024-10. More history is better. The best configuration measured was
-    # the FULL window with the split late (fitting 200,678 rows), which is what
-    # --train-end makes reachable: keep the history AND reach the present.
-    #
-    # Numbers and the caveat that it is one window and one market:
-    # docs/training_window.md.
-    import pandas as pd
 
-    if train_end:
-        cutoff = pd.Timestamp(train_end)
-        train = work[work["GAME_DATE"] <= cutoff]
-        val = work[work["GAME_DATE"] > cutoff]
-        if train.empty or val.empty:
-            typer.echo(
-                f"--train-end {train_end} leaves {len(train)} fit row(s) and "
-                f"{len(val)} holdout row(s); one side is empty, so there is "
-                f"nothing to fit or nothing to calibrate on. The window is "
-                f"{work['GAME_DATE'].min().date()} to "
-                f"{work['GAME_DATE'].max().date()}.",
-                err=True,
-            )
-            raise SystemExit(2)
-    else:
-        mid = len(work) * 2 // 3
-        train, val = work.iloc[:mid], work.iloc[mid:]
+    try:
+        report = fit_market_artifacts(
+            frame, market,
+            start_date=start_date, end_date=end_date,
+            train_end=train_end, artifacts_dir=art, config=cfg,
+        )
+    except TrainingDataError as exc:
+        typer.echo(str(exc), err=True)
+        raise SystemExit(2) from exc
+
     typer.echo(
-        f"{market}: fitting {len(train):,} row(s) "
-        f"({train['GAME_DATE'].min().date()} -> {train['GAME_DATE'].max().date()}), "
-        f"holding out {len(val):,} "
-        f"({val['GAME_DATE'].min().date()} -> {val['GAME_DATE'].max().date()})"
+        f"{market}: fitting {report['fit_rows']:,} row(s) "
+        f"({report['fit_window'][0]} -> {report['fit_window'][1]}), "
+        f"holding out {report['holdout_rows']:,} "
+        f"({report['holdout_window'][0]} -> {report['holdout_window'][1]})"
     )
-    for name, model in comps.items():
-        try:
-            model.fit(train, val)
-            if hasattr(model, "save"):
-                model.save(art / f"{name}_{market}")
-            typer.echo(f"fitted {name} {market} -> {art}")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("%s failed: %s", name, exc)
+    for name in report["fitted"]:
+        typer.echo(f"fitted {name} {market} -> {report['artifacts_dir']}")
+    for name, why in report["failed"].items():
+        typer.echo(f"{name} {market} FAILED: {why}", err=True)
 
 
 @app.command("evaluate")

@@ -251,6 +251,16 @@ def test_train_stats_takes_an_explicit_split_date():
     assert "train_end" in inspect.signature(train_stats).parameters
 
 
+# THE SPLIT MOVED, AND THESE TESTS FOLLOWED IT RATHER THAN BEING RELAXED.
+# `train-stats` was the only thing that trained until the deployed worker had
+# to train too -- the panel is in the deployed database and nowhere else -- and
+# a second fit loop in `scheduler_worker` would have been a second definition
+# of what training is. So the loop lives in `src/models/training.py` and both
+# callers use it. These assertions now read THAT function, because that is
+# where the decision is; `train_stats` keeps the flag, which the test above
+# still pins.
+
+
 def test_the_explicit_split_is_by_date_and_the_fallback_is_by_row_count():
     """
     Both halves. The fallback has to stay, because every scripted invocation
@@ -259,9 +269,9 @@ def test_the_explicit_split_is_by_date_and_the_fallback_is_by_row_count():
     """
     import inspect
 
-    from scripts import nba_model_cli
+    from src.models import training
 
-    source = inspect.getsource(nba_model_cli.train_stats)
+    source = inspect.getsource(training.fit_market_artifacts)
     assert 'work[work["GAME_DATE"] <= cutoff]' in source
     assert 'work[work["GAME_DATE"] > cutoff]' in source
     assert "len(work) * 2 // 3" in source, (
@@ -270,19 +280,46 @@ def test_the_explicit_split_is_by_date_and_the_fallback_is_by_row_count():
     )
 
 
-def test_a_split_date_outside_the_window_is_refused_rather_than_fitting_nothing():
+def test_the_cli_still_reaches_the_split_it_no_longer_owns():
     """
-    `--train-end 2010-01-01` leaves an empty fit set and `--train-end 2030`
-    an empty holdout. Either one silently produces an artifact fitted on
-    nothing or calibrated on nothing, which is worse than a refusal.
+    MOVING THE LOOP MUST NOT HAVE ORPHANED THE FLAG. `--train-end` is still a
+    `train-stats` option, and the only thing that makes it mean anything is
+    that the command passes it to the function that now does the splitting.
     """
     import inspect
 
     from scripts import nba_model_cli
 
     source = inspect.getsource(nba_model_cli.train_stats)
+    assert "fit_market_artifacts(" in source
+    assert "train_end=train_end" in source, (
+        "train-stats takes --train-end and does not pass it on, so the flag "
+        "is accepted and ignored"
+    )
+
+
+def test_a_split_date_outside_the_window_is_refused_rather_than_fitting_nothing():
+    """
+    `--train-end 2010-01-01` leaves an empty fit set and `--train-end 2030`
+    an empty holdout. Either one silently produces an artifact fitted on
+    nothing or calibrated on nothing, which is worse than a refusal.
+
+    The refusal is now a `TrainingDataError` raised where the split happens;
+    `train-stats` turns it into the same SystemExit(2) it always did, which
+    the second assertion pins so the exit status cannot quietly become 0.
+    """
+    import inspect
+
+    from scripts import nba_model_cli
+    from src.models import training
+
+    source = inspect.getsource(training.fit_market_artifacts)
     assert "if train.empty or val.empty:" in source
-    assert "SystemExit(2)" in source
+    assert "TrainingDataError(" in source
+
+    cli = inspect.getsource(nba_model_cli.train_stats)
+    assert "except TrainingDataError" in cli
+    assert "SystemExit(2)" in cli
 
 
 def test_the_split_is_chronological_either_way():
