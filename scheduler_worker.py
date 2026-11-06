@@ -233,6 +233,10 @@ TRAINING_MISFIRE_GRACE_SECONDS = 30 * 60
 #: 09:00. Measured on the demo panel a market fits in seconds; on the real
 #: panel it is minutes. Two hours is not a tuned number, it is a margin.
 TRAINING_MIN_LEAD_MINUTES = 120
+#: How long after boot the one-off "there is no artifact at all" fit starts.
+#: Long enough that the worker is up and its job table is logged first, short
+#: enough that an operator who just switched training on sees it happen.
+TRAINING_BOOT_DELAY_SECONDS = 30
 
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
@@ -3146,6 +3150,44 @@ def _training_markets() -> list[str]:
     return wanted
 
 
+def training_is_needed_now(markets: list[str]) -> list[str]:
+    """
+    The configured markets that have NO resolvable artifact yet.
+
+    WHY A BOOT FIT EXISTS AT ALL. The daily job runs at 07:00 PT, so turning
+    training on at any other hour left the deployment in its old state --
+    every row abstaining -- until the next morning, for no reason other than
+    the clock. The first fit is the one that matters most, because it is the
+    difference between a board that can score and one that cannot.
+
+    SELF-LIMITING, WHICH IS WHY IT NEEDS NO SWITCH OF ITS OWN. It asks the
+    SAME resolver the slate asks (`main.resolve_model_artifact`), so once an
+    artifact exists this returns nothing and no boot fit is scheduled. A
+    redeploy loop cannot turn into a training loop.
+
+    A path that resolves but does not EXIST counts as missing: `PROPIQ_MODEL`
+    pointing at a file that is not there, or the legacy `models/` default,
+    both resolve to a path and neither can be scored with.
+    """
+    if not markets:
+        return []
+    try:
+        import main as propiq_main
+    except Exception as exc:  # noqa: BLE001 — a boot fit is never worth a crash
+        logger.warning("Could not check for an existing artifact: %s", exc)
+        return []
+    missing: list[str] = []
+    for market in markets:
+        try:
+            path, _how = propiq_main.resolve_model_artifact(market=market)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Artifact check for %s failed: %s", market, exc)
+            continue
+        if path is None or not Path(path).exists():
+            missing.append(market)
+    return missing
+
+
 def training_time(slate_hour: int, slate_minute: int) -> tuple[int, int]:
     """
     When training runs: a fixed lead before the slate, with no override.
@@ -3464,6 +3506,42 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         misfire_grace_time=ESPN_HISTORY_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
+    # THE FIRST FIT DOES NOT WAIT FOR TOMORROW MORNING.
+    #
+    # Scheduled rather than run inline, and that is the whole point: a fit
+    # takes minutes, and doing it before `scheduler.start()` would hold the
+    # worker down for that long -- a boot at 08:55 would miss the 09:00
+    # slate entirely. As a date job it runs on the scheduler's own pool with
+    # the worker already up, and `run_training` takes the slate's write lock,
+    # so the two cannot interleave however long the fit turns out to take.
+    #
+    # It asks the resolver, so it is a no-op on every boot after the first.
+    from datetime import timedelta
+
+    boot_markets = training_is_needed_now(_training_markets())
+    if boot_markets:
+        logger.warning(
+            "NO ARTIFACT RESOLVES FOR %s, and training is configured. Fitting "
+            "once now rather than waiting for %02d:00 PT: until an artifact "
+            "exists every board row abstains and the publication gate's "
+            "graded counter cannot move. Later boots find the artifact and "
+            "skip this.",
+            ", ".join(boot_markets), training_time(slate_hour, slate_minute)[0],
+        )
+        scheduler.add_job(
+            run_training,
+            trigger="date",
+            run_date=(
+                datetime.now(tz=DISPLAY_TZ)
+                + timedelta(seconds=TRAINING_BOOT_DELAY_SECONDS)
+            ),
+            id="training_boot",
+            name="Fit the scoring artifacts once, because none exist",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=TRAINING_MISFIRE_GRACE_SECONDS,
+            replace_existing=True,
+        )
     training_hour, training_minute = training_time(slate_hour, slate_minute)
     scheduler.add_job(
         run_training,

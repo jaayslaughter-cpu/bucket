@@ -199,3 +199,105 @@ def test_a_panel_with_no_labelled_row_is_refused_as_unlabelled_not_as_empty(tmp_
     message = str(exc.value)
     assert "NONE carries a label" in message, message
     assert "L10" in message
+
+
+# --- the first fit, which must not wait for tomorrow morning ---------------
+
+
+def test_no_boot_fit_when_training_is_switched_off(monkeypatch):
+    monkeypatch.delenv(worker.ENV_TRAIN_MARKETS, raising=False)
+    jobs = {j["id"] for j in worker.describe(worker.build_scheduler())}
+    assert "training_boot" not in jobs
+    assert worker.training_is_needed_now([]) == []
+
+
+def test_a_boot_fit_is_scheduled_when_no_artifact_resolves(monkeypatch, tmp_path):
+    """
+    TURNING TRAINING ON AT ANY HOUR BUT 07:00 PT used to leave the deployment
+    in its old state -- every row abstaining -- until the next morning, for
+    no reason but the clock. The first fit is the one that matters, because
+    it is the difference between a board that can score and one that cannot.
+    """
+    monkeypatch.setenv(worker.ENV_TRAIN_MARKETS, "PTS")
+    monkeypatch.setattr(
+        "main.resolve_model_artifact",
+        lambda *a, **k: (tmp_path / "absent.json", "test"),
+    )
+    jobs = {j["id"] for j in worker.describe(worker.build_scheduler())}
+    assert "training_boot" in jobs, sorted(jobs)
+    # AND THE DAILY JOB IS STILL THERE: the boot fit is an addition, not a
+    # replacement, or training would happen exactly once per deploy.
+    assert "training" in jobs
+
+
+def test_the_boot_fit_stops_once_an_artifact_exists(monkeypatch, tmp_path):
+    """
+    SELF-LIMITING, which is why it needs no switch of its own: it asks the
+    same resolver the slate asks. A redeploy loop must not become a training
+    loop.
+    """
+    artifact = tmp_path / "xgboost_PTS.json"
+    artifact.write_text("{}")
+    monkeypatch.setenv(worker.ENV_TRAIN_MARKETS, "PTS")
+    monkeypatch.setattr("main.resolve_model_artifact", lambda *a, **k: (artifact, "test"))
+
+    assert worker.training_is_needed_now(["PTS"]) == []
+    jobs = {j["id"] for j in worker.describe(worker.build_scheduler())}
+    assert "training_boot" not in jobs, (
+        "a boot fit was scheduled although the artifact resolves and exists"
+    )
+
+
+def test_a_resolver_path_that_does_not_exist_counts_as_missing(monkeypatch, tmp_path):
+    """
+    `PROPIQ_MODEL` pointing at a file that is not there, and the legacy
+    `models/xgb_prop_over.json` default, both RESOLVE to a path. Neither can
+    be scored with, so neither may suppress the first fit.
+    """
+    monkeypatch.setattr(
+        "main.resolve_model_artifact",
+        lambda *a, **k: (tmp_path / "models" / "xgb_prop_over.json", "test"),
+    )
+    assert worker.training_is_needed_now(["PTS", "REB"]) == ["PTS", "REB"]
+
+
+def test_the_boot_fit_is_a_scheduled_job_and_not_an_inline_call(monkeypatch):
+    """
+    A fit takes minutes. Running it before `scheduler.start()` would hold the
+    worker down for that long, and a boot at 08:55 would miss the 09:00
+    slate entirely. It has to be a job on the scheduler's own pool.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    source = inspect.getsource(worker.build_scheduler)
+    assert 'id="training_boot"' in source
+    assert 'trigger="date"' in source, (
+        "the boot fit is not a date job, so it may be running inline and "
+        "delaying the worker's start"
+    )
+
+    # AST, NOT A STRING SEARCH. The first version of this test looked for
+    # "scheduler.start()" in the source and found it in this function's own
+    # COMMENT about not calling it -- prose, matched as if it were code. What
+    # it has to rule out is a CALL: `run_training()` or `scheduler.start()`
+    # executed while building the table, either of which holds the worker
+    # down for the length of a fit.
+    tree = ast.parse(textwrap.dedent(source))
+    called: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    assert "run_training" not in called, (
+        "build_scheduler CALLS run_training; a fit takes minutes and this "
+        "runs before the worker is up, so a boot near 09:00 loses the slate"
+    )
+    assert "start" not in called, (
+        "build_scheduler starts the scheduler; the caller does that, and the "
+        "boot fit must be queued rather than run here"
+    )
