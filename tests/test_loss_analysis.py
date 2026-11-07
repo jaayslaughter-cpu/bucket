@@ -242,3 +242,135 @@ def test_an_empty_ledger_says_day_one_rather_than_reporting_zeroes():
     assert report["residuals_overall"]["mean_bias"] is None
     assert "nothing to analyse" in report["findings"][0]
     assert "day one" in report["findings"][0]
+
+
+# --- the nightly job -------------------------------------------------------
+
+
+def test_the_panel_window_is_derived_from_the_rows_not_flat():
+    """
+    A FLAT 400 WAS NOT MERELY WASTEFUL, IT WAS WRONG. A graded game from
+    April 2026 belongs to the season that began in August 2025, so counting
+    its prior games needs 470 days of panel. At 400 the earliest games of
+    that season fall outside the window and the count comes back short --
+    biasing the early-season bins in the exact direction the report tests.
+    """
+    from src.settlement.loss_analysis import panel_lookback_days_for
+
+    current = panel_lookback_days_for(
+        [{"game_date": "2026-11-06"}], today="2026-11-07"
+    )
+    previous = panel_lookback_days_for(
+        [{"game_date": "2026-04-10"}], today="2026-11-07"
+    )
+
+    assert current == 105, current
+    assert previous == 470, previous
+    assert previous > 400, "this is the case a flat 400-day window got wrong"
+    # The earliest row sets the window, not the latest.
+    mixed = panel_lookback_days_for(
+        [{"game_date": "2026-11-06"}, {"game_date": "2026-04-10"}],
+        today="2026-11-07",
+    )
+    assert mixed == previous
+
+
+def test_an_empty_or_dateless_set_still_returns_a_legal_window():
+    from src.settlement.loss_analysis import panel_lookback_days_for
+
+    assert panel_lookback_days_for([]) == 1
+    assert panel_lookback_days_for([{"game_date": None}]) == 1
+    assert panel_lookback_days_for([{"game_date": "not a date"}]) == 1
+
+
+def test_prior_games_are_counted_strictly_before_the_graded_game_and_in_season():
+    """
+    Two things that would each quietly corrupt the early-season bins: counting
+    the game being predicted as its own prior game, and letting the count span
+    a summer so an established player looks like a rookie's opposite.
+    """
+    import pandas as pd
+
+    from src.settlement.loss_analysis import prior_game_counts
+
+    panel = pd.DataFrame({
+        "PLAYER_ID": ["espn:1"] * 6,
+        "GAME_DATE": pd.to_datetime([
+            "2025-11-01", "2025-11-03", "2025-11-05",   # previous season
+            "2026-10-20", "2026-10-22", "2026-11-06",   # current season
+        ]),
+    })
+    counts = prior_game_counts(panel, {("espn:1", "2026-11-06")})
+
+    assert counts[("espn:1", "2026-11-06")] == 2, (
+        "expected the two current-season games before 2026-11-06: not the "
+        "game itself, and not the previous season's three"
+    )
+
+
+def test_a_panel_without_the_columns_counts_nothing_rather_than_guessing():
+    import pandas as pd
+
+    from src.settlement.loss_analysis import prior_game_counts
+
+    assert prior_game_counts(pd.DataFrame(), {("espn:1", "2026-11-06")}) == {}
+    assert prior_game_counts(
+        pd.DataFrame({"PLAYER_ID": ["espn:1"]}), {("espn:1", "2026-11-06")}
+    ) == {}
+
+
+def test_the_nightly_job_is_registered_and_runs_after_settlement():
+    import scheduler_worker as worker
+
+    jobs = {j["id"] for j in worker.describe(worker.build_scheduler())}
+    assert "loss_analysis" in jobs, sorted(jobs)
+
+    settle = (3, 30)
+    hour, minute = worker.loss_analysis_time(*settle)
+    settle_minutes = settle[0] * 60 + settle[1]
+    run_minutes = hour * 60 + minute
+    assert run_minutes > settle_minutes, (
+        "the analysis must run AFTER settlement, which is what grades the "
+        "rows it reads -- before it, it reports last night's ledger as tonight's"
+    )
+    assert run_minutes - settle_minutes == worker.LOSS_ANALYSIS_LAG_MINUTES
+
+
+def test_the_nightly_job_can_be_switched_off(monkeypatch):
+    import scheduler_worker as worker
+
+    monkeypatch.setenv(worker.ENV_LOSS_ANALYSIS, "false")
+
+    def explode():  # pragma: no cover - must not be reached
+        raise AssertionError("a disabled job took the write lock")
+
+    monkeypatch.setattr("src.utils.write_lock.write_lock", explode)
+    out = worker.run_loss_analysis()
+    assert out["status"] == "SKIPPED"
+
+
+def test_the_nightly_job_is_on_by_default(monkeypatch):
+    """
+    Unlike training and the backfill, this one reads and writes one report
+    file, so it defaults ON -- and a default of OFF would mean the user who
+    asked for a nightly job does not get one.
+    """
+    import scheduler_worker as worker
+
+    monkeypatch.delenv(worker.ENV_LOSS_ANALYSIS, raising=False)
+    calls = {"locked": False}
+
+    class _Lock:
+        def __enter__(self):
+            calls["locked"] = True
+            return False  # decline, so nothing touches a database
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("src.utils.write_lock.write_lock", lambda *a, **k: _Lock())
+    out = worker.run_loss_analysis()
+
+    assert calls["locked"], "the job did not even reach the lock, so it is off"
+    assert out["status"] == "SKIPPED"
+    assert "write lock" in out["reason"]

@@ -104,6 +104,97 @@ def _reported(values: Sequence[float]) -> dict[str, Any]:
     return out
 
 
+def prior_game_counts(panel: Any, keys: set[tuple[Any, Any]]) -> dict[tuple[Any, Any], int]:
+    """
+    ``(player_id, game_date) -> games that player had already played that season``.
+
+    IT LIVES HERE AND NOT IN THE SCRIPT because the nightly job needs it
+    too, and a worker reaching into `scripts/` for logic is how an entry
+    point quietly becomes a library with two callers and one test.
+
+    COUNTED FROM THE PANEL, NOT FROM THE LEDGER. The ledger holds only rows
+    the model scored; a player's games before the model existed are still
+    games he played, and they are what his baseline was built from.
+
+    SEASON-SCOPED, via `features.season.season_start_year`, because "games
+    played" that silently spans a summer is not the quantity the early-season
+    question is about. STRICTLY BEFORE the graded date, so a count can never
+    include the game being predicted.
+    """
+    import pandas as pd
+
+    from src.features.season import season_start_year
+
+    if panel is None or getattr(panel, "empty", True):
+        return {}
+    need = {"PLAYER_ID", "GAME_DATE"}
+    missing = need - set(panel.columns)
+    if missing:
+        logger.warning(
+            "Panel has no %s, so prior games cannot be counted; the report "
+            "will say the early-season question was not measured.",
+            ", ".join(sorted(missing)),
+        )
+        return {}
+
+    frame = panel[["PLAYER_ID", "GAME_DATE"]].copy()
+    frame["GAME_DATE"] = pd.to_datetime(frame["GAME_DATE"])
+    frame["SEASON"] = season_start_year(frame["GAME_DATE"])
+
+    out: dict[tuple[Any, Any], int] = {}
+    by_player: dict[Any, Any] = {
+        pid: group.sort_values("GAME_DATE")
+        for pid, group in frame.groupby("PLAYER_ID", sort=False)
+    }
+    for player_id, game_date in keys:
+        group = by_player.get(player_id)
+        if group is None:
+            continue
+        stamp = pd.to_datetime(game_date)
+        season = season_start_year(pd.Series([stamp])).iloc[0]
+        same_season = group[group["SEASON"] == season]
+        out[(player_id, game_date)] = int((same_season["GAME_DATE"] < stamp).sum())
+    return out
+
+
+def panel_lookback_days_for(
+    rows: Iterable[Mapping[str, Any]], *, today: Any = None
+) -> int:
+    """
+    How far the panel must be read to count prior games for THESE rows.
+
+    DERIVED, NOT A FLAT WINDOW. The first version of the caller read 400 days
+    of panel on every run, which is fine once from a terminal and wasteful
+    nightly. The quantity actually needed is the start of the SEASON holding
+    the earliest graded row: `season_start_year` cuts at August, so that
+    season began on 1 August of its starting year, and nothing before that
+    date can be a prior game within it.
+
+    A week of slack is added because the cut is a convention, not a fixture,
+    and a panel short by a day would undercount a prior game -- which biases
+    the early-season bins in exactly the direction the report is testing.
+
+    Returns a floor of 1 for an empty set: there is nothing to count, and the
+    caller still needs a legal window.
+    """
+    import pandas as pd
+
+    stamps = [
+        pd.to_datetime(row.get("game_date"), errors="coerce")
+        for row in rows
+        if row.get("game_date") is not None
+    ]
+    stamps = [s for s in stamps if s is not pd.NaT and not pd.isna(s)]
+    if not stamps:
+        return 1
+
+    now = pd.to_datetime(today) if today is not None else pd.Timestamp.today()
+    earliest = min(stamps)
+    season_start_year = earliest.year - (1 if earliest.month < 8 else 0)
+    season_start = pd.Timestamp(year=season_start_year, month=8, day=1)
+    return max(1, int((now.normalize() - season_start).days) + 7)
+
+
 def residual_of(row: Mapping[str, Any]) -> float | None:
     """
     ``actual - model_projection``: positive means the player beat the model.

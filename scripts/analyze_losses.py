@@ -51,61 +51,6 @@ logger = logging.getLogger("analyze_losses")
 EXIT_OK = 0
 EXIT_LEDGER_UNREADABLE = 2
 
-#: How far back the panel is read when counting prior games. It only has to
-#: reach the start of the season the graded rows fall in; 400 matches the
-#: live slate's own window.
-PANEL_LOOKBACK_DAYS = 400
-
-
-def prior_game_counts(panel: Any, keys: set[tuple[Any, Any]]) -> dict[tuple[Any, Any], int]:
-    """
-    ``(player_id, game_date) -> games that player had already played that season``.
-
-    COUNTED FROM THE PANEL, NOT FROM THE LEDGER. The ledger holds only rows
-    the model scored; a player's games before the model existed are still
-    games he played, and they are what his baseline was built from.
-
-    SEASON-SCOPED, via `features.season.season_start_year`, because "games
-    played" that silently spans a summer is not the quantity the early-season
-    question is about. STRICTLY BEFORE the graded date, so a count can never
-    include the game being predicted.
-    """
-    import pandas as pd
-
-    from src.features.season import season_start_year
-
-    if panel is None or getattr(panel, "empty", True):
-        return {}
-    need = {"PLAYER_ID", "GAME_DATE"}
-    missing = need - set(panel.columns)
-    if missing:
-        logger.warning(
-            "Panel has no %s, so prior games cannot be counted; the report "
-            "will say the early-season question was not measured.",
-            ", ".join(sorted(missing)),
-        )
-        return {}
-
-    frame = panel[["PLAYER_ID", "GAME_DATE"]].copy()
-    frame["GAME_DATE"] = pd.to_datetime(frame["GAME_DATE"])
-    frame["SEASON"] = season_start_year(frame["GAME_DATE"])
-
-    out: dict[tuple[Any, Any], int] = {}
-    by_player: dict[Any, Any] = {
-        pid: group.sort_values("GAME_DATE")
-        for pid, group in frame.groupby("PLAYER_ID", sort=False)
-    }
-    for player_id, game_date in keys:
-        group = by_player.get(player_id)
-        if group is None:
-            continue
-        stamp = pd.to_datetime(game_date)
-        season = season_start_year(pd.Series([stamp])).iloc[0]
-        same_season = group[group["SEASON"] == season]
-        out[(player_id, game_date)] = int((same_season["GAME_DATE"] < stamp).sum())
-    return out
-
-
 def render(report: dict[str, Any]) -> str:
     """The report as a person reads it. One block per section, numbers aligned."""
     lines: list[str] = []
@@ -196,7 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
-    from src.settlement.loss_analysis import analyse_losses
+    from src.settlement.loss_analysis import (
+        analyse_losses,
+        panel_lookback_days_for,
+        prior_game_counts,
+    )
     from src.utils.timezones import format_pacific_iso, now_pacific
 
     try:
@@ -219,7 +168,16 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from src.db.repository import load_player_panel
 
-            panel = load_player_panel(lookback_days=PANEL_LOOKBACK_DAYS)
+            # DERIVED FROM THE ROWS, not a flat window. A flat 400 was not
+            # only wasteful nightly, it was WRONG for older rows: a graded
+            # game from April 2026 needs 470 days to reach its own season's
+            # start, so 400 would have silently undercounted prior games and
+            # biased the early-season bins the report exists to test.
+            lookback = panel_lookback_days_for(rows)
+            logger.info(
+                "Reading %d day(s) of panel to count prior games.", lookback
+            )
+            panel = load_player_panel(lookback_days=lookback)
             priors = prior_game_counts(panel, keys)
         except Exception as exc:  # noqa: BLE001 — a bin is worth less than the report
             # DEGRADES, DOES NOT FAIL. The residuals are still worth printing

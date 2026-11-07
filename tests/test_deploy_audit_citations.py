@@ -71,14 +71,14 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 3582, "job_defaults"),
-    ("scheduler_worker.py", 3583, "max_instances"),
+    ("scheduler_worker.py", 3753, "job_defaults"),
+    ("scheduler_worker.py", 3754, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1818, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1834, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 767, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
@@ -113,7 +113,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "wired into the nightly dispatch at",
-        ("scheduler_worker.py", 1818, "artifact_freshness_verdict()"),
+        ("scheduler_worker.py", 1834, "artifact_freshness_verdict()"),
     ),
     # A1's two entry points. This entry described a SHIPPED guardrail as an
     # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
@@ -124,7 +124,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "scheduled slate at",
-        ("scheduler_worker.py", 1159, "with write_lock() as acquired:"),
+        ("scheduler_worker.py", 1175, "with write_lock() as acquired:"),
     ),
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",

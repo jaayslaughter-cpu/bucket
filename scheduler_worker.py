@@ -241,6 +241,22 @@ TRAINING_MIN_LEAD_MINUTES = 120
 #: enough that an operator who just switched training on sees it happen.
 TRAINING_BOOT_DELAY_SECONDS = 30
 
+#: The nightly loss analysis. ON BY DEFAULT, unlike training and the history
+#: backfill: it only READS the ledger and the panel and writes one report
+#: file, so there is nothing to be careful about turning on. Set it to a false
+#: value to switch it off.
+ENV_LOSS_ANALYSIS = "PROPIQ_LOSS_ANALYSIS"
+#: How many days of graded rows each run reads.
+ENV_LOSS_ANALYSIS_DAYS = "PROPIQ_LOSS_ANALYSIS_DAYS"
+DEFAULT_LOSS_ANALYSIS_DAYS = 30
+#: Written under the state root, so it survives a redeploy and an operator can
+#: read last night's figures without waiting for tonight's run.
+LOSS_ANALYSIS_REPORT_RELPATH = "loss_analysis.json"
+LOSS_ANALYSIS_MISFIRE_GRACE_SECONDS = 2 * 60 * 60
+#: Minutes after settlement. Settlement is what GRADES the rows this reads, so
+#: running before it would analyse yesterday's ledger and call it tonight's.
+LOSS_ANALYSIS_LAG_MINUTES = 30
+
 # MINUTES BEFORE TIP for the availability re-check. 35 is the middle of the
 # 30-45 minute window: late enough that ESPN's injury report has settled, early
 # enough that a withdrawal is still actionable. Bounded 5..180 -- below 5 the
@@ -3492,6 +3508,161 @@ def _run_training_locked(markets: list[str]) -> dict[str, Any]:
     return out
 
 
+def loss_analysis_report_path() -> Path:
+    """Where the nightly report is written, on the mounted state root."""
+    from src.utils.volume import resolve_state_root
+
+    return resolve_state_root()[0] / LOSS_ANALYSIS_REPORT_RELPATH
+
+
+def loss_analysis_time(settle_hour: int, settle_minute: int) -> tuple[int, int]:
+    """
+    When the loss analysis runs: a fixed lag AFTER settlement.
+
+    DERIVED FROM SETTLEMENT, not configured separately, because settlement is
+    what grades the rows this reads. A time an operator could move before it
+    would analyse last night's ledger and report it as tonight's -- a wrong
+    number that looks like a right one, which is worse than no number.
+    """
+    minutes = settle_hour * 60 + settle_minute + LOSS_ANALYSIS_LAG_MINUTES
+    return divmod(minutes % (24 * 60), 60)
+
+
+def run_loss_analysis() -> dict[str, Any]:
+    """
+    Residuals and calibration over the graded ledger, written to the volume.
+
+    WHAT IT ADDS TO THE NIGHT. Settlement grades the rows; this says where the
+    model was WRONG -- whether the error is one-directional, whether it is
+    concentrated in a market, and whether it shrinks as a player accumulates
+    games this season. `src/settlement/loss_analysis.py` holds the arithmetic
+    and is pure; this job is the read, the log and the file.
+
+    DAY ONE IS A RESULT, NOT A FAULT. With no graded rows it reports "nothing
+    to analyse" and returns OK. The first graded rows cannot exist until a
+    slate has scored predictions and the games have finished, so an empty
+    report on the first nights is the honest state of the ledger rather than a
+    broken job.
+
+    IT TAKES THE SLATE'S WRITE LOCK, for one reason: it counts prior games
+    from `player_game_logs`, and the history backfill writes that table half
+    an hour later. A partially written panel undercounts prior games, which
+    biases precisely the early-season bins this report exists to test.
+    Declining costs one night's report and nothing else.
+
+    IT CHANGES NO WEIGHTS AND TUNES NOTHING. See the module docstring: the
+    halflife shrink family was excluded on measurement, and fitting to the
+    residuals of the rows you then report on has no holdout in it.
+
+    RESEARCH_ONLY. Reads a ledger and writes a report.
+    """
+    if not _flag(ENV_LOSS_ANALYSIS, True):
+        logger.info("Loss analysis skipped: disabled (%s).", ENV_LOSS_ANALYSIS)
+        return {"status": "SKIPPED", "reason": f"{ENV_LOSS_ANALYSIS} is false"}
+
+    from src.utils.write_lock import write_lock
+
+    with write_lock() as acquired:
+        if not acquired:
+            logger.warning(
+                "Loss analysis SKIPPED: another process holds the slate write "
+                "lock. Counting prior games off a half-written panel would "
+                "bias the early-season bins, so the report waits for tomorrow.",
+            )
+            return {"status": "SKIPPED",
+                    "reason": "another process holds the slate write lock"}
+        return _run_loss_analysis_locked()
+
+
+def _run_loss_analysis_locked() -> dict[str, Any]:
+    """The body of `run_loss_analysis`, with the write lock already held."""
+    import json
+
+    from src.db.repository import (
+        load_graded_prop_residual_rows,
+        load_player_panel,
+    )
+    from src.settlement.calibration import calibration_from_graded_rows
+    from src.settlement.loss_analysis import (
+        analyse_losses,
+        panel_lookback_days_for,
+        prior_game_counts,
+    )
+    from src.utils.timezones import format_pacific_iso, now_pacific
+
+    days = _int_env(
+        ENV_LOSS_ANALYSIS_DAYS, DEFAULT_LOSS_ANALYSIS_DAYS, low=1, high=400,
+    )
+    try:
+        rows = load_graded_prop_residual_rows(lookback_days=days)
+    except Exception as exc:  # noqa: BLE001 — the ledger is the one hard input
+        logger.error(
+            "LOSS ANALYSIS COULD NOT READ THE LEDGER: %s. This is a database "
+            "fault, not an empty ledger -- an empty one reports itself.", exc,
+        )
+        return {"status": "FAILED", "reason": f"{type(exc).__name__}: {exc}"}
+
+    priors = None
+    if rows:
+        try:
+            lookback = panel_lookback_days_for(rows)
+            logger.info(
+                "Loss analysis: %d graded row(s); reading %d day(s) of panel "
+                "to count prior games.", len(rows), lookback,
+            )
+            panel = load_player_panel(lookback_days=lookback)
+            keys = {(r.get("nba_player_id"), r.get("game_date")) for r in rows}
+            priors = prior_game_counts(panel, keys)
+        except Exception as exc:  # noqa: BLE001 — a bin is worth less than the report
+            # DEGRADES RATHER THAN FAILS. The residuals are still worth having
+            # without the early-season split, and `analyse_losses` reports that
+            # section as NOT_MEASURED rather than as a negative answer.
+            logger.warning(
+                "Loss analysis: prior-game counts unavailable (%s); the "
+                "early-season section will report NOT_MEASURED.", exc,
+            )
+            priors = None
+
+    report = analyse_losses(
+        rows, prior_games=priors, as_of=format_pacific_iso(now_pacific())
+    )
+    report["filters"] = {"days": days, "market": None}
+    try:
+        report["calibration"] = calibration_from_graded_rows(rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Loss analysis: calibration section unavailable: %s", exc)
+
+    target = loss_analysis_report_path()
+    written: str | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        written = str(target)
+    except OSError as exc:
+        # THE REPORT IS STILL IN THE LOG. A volume that refused the write is
+        # worth saying out loud, but it does not make the analysis itself a
+        # failure -- the figures below are the deliverable.
+        logger.error("Loss analysis: could not write %s: %s", target, exc)
+
+    for finding in report.get("findings", []):
+        logger.info("Loss analysis: %s", finding)
+    logger.info(
+        "Loss analysis: {'status': 'OK', 'graded': %d, 'with_residual': %d, "
+        "'record': %s, 'report': %s}",
+        report["n_graded"], report["n_with_residual"], report["record"], written,
+    )
+    return {
+        "status": "OK",
+        "graded": report["n_graded"],
+        "with_residual": report["n_with_residual"],
+        "record": report["record"],
+        "report_path": written,
+        "findings": report.get("findings", []),
+    }
+
+
 def history_backfill_time(slate_hour: int, slate_minute: int) -> tuple[int, int]:
     """
     When the history backfill runs, REFUSING a time that races the slate.
@@ -3679,6 +3850,20 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=TRAINING_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    loss_hour, loss_minute = loss_analysis_time(settle_hour, settle_minute)
+    scheduler.add_job(
+        run_loss_analysis,
+        trigger="cron",
+        hour=loss_hour,
+        minute=loss_minute,
+        timezone=DISPLAY_TZ,
+        id="loss_analysis",
+        name="Residuals and calibration over the graded ledger",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=LOSS_ANALYSIS_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
     scheduler.add_job(
