@@ -1374,6 +1374,81 @@ def upsert_parlay_ledger(table: str, frame: pd.DataFrame) -> int:
     return len(rows)
 
 
+def load_graded_prop_residual_rows(
+    *,
+    lookback_days: int | None = 30,
+    market: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Graded rows with the columns a RESIDUAL needs, which calibration does not.
+
+    A SEPARATE FUNCTION, NOT A WIDER `load_graded_prop_results`. That one's
+    docstring says why it selects four columns: "Selecting the whole table
+    would pull raw box-score JSONB for every row to compute one number from
+    four of its columns." Widening it would make every calibration call carry
+    this cost for figures it does not use. Two questions, two column sets,
+    one table.
+
+    `model_projection` and `actual_result` are the pair `loss_analysis`
+    subtracts; `nba_player_id` and `game_date` are the key it bins by prior
+    games played; `did_not_play` is here because a scratch is not a loss and
+    the analysis drops it by name rather than by absence.
+
+    Decimal -> float at this boundary, matching the sibling loader, so the
+    pure module never learns that these columns came from Numeric.
+    """
+    conditions = [PropResult.outcome_status.in_(("WIN", "LOSS", "PUSH"))]
+    if lookback_days is not None and int(lookback_days) > 0:
+        cutoff = datetime.now(timezone.utc).date() - timedelta(days=int(lookback_days))
+        conditions.append(PropResult.game_date >= cutoff)
+    if market:
+        conditions.append(PropResult.market == str(market).upper())
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                PropResult.outcome_status,
+                PropResult.market,
+                PropResult.game_date,
+                PropResult.player_name,
+                PropResult.nba_player_id,
+                PropResult.predicted_side,
+                PropResult.predicted_line,
+                PropResult.model_projection,
+                PropResult.prob_over,
+                PropResult.actual_result,
+                PropResult.minutes_played,
+                PropResult.did_not_play,
+                PropResult.profit_units,
+                PropResult.source,
+            ).where(and_(*conditions))
+        ).all()
+
+    def num(value: Any) -> float | None:
+        return float(value) if value is not None else None
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "outcome_status": r.outcome_status,
+            "market": r.market,
+            "game_date": r.game_date,
+            "player_name": r.player_name,
+            "nba_player_id": r.nba_player_id,
+            "predicted_side": r.predicted_side,
+            "predicted_line": num(r.predicted_line),
+            "model_projection": num(r.model_projection),
+            "prob_over": num(r.prob_over),
+            "actual_result": num(r.actual_result),
+            "minutes_played": num(r.minutes_played),
+            "did_not_play": bool(r.did_not_play),
+            "profit_units": num(r.profit_units),
+            "source": r.source,
+        })
+    logger.info("Loaded %d graded prop result(s) for residual analysis", len(out))
+    return out
+
+
 def load_graded_prop_results(
     *,
     lookback_days: int | None = 180,
