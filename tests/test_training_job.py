@@ -240,6 +240,13 @@ def test_the_boot_fit_stops_once_an_artifact_exists(monkeypatch, tmp_path):
     artifact.write_text("{}")
     monkeypatch.setenv(worker.ENV_TRAIN_MARKETS, "PTS")
     monkeypatch.setattr("main.resolve_model_artifact", lambda *a, **k: (artifact, "test"))
+    # THE FRESHNESS HALF IS STUBBED ALLOWED, because this test is about the
+    # resolver half only. Left real, it refuses this fixture for a reason that
+    # is correct and not the point: a bare .json with no `.meta.json` beside
+    # it has no readable age, and an artifact of unknown age is treated as
+    # stale. The two halves have their own tests below.
+    allowed = type("V", (), {"allowed": True, "reason": None})()
+    monkeypatch.setattr(worker, "artifact_freshness_verdict", lambda *a, **k: allowed)
 
     assert worker.training_is_needed_now(["PTS"]) == []
     jobs = {j["id"] for j in worker.describe(worker.build_scheduler())}
@@ -301,3 +308,112 @@ def test_the_boot_fit_is_a_scheduled_job_and_not_an_inline_call(monkeypatch):
         "build_scheduler starts the scheduler; the caller does that, and the "
         "boot fit must be queued rather than run here"
     )
+
+
+# --- the cutoff: counted in game dates, because the calendar lied ----------
+
+
+def _production_shaped_dates() -> list[pd.Timestamp]:
+    """
+    Two complete past seasons and the current one, with the NBA off-season
+    gaps between them -- the exact shape the first real fit ran against.
+    """
+    return (
+        list(pd.date_range("2024-10-22", "2025-04-13", freq="D"))
+        + list(pd.date_range("2025-10-21", "2026-04-12", freq="D"))
+        + list(pd.date_range("2026-10-20", "2026-11-05", freq="D"))
+    )
+
+
+def test_the_cutoff_does_not_land_in_the_off_season():
+    """
+    THE DEFECT PRODUCTION CAUGHT, IN ONE ASSERTION.
+
+    A 30-day holdout measured as a calendar subtraction from the newest game
+    (2026-11-05) puts the cutoff at 2026-10-06, which is in the off-season.
+    The last game at or before that is 2026-04-12, so the fit ended there and
+    the model saw NONE of the current season. The deploy probe said it
+    outright: "Training stopped at 2026-04-12 and we hold games through
+    2026-11-05 -- 207 day(s) of games the model never saw, over the 21-day
+    limit".
+
+    Counting game dates instead, and shrinking the holdout until the last
+    FITTED game is inside the limit, keeps the cutoff on a real game date.
+    """
+    dates = _production_shaped_dates()
+    cutoff, held, lag = worker.choose_train_cutoff(dates, 30, 21)
+
+    assert lag <= 21, (
+        f"cutoff {cutoff.date()} leaves a {lag}-day training lag, which the "
+        f"freshness check refuses -- this is the 207-day bug"
+    )
+    assert cutoff >= pd.Timestamp("2026-10-20"), (
+        f"the cutoff fell back to {cutoff.date()}, before the current season "
+        f"started, so the fit sees none of it"
+    )
+    assert 1 <= held < len(dates)
+
+
+@pytest.mark.parametrize("holdout", [7, 14, 21, 30, 60, 120])
+def test_the_lag_limit_is_respected_whatever_the_holdout_asks_for(holdout):
+    """
+    The holdout is a REQUEST; the limit is a constraint. Any holdout that
+    would strand the fit behind the limit is shrunk, never honoured.
+    """
+    dates = _production_shaped_dates()
+    _cutoff, held, lag = worker.choose_train_cutoff(dates, holdout, 21)
+    assert lag <= 21, f"holdout={holdout} produced a {lag}-day lag"
+    assert held >= 1, "nothing was held out, so there is nothing to calibrate on"
+
+
+def test_the_default_holdout_stays_under_the_freshness_limit(monkeypatch):
+    """
+    A 30-day default against a 21-day limit is what shipped first, and every
+    artifact it wrote was refused on arrival. The default is derived from the
+    limit now, so the two cannot drift apart.
+    """
+    from src.models.artifact_freshness import max_training_lag_days
+
+    assert worker.default_train_holdout_days() < max_training_lag_days()
+
+    monkeypatch.setenv("PROPIQ_MAX_TRAINING_LAG_DAYS", "40")
+    assert worker.default_train_holdout_days() < 40
+    assert worker.default_train_holdout_days() >= 7
+
+
+def test_a_panel_too_short_to_satisfy_the_limit_reports_the_lag_rather_than_hiding_it():
+    """
+    One game date inside the limit means holding out anything at all strands
+    the fit behind it. That is a panel problem, so the lag comes back as it
+    is and the caller says so -- rather than a split that pretends to fix it.
+    """
+    dates = [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-11-05")]
+    _cutoff, held, lag = worker.choose_train_cutoff(dates, 14, 21)
+    assert held == 1
+    assert lag > 21, "the honest answer here is a lag over the limit"
+
+
+def test_a_stale_artifact_counts_as_needing_a_fit(monkeypatch, tmp_path):
+    """
+    STALE RESOLVES AND EXISTS, so a missing-only check left the deployment
+    carrying artifacts the gate refuses until the next 07:00 PT -- for a
+    reason a refit fixes in minutes.
+    """
+    artifact = tmp_path / "xgboost_PTS.json"
+    artifact.write_text("{}")
+    monkeypatch.setattr("main.resolve_model_artifact", lambda *a, **k: (artifact, "test"))
+    refused = type("V", (), {"allowed": False, "reason": "207 days of games unseen"})()
+    monkeypatch.setattr(worker, "artifact_freshness_verdict", lambda *a, **k: refused)
+
+    assert worker.training_is_needed_now(["PTS"]) == ["PTS"]
+
+
+def test_a_fresh_artifact_does_not_trigger_a_fit(monkeypatch, tmp_path):
+    """The other half: self-limiting still holds, or every boot refits."""
+    artifact = tmp_path / "xgboost_PTS.json"
+    artifact.write_text("{}")
+    monkeypatch.setattr("main.resolve_model_artifact", lambda *a, **k: (artifact, "test"))
+    allowed = type("V", (), {"allowed": True, "reason": None})()
+    monkeypatch.setattr(worker, "artifact_freshness_verdict", lambda *a, **k: allowed)
+
+    assert worker.training_is_needed_now(["PTS"]) == []

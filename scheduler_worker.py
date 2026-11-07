@@ -221,7 +221,10 @@ ENV_TRAIN_MARKETS = "PROPIQ_TRAIN_MARKETS"
 #: recent slice on purpose: a model is asked about tomorrow, so the only
 #: honest check is on games after everything it learned from.
 ENV_TRAIN_HOLDOUT_DAYS = "PROPIQ_TRAIN_HOLDOUT_DAYS"
-DEFAULT_TRAIN_HOLDOUT_DAYS = 30
+#: Not a constant, because it must stay UNDER the freshness limit the deploy
+#: probe and the publication gate enforce. A 30-day default was what shipped
+#: first, against a 21-day limit, and every artifact it produced was refused.
+DEFAULT_TRAIN_HOLDOUT_MARGIN_DAYS = 7
 #: How far back the training panel reaches. NOT 0: `load_player_panel`
 #: HONOURS this now and computes `lower = upper - days`, so 0 would load a
 #: single day. 1200 reaches 2023-07 from a 2026-11 slate, which covers every
@@ -3150,6 +3153,57 @@ def _training_markets() -> list[str]:
     return wanted
 
 
+def choose_train_cutoff(
+    dates: list[Any], holdout_days: int, lag_limit: int
+) -> tuple[Any, int, int]:
+    """
+    Where the fit stops, counted in GAME DATES. Returns (cutoff, held, lag).
+
+    THE CALENDAR VERSION OF THIS WAS WRONG, and production caught it within
+    minutes of the first real fit. A 30-day holdout measured back from the
+    newest game (2026-11-05) put the cutoff at 2026-10-06, which falls in the
+    NBA's off-season: the last game at or before it was 2026-04-12, so the
+    model saw NONE of the current season. The probe said so plainly -- "207
+    day(s) of games the model never saw, over the 21-day limit". A calendar
+    subtraction cannot see a four-month gap with no basketball in it.
+
+    So `holdout_days` picks a first guess and the number of HELD game dates
+    then shrinks until the last FITTED game is inside `lag_limit`. At least
+    one date is always held, or there is nothing to calibrate on, and at
+    least one is always fitted.
+
+    The returned lag can still exceed the limit, and only one thing causes
+    that: a panel with just one game date inside the limit, where holding out
+    anything at all strands the fit behind it. The caller reports that rather
+    than pretending the split fixed it.
+    """
+    import pandas as pd
+
+    newest = dates[-1]
+    horizon = newest - pd.Timedelta(days=holdout_days)
+    held = max(1, min(sum(1 for d in dates if d > horizon), len(dates) - 1))
+    while held > 1 and (newest - dates[-held - 1]).days > lag_limit:
+        held -= 1
+    cutoff = dates[-held - 1]
+    return cutoff, held, (newest - cutoff).days
+
+
+def default_train_holdout_days() -> int:
+    """
+    The holdout, derived from the freshness limit rather than guessed.
+
+    `artifact_freshness` refuses an artifact whose training data stops more
+    than `PROPIQ_MAX_TRAINING_LAG_DAYS` before the newest game it holds, and
+    the publication gate reads that same verdict. A holdout AT or OVER that
+    limit therefore produces an artifact that is refused the moment it is
+    written -- which is what a 30-day default did against a 21-day limit on
+    the first real fit. Deriving it means the two cannot drift apart.
+    """
+    from src.models.artifact_freshness import max_training_lag_days
+
+    return max(7, max_training_lag_days() - DEFAULT_TRAIN_HOLDOUT_MARGIN_DAYS)
+
+
 def training_is_needed_now(markets: list[str]) -> list[str]:
     """
     The configured markets that have NO resolvable artifact yet.
@@ -3184,6 +3238,37 @@ def training_is_needed_now(markets: list[str]) -> list[str]:
             logger.warning("Artifact check for %s failed: %s", market, exc)
             continue
         if path is None or not Path(path).exists():
+            missing.append(market)
+            continue
+        # STALE COUNTS AS UNUSABLE, not merely imperfect.
+        #
+        # The first real fit wrote three artifacts the freshness check
+        # refused the moment it read them -- the holdout had been counted in
+        # calendar days and fell inside the off-season, so the model saw none
+        # of the current season. Those files RESOLVE and EXIST, so a
+        # missing-only check left the deployment carrying refused artifacts
+        # until the next 07:00 PT, with the gate withholding for a reason a
+        # refit fixes in minutes.
+        #
+        # Still self-limiting: a fresh artifact answers here and no boot fit
+        # is scheduled. Where the PANEL cannot satisfy the limit at all --
+        # deep off-season, nothing recent to fit -- this refits once per
+        # boot, which is rare and loudly logged, rather than silently
+        # serving something the gate will refuse anyway.
+        # THE GATE'S OWN VERDICT, not a second reading of the same files.
+        # `artifact_freshness_verdict` is what `run_dispatch` asks before it
+        # publishes anything, so asking it here means the boot fit triggers on
+        # exactly the condition that would withhold the board.
+        try:
+            verdict = artifact_freshness_verdict([market])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Freshness check for %s failed: %s", market, exc)
+            continue
+        if verdict is not None and not getattr(verdict, "allowed", True):
+            logger.warning(
+                "ARTIFACT FOR %s RESOLVES BUT IS REFUSED: %s. Counting it as "
+                "needing a fit.", market, getattr(verdict, "reason", None),
+            )
             missing.append(market)
     return missing
 
@@ -3289,6 +3374,7 @@ def _run_training_locked(markets: list[str]) -> dict[str, Any]:
         load_player_panel,
         load_team_game_stats,
     )
+    from src.models.artifact_freshness import max_training_lag_days
     from src.models.compare import load_comparison_config
     from src.models.training import TrainingDataError, fit_market_artifacts
     from src.utils.timezones import pacific_calendar_date
@@ -3298,7 +3384,7 @@ def _run_training_locked(markets: list[str]) -> dict[str, Any]:
         ENV_TRAIN_LOOKBACK_DAYS, DEFAULT_TRAIN_LOOKBACK_DAYS, low=1, high=4000,
     )
     holdout_days = _int_env(
-        ENV_TRAIN_HOLDOUT_DAYS, DEFAULT_TRAIN_HOLDOUT_DAYS, low=1, high=365,
+        ENV_TRAIN_HOLDOUT_DAYS, default_train_holdout_days(), low=1, high=365,
     )
 
     panel = load_player_panel(slate_date=slate_date, lookback_days=lookback)
@@ -3316,12 +3402,48 @@ def _run_training_locked(markets: list[str]) -> dict[str, Any]:
         panel, team_games=team_games, market_lines=market_lines,
     )
 
-    # THE CUTOFF IS COMPUTED FROM THE PANEL, not from today. A panel whose
-    # newest game is a week old would otherwise lose a week of its holdout to
-    # days with no games in them, and in the off-season the holdout would be
-    # empty while the fit set looked fine.
-    newest = pd.to_datetime(features["GAME_DATE"]).max()
-    train_end = (newest - pd.Timedelta(days=holdout_days)).date().isoformat()
+    # THE CUTOFF IS COUNTED IN GAME DATES, NOT CALENDAR DAYS, and the first
+    # version of this got it wrong in a way production caught within minutes.
+    #
+    # WHAT HAPPENED. A 30-day holdout measured back from the newest game
+    # (2026-11-05) put the cutoff at 2026-10-06 -- which falls in the NBA's
+    # off-season. The last game at or before it was 2026-04-12, so the fit
+    # ended there and the model saw none of the current season at all. The
+    # deploy probe said so immediately: "Training stopped at 2026-04-12 and
+    # we hold games through 2026-11-05 -- 207 day(s) of games the model never
+    # saw, over the 21-day limit". A calendar subtraction cannot see a
+    # four-month gap with no basketball in it.
+    #
+    # SO THE HOLDOUT IS A COUNT OF GAME DATES, shrunk until the last FITTED
+    # game is inside the freshness limit. The limit is read from
+    # `artifact_freshness.max_training_lag_days`, the same function the probe
+    # and the publication gate read -- training must not knowingly write an
+    # artifact that the gate will then refuse, and two copies of that number
+    # would drift.
+    lag_limit = max_training_lag_days()
+    dates = sorted(set(pd.to_datetime(features["GAME_DATE"]).dt.normalize()))
+    if len(dates) < 2:
+        logger.error(
+            "TRAINING FOUND ONE GAME DATE (%s) in the panel; there is nothing "
+            "to split into a fit set and a holdout.", dates[0].date() if dates else None,
+        )
+        return {"status": "FAILED", "reason": "one game date", "markets": markets}
+    train_end_ts, held, lag = choose_train_cutoff(dates, holdout_days, lag_limit)
+    train_end = train_end_ts.date().isoformat()
+    logger.info(
+        "Training split: holding out the newest %d game date(s) (%s -> %s), "
+        "fitting through %s. Training lag %d day(s) against a %d-day limit.",
+        held, dates[-held].date(), dates[-1].date(), train_end, lag, lag_limit,
+    )
+    if lag > lag_limit:
+        logger.error(
+            "TRAINING LAG %d DAY(S) EXCEEDS THE %d-DAY LIMIT and cannot be "
+            "reduced: holding out the single newest game date still leaves "
+            "the fit ending %s against games through %s. The artifact will be "
+            "written and the freshness check will refuse it; the panel needs "
+            "more recent dates, not a different split.",
+            lag, lag_limit, train_end, dates[-1].date(),
+        )
     artifacts_dir = Path(str(
         (load_comparison_config() or {}).get(
             "artifacts_dir", "data/external/model_runs/comparison"
@@ -3351,9 +3473,12 @@ def _run_training_locked(markets: list[str]) -> dict[str, Any]:
         "status": status,
         "panel_rows": int(len(panel)),
         "feature_rows": int(len(features)),
-        "newest_game": str(newest.date()),
+        "newest_game": str(dates[-1].date()),
         "train_end": train_end,
         "holdout_days": holdout_days,
+        "held_game_dates": held,
+        "training_lag_days": lag,
+        "training_lag_limit": lag_limit,
         "artifacts_dir": str(artifacts_dir),
         "markets": reports,
         "failed": failures,
