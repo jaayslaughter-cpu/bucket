@@ -71,6 +71,44 @@ CALIBRATION_NOTE = (
 )
 
 
+#: THE RANGE A TAKEN-SIDE PROBABILITY CAN OCCUPY, and it is not [0, 1].
+#:
+#: `settlement.recorder` records the side the model thinks is MORE LIKELY
+#: (``side = SIDE_OVER if prob_over > 0.5 else SIDE_UNDER``), so
+#: `probability_of_taken_side` returns ``prob_over`` above 0.5 and
+#: ``1 - prob_over`` below it. Either way the result exceeds 0.5. Binning that
+#: over [0, 1] leaves half the bins unreachable BY CONSTRUCTION: coverage
+#: could never exceed 0.5, the 0.8 requirement could never be met, and no
+#: number of graded predictions would ever have opened the publication gate.
+#:
+#: Measured against this file before the change, on 1,000 synthetic rows drawn
+#: to be perfectly calibrated: ``bin_coverage 0.5``, ``ece_ungated 0.021612``
+#: -- well inside the 0.05 bar -- and ``ece: None``, WITHHELD.
+#:
+#: The fix is to bin the range actually being evaluated. The sample-size
+#: requirement, the 0.05 quality bar and the push/no-line exclusions are all
+#: unchanged; only the domain the coverage fraction is measured over moves.
+#: `test_calibration_domain.py` ties this constant to the recorder's rule, so
+#: a recorder that ever records the less likely side fails rather than
+#: silently invalidating this.
+TAKEN_SIDE_PROBABILITY_DOMAIN: tuple[float, float] = (0.5, 1.0)
+
+#: Bins for that domain, chosen to PRESERVE BIN WIDTH rather than bin count.
+#:
+#: This is the part that is easy to get wrong, and I did get it wrong first.
+#: Ten bins across [0, 1] are 0.10 wide, and the 0.05 ECE bar was set against
+#: that resolution. Keeping ten bins while halving the domain makes them 0.05
+#: wide, and finer bins expose more miscalibration -- so the same data scores
+#: a HIGHER ECE and the bar silently becomes stricter. Two existing fixtures
+#: that passed at 0.10 width failed at 0.05 (one at ECE 0.0637), which is how
+#: the mistake surfaced.
+#:
+#: Five bins over (0.5, 1.0] are 0.10 wide: the same resolution the bar was
+#: set against, and 0.8 coverage means 4 of 5, which is reachable. Fixing the
+#: domain must not quietly move the quality bar as well.
+TAKEN_SIDE_BINS: int = 5
+
+
 def probability_of_taken_side(
     prob_over: Any, predicted_side: Any, predicted_line: Any
 ) -> float | None:
@@ -171,7 +209,8 @@ def calibration_from_graded_rows(
     p = np.asarray(probabilities, dtype=float)
     y = np.asarray(outcomes, dtype=float)
     ece = expected_calibration_error(
-        y, p, n_bins=n_bins, min_bin_coverage=min_bin_coverage
+        y, p, n_bins=TAKEN_SIDE_BINS, min_bin_coverage=min_bin_coverage,
+        domain=TAKEN_SIDE_PROBABILITY_DOMAIN,
     )
 
     base.update({
@@ -185,11 +224,28 @@ def calibration_from_graded_rows(
         "ece": ece.get("ece"),
         "ece_ungated": ece.get("ece_ungated"),
         "bin_coverage": ece.get("bin_coverage"),
+        # How many graded rows the figure above does NOT describe. A row whose
+        # taken-side probability falls outside the domain is excluded, not
+        # clipped, so a non-zero count here means the figure covers fewer rows
+        # than `scored` claims. The recorder cannot emit such a row today; if
+        # one appears, the producer changed and this number says so.
+        "out_of_domain": ece.get("out_of_domain"),
         "nonempty_bins": ece.get("nonempty_bins"),
         "n_bins": ece.get("n_bins"),
         "ece_gate_passed": ece.get("gate_passed"),
-        "reliability_table": reliability_table(y, p, n_bins=n_bins),
+        "reliability_table": reliability_table(
+            y, p, n_bins=TAKEN_SIDE_BINS, domain=TAKEN_SIDE_PROBABILITY_DOMAIN,
+        ),
     })
+    if ece.get("out_of_domain"):
+        logger.warning(
+            "CALIBRATION: %d graded row(s) carried a taken-side probability "
+            "outside %s and were EXCLUDED from the figure, not clipped into it. "
+            "The recorder takes the more likely side, so it cannot produce such "
+            "a row -- check what wrote these before trusting the ECE.",
+            ece.get("out_of_domain"),
+            list(TAKEN_SIDE_PROBABILITY_DOMAIN),
+        )
     return base
 
 

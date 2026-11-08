@@ -128,11 +128,29 @@ def test_the_calibration_producer_emits_what_the_gate_reads():
 
     rng = np.random.default_rng(7)
     rows = []
-    for _ in range(400):
-        p = float(rng.uniform(0.05, 0.95))
+    # 400 ROWS WAS NOT ENOUGH TO PIN WIRING. Measured over 12 seeds with this
+    # same generator: at 400 rows the ECE averaged 0.0345 and 1 seed in 12 --
+    # this one -- came out at 0.0511, over the gate's 0.05. That is sampling
+    # noise, not miscalibration: a perfectly calibrated generator binned 5 ways
+    # puts ~80 rows in a bin, where the per-bin standard error is ~0.056. The
+    # gate was right to refuse it. At 2000 rows the worst of the same 12 seeds
+    # was 0.0266, so the outcome of this test now turns on the wiring it is
+    # named for rather than on which seed was picked.
+    for _ in range(2000):
+        p_over = float(rng.uniform(0.05, 0.95))
+        # THE SIDE FOLLOWS THE RECORDER'S OWN RULE (recorder.py:252:
+        # `side = SIDE_OVER if prob_over > 0.5 else SIDE_UNDER`). This fixture
+        # used to label EVERY row OVER, including ones with prob_over below
+        # 0.5 -- rows the only producer of this table cannot emit. It fed the
+        # gate taken-side probabilities under 0.5, which is outside the domain
+        # `settlement.calibration` bins, so half of them were excluded and the
+        # ECE moved. A fixture that pins wiring should not depend on an input
+        # the system cannot produce.
+        side = "OVER" if p_over > 0.5 else "UNDER"
+        p_taken = p_over if side == "OVER" else 1.0 - p_over
         rows.append({
-            "outcome_status": "WIN" if rng.random() < p else "LOSS",
-            "prob_over": p, "predicted_side": "OVER", "predicted_line": 24.5,
+            "outcome_status": "WIN" if rng.random() < p_taken else "LOSS",
+            "prob_over": p_over, "predicted_side": side, "predicted_line": 24.5,
         })
     report = calibration_from_graded_rows(rows)
     assert report["status"] == "OK", report.get("reason")

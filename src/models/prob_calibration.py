@@ -102,15 +102,67 @@ def choose_calibrator(
     return final, scores
 
 
+#: The full probability domain, which is what a raw P(over) spans.
+FULL_PROBABILITY_DOMAIN: tuple[float, float] = (0.0, 1.0)
+
+#: Float drift at a domain edge is not an out-of-domain value. `reliability_table`
+#: used to `np.clip(p, 0, 1)`, which quietly absorbed a 1.0000000002 from a
+#: sigmoid; excluding it instead would have DROPPED a legitimate row. Values
+#: this close to an edge are snapped onto it, anything further out is excluded.
+DOMAIN_EDGE_TOLERANCE: float = 1e-9
+
+
+def in_domain(p_hat: np.ndarray, domain: tuple[float, float]) -> np.ndarray:
+    """
+    Which predictions fall inside ``domain``. ONE DEFINITION, because two
+    readers of this rule is how a count and a table come to disagree: the
+    exclusion count in `expected_calibration_error` and the binning in
+    `reliability_table` must answer to the same test, or the report would say
+    it excluded n rows while the table weighed a different number.
+    """
+    lo, hi = (float(domain[0]), float(domain[1]))
+    if not (hi > lo):
+        raise ValueError(f"domain must be increasing, got {domain!r}")
+    p = np.asarray(p_hat).astype(float)
+    return (p >= lo - DOMAIN_EDGE_TOLERANCE) & (p <= hi + DOMAIN_EDGE_TOLERANCE)
+
+
 def reliability_table(
     y_true: np.ndarray,
     p_hat: np.ndarray,
     *,
     n_bins: int = 10,
+    domain: tuple[float, float] = FULL_PROBABILITY_DOMAIN,
 ) -> list[dict[str, Any]]:
-    y = np.asarray(y_true).astype(int)
-    p = np.clip(np.asarray(p_hat).astype(float), 0, 1)
-    edges = np.linspace(0, 1, n_bins + 1)
+    """
+    Bin predictions against outcomes. ``domain`` is the range being binned.
+
+    WHY THE DOMAIN IS A PARAMETER, with the receipt. The edges were
+    ``linspace(0, 1, ...)`` unconditionally, and the publication gate feeds
+    this the TAKEN-SIDE probability -- which `settlement.recorder` confines to
+    (0.5, 1.0] because it records the more likely side
+    (``side = SIDE_OVER if prob_over > 0.5 else SIDE_UNDER``). Half the bins
+    were therefore unreachable by construction, coverage could never exceed
+    0.5, and an 0.8 coverage requirement could never be met. Measured on 1,000
+    synthetic PERFECTLY CALIBRATED rows against this file before the change:
+    ``bin_coverage 0.5``, ``ece_ungated 0.0216`` -- comfortably inside the
+    0.05 bar -- and ``ece: None``, withheld. No number of graded predictions
+    would ever have opened that gate.
+
+    A row outside ``domain`` is EXCLUDED rather than clipped. Clipping would
+    fold a 0.30 into the 0.5 bin and move the ECE; excluding it keeps the
+    figure honest and lets the caller see that the domain assumption no longer
+    holds.
+
+    The default is the full range, so every existing caller -- model selection
+    on a raw P(over) in ``models.compare``, the research path in
+    ``quant.paper_calibration`` -- is unchanged.
+    """
+    domain_lo, domain_hi = (float(domain[0]), float(domain[1]))
+    inside = in_domain(p_hat, domain)
+    y = np.asarray(y_true).astype(int)[inside]
+    p = np.clip(np.asarray(p_hat).astype(float)[inside], domain_lo, domain_hi)
+    edges = np.linspace(domain_lo, domain_hi, n_bins + 1)
     rows: list[dict[str, Any]] = []
     for i in range(n_bins):
         lo, hi = edges[i], edges[i + 1]
@@ -121,7 +173,7 @@ def reliability_table(
         obs = float(y[mask].mean())
         rows.append(
             {
-                "probability_bin": f"{lo:.1f}-{hi:.1f}",
+                "probability_bin": f"{lo:.2f}-{hi:.2f}",
                 "n_predictions": int(mask.sum()),
                 "mean_predicted_probability": round(mean_p, 4),
                 "observed_frequency": round(obs, 4),
@@ -137,6 +189,7 @@ def expected_calibration_error(
     *,
     n_bins: int = 10,
     min_bin_coverage: float = 0.8,
+    domain: tuple[float, float] = FULL_PROBABILITY_DOMAIN,
 ) -> dict[str, Any]:
     """
     Weighted ECE with a non-empty-bin coverage gate.
@@ -145,7 +198,13 @@ def expected_calibration_error(
     ``ece`` is None and ``gate_passed`` is False — sparse reliability diagrams
     must not win model selection (Wave 1 / calibration-driven selection).
     """
-    table = reliability_table(y_true, p_hat, n_bins=n_bins)
+    table = reliability_table(y_true, p_hat, n_bins=n_bins, domain=domain)
+    # OUT OF DOMAIN IS A SIGNAL, NOT NOISE. The caller stated the range it
+    # believes these probabilities live in; a value outside it means that
+    # belief is now wrong -- the recorder changed, or someone passed a raw
+    # P(over) where a taken-side probability was expected -- and the figure
+    # below was computed without those rows.
+    out_of_domain = int((~in_domain(p_hat, domain)).sum())
     nonempty = len(table)
     coverage = nonempty / float(n_bins) if n_bins else 0.0
     gate_passed = coverage >= float(min_bin_coverage)
@@ -156,6 +215,8 @@ def expected_calibration_error(
             "nonempty_bins": 0,
             "n_bins": n_bins,
             "gate_passed": False,
+            "probability_domain": [float(domain[0]), float(domain[1])],
+            "out_of_domain": out_of_domain,
             "table": table,
         }
     ntot = sum(t["n_predictions"] for t in table)
@@ -167,6 +228,8 @@ def expected_calibration_error(
         "nonempty_bins": nonempty,
         "n_bins": n_bins,
         "gate_passed": gate_passed,
+        "probability_domain": [float(domain[0]), float(domain[1])],
+        "out_of_domain": out_of_domain,
         "table": table,
     }
 
