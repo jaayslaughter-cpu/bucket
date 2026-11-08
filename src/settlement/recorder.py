@@ -197,8 +197,19 @@ def pending_prop_result_rows(
         market = _text(row.get("MARKET"))
         label = f"{player or '?'} {market or '?'}"
 
+        def skip(reason: str, *, _label=label, _p=player, _m=market) -> None:
+            """
+            ONE PLACE BUILDS A SKIP ENTRY. `decision_record` needs the player
+            and the market as fields, not parsed back out of `row`, and nine
+            hand-built dicts is nine chances for one of them to carry only the
+            label. The defaults bind this iteration's values.
+            """
+            report.skipped.append(
+                {"row": _label, "player": _p, "market": _m, "reason": reason}
+            )
+
         if not player or not market:
-            report.skipped.append({"row": label, "reason": "no player name or market"})
+            skip("no player name or market")
             continue
 
         game_id = _text(row.get("GAME_ID"))
@@ -211,42 +222,30 @@ def pending_prop_result_rows(
         game_id = game_id or _text(posted.get("nba_game_id"))
 
         if line is None:
-            report.skipped.append({"row": label, "reason": "no posted line"})
+            skip("no posted line")
             continue
         if prob_over is None:
-            report.skipped.append({"row": label, "reason": "no model probability"})
+            skip("no model probability")
             continue
         if not 0.0 <= prob_over <= 1.0:
-            report.skipped.append({
-                "row": label, "reason": "model probability outside [0, 1]",
-            })
+            skip("model probability outside [0, 1]")
             continue
         if prob_over == 0.5:
-            report.skipped.append({
-                "row": label, "reason": "no side predicted (P(over) is exactly 0.50)",
-            })
+            skip("no side predicted (P(over) is exactly 0.50)")
             continue
         if not source:
-            report.skipped.append({
-                "row": label,
-                "reason": "no line source (a null source defeats the unique key)",
-            })
+            skip("no line source (a null source defeats the unique key)")
             continue
         if not game_id:
-            report.skipped.append({
-                "row": label, "reason": "no game id (the grader could never match it)",
-            })
+            skip("no game id (the grader could never match it)")
             continue
         if pd.isna(game_date):
-            report.skipped.append({"row": label, "reason": "no game date"})
+            skip("no game date")
             continue
         # Only WITHHELD. See the module docstring on why an unverified check is
         # not a scratch.
         if str(row.get("AVAILABILITY") or "").strip().upper() == "WITHHELD":
-            report.skipped.append({
-                "row": label,
-                "reason": "player is listed OUT or DOUBTFUL (would settle VOID)",
-            })
+            skip("player is listed OUT or DOUBTFUL (would settle VOID)")
             continue
 
         side = SIDE_OVER if prob_over > 0.5 else SIDE_UNDER

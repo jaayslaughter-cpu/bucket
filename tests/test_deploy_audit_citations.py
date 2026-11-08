@@ -129,7 +129,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "`python main.py` at",
-        ("main.py", 2098, "with write_lock() as _acquired:"),
+        ("main.py", 2157, "with write_lock() as _acquired:"),
     ),
 ]
 

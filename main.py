@@ -1331,6 +1331,11 @@ def score_prob_over_by_market(
                 "no market receives these probabilities."
             )
             return {}
+        # WHICH FILE ANSWERED, carried on the Series so the decision record can
+        # bind a slate's probabilities to the artifact that produced them. The
+        # calibration report pools graded rows with no idea which generation
+        # scored them; this is where that identity starts.
+        scored.attrs["artifact"] = str(explicit)
         return {str(market): scored}
 
     component = scoring_component()
@@ -1360,6 +1365,7 @@ def score_prob_over_by_market(
                 "market.", path, market, how, resolved_market,
             )
             continue
+        scored.attrs["artifact"] = str(path)
         out[market.upper()] = scored
 
     if missing:
@@ -2061,6 +2067,59 @@ def main(argv: list[str] | None = None) -> int:
             )
             record_pending_prop_results(recorded.rows)
             stage_summary["prop_results"] = recorded.as_dict()
+
+            # THE WHOLE SLATE, NOT THE PART THAT CLEARED. `prop_results` holds
+            # only recorded rows, so a day like 2026-11-08 -- 0 recorded, 796
+            # skipped -- leaves a ledger that reads as though nothing was
+            # decided. The chain below records both, with the artifact digests
+            # that produced them, so the denominator behind any later strike
+            # rate or calibration figure is visible and cannot be edited after
+            # the fact without breaking every record after it.
+            #
+            # A FAILURE HERE DOES NOT FAIL THE SLATE. The record is evidence
+            # about a run, not part of it; losing one night's evidence is worth
+            # less than losing the night's board.
+            try:
+                from src.settlement.decision_record import (
+                    artifact_provenance,
+                    build_record,
+                    decision_rows,
+                    latest_sha256,
+                    write_record,
+                )
+                from src.utils.timezones import format_pacific_iso
+                from src.utils.volume import resolve_state_root
+
+                state_root, _how = resolve_state_root()
+                body, digest = build_record(
+                    slate_date=slate_pt,
+                    as_of_ts=format_pacific_iso(now_pacific()),
+                    rows=decision_rows(recorded),
+                    prev_sha256=latest_sha256(state_root),
+                    model_provenance=artifact_provenance({
+                        market: series.attrs.get("artifact")
+                        for market, series in (prob_over or {}).items()
+                    }),
+                    gate=stage_summary.get("ev_gate") or {},
+                )
+                written = write_record(state_root, body)
+                stage_summary["decision_record"] = {
+                    "sha256": digest, "rows": body["counts"]["total"],
+                    "by_decision": body["counts"]["by_decision"],
+                }
+                logger.info(
+                    "Decision record %s written (%d row(s): %s), chained to %s.",
+                    digest[:12], body["counts"]["total"],
+                    body["counts"]["by_decision"],
+                    (body["prev_sha256"] or "nothing — this starts the chain")[:12],
+                )
+                logger.debug("Decision record path: %s", written)
+            except Exception as exc:  # noqa: BLE001 — evidence, not the pipeline
+                logger.warning(
+                    "Decision record NOT written (%s). The slate is unaffected, "
+                    "but this run leaves no chained evidence of its decisions.",
+                    exc,
+                )
 
             record_run(run_id, status="success", stage_summary=stage_summary)
 
