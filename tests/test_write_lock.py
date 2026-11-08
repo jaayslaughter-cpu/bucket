@@ -34,6 +34,7 @@ import ast
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -318,3 +319,154 @@ def test_the_backfill_proceeds_when_the_lock_is_free(monkeypatch):
         "a FREE lock did not let the backfill reach its planning read, so it "
         f"is declining unconditionally: {out}"
     )
+
+
+# --- the refcount is per PATH, and that was not enough ---------------------
+
+def _hold_in_a_thread(tmp_path, results, entered, release, key="owner"):
+    """Take the lock in a separate thread and hold it until `release` is set."""
+    def body():
+        try:
+            with write_lock(root=tmp_path) as acquired:
+                results[key] = acquired
+                entered.set()
+                release.wait(timeout=10)
+        except BaseException as exc:  # noqa: BLE001 — surfaced to the assertion
+            results[key] = exc
+            entered.set()
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=10), "the holder thread never acquired the lock"
+    return thread
+
+
+def test_a_second_thread_declines_rather_than_sharing_the_holders_refcount(tmp_path):
+    """
+    THE DEFECT, and the docstring above walked right past it: "a thread would
+    share the refcount and prove nothing about `flock`" treats shared state
+    between threads as a nuisance for testing rather than as the bug.
+
+    `_DEPTH` was keyed by lock PATH alone. Reentrancy exists for one call chain
+    on one thread -- run_slate -> main.main -- but any OTHER thread that asked
+    for the same path found a non-zero depth and took the "already ours" branch,
+    so it was handed `True` without ever touching `flock`. Two threads then ran
+    the protected region at once.
+
+    That is not hypothetical here: APScheduler's `BlockingScheduler` dispatches
+    each job onto its own pool thread, and `max_instances=1` is PER JOB -- which
+    `scheduler_worker` itself notes in two places. Settlement, loss analysis,
+    the backfill, training and the slate are five different jobs, so two of them
+    overlapping is two threads, not two processes.
+
+    `flock` would have refused the second acquire on its own: it conflicts
+    across file descriptors within one process. The short-circuit above it is
+    the whole defect.
+    """
+    results, entered, release = {}, threading.Event(), threading.Event()
+    thread = _hold_in_a_thread(tmp_path, results, entered, release)
+    try:
+        assert results["owner"] is True, "the holder thread did not get the lock"
+        with write_lock(root=tmp_path) as second:
+            assert second is False, (
+                "a second THREAD was handed the lock while another thread held "
+                "it; both would write the panel at once"
+            )
+    finally:
+        release.set()
+        thread.join(timeout=10)
+
+
+def test_the_holders_own_nesting_still_works_while_another_thread_is_excluded(tmp_path):
+    """
+    Fixing exclusion must not cost reentrancy. The holder nests; everyone else
+    declines; and those are the same lock at the same path.
+    """
+    results, entered, release = {}, threading.Event(), threading.Event()
+    nested: dict[str, object] = {}
+
+    def body():
+        with write_lock(root=tmp_path) as outer:
+            results["owner"] = outer
+            with write_lock(root=tmp_path) as inner:
+                nested["inner"] = inner
+            entered.set()
+            release.wait(timeout=10)
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=10)
+    try:
+        assert results["owner"] is True
+        assert nested["inner"] is True, "the holder's own nested acquire declined"
+        with write_lock(root=tmp_path) as other:
+            assert other is False
+    finally:
+        release.set()
+        thread.join(timeout=10)
+
+
+def test_the_lock_returns_to_the_pool_once_the_holding_thread_leaves(tmp_path):
+    """
+    A decline must be for the duration of the hold, not for the life of the
+    process: the next job's thread has to be able to take it.
+    """
+    results, entered = {}, threading.Event()
+    done = threading.Event()
+
+    # THE FIRST THREAD STAYS ALIVE AFTER RELEASING. Joining it first would let
+    # the runtime hand its thread id straight to the next thread, and a holder
+    # recorded by id would then compare equal to its own successor -- which is
+    # exactly how a mutation that never cleared the owner survived this test.
+    def holder():
+        with write_lock(root=tmp_path) as acquired:
+            results["owner"] = acquired
+        entered.set()
+        done.wait(timeout=10)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=10)
+
+    after: dict[str, object] = {}
+    second_entered = threading.Event()
+
+    def later():
+        with write_lock(root=tmp_path) as acquired:
+            after["acquired"] = acquired
+        second_entered.set()
+
+    later_thread = threading.Thread(target=later, daemon=True)
+    later_thread.start()
+    assert second_entered.wait(timeout=10)
+    later_thread.join(timeout=10)
+    done.set()
+    thread.join(timeout=10)
+    assert after["acquired"] is True, (
+        "the lock stayed owned after its holder returned, so every later job "
+        "would decline forever"
+    )
+
+
+def test_a_holder_that_raises_does_not_strand_the_lock(tmp_path):
+    """
+    `_run_slate_locked` catches its own exceptions, but a job that dies inside
+    the lock must still hand it back, or one bad night silences every job after.
+    """
+    entered = threading.Event()
+
+    def body():
+        try:
+            with write_lock(root=tmp_path):
+                entered.set()
+                raise RuntimeError("synthetic failure inside the lock")
+        except RuntimeError:
+            pass
+
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=10)
+    thread.join(timeout=10)
+
+    with write_lock(root=tmp_path) as acquired:
+        assert acquired is True, "a raising holder stranded the lock"
