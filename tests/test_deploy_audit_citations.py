@@ -71,14 +71,14 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 3753, "job_defaults"),
-    ("scheduler_worker.py", 3754, "max_instances"),
+    ("scheduler_worker.py", 3789, "job_defaults"),
+    ("scheduler_worker.py", 3790, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1834, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1870, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 767, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
@@ -86,15 +86,15 @@ ANCHORS = [
     # line it replaced did -- that row named `logging.basicConfig` for
     # months after the two basicConfig calls were deleted.
     ("src/utils/logstreams.py", 57, "def configure_logging("),
-    ("main.py", 183, "Deliberately NOT read"),
+    ("main.py", 212, "Deliberately NOT read"),
     # README.md, rewritten 2026-10-29. Its predecessor named `TZ_DISPLAY` as a
     # variable nothing reads, `PROPIQ_SLATE_HOUR` without the `_PT` suffix the
     # code requires, and the panel-lag variable for the MARKET staleness
     # check -- three settings an operator could have set to no effect. The
     # rewrite cites the lines instead of restating them, so these keep it
     # honest the way `tests/test_agents_md.py` keeps AGENTS.md honest.
-    ("main.py", 683, "MARKET DATA IS STALE"),
-    ("main.py", 118, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
+    ("main.py", 749, "MARKET DATA IS STALE"),
+    ("main.py", 146, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
     ("src/quant/publication_gate.py", 70, "DEFAULT_MIN_SCORED = 100"),
@@ -113,7 +113,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "wired into the nightly dispatch at",
-        ("scheduler_worker.py", 1834, "artifact_freshness_verdict()"),
+        ("scheduler_worker.py", 1870, "artifact_freshness_verdict()"),
     ),
     # A1's two entry points. This entry described a SHIPPED guardrail as an
     # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
@@ -124,12 +124,12 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "scheduled slate at",
-        ("scheduler_worker.py", 1175, "with write_lock() as acquired:"),
+        ("scheduler_worker.py", 1211, "with write_lock() as acquired:"),
     ),
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "`python main.py` at",
-        ("main.py", 1898, "with write_lock() as _acquired:"),
+        ("main.py", 2098, "with write_lock() as _acquired:"),
     ),
 ]
 

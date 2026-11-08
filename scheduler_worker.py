@@ -332,9 +332,15 @@ ALERT_STATE_FILENAME = "alerts_sent.json"
 #: message, and that URL carries the password. `notify.discord` already redacts
 #: its own webhook from everything it logs; this is the same argument applied
 #: to the other credential in the process.
+#: What a scrubbed secret is replaced BY. Named once because two things read
+#: it: the scrubbers below, and the markdown escaping in `notify_failure`,
+#: which has to leave it alone -- escaping turned `***` into `\*\*\*` on the
+#: card, so the redaction marker arrived wearing backslashes.
+ALERT_REDACTION = "***"
+
 _ALERT_SCRUBBERS: tuple[tuple[str, str], ...] = (
     # postgresql://user:password@host/db  ->  postgresql://user:***@host/db
-    (r"(?i)\b([a-z0-9+]+://[^\s:/@]+):[^\s@/]+@", r"\1:***@"),
+    (r"(?i)\b([a-z0-9+]+://[^\s:/@]+):[^\s@/]+@", r"\1:" + ALERT_REDACTION + "@"),
     # Any remaining key=value that names a secret.
     (r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|WEBHOOK|CREDENTIAL)"
      r"[A-Z0-9_]*)\s*=\s*\S+",
@@ -422,6 +428,27 @@ def _mark_alert_sent(stage: str) -> None:
         logger.debug("Could not record the alert mark for %s (%s).", stage, exc)
 
 
+def _escaped_alert_body(safe: str) -> str:
+    r"""
+    Markdown-escaped, with the redaction marker left readable.
+
+    TWO THINGS HAVE TO BE TRUE OF AN ALERT BODY AT ONCE. Identifiers must
+    survive Discord's markdown -- `PROPIQ_MODEL` arrived as `PROPIQMODEL`
+    because its underscores pair with the next one's -- and the credential
+    scrubber's marker must still look like a redaction. Escaping everything
+    satisfied the first and broke the second: `postgresql://propiq:***@host`
+    came out as `propiq:\*\*\*@host`.
+
+    THE CREDENTIAL IS REDACTED EITHER WAY; this is about the marker being
+    legible, not about leakage. `scrub_alert` has already run on `safe` by the
+    time this is called, so the only `***` here is one the scrubber put there.
+    """
+    from src.notify.discord import escape_markdown
+
+    escaped_marker = escape_markdown(ALERT_REDACTION)
+    return escape_markdown(safe).replace(escaped_marker, ALERT_REDACTION)
+
+
 def notify_failure(stage: str, detail: str, *, dedupe: bool = True) -> dict[str, Any]:
     """
     Log a failure AND dispatch it to Discord. Never raises.
@@ -457,9 +484,18 @@ def notify_failure(stage: str, detail: str, *, dedupe: bool = True) -> dict[str,
 
         embed = {
             "title": f"PropIQ: {stage} FAILED",
+            # ESCAPED, because these bodies are full of identifiers. The
+            # underscores in `PROPIQ_MODEL` and `xgboost_*.json` are a markdown
+            # PAIR: Discord italicised the text between them and ate both, so
+            # the alert told an operator to check a variable spelled
+            # `PROPIQMODEL` and to look for `xgboost*.json`. See
+            # `discord.escape_markdown`.
+            #
+            # Truncated AFTER escaping, so a cut can never land between a
+            # backslash and the character it escapes.
             # Discord rejects an over-long embed; the first 1,500 characters of
             # an exception carry the cause, and the log has the rest.
-            "description": safe[:1500],
+            "description": _escaped_alert_body(safe)[:1500],
             "color": 0xB00020,
             "footer": {
                 "text": (

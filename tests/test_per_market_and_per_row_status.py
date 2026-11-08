@@ -313,9 +313,18 @@ def test_the_scorer_resolves_one_artifact_per_market(monkeypatch):
     """
     import main
 
-    asked: list[str | None] = []
+    # PINNED TO XGBOOST, because this test's fixtures ARE xgboost artifacts
+    # with sidecars. The live default moved to `distribution` once the
+    # classifier was found unable to answer at a posted line; the per-market
+    # routing asserted below is the same either way, and `asked_components`
+    # proves which component the scorer actually asked the resolver for.
+    monkeypatch.setenv(main.ENV_SCORING_COMPONENT, "xgboost")
 
-    def _resolve(explicit=None, *, market=None):
+    asked: list[str | None] = []
+    asked_components: list[str] = []
+
+    def _resolve(explicit=None, *, market=None, component="xgboost"):
+        asked_components.append(component)
         asked.append(market)
         return (f"/fake/xgboost_{market}.json", "glob") if market else (None, "none")
 
@@ -332,6 +341,10 @@ def test_the_scorer_resolves_one_artifact_per_market(monkeypatch):
         features(2), prop_lines([_line("P0", "PTS")]), markets=MARKETS
     )
     assert asked == list(MARKETS)
+    assert set(asked_components) == {"xgboost"}, (
+        f"the scorer asked the resolver for {set(asked_components)} while "
+        f"{main.ENV_SCORING_COMPONENT} said xgboost"
+    )
     assert set(out) == set(MARKETS)
 
 
@@ -363,7 +376,11 @@ def test_an_explicit_artifact_is_scored_once_not_once_per_market(monkeypatch):
 def test_a_mislabelled_sidecar_is_skipped_not_misattributed(monkeypatch):
     import main
 
-    def _resolve(explicit=None, *, market=None):
+    monkeypatch.setenv(main.ENV_SCORING_COMPONENT, "xgboost")
+    asked_components: list[str] = []
+
+    def _resolve(explicit=None, *, market=None, component="xgboost"):
+        asked_components.append(component)
         return (f"/fake/xgboost_{market}.json", "glob")
 
     def _score(feats, lines, path):
@@ -387,7 +404,9 @@ def test_a_market_with_no_resolvable_artifact_is_reported(monkeypatch, caplog):
 
     monkeypatch.setattr(
         main, "resolve_model_artifact",
-        lambda explicit=None, *, market=None: (None, "nothing found"),
+        lambda explicit=None, *, market=None, component="xgboost": (
+            None, "nothing found"
+        ),
     )
     with caplog.at_level(logging.INFO):
         out = main.score_prob_over_by_market(

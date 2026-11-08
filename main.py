@@ -95,6 +95,34 @@ MASTER_GUIDELINE_DEFAULT_PATH = Path("config/master_guideline_props.yaml")
 #: never coincided (readiness item O2).
 MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
 
+#: Which fitted component answers P(over) on the live slate.
+#:
+#: "distribution" is the default BECAUSE OF THE QUESTION BEING ASKED. The board
+#: asks P(stat > posted line); the XGBoost classifier can only answer at the
+#: line its labels were built from, so `mask_probabilities_at_unsupported_lines`
+#: refuses it and every row abstains -- measured on three consecutive slates,
+#: ~199 rows per market per day, with the artifact present and healthy. The
+#: distribution component takes the line as an argument and is correct at any
+#: line. Set this to "xgboost" to restore the previous behaviour.
+ENV_SCORING_COMPONENT = "PROPIQ_SCORING_COMPONENT"
+DEFAULT_SCORING_COMPONENT = "distribution"
+SCORING_COMPONENTS = ("distribution", "xgboost")
+
+
+def scoring_component() -> str:
+    """The component to score with, falling back loudly on an unknown name."""
+    raw = (os.environ.get(ENV_SCORING_COMPONENT) or "").strip().lower()
+    if not raw:
+        return DEFAULT_SCORING_COMPONENT
+    if raw in SCORING_COMPONENTS:
+        return raw
+    logger.error(
+        "%s=%r is not a scoring component; they are %s. Using %r.",
+        ENV_SCORING_COMPONENT, raw, ", ".join(SCORING_COMPONENTS),
+        DEFAULT_SCORING_COMPONENT,
+    )
+    return DEFAULT_SCORING_COMPONENT
+
 ENV_MODEL = "PROPIQ_MODEL"
 
 #: The licensed BigDataBall team-stats workbook. NAMED HERE rather than inline
@@ -158,6 +186,7 @@ def resolve_model_artifact(
     explicit: Path | str | None = None,
     *,
     market: str | None = None,
+    component: str = "xgboost",
 ) -> tuple[Path | None, str]:
     """
     Find the fitted artifact to score with. Returns ``(path, how)``.
@@ -191,9 +220,19 @@ def resolve_model_artifact(
     if explicit:
         return Path(explicit), "--model"
 
-    from_env = (os.environ.get(ENV_MODEL) or "").strip()
-    if from_env:
-        return Path(from_env), ENV_MODEL
+    # $PROPIQ_MODEL NAMES ONE FILE, AND THAT FILE IS ONE COMPONENT'S. Honouring
+    # it for a different component would hand a caller asking for the
+    # distribution model an XGBoost booster and let its sidecar decide the
+    # market. It applies to the default component only; anything else resolves
+    # from the artifacts directory, where the filename says which it is.
+    #
+    # `explicit` is handled above and deliberately NOT gated this way: it is
+    # the caller naming a file outright, and `score_prob_over_by_market` routes
+    # an explicit artifact to the XGBoost scorer by itself.
+    if component == "xgboost":
+        from_env = (os.environ.get(ENV_MODEL) or "").strip()
+        if from_env:
+            return Path(from_env), ENV_MODEL
 
     try:
         from src.models.compare import load_comparison_config
@@ -207,31 +246,58 @@ def resolve_model_artifact(
         logger.debug("Could not read artifacts_dir from the comparison config: %s", exc)
         artifacts_dir = Path("data/external/model_runs/comparison")
 
-    pattern = f"xgboost_{market.upper()}.json" if market else "xgboost_*.json"
+    stem = (component or "xgboost").strip().lower()
+    pattern = f"{stem}_{market.upper()}.json" if market else f"{stem}_*.json"
+    # THE SIDECAR REQUIREMENT IS THE BOOSTER'S, NOT EVERY COMPONENT'S.
+    #
+    # A tree model is scored through `feature_cols`, which live in a
+    # `.meta.json` beside it; without them the column ORDER is a guess and the
+    # probabilities are garbage, so an unpaired booster is correctly not a
+    # candidate. `distribution_{MARKET}.json` is not shaped that way: it holds
+    # `target_market`, `model_version` and the fitted dispersion INSIDE the
+    # file, and `DistributionPropModel.load` reads them from there. Requiring a
+    # sidecar it was never designed to have rejected the one component that can
+    # answer at a posted line -- which is how three slates in a row scored
+    # nothing while a usable artifact sat in this very directory.
+    needs_sidecar = (component or "xgboost").strip().lower() == "xgboost"
     if artifacts_dir.is_dir():
+        found = sorted(artifacts_dir.glob(pattern))
         candidates = [
-            p for p in sorted(artifacts_dir.glob(pattern))
-            if p.with_suffix(".meta.json").exists()
+            p for p in found
+            if not needs_sidecar or p.with_suffix(".meta.json").exists()
         ]
         if candidates:
             newest = max(candidates, key=lambda p: p.stat().st_mtime)
             return newest, f"{artifacts_dir}/{pattern}"
-        unpaired = sorted(artifacts_dir.glob(pattern))
-        if unpaired:
+        if found and needs_sidecar:
             logger.warning(
                 "%d artifact(s) in %s have no .meta.json sidecar, so none can be "
                 "scored with: %s. The feature_cols used at training time must be "
                 "persisted beside the model.",
-                len(unpaired), artifacts_dir, [p.name for p in unpaired][:4],
+                len(found), artifacts_dir, [p.name for p in found][:4],
             )
 
-    if MODEL_ARTIFACT_DEFAULT.exists():
+    # THE LEGACY DEFAULT IS AN XGBOOST FILE. Returning it for another component
+    # would hand a caller asking for a distribution a booster.
+    if needs_sidecar and MODEL_ARTIFACT_DEFAULT.exists():
         return MODEL_ARTIFACT_DEFAULT, "legacy default"
+    if needs_sidecar:
+        return None, (
+            f"no artifact found: {ENV_MODEL} unset, no {pattern} with a sidecar "
+            f"in {artifacts_dir}, and {MODEL_ARTIFACT_DEFAULT} does not exist. "
+            f"Train one with `scripts/nba_model_cli.py train-stats --market PTS "
+            f"--start-date ... --end-date ...` and it will be found there."
+        )
     return None, (
-        f"no artifact found: {ENV_MODEL} unset, no xgboost_*.json with a sidecar "
-        f"in {artifacts_dir}, and {MODEL_ARTIFACT_DEFAULT} does not exist. Train "
-        f"one with `scripts/nba_model_cli.py train-stats --market PTS "
-        f"--start-date ... --end-date ...` and it will be found there."
+        # NAMED WITHOUT NAMING, deliberately. Writing the training switch's
+        # variable name here would put it in `main.py`'s source, and
+        # `test_flag_parsers_agree` intersects the env names referenced by the
+        # two processes to prove no boolean is read through both parsers --
+        # a prose mention is indistinguishable from a read to that scan. The
+        # pointer below is as useful and costs no false positive.
+        f"no artifact found: no {pattern} in {artifacts_dir}. The nightly fit "
+        f"writes one per market there, and is off until configured; see "
+        f".env.example for the switch."
     )
 
 
@@ -1092,6 +1158,135 @@ def score_prob_over(
         return null
 
 
+def posted_line_for_market(
+    features: pd.DataFrame, prop_lines: pd.DataFrame, market: str
+) -> pd.Series:
+    """
+    The POSTED line per feature row for one market, or NaN where none matched.
+
+    THROUGH THE SAME CROSSWALK THE PROJECTION JOIN USES
+    (`_attach_prop_lines` -> `id_crosswalk.resolve_board_names`), so a book
+    spelling that resolves there resolves here. A second name-matching
+    implementation would mean a player whose line reaches the board carries no
+    probability, or worse, carries one matched from a different person.
+    """
+    from src.ingestion.id_crosswalk import apply_name_map, resolve_board_names
+
+    blank = pd.Series(float("nan"), index=features.index, dtype=float)
+    if prop_lines is None or prop_lines.empty:
+        return blank
+    if not {"player_name", "market", "line"}.issubset(prop_lines.columns):
+        logger.warning(
+            "Prop lines frame missing player_name/market/line, so no posted "
+            "line can be attached for %s.", market,
+        )
+        return blank
+    if "PLAYER_NAME" not in features.columns:
+        logger.warning("Feature matrix has no PLAYER_NAME; no posted line attached.")
+        return blank
+
+    name_map, _report = resolve_board_names(prop_lines, features)
+    resolved = apply_name_map(prop_lines, name_map)
+    wanted = resolved[
+        resolved["market"].astype(str).str.upper() == str(market).upper()
+    ]
+    if wanted.empty:
+        return blank
+    lookup = (
+        wanted.dropna(subset=["player_name", "line"])
+        .drop_duplicates(subset=["player_name"], keep="last")
+        .set_index("player_name")["line"]
+    )
+    return pd.Series(
+        [pd.to_numeric(lookup.get(n), errors="coerce") for n in features["PLAYER_NAME"]],
+        index=features.index, dtype=float,
+    )
+
+
+def score_prob_over_distribution(
+    features: pd.DataFrame,
+    prop_lines: pd.DataFrame,
+    model_path: Path | str,
+) -> pd.Series:
+    """
+    P(over) at THE POSTED LINE, from the fitted count distribution.
+
+    WHY THIS EXISTS, and why the booster could not do it. An XGBoost
+    classifier trained on ``over_hit`` learns P(stat > L) for the ONE line its
+    labels were built from -- ``RESEARCH_LINE``, the player's trailing
+    average. The line is not one of its inputs, so asking it at a posted line
+    returns the identical number, and
+    ``labels.mask_probabilities_at_unsupported_lines`` correctly refuses to
+    publish that. Three consecutive slates scored 0 of ~199 rows per market
+    for exactly this reason while every other part of the pipeline was
+    healthy.
+
+    This model is shaped for the question instead: ``predict_probability_over``
+    TAKES the line, and the probability is the tail mass of a count
+    distribution centred on ``{MARKET}_L2`` with a dispersion fitted on real
+    residuals. It is correct at any line by construction, so there is nothing
+    to mask -- and the number is consistent with the projection the research
+    preview already shows, because they come from the same mean column.
+
+    IT IS THE WEAKEST COMPONENT ON THE MEASUREMENT WE HAVE, and that is said
+    out loud rather than buried: ``config/model_comparison.yaml`` puts it at
+    0.019 / 0.008 / 0.000 of the ensemble. But that measurement was made
+    against RESEARCH-LINE labels, so it ranks components at answering "over
+    the trailing average", not "over a book line" -- the question here. The
+    honest statement is that its standing at THIS question is unmeasured, and
+    the publication gate's 100 graded predictions are what will measure it.
+
+    A ROW WITH NO POSTED LINE ABSTAINS. There is nothing to be over.
+    """
+    null = pd.Series([None] * len(features), index=features.index, dtype="object")
+    if prop_lines is None or prop_lines.empty:
+        logger.info("P(Over) skipped: no prop lines (expected off-season).")
+        return null
+
+    try:
+        from src.models.distribution_adapter import DistributionPropModel
+
+        model = DistributionPropModel().load(Path(model_path))
+        scored_market = str(model.target_market or "").upper()
+        if not scored_market:
+            logger.warning(
+                "P(Over) skipped: %s names no target_market, so there is no way "
+                "to tell which market these probabilities belong to.", model_path,
+            )
+            return null
+
+        lines = posted_line_for_market(features, prop_lines, scored_market)
+        if not lines.notna().any():
+            logger.info(
+                "P(Over) skipped for %s: no feature row matched a posted line.",
+                scored_market,
+            )
+            return null
+
+        probs = pd.to_numeric(
+            model.predict_probability_over(features, lines), errors="coerce"
+        )
+        # A LINE WE DO NOT HAVE IS NOT A LINE OF ZERO. `predict_probability_over`
+        # already returns NaN for a NaN line; this makes that explicit so a
+        # future change to the adapter cannot start publishing a number here.
+        probs = probs.where(lines.notna())
+        usable = int(probs.notna().sum())
+        logger.info(
+            "P(Over) scored for %d of %d rows for market %s via the fitted "
+            "distribution at the POSTED line (mean %.4f); %d row(s) had no "
+            "posted line to be over.",
+            usable, len(probs), scored_market,
+            float(probs.mean()) if usable else float("nan"),
+            int(lines.isna().sum()),
+        )
+        out = pd.Series(probs, index=features.index, dtype="object")
+        out.attrs["target_market"] = scored_market
+        return out
+    except Exception as exc:  # noqa: BLE001 — a scoring failure abstains, loudly
+        logger.warning("P(Over) skipped: %s", exc)
+        return null
+
+
 def score_prob_over_by_market(
     features: pd.DataFrame,
     prop_lines: pd.DataFrame,
@@ -1138,14 +1333,19 @@ def score_prob_over_by_market(
             return {}
         return {str(market): scored}
 
+    component = scoring_component()
+    scorer = (
+        score_prob_over_distribution if component == "distribution"
+        else score_prob_over
+    )
     out: dict[str, pd.Series] = {}
     missing: list[str] = []
     for market in markets:
-        path, how = resolve_model_artifact(market=market)
+        path, how = resolve_model_artifact(market=market, component=component)
         if path is None:
             missing.append(market)
             continue
-        scored = score_prob_over(features, prop_lines, path)
+        scored = scorer(features, prop_lines, path)
         resolved_market = scored.attrs.get("target_market")
         if not resolved_market:
             continue

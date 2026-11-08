@@ -228,7 +228,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   I first wrote that `src/models/artifact_registry.py:52` put
   `registered_at_utc` in every sidecar. It does not: that module builds a
   separate append-only `model_registry.jsonl`, **nothing writes to it**, and
-  `main.py:183` says in as many words that it is
+  `main.py:212` says in as many words that it is
   deliberately not read because "resolving through a dead module is how
   `oddspapi` stayed in the source precedence for months". What training actually
   persists is `saved_at_utc`, present in 8 of the 9 sidecars under
@@ -255,7 +255,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/quant/publication_gate.py:378` as a second verdict beside
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
-  `scheduler_worker.py:1834` and into the deploy probe as a FAILURE at
+  `scheduler_worker.py:1870` and into the deploy probe as a FAILURE at
   `scripts/railway_healthcheck.py:269`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
@@ -268,7 +268,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   is already held, so an overlapping run is *skipped* rather than queued; its
   publisher separately exits `3` when the database is mid-write rather than
   shipping a torn snapshot.
-- **The gap this described.** `scheduler_worker.py:3751-3758` sets
+- **The gap this described.** `scheduler_worker.py:3787-3794` sets
   `max_instances: 1` and `coalesce: True`, which is correct and sufficient
   **within one process** and does nothing about a second one: an operator
   running `railway run python main.py` while the slate job is firing can
@@ -278,8 +278,8 @@ most of what looks like autonomy is a laptop — but these two are real.
 - **CLOSED, and this entry said otherwise for three weeks.**
   `src/utils/write_lock.py` landed in `89be638` on 2026-10-11 — the same day
   this evaluation was written — and is taken by BOTH entry points: the
-  scheduled slate at `scheduler_worker.py:1175` and the manual
-  `python main.py` at `main.py:1898`. It **declines** rather than waits, and
+  scheduled slate at `scheduler_worker.py:1211` and the manual
+  `python main.py` at `main.py:2098`. It **declines** rather than waits, and
   says so: *"Another process holds the slate write lock, so the 09:00 PT run
   is SKIPPED … A deliberate decline, not a failure."* The scope deliberately
   covers the board write and the dispatch, not only the scoring, because a

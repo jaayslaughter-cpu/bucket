@@ -873,6 +873,42 @@ def build_prelock_correction_embed(
     }
 
 
+#: Characters Discord reads as markup inside an embed description.
+#: Backslash-escaping each one makes it render literally.
+_MARKDOWN_CHARS = ("\\", "`", "*", "_", "~", "|", ">")
+
+
+def escape_markdown(text: Any) -> str:
+    r"""
+    Render text literally in an embed, underscores and all.
+
+    WHY THIS EXISTS, with the receipt. The boot alert said:
+
+        No usable scoring artifact: PROPIQ_MODEL unset, no xgboost_*.json
+        with a sidecar in data/external/model_runs/comparison
+
+    and it arrived in Discord as:
+
+        No usable scoring artifact: PROPIQMODEL unset, no xgboost*.json
+        with a sidecar in data/external/model_runs/comparison
+
+    The two underscores in `PROPIQ_MODEL` and `xgboost_*.json` are a PAIR, so
+    Discord italicised everything between them and ate both. An operator was
+    told to check a variable that does not exist under that name and to look
+    for a glob that would never match. A diagnostic that renames the things
+    it is diagnosing is worse than no diagnostic.
+
+    Escaped rather than wrapped in a code fence: a fence would be broken by a
+    backtick anywhere in an exception string, and these bodies carry arbitrary
+    text. The backslash goes FIRST in `_MARKDOWN_CHARS`, or escaping it again
+    would double every escape that follows.
+    """
+    out = str(text)
+    for char in _MARKDOWN_CHARS:
+        out = out.replace(char, "\\" + char)
+    return out
+
+
 def build_research_preview_embed(
     candidates: Sequence[Any],
     *,
