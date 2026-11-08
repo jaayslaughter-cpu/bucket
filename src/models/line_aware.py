@@ -36,7 +36,11 @@ when supplied, and generated candidates are labelled as such.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import logging
+import uuid
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -511,6 +515,114 @@ class LineAwarePropModel:
             self.stat, len(labelled), self.augmentation_report,
         )
         return self
+
+    # --- PERSISTENCE -------------------------------------------------------
+    #
+    # PORTED, with attribution, from the recovery bundle supplied 2026-11-08,
+    # and read line by line before being taken. It closes a real gap: this
+    # class had no `save`, so `models.training.fit_market_artifacts` skipped it
+    # (`if hasattr(model, "save")`) and reported it as fitted anyway. Every run
+    # claimed four components and wrote three; the demo run's own artifacts
+    # directory shows catboost, distribution and xgboost files and no
+    # line_aware file.
+    #
+    # WHY IT WAS WORTH TAKING RATHER THAN WRITING FRESH: the manifest is
+    # published atomically (temp file, then `replace`), every component is
+    # SHA-256 checksummed and re-verified on load, a component name is refused
+    # unless it is a sibling of the manifest so a crafted manifest cannot read
+    # across the filesystem, the format is versioned, the trained line support
+    # is validated on load, and an unfitted model refuses to save rather than
+    # writing something that would score. Those are the properties this project
+    # would have insisted on, already met.
+    #
+    # SERVING STILL DEFAULTS TO THE DISTRIBUTION COMPONENT
+    # ($PROPIQ_SCORING_COMPONENT). Persisting a model is not evidence it should
+    # be served: line_aware measures 0.089 / 0.000 / 0.000 in the ensemble, and
+    # on two of three markets the optimiser gives it nothing. What changes here
+    # is only that the choice exists.
+
+    def save(self, path: Path | str) -> None:
+        """Persist the wrapper, its support and native base files, without pickle.
+
+        Generation-specific component names prevent a reader mixing heads from
+        different fits. The manifest is the final atomic publication point.
+        Old generations are retained for rollback, not deleted during a fit.
+        """
+        if self.model is None or self.trained_z_range is None:
+            raise RuntimeError("Cannot save an unfitted line-aware model")
+        base_name = str(getattr(self.model, "model_name", ""))
+        if base_name not in {"xgboost", "catboost"}:
+            raise ValueError(f"Unsupported persisted base: {base_name}")
+        path = Path(path)
+        manifest = path if path.name.endswith(".manifest.json") else Path(f"{path}.manifest.json")
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        stem = manifest.name.removesuffix(".manifest.json")
+        suffix = ".json" if base_name == "xgboost" else ".cbm"
+        prefix = f"{stem}.{uuid.uuid4().hex}"
+        component = manifest.parent / f"{prefix}{suffix}"
+        self.model.save(component)
+        meta = json.loads(component.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        files = sorted(manifest.parent.glob(prefix + ".*"))
+        checksums = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in files if p.is_file()
+        }
+        payload = {
+            **meta, "format": "propiq-line-aware-v1", "base_model": base_name,
+            "base_artifact": component.name, "base_feature_cols": self.base_feature_cols,
+            "offsets": list(self.offsets), "trained_z_range": list(self.trained_z_range),
+            "augmentation_report": self.augmentation_report, "files_sha256": checksums,
+        }
+        serialized = json.dumps(payload, indent=2, allow_nan=False)
+        # Keep the existing freshness/probe sidecar convention.
+        manifest.with_suffix(".meta.json").write_text(serialized, encoding="utf-8")
+        temporary = manifest.with_name(manifest.name + ".tmp")
+        temporary.write_text(serialized, encoding="utf-8")
+        temporary.replace(manifest)
+
+    @classmethod
+    def load(cls, path: Path | str) -> "LineAwarePropModel":
+        """Load only checked native components beneath the manifest directory."""
+        path = Path(path)
+        if not path.name.endswith(".manifest.json"):
+            path = Path(f"{path}.manifest.json")
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        if meta.get("format") != "propiq-line-aware-v1":
+            raise ValueError("Unknown line-aware artifact format")
+        for filename, expected in meta["files_sha256"].items():
+            if Path(filename).name != filename:
+                raise ValueError("Artifact component must be a sibling file")
+            actual = hashlib.sha256((path.parent / filename).read_bytes()).hexdigest()
+            if actual != expected:
+                raise ValueError(f"Artifact checksum mismatch: {filename}")
+        component_name = meta["base_artifact"]
+        if Path(component_name).name != component_name:
+            raise ValueError("Base artifact must be a sibling file")
+        component = path.parent / component_name
+        if component_name not in meta["files_sha256"] or component.with_suffix(".meta.json").name not in meta["files_sha256"]:
+            raise ValueError("Base model and sidecar must be checksummed")
+        base_name = meta["base_model"]
+        if base_name == "xgboost":
+            from src.models.xgb_adapter import XGBoostAdapter
+            def factory(cols):
+                return XGBoostAdapter(cols, target_market=meta["target_market"])
+        elif base_name == "catboost":
+            from src.models.catboost_pipeline import CatBoostPropPipeline
+            def factory(cols):
+                return CatBoostPropPipeline(cols, target_market=meta["target_market"])
+        else:
+            raise ValueError(f"Unknown line-aware base: {base_name}")
+        obj = cls(factory, stat=meta["target_market"],
+                  base_feature_cols=meta["base_feature_cols"], offsets=tuple(meta["offsets"]))
+        obj.model = factory(meta["feature_cols"]).load(component)
+        obj.model.line_aware = True
+        obj.feature_cols = list(meta["feature_cols"])
+        low, high = map(float, meta["trained_z_range"])
+        if not np.isfinite([low, high]).all() or low > high:
+            raise ValueError("Invalid trained line support")
+        obj.trained_z_range = (low, high)
+        obj.augmentation_report = dict(meta.get("augmentation_report") or {})
+        return obj
 
     def predict_probability_over(
         self,

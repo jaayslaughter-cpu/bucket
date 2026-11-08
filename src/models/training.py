@@ -171,12 +171,34 @@ def fit_market_artifacts(
 
     comps = build_components(market, cols, cfg, xgb_feature_cols=numeric_cols)
     fitted: list[str] = []
+    persisted: list[str] = []
+    unpersisted: list[str] = []
     failures: dict[str, str] = {}
     for name, model in comps.items():
         try:
             model.fit(train, val)
+            # FITTED AND PERSISTED ARE DIFFERENT FACTS, and reporting one as
+            # the other is a defect I shipped. `if hasattr(model, "save")`
+            # quietly skipped any component without a `save` method and then
+            # appended it to `fitted` regardless -- so every run reported
+            # "fitted: [distribution, xgboost, catboost, line_aware]" while
+            # writing three artifacts. `line_aware` had no `save` at all, and
+            # the demo run's own artifacts directory shows it: catboost,
+            # distribution and xgboost files, no line_aware file.
+            #
+            # A COMPONENT THAT CANNOT PERSIST CANNOT BE SERVED, so its weight
+            # in the ensemble is unreachable and its absence should be visible
+            # in the report rather than inferred from a directory listing.
             if hasattr(model, "save"):
                 model.save(art / f"{name}_{market}")
+                persisted.append(name)
+            else:
+                unpersisted.append(name)
+                logger.warning(
+                    "%s %s fitted but has no save(): nothing was written, so it "
+                    "cannot be resolved or served and its share of the ensemble "
+                    "is unreachable.", name, market,
+                )
             fitted.append(name)
         except Exception as exc:  # noqa: BLE001 — one component, not the market
             # ONE COMPONENT'S FAILURE IS NOT THE MARKET'S, but it is also not
@@ -201,6 +223,8 @@ def fit_market_artifacts(
         "holdout_window": [str(val["GAME_DATE"].min().date()),
                            str(val["GAME_DATE"].max().date())],
         "fitted": fitted,
+        "persisted": persisted,
+        "fitted_but_not_persisted": unpersisted,
         "failed": failures,
     }
     logger.info("Trained %s: %s", market, report)
