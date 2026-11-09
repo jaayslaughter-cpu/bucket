@@ -93,7 +93,7 @@ ANCHORS = [
     # check -- three settings an operator could have set to no effect. The
     # rewrite cites the lines instead of restating them, so these keep it
     # honest the way `tests/test_agents_md.py` keeps AGENTS.md honest.
-    ("main.py", 749, "MARKET DATA IS STALE"),
+    ("main.py", 759, "MARKET DATA IS STALE"),
     ("main.py", 146, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
@@ -129,7 +129,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "`python main.py` at",
-        ("main.py", 2157, "with write_lock() as _acquired:"),
+        ("main.py", 2190, "with write_lock() as _acquired:"),
     ),
 ]
 

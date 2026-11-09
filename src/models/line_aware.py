@@ -395,6 +395,14 @@ class LineAwarePropModel:
 
     model_name = "line_aware"
 
+    #: HOW THIS COMPONENT'S ARTIFACT IS NAMED, declared by the class that
+    #: writes it. `resolve_model_artifact` globs `{component}_{MARKET}` plus
+    #: this suffix, and it globbed a bare `.json` for every component -- so
+    #: `line_aware_PTS.manifest.json` was persisted, verified and unfindable.
+    #: Naming it here rather than in the resolver keeps the writer and the
+    #: reader on one string.
+    ARTIFACT_SUFFIX = ".manifest.json"
+
     def __init__(
         self,
         base_factory,
@@ -554,9 +562,12 @@ class LineAwarePropModel:
         if base_name not in {"xgboost", "catboost"}:
             raise ValueError(f"Unsupported persisted base: {base_name}")
         path = Path(path)
-        manifest = path if path.name.endswith(".manifest.json") else Path(f"{path}.manifest.json")
+        manifest = (
+            path if path.name.endswith(self.ARTIFACT_SUFFIX)
+            else Path(f"{path}{self.ARTIFACT_SUFFIX}")
+        )
         manifest.parent.mkdir(parents=True, exist_ok=True)
-        stem = manifest.name.removesuffix(".manifest.json")
+        stem = manifest.name.removesuffix(self.ARTIFACT_SUFFIX)
         suffix = ".json" if base_name == "xgboost" else ".cbm"
         prefix = f"{stem}.{uuid.uuid4().hex}"
         component = manifest.parent / f"{prefix}{suffix}"
@@ -584,8 +595,8 @@ class LineAwarePropModel:
     def load(cls, path: Path | str) -> "LineAwarePropModel":
         """Load only checked native components beneath the manifest directory."""
         path = Path(path)
-        if not path.name.endswith(".manifest.json"):
-            path = Path(f"{path}.manifest.json")
+        if not path.name.endswith(cls.ARTIFACT_SUFFIX):
+            path = Path(f"{path}{cls.ARTIFACT_SUFFIX}")
         meta = json.loads(path.read_text(encoding="utf-8"))
         if meta.get("format") != "propiq-line-aware-v1":
             raise ValueError("Unknown line-aware artifact format")

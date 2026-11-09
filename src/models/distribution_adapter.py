@@ -31,6 +31,10 @@ class DistributionPropModel:
 
     model_name = "distribution"
 
+    #: See `LineAwarePropModel.ARTIFACT_SUFFIX`. Plain `.json` here, which is
+    #: also the resolver's default, but stated rather than assumed.
+    ARTIFACT_SUFFIX = ".json"
+
     def __init__(
         self,
         *,

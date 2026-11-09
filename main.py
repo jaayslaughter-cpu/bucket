@@ -106,7 +106,7 @@ MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
 #: line. Set this to "xgboost" to restore the previous behaviour.
 ENV_SCORING_COMPONENT = "PROPIQ_SCORING_COMPONENT"
 DEFAULT_SCORING_COMPONENT = "distribution"
-SCORING_COMPONENTS = ("distribution", "xgboost")
+SCORING_COMPONENTS = ("distribution", "line_aware", "xgboost")
 
 
 def scoring_component() -> str:
@@ -247,7 +247,17 @@ def resolve_model_artifact(
         artifacts_dir = Path("data/external/model_runs/comparison")
 
     stem = (component or "xgboost").strip().lower()
-    pattern = f"{stem}_{market.upper()}.json" if market else f"{stem}_*.json"
+    # THE SUFFIX IS THE COMPONENT'S, NOT ".json". This globbed a bare `.json`
+    # for every component, so `line_aware_PTS.manifest.json` -- written,
+    # checksummed and verified on every nightly fit -- was never a candidate.
+    # `serving_components.artifact_suffix` reads it from the class that writes
+    # the file, so the resolver cannot look for a name training never emits.
+    from src.models.serving_components import artifact_suffix
+
+    suffix = artifact_suffix(stem)
+    pattern = (
+        f"{stem}_{market.upper()}{suffix}" if market else f"{stem}_*{suffix}"
+    )
     # THE SIDECAR REQUIREMENT IS THE BOOSTER'S, NOT EVERY COMPONENT'S.
     #
     # A tree model is scored through `feature_cols`, which live in a
@@ -1203,10 +1213,12 @@ def posted_line_for_market(
     )
 
 
-def score_prob_over_distribution(
+def score_prob_over_at_posted_line(
     features: pd.DataFrame,
     prop_lines: pd.DataFrame,
     model_path: Path | str,
+    *,
+    component: str = "distribution",
 ) -> pd.Series:
     """
     P(over) at THE POSTED LINE, from the fitted count distribution.
@@ -1244,9 +1256,14 @@ def score_prob_over_distribution(
         return null
 
     try:
-        from src.models.distribution_adapter import DistributionPropModel
+        # ONE SCORER FOR EVERY COMPONENT THAT TAKES A LINE. `distribution` and
+        # `line_aware` answer the same question with the same signature, so a
+        # second copy of this function would be two readers of one procedure --
+        # and the copy is where the `probs.where(lines.notna())` guard below
+        # would eventually be missing from.
+        from src.models.serving_components import load_line_taking
 
-        model = DistributionPropModel().load(Path(model_path))
+        model = load_line_taking(component, Path(model_path))
         scored_market = str(model.target_market or "").upper()
         if not scored_market:
             logger.warning(
@@ -1273,9 +1290,9 @@ def score_prob_over_distribution(
         usable = int(probs.notna().sum())
         logger.info(
             "P(Over) scored for %d of %d rows for market %s via the fitted "
-            "distribution at the POSTED line (mean %.4f); %d row(s) had no "
+            "%s component at the POSTED line (mean %.4f); %d row(s) had no "
             "posted line to be over.",
-            usable, len(probs), scored_market,
+            usable, len(probs), scored_market, component,
             float(probs.mean()) if usable else float("nan"),
             int(lines.isna().sum()),
         )
@@ -1285,6 +1302,17 @@ def score_prob_over_distribution(
     except Exception as exc:  # noqa: BLE001 — a scoring failure abstains, loudly
         logger.warning("P(Over) skipped: %s", exc)
         return null
+
+
+def score_prob_over_distribution(
+    features: pd.DataFrame,
+    prop_lines: pd.DataFrame,
+    model_path: Path | str,
+) -> pd.Series:
+    """The distribution component, through the shared posted-line scorer."""
+    return score_prob_over_at_posted_line(
+        features, prop_lines, model_path, component="distribution",
+    )
 
 
 def score_prob_over_by_market(
@@ -1339,10 +1367,15 @@ def score_prob_over_by_market(
         return {str(market): scored}
 
     component = scoring_component()
-    scorer = (
-        score_prob_over_distribution if component == "distribution"
-        else score_prob_over
-    )
+    # THE COMPONENT DECIDES, NOT A NAME CHECK. `is_line_taking` is the same
+    # registry the resolver reads for the artifact suffix, so a component
+    # cannot be findable and unscoreable, or the reverse.
+    from src.models.serving_components import is_line_taking
+
+    def scorer(f: pd.DataFrame, pl: pd.DataFrame, path: Path | str) -> pd.Series:
+        if is_line_taking(component):
+            return score_prob_over_at_posted_line(f, pl, path, component=component)
+        return score_prob_over(f, pl, path)
     out: dict[str, pd.Series] = {}
     missing: list[str] = []
     for market in markets:
