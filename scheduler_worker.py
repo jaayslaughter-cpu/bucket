@@ -3566,7 +3566,7 @@ def loss_analysis_time(settle_hour: int, settle_minute: int) -> tuple[int, int]:
 
 def run_loss_analysis() -> dict[str, Any]:
     """
-    Residuals and calibration over the graded ledger, written to the volume.
+    Residuals, calibration and the component comparison over the graded ledger.
 
     WHAT IT ADDS TO THE NIGHT. Settlement grades the rows; this says where the
     model was WRONG -- whether the error is one-directional, whether it is
@@ -3668,6 +3668,40 @@ def _run_loss_analysis_locked() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Loss analysis: calibration section unavailable: %s", exc)
 
+    # WHICH COMPONENT WAS ACTUALLY MORE ACCURATE, on the rows above.
+    #
+    # It belongs in this job rather than its own: the graded window is the
+    # same window, and reading the ledger twice an hour apart would compare
+    # against a slightly different row set for no reason. `rows` is reused
+    # rather than re-queried -- one read, one definition of what "the graded
+    # window" means tonight.
+    #
+    # DEGRADES LIKE EVERY OTHER SECTION. The comparison needs the decision
+    # records as well as the ledger, so it has one more way to be
+    # unavailable than the residuals do; losing it must not cost the night's
+    # residual report, which is this job's reason to exist.
+    try:
+        from src.settlement.component_comparison import compare_components
+        from src.settlement.decision_record import read_records, recorded_rows_from
+        from src.utils.volume import resolve_state_root
+
+        # BOUNDED BY THE ROWS, not by reading every record ever written. The
+        # oldest graded game is the oldest record that can possibly join.
+        dates = sorted(str(r.get("game_date") or "")[:10] for r in rows if r.get("game_date"))
+        state_root, _how = resolve_state_root()
+        records = read_records(state_root, since=dates[0] if dates else None)
+        report["component_comparison"] = compare_components(
+            rows, recorded_rows_from(records),
+            as_of=format_pacific_iso(now_pacific()),
+        )
+        for finding in report["component_comparison"].get("findings", []):
+            logger.info("Component comparison: %s", finding)
+    except Exception as exc:  # noqa: BLE001 — a section, not the report
+        logger.warning(
+            "Loss analysis: component comparison unavailable (%s). The "
+            "residual and calibration sections are unaffected.", exc,
+        )
+
     target = loss_analysis_report_path()
     written: str | None = None
     try:
@@ -3689,6 +3723,7 @@ def _run_loss_analysis_locked() -> dict[str, Any]:
         "'record': %s, 'report': %s}",
         report["n_graded"], report["n_with_residual"], report["record"], written,
     )
+    comparison = report.get("component_comparison") or {}
     return {
         "status": "OK",
         "graded": report["n_graded"],
@@ -3696,6 +3731,10 @@ def _run_loss_analysis_locked() -> dict[str, Any]:
         "record": report["record"],
         "report_path": written,
         "findings": report.get("findings", []),
+        # Named separately from `graded` because they count different things:
+        # a row can be graded and still join no recorded probability.
+        "components_compared": sorted(comparison.get("components") or []),
+        "paired_rows": comparison.get("paired_rows", 0),
     }
 
 
@@ -3896,7 +3935,7 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         minute=loss_minute,
         timezone=DISPLAY_TZ,
         id="loss_analysis",
-        name="Residuals and calibration over the graded ledger",
+        name="Residuals, calibration and component comparison over the ledger",
         max_instances=1,
         coalesce=True,
         misfire_grace_time=LOSS_ANALYSIS_MISFIRE_GRACE_SECONDS,

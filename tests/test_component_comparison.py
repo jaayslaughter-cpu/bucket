@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from typing import Any
 
 import pytest
 
@@ -283,3 +284,109 @@ def test_an_empty_ledger_reports_itself_and_exits_zero(monkeypatch, tmp_path, ca
     out = capsys.readouterr().out
     assert "DATA_NOT_AVAILABLE" in out
     assert "RESEARCH_ONLY" in out
+
+
+# --- the 04:00 job ---------------------------------------------------------
+
+def _nightly(monkeypatch, tmp_path, *, graded, records, reads):
+    """Drive `_run_loss_analysis_locked` with no database and no volume."""
+    import scheduler_worker as worker
+
+    def ledger(**kwargs):
+        reads.append(kwargs)
+        return graded
+
+    monkeypatch.setattr("src.db.repository.load_graded_prop_residual_rows", ledger)
+    monkeypatch.setattr("src.db.repository.load_player_panel", lambda **k: None)
+    monkeypatch.setattr("src.utils.volume.resolve_state_root", lambda: (tmp_path, "test"))
+
+    from src.settlement.decision_record import build_record, write_record
+
+    if records:
+        body, _ = build_record(
+            slate_date="2026-11-09", as_of_ts="2026-11-09T09:05:00-08:00",
+            rows=records, prev_sha256=None,
+        )
+        write_record(tmp_path, body)
+    return worker._run_loss_analysis_locked()
+
+
+def test_the_nightly_job_now_reports_the_comparison(monkeypatch, tmp_path):
+    reads: list[dict] = []
+    out = _nightly(
+        monkeypatch, tmp_path,
+        graded=_graded(12), records=_records(12), reads=reads,
+    )
+    assert out["status"] == "OK"
+    assert out["components_compared"] == ["line_aware", SERVED_COMPONENT]
+    assert out["paired_rows"] == 12
+
+    # ASSERTED UNCONDITIONALLY. Guarding this on the file existing would let
+    # the job stop writing the section without a single test noticing -- the
+    # report on the volume is what an operator reads, not the return value.
+    written = json.loads((tmp_path / "loss_analysis.json").read_text(encoding="utf-8"))
+    comparison = written["component_comparison"]
+    assert comparison["status"] == "OK"
+    assert comparison["paired_rows"] == 12
+    assert set(comparison["head_to_head"]) == {"line_aware", SERVED_COMPONENT}
+
+
+def test_the_ledger_is_read_once_for_both_sections(monkeypatch, tmp_path):
+    """
+    Reading it twice would score the residuals and the comparison against
+    slightly different row sets, for no reason: the graded window is the
+    same window.
+    """
+    reads: list[dict] = []
+    _nightly(monkeypatch, tmp_path, graded=_graded(6), records=_records(6), reads=reads)
+    assert len(reads) == 1, f"the ledger was read {len(reads)} times"
+
+
+def test_the_record_read_is_bounded_by_the_oldest_graded_row(monkeypatch, tmp_path):
+    """
+    Reading every record ever written would grow without limit. The oldest
+    graded game is the oldest record that can possibly join.
+    """
+    import scheduler_worker as worker
+
+    seen: dict[str, Any] = {}
+    real_read = __import__(
+        "src.settlement.decision_record", fromlist=["read_records"]
+    ).read_records
+
+    def spy(root, *, since=None):
+        seen["since"] = since
+        return real_read(root, since=since)
+
+    monkeypatch.setattr("src.settlement.decision_record.read_records", spy)
+    monkeypatch.setattr(
+        "src.db.repository.load_graded_prop_residual_rows", lambda **k: _graded(3)
+    )
+    monkeypatch.setattr("src.db.repository.load_player_panel", lambda **k: None)
+    monkeypatch.setattr("src.utils.volume.resolve_state_root", lambda: (tmp_path, "test"))
+    worker._run_loss_analysis_locked()
+    assert seen["since"] == "2026-11-09"
+
+
+def test_a_broken_comparison_does_not_cost_the_nights_residuals(monkeypatch, tmp_path):
+    """
+    The comparison needs the decision records AS WELL AS the ledger, so it
+    has one more way to be unavailable than the residuals do. The residual
+    report is this job's reason to exist and must survive losing it.
+    """
+    import scheduler_worker as worker
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic comparison failure")
+
+    monkeypatch.setattr("src.settlement.component_comparison.compare_components", boom)
+    monkeypatch.setattr(
+        "src.db.repository.load_graded_prop_residual_rows", lambda **k: _graded(5)
+    )
+    monkeypatch.setattr("src.db.repository.load_player_panel", lambda **k: None)
+    monkeypatch.setattr("src.utils.volume.resolve_state_root", lambda: (tmp_path, "test"))
+
+    out = worker._run_loss_analysis_locked()
+    assert out["status"] == "OK", "a failed section failed the whole job"
+    assert out["graded"] == 5
+    assert out["components_compared"] == []
