@@ -299,3 +299,37 @@ def artifact_provenance(artifacts: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "bytes": len(blob),
         }
     return out
+
+
+def read_records(root: Path | str, *, since: str | None = None) -> list[dict[str, Any]]:
+    """
+    Every record on disk, oldest first, optionally from a slate date onward.
+
+    THE LAYOUT IS OWNED HERE, not by the readers. `write_record` chooses
+    `decision_records/YYYY/MM/DD/<utc>.json`; a consumer that globbed that
+    shape itself would be a second definition of where records live, and the
+    first rename would leave it silently reading nothing.
+
+    A record that cannot be parsed is logged and skipped rather than failing
+    the read: one corrupt file must not hide every other night's evidence.
+    The chain is what detects tampering; this is a reader.
+    """
+    base = records_dir(root)
+    if not base.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(base.rglob("*.json")):
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("Skipping unreadable decision record %s (%s)", path, exc)
+            continue
+        if since and str(body.get("slate_date") or "") < str(since):
+            continue
+        out.append(body)
+    return out
+
+
+def recorded_rows_from(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten the `rows` of several records into one list."""
+    return [row for body in records for row in (body.get("rows") or [])]
