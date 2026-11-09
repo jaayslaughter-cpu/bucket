@@ -123,6 +123,52 @@ def scoring_component() -> str:
     )
     return DEFAULT_SCORING_COMPONENT
 
+ENV_SHADOW_COMPONENTS = "PROPIQ_SHADOW_COMPONENTS"
+
+
+def shadow_components() -> tuple[str, ...]:
+    """
+    Components scored ALONGSIDE the serving one, for comparison only.
+
+    WHY BOTH, AND WHY ONLY ONE PUBLISHES. Every component's standing was
+    measured against RESEARCH-LINE labels, so the ensemble weights in
+    config/model_comparison.yaml rank them at "over the trailing average",
+    not "over a book line" -- the question the board asks. Nothing on record
+    says which is better at the real question. The only way to find out is to
+    ask them the same rows at the same posted lines and grade both.
+
+    A SHADOW NEVER REACHES THE BOARD. Its probability is written to the
+    decision record and nowhere else: not to `prop_results`, not to the
+    publication gate, not to a card. Two probabilities in the graded ledger
+    would double the denominator behind every strike rate, and a challenger
+    that could publish is not a challenger.
+
+    Default: every other line-taking component. Set the variable to a
+    comma-separated list to narrow it, or to "none" to turn it off. The
+    serving component is removed either way -- scoring it twice would compare
+    it with itself.
+    """
+    from src.models.serving_components import LINE_TAKING_COMPONENTS
+
+    serving = scoring_component()
+    raw = (os.environ.get(ENV_SHADOW_COMPONENTS) or "").strip().lower()
+    if raw in {"none", "off", "0", "false"}:
+        return ()
+    if not raw:
+        wanted = list(LINE_TAKING_COMPONENTS)
+    else:
+        wanted = [part.strip() for part in raw.split(",") if part.strip()]
+        unknown = [w for w in wanted if w not in LINE_TAKING_COMPONENTS]
+        if unknown:
+            logger.error(
+                "%s names %s, which cannot answer at a posted line; the "
+                "line-taking components are %s. Ignoring those entries.",
+                ENV_SHADOW_COMPONENTS, unknown, sorted(LINE_TAKING_COMPONENTS),
+            )
+        wanted = [w for w in wanted if w in LINE_TAKING_COMPONENTS]
+    return tuple(dict.fromkeys(w for w in wanted if w != serving))
+
+
 ENV_MODEL = "PROPIQ_MODEL"
 
 #: The licensed BigDataBall team-stats workbook. NAMED HERE rather than inline
@@ -1315,6 +1361,72 @@ def score_prob_over_distribution(
     )
 
 
+def shadow_probabilities(
+    features: pd.DataFrame,
+    prop_lines: pd.DataFrame,
+    *,
+    markets: tuple[str, ...] = DEFAULT_STATS,
+) -> dict[str, dict[tuple[str, str], float]]:
+    """
+    Every shadow component's P(over), at the SAME rows and the SAME lines.
+
+    ``{component: {(player_name, MARKET): probability}}``. Keyed that way
+    because it is the key the rest of this pipeline already joins on --
+    ``_attach_prop_lines`` and ``posted_line_for_market`` both resolve a board
+    name to a panel name and then look up by (player, market). A second key
+    here would mean a shadow landing on a row the served probability did not.
+    Unique by construction: ``features`` is slate-filtered before scoring, so
+    there is one row per player per market.
+
+    A FAILING SHADOW COSTS A COMPARISON, NOT A SLATE. Each component is
+    isolated: one that cannot resolve, load or score is logged and skipped,
+    and the others still report.
+    """
+    out: dict[str, dict[tuple[str, str], float]] = {}
+    wanted = shadow_components()
+    if not wanted or features is None or features.empty:
+        return out
+    if "PLAYER_NAME" not in features.columns:
+        logger.warning("No PLAYER_NAME column, so no shadow can be keyed to a row.")
+        return out
+
+    names = features["PLAYER_NAME"].astype(str)
+    for component in wanted:
+        keyed: dict[tuple[str, str], float] = {}
+        for market in markets:
+            try:
+                path, how = resolve_model_artifact(market=market, component=component)
+                if path is None:
+                    logger.info(
+                        "Shadow %s has no %s artifact (%s), so that market is "
+                        "not compared.", component, market, how,
+                    )
+                    continue
+                scored = score_prob_over_at_posted_line(
+                    features, prop_lines, path, component=component,
+                )
+                resolved = str(scored.attrs.get("target_market") or "").upper()
+                if resolved != market.upper():
+                    continue
+                probs = pd.to_numeric(scored, errors="coerce")
+                for name, value in zip(names, probs, strict=True):
+                    if pd.notna(value):
+                        keyed[(name, market.upper())] = round(float(value), 6)
+            except Exception as exc:  # noqa: BLE001 — a shadow must not fail a slate
+                logger.warning(
+                    "Shadow %s failed on %s (%s); the served probability is "
+                    "unaffected.", component, market, exc,
+                )
+        if keyed:
+            out[component] = keyed
+            logger.info(
+                "Shadow %s scored %d row(s) at the posted line, for comparison "
+                "only -- it is not published and not recorded in prop_results.",
+                component, len(keyed),
+            )
+    return out
+
+
 def score_prob_over_by_market(
     features: pd.DataFrame,
     prop_lines: pd.DataFrame,
@@ -2051,6 +2163,15 @@ def main(argv: list[str] | None = None) -> int:
             features, prop_df, explicit=explicit, markets=DEFAULT_STATS
         )
         stage_summary["model"]["markets_scored"] = sorted(prob_over)
+        # SCORED ON THE SAME FRAMES, IN THE SAME BREATH. Comparing components
+        # means asking them the same rows at the same posted lines; computing
+        # a shadow later, from a frame rebuilt elsewhere, would compare two
+        # questions. These never reach the board -- see `shadow_probabilities`.
+        shadow_probs = shadow_probabilities(features, prop_df, markets=DEFAULT_STATS)
+        if shadow_probs:
+            stage_summary["model"]["shadow_components"] = {
+                c: len(v) for c, v in shadow_probs.items()
+            }
         ev_verdict = evaluate_ev_gate(prop_df, market_df)
         # by_key is one entry per priced (player, market) and is joined onto
         # the rows; it does not belong in a run summary that goes to the
@@ -2127,7 +2248,7 @@ def main(argv: list[str] | None = None) -> int:
                 body, digest = build_record(
                     slate_date=slate_pt,
                     as_of_ts=format_pacific_iso(now_pacific()),
-                    rows=decision_rows(recorded),
+                    rows=decision_rows(recorded, shadow=shadow_probs),
                     prev_sha256=latest_sha256(state_root),
                     model_provenance=artifact_provenance({
                         market: series.attrs.get("artifact")

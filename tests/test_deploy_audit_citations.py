@@ -86,15 +86,15 @@ ANCHORS = [
     # line it replaced did -- that row named `logging.basicConfig` for
     # months after the two basicConfig calls were deleted.
     ("src/utils/logstreams.py", 57, "def configure_logging("),
-    ("main.py", 212, "Deliberately NOT read"),
+    ("main.py", 258, "Deliberately NOT read"),
     # README.md, rewritten 2026-10-29. Its predecessor named `TZ_DISPLAY` as a
     # variable nothing reads, `PROPIQ_SLATE_HOUR` without the `_PT` suffix the
     # code requires, and the panel-lag variable for the MARKET staleness
     # check -- three settings an operator could have set to no effect. The
     # rewrite cites the lines instead of restating them, so these keep it
     # honest the way `tests/test_agents_md.py` keeps AGENTS.md honest.
-    ("main.py", 759, "MARKET DATA IS STALE"),
-    ("main.py", 146, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
+    ("main.py", 805, "MARKET DATA IS STALE"),
+    ("main.py", 192, 'ENV_MAX_PANEL_LAG = "PROPIQ_MAX_PANEL_LAG_DAYS"'),
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
     ("src/quant/publication_gate.py", 70, "DEFAULT_MIN_SCORED = 100"),
@@ -129,7 +129,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "`python main.py` at",
-        ("main.py", 2190, "with write_lock() as _acquired:"),
+        ("main.py", 2311, "with write_lock() as _acquired:"),
     ),
 ]
 

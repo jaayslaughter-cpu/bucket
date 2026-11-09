@@ -81,7 +81,11 @@ def sha256_of(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
-def decision_rows(recorded: Any) -> list[dict[str, Any]]:
+def decision_rows(
+    recorded: Any,
+    *,
+    shadow: dict[str, dict[tuple[str, str], float]] | None = None,
+) -> list[dict[str, Any]]:
     """
     One entry per projection the recorder saw, from the recorder's own report.
 
@@ -89,11 +93,27 @@ def decision_rows(recorded: Any) -> list[dict[str, Any]]:
     decision from the projections frame. The recorder decides; this reports.
     A second classifier here would disagree with it the first time either
     changed, and the disagreement would be invisible.
+
+    ``shadow`` is ``{component: {(player_name, MARKET): probability}}`` for
+    components scored ALONGSIDE the serving one. They are attached to
+    RECORDED rows only, under a `shadow` key, and they go nowhere else: not
+    to `prop_results`, not to the gate, not to a card. When these rows grade,
+    the same outcome scores every component that answered -- which is the
+    only way to learn which is better at a posted line, since every published
+    measurement ranks them at the trailing average instead.
     """
     out: list[dict[str, Any]] = []
+    shadow = shadow or {}
     for row in getattr(recorded, "rows", []) or []:
         entry = {"decision": "RECORDED"}
         entry.update({k: row.get(k) for k in RECORDED_FIELDS})
+        key = (str(row.get("player_name") or ""), str(row.get("market") or "").upper())
+        # A COMPONENT THAT ABSTAINED IS RECORDED AS ABSTAINING. Omitting it
+        # would make "did not answer" indistinguishable from "was not asked",
+        # and the second reads as a smaller sample rather than a refusal.
+        challengers = {c: probs.get(key) for c, probs in shadow.items()}
+        if challengers:
+            entry["shadow"] = challengers
         out.append(entry)
     for skip in getattr(recorded, "skipped", []) or []:
         out.append({
