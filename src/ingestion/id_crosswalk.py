@@ -85,7 +85,7 @@ _TO_SPACE = re.compile(r"[-_/,]")
 # a specific person that someone checked.
 #
 # PROVENANCE IS THE WHOLE POINT. The panel stores ESPN's
-# ``athlete.displayName`` (``src/ingestion/espn_game.py:282``), so an entry is
+# ``athlete.displayName`` (``src/ingestion/espn_game.py:387``), so an entry is
 # only admissible if ESPN's own roster carries the value spelling and carries
 # no player under the key spelling. Every entry below was checked against
 # ESPN's NBA rosters on 2026-11-05 and was logged unmatched by the 2026-11-04

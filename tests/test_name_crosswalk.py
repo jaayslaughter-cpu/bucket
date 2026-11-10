@@ -300,7 +300,7 @@ def _board(names):
 
 
 # VERIFIED AGAINST THE PANEL'S OWN NAME SOURCE, not guessed. The panel stores
-# ESPN's `athlete.displayName` (src/ingestion/espn_game.py:282), and these are
+# ESPN's `athlete.displayName` (src/ingestion/espn_game.py:387), and these are
 # the spellings ESPN's own NBA rosters carried on 2026-11-05:
 #
 #   board "Alexandre Sarr"  -> ESPN "Alex Sarr"        (WSH, sole Sarr)

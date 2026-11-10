@@ -17,15 +17,48 @@ wrong. Every row is therefore built by ZIPPING the header names ESPN sent with
 that same block's values. A row whose two arrays differ in length is skipped
 and counted, never truncated to fit.
 
-WHAT THIS PLAY-BY-PLAY IS NOT. The existing PBP feature layer
-(``scripts/build_pbp_panel.py``) consumes NBA-native event columns:
-``actionNumber``, ``actionType``, ``subType``, ``personId``, ``teamId``,
-``shotDistance``, ``shotResult``. ESPN plays carry none of those -- they have
-an id, a sequence number, a period, a clock, a team id, a score value, and a
-free-text ``text`` field. So this CANNOT feed ``PBP_SHOT_DIST_AVG_*`` or
-``PBP_RIM_RATE_*`` without parsing distances out of English prose, which is
-not done here and is not recommended. Treat ESPN plays as their own source:
-scoring runs, period structure, and event ordering.
+WHAT THIS PLAY-BY-PLAY IS NOT, AND WHAT IT TURNED OUT TO BE. The existing PBP
+feature layer (``scripts/build_pbp_panel.py``) consumes NBA-native event
+columns -- ``actionNumber``, ``actionType``, ``subType``, ``personId``,
+``teamId``, ``shotDistance``, ``shotResult`` -- and ESPN uses none of those
+NAMES, so this still cannot be pointed at that script.
+
+WHAT THIS DOCSTRING SAID AND GOT WRONG, until 2026-11-10: that ESPN plays
+"have an id, a sequence number, a period, a clock, a team id, a score value,
+and a free-text ``text`` field", and therefore nothing player-level without
+parsing English prose. Measured against the live endpoint over six finals
+(2,999 plays) that is false in three ways, and the error cost this project the
+whole play-by-play layer, because it read as a property of the FEED rather
+than of this parser:
+
+  ``type``          every one of the 2,999 plays carried a STRUCTURED
+                    ``{"id", "text"}`` -- "Jump Shot", "Step Back Jump Shot",
+                    "Defensive Rebound", "Substitution". An action type, under
+                    a different name.
+  ``participants``  the athlete ids acting on the play, for the team in
+                    ``team.id``. Player-level, no prose.
+  ``coordinate``    an integer ``{"x", "y"}`` grid position.
+
+THE FIELDS WERE ALREADY ARRIVING AND THIS PARSER DROPPED THEM. They are kept
+now, because two blocked layers need exactly them and nothing else:
+
+  LINEUP STINTS -> RAPM. ESPN logs in-period substitutions as ``type.id ==
+                   ESPN_SUBSTITUTION_TYPE_ID`` with ``participants ==
+                   [entering, leaving]``, and ``boxscore`` flags each team's
+                   starting five. Verified across 404 substitutions in six
+                   games: every one carried exactly two participants in that
+                   order, and all 12 team blocks flagged exactly 5 starters.
+                   That is sufficient to reconstruct who is on the floor
+                   without stats.nba.com, which this environment cannot reach
+                   (the proxy opens the tunnel; NBA then drops the request).
+  SHOT ZONES    -> from ``coordinate``, NOT from prose.
+
+WHAT IS STILL NOT HERE. No shot DISTANCE as a number -- it appears only inside
+``text`` ("misses 6-foot two point shot") and is deliberately not parsed. And
+``coordinate`` is absent or sentinel on a large minority of plays: 907 of
+2,999 carried ``ESPN_COORDINATE_SENTINEL``, including 48 of 237 SHOOTING plays
+in one game. A zone layer built on this must abstain per row, not impute, or it
+silently loses a fifth of its shots.
 """
 
 from __future__ import annotations
@@ -48,6 +81,25 @@ from src.ingestion.espn_client import (
 logger = logging.getLogger(__name__)
 
 SUMMARY_PATH = "/summary"
+
+#: ESPN's ``type.id`` for "X enters the game for Y". Matched STRUCTURALLY
+#: rather than on the English text, which is the whole reason the type field is
+#: worth keeping: over six games this id and the "enters the game" wording
+#: agreed on all 404 occurrences, in both directions, so the id is used and the
+#: prose is not.
+ESPN_SUBSTITUTION_TYPE_ID = "584"
+
+#: ESPN emits this exact pair where a play has no position. It is int32-min
+#: territory, not a place on a court, and read naively it puts a shot two
+#: hundred million feet off the floor.
+ESPN_COORDINATE_SENTINEL = (-214748340, -214748365)
+
+#: Second net under the sentinel above, in case ESPN emits a different
+#: overflow value. Observed real coordinates sat in x 0..50, y -4..49, so this
+#: is three orders of magnitude of headroom and makes no assumption about the
+#: unit -- it only asserts that a basketball court is not a thousand of them
+#: across. NEGATIVES ARE LEGITIMATE: y went to -4, behind the baseline.
+COORDINATE_ABS_LIMIT = 1000
 
 # Header labels ESPN uses for the counting stats this project models. Mapped to
 # the panel's own names so a caller never has to guess which is which. Absent
@@ -81,6 +133,11 @@ class BoxScoreRow:
     player_name: str | None
     espn_team_id: str | None
     did_not_play: bool
+    #: ESPN's own flag, kept because a period's opening five cannot be
+    #: reconstructed without it: substitutions say who CHANGED, never who
+    #: began. Defaults False, so a payload that omits the flag yields no
+    #: starters rather than inventing five.
+    starter: bool = False
     stats: dict[str, float | None] = field(default_factory=dict)
     raw: dict[str, str] = field(default_factory=dict)
 
@@ -91,6 +148,7 @@ class BoxScoreRow:
             "PLAYER_NAME": self.player_name,
             "ESPN_TEAM_ID": self.espn_team_id,
             "DID_NOT_PLAY": self.did_not_play,
+            "STARTER": self.starter,
         }
         out.update(self.stats)
         return out
@@ -107,6 +165,47 @@ class PlayRow:
     text: str | None
     score_value: int | None
     scoring_play: bool | None
+    #: ESPN's structured action type. NOT NBA's ``actionType`` and not named
+    #: like it -- see the module docstring. Present on every play observed.
+    play_type_id: str | None = None
+    play_type_text: str | None = None
+    #: The athlete ids acting on this play, in the order ESPN listed them.
+    #: A tuple, because a mutable default on a frozen-by-convention row is how
+    #: one game's participants end up on another's.
+    participant_athlete_ids: tuple[str, ...] = ()
+    #: Position on ESPN's integer grid, or None where the payload carried the
+    #: sentinel or nothing. NEVER imputed: see the docstring on the fifth of
+    #: shooting plays that arrive without one.
+    coord_x: int | None = None
+    coord_y: int | None = None
+
+    def substitution(self) -> tuple[str, str] | None:
+        """``(entering, leaving)`` athlete ids, or None if not a substitution.
+
+        THE ORDER IS ESPN'S AND IS NOT VERIFIED HERE. Over six games all 404
+        substitutions listed the entering player first, cross-checked against
+        the "X enters the game for Y" wording and the box score's names. This
+        reads the structured fields only -- it does not re-parse that prose to
+        confirm, because doing so would reintroduce the dependency on English
+        the type id exists to remove.
+
+        So a reversal in ESPN's ordering would invert lineups SILENTLY here.
+        The check that would catch it is not local to one play: the leaving
+        player must already be on the floor and the entering one must not be.
+        That belongs to whatever tracks floor state, and it must do it.
+        """
+        if self.play_type_id != ESPN_SUBSTITUTION_TYPE_ID:
+            return None
+        if len(self.participant_athlete_ids) != 2:
+            # A substitution naming one player, or three, is not one this can
+            # resolve. Dropped rather than guessed: a stint built on half a
+            # substitution has four players on the floor and is worse than a
+            # stint that was never built.
+            return None
+        entering, leaving = self.participant_athlete_ids
+        if not entering or not leaving or entering == leaving:
+            return None
+        return entering, leaving
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +218,11 @@ class PlayRow:
             "TEXT": self.text,
             "SCORE_VALUE": self.score_value,
             "SCORING_PLAY": self.scoring_play,
+            "PLAY_TYPE_ID": self.play_type_id,
+            "PLAY_TYPE_TEXT": self.play_type_text,
+            "PARTICIPANT_ATHLETE_IDS": ";".join(self.participant_athlete_ids),
+            "COORD_X": self.coord_x,
+            "COORD_Y": self.coord_y,
         }
 
 
@@ -247,6 +351,7 @@ def parse_box_score(payload: dict[str, Any], event_id: str) -> tuple[list[BoxSco
                 athlete = as_dict(athlete_entry.get("athlete"))
                 values = as_list(athlete_entry.get("stats"))
                 dnp = bool(athlete_entry.get("didNotPlay"))
+                starter = bool(athlete_entry.get("starter"))
 
                 athlete_id = str(athlete.get("id")) if athlete.get("id") else None
                 if athlete_id is not None:
@@ -282,6 +387,7 @@ def parse_box_score(payload: dict[str, Any], event_id: str) -> tuple[list[BoxSco
                     player_name=athlete.get("displayName"),
                     espn_team_id=str(block_team) if block_team else None,
                     did_not_play=dnp,
+                    starter=starter,
                     stats=stats,
                     raw={str(n): str(v) for n, v in zip(names, values, strict=False)},
                 ))
@@ -294,6 +400,43 @@ def parse_box_score(payload: dict[str, Any], event_id: str) -> tuple[list[BoxSco
     return rows, notes
 
 
+def _coordinate(play: dict[str, Any]) -> tuple[int | None, int | None]:
+    """ESPN's grid position, or ``(None, None)`` where there is not one.
+
+    BOTH OR NEITHER. A play with a usable x and a sentinel y has no position,
+    and returning the half that parsed would put it on the baseline at that x
+    -- a plausible-looking coordinate that is not where anything happened.
+    """
+    raw = as_dict(play.get("coordinate"))
+    if not raw:
+        return None, None
+    try:
+        x, y = int(raw["x"]), int(raw["y"])
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if (x, y) == ESPN_COORDINATE_SENTINEL:
+        return None, None
+    if abs(x) > COORDINATE_ABS_LIMIT or abs(y) > COORDINATE_ABS_LIMIT:
+        return None, None
+    return x, y
+
+
+def _participants(play: dict[str, Any]) -> tuple[str, ...]:
+    """Athlete ids on this play, ESPN's order preserved.
+
+    Order is preserved because ``PlayRow.substitution`` depends on it; sorting
+    these for tidiness would silently swap who entered for who left.
+    """
+    out: list[str] = []
+    for entry in as_list(play.get("participants")):
+        athlete = as_dict(as_dict(entry).get("athlete"))
+        athlete_id = athlete.get("id")
+        if athlete_id is None or str(athlete_id) == "":
+            continue
+        out.append(str(athlete_id))
+    return tuple(out)
+
+
 def parse_plays(payload: dict[str, Any], event_id: str) -> list[PlayRow]:
     """Play-by-play from ``plays[]``. See the module docstring on its limits."""
     plays: list[PlayRow] = []
@@ -301,6 +444,8 @@ def parse_plays(payload: dict[str, Any], event_id: str) -> list[PlayRow]:
         play = as_dict(play)
         clock = as_dict(play.get("clock"))
         period = as_dict(play.get("period"))
+        play_type = as_dict(play.get("type"))
+        coord_x, coord_y = _coordinate(play)
         seq = play.get("sequenceNumber")
         try:
             seq_int = int(seq) if seq is not None else None
@@ -318,6 +463,11 @@ def parse_plays(payload: dict[str, Any], event_id: str) -> list[PlayRow]:
             scoring_play=(
                 bool(play.get("scoringPlay")) if play.get("scoringPlay") is not None else None
             ),
+            play_type_id=str(play_type.get("id")) if play_type.get("id") else None,
+            play_type_text=play_type.get("text") or None,
+            participant_athlete_ids=_participants(play),
+            coord_x=coord_x,
+            coord_y=coord_y,
         ))
     return plays
 
