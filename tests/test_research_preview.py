@@ -157,3 +157,82 @@ def test_max_rows_caps_the_card_and_keeps_the_largest_leans():
     )
     assert "PLAYER 39" in shown[0]
     assert "PLAYER 00" not in body, "the smallest lean was shown over larger ones"
+
+
+# --- the card must not describe a slate it is not looking at ---------------
+
+def _previewable(model_prob, *, player="A. Player", line=24.5, proj=27.0):
+    return type("C", (), {
+        "player_name": player, "target_market": "PTS", "side": "over",
+        "line": line, "prediction_mean": proj, "decision_status": "ABSTAIN",
+        "model_prob": model_prob,
+    })()
+
+
+def test_a_slate_with_no_probabilities_says_none_was_computed():
+    from src.notify.discord import build_research_preview_embed
+
+    embed = build_research_preview_embed(
+        [_previewable(None)], slate_date="2026-11-08",
+    )
+    assert "No probability is shown because none was computed." in embed["description"]
+
+
+def test_a_slate_that_computed_probabilities_does_not_claim_otherwise():
+    """
+    THE DEFECT. This sentence was hardcoded, so it stayed true by accident
+    for six slates and then went on asserting "none was computed" on
+    2026-11-09, when 312 were -- the card reported the opposite of the one
+    real change that day.
+    """
+    from src.notify.discord import build_research_preview_embed
+
+    embed = build_research_preview_embed(
+        [_previewable(0.61, player="A. Player"),
+         _previewable(0.55, player="B. Player")],
+        slate_date="2026-11-09",
+    )
+    body = embed["description"]
+    assert "none was computed" not in body, (
+        "the card still claims no probability was computed on a slate that "
+        "computed two"
+    )
+    assert "2 of these carry a model probability" in body
+
+
+def test_the_number_itself_stays_off_the_withheld_card():
+    """
+    Saying a probability EXISTS is not the same as publishing it. The gate
+    decides whether a figure may be shown, and this is the abstention-time
+    card.
+    """
+    from src.notify.discord import build_research_preview_embed
+
+    embed = build_research_preview_embed(
+        [_previewable(0.9123456)], slate_date="2026-11-09",
+    )
+    body = embed["description"]
+    assert "1 of these carry a model probability" in body
+    assert "0.91" not in body and "91" not in body.split("carry")[1][:40]
+
+
+def test_a_nan_probability_is_not_a_probability():
+    """
+    NaN is not None and defeats a null check -- the same trap that put
+    "`+nan` PLAYER PTS OVER nan" one caller away from a live card.
+    """
+    from src.notify.discord import build_research_preview_embed
+
+    embed = build_research_preview_embed(
+        [_previewable(float("nan"))], slate_date="2026-11-09",
+    )
+    assert "none was computed" in embed["description"]
+
+
+def test_a_probability_outside_zero_to_one_is_not_counted():
+    from src.notify.discord import build_research_preview_embed
+
+    embed = build_research_preview_embed(
+        [_previewable(1.4)], slate_date="2026-11-09",
+    )
+    assert "none was computed" in embed["description"]

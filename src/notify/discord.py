@@ -909,6 +909,40 @@ def escape_markdown(text: Any) -> str:
     return out
 
 
+def _finite_probability(value: Any) -> float | None:
+    """A usable probability, or None. NaN is not a probability and is not None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not (0.0 <= number <= 1.0):
+        return None
+    return number
+
+
+def _probability_note(priced: int) -> str:
+    """
+    What the preview says about probabilities, DERIVED from the rows.
+
+    Two different facts were being reported as one. "None was computed" is
+    true on a slate where no artifact resolved; "computed but not shown here"
+    is true on a slate that scored and was then withheld by the publication
+    gate. Printing the first in both cases told an operator the pipeline was
+    doing less than it was, on the exact day it started working.
+
+    THE NUMBER STAYS OFF THIS CARD EITHER WAY. This is the abstention-time
+    preview; a probability the gate has withheld does not belong on it, and
+    the lean is what this card ranks by.
+    """
+    if priced <= 0:
+        return "No probability is shown because none was computed."
+    return (
+        f"{priced} of these carry a model probability. It is not shown here: "
+        f"this card ranks by lean, and whether a probability may be published "
+        f"is the calibration gate's decision, not this card's."
+    )
+
+
 def build_research_preview_embed(
     candidates: Sequence[Any],
     *,
@@ -984,6 +1018,17 @@ def build_research_preview_embed(
         if key not in best or abs(lean) > abs(best[key][0]):
             best[key] = (lean, c)
 
+    # HOW MANY OF THESE ACTUALLY CARRY A PROBABILITY. The sentence below used
+    # to assert "none was computed" unconditionally. That was written when
+    # PROB_OVER was null on every row, and it stayed true by accident for six
+    # slates. On 2026-11-09 the slate computed 312 of them and the card still
+    # said none existed -- it reported the opposite of the day's one real
+    # change. A claim about the data has to be read off the data.
+    priced = sum(
+        1 for (_lean, c) in best.values()
+        if _finite_probability(getattr(c, "model_prob", None)) is not None
+    )
+
     ordered = sorted(best.items(), key=lambda kv: -abs(kv[1][0]))
     lines: list[str] = []
     for (player, market), (lean, c) in ordered[:max_rows]:
@@ -1015,8 +1060,7 @@ def build_research_preview_embed(
             f"{len(best)} prop(s) with a posted line, ordered by model lean "
             f"(projection − line). A lean is not an edge and not an EV: it "
             f"says the model disagrees with the line, not that the "
-            f"disagreement is worth anything. No probability is shown "
-            f"because none was computed."
+            f"disagreement is worth anything. {_probability_note(priced)}"
             f"{verdict_line}\n\n" + "\n".join(lines)
         )
 

@@ -2301,27 +2301,76 @@ def run_prelock(
             )
             return {"status": "SKIPPED", "reason": "no board", "game": game}
 
-        frame = pd.read_csv(board_csv)
+        # THE IDENTITY COLUMNS STAY STRINGS. An NBA game id is zero-prefixed
+        # ("0022600321"), and pandas reads that column as int64 by default --
+        # 22600321, which matches no scheduled event id. Scoping by event
+        # would have gone on failing for a second reason after the team
+        # filter below was fixed, and the symptom would have been identical.
+        # Caught by the first run of `tests/test_prelock_scoping.py`.
+        frame = pd.read_csv(board_csv, dtype={"event_id": str, "player_id": str})
         if frame.empty:
             return {"status": "SKIPPED", "reason": "empty board", "game": game}
 
         # ONLY THIS GAME'S ROWS, and only the ones that were RECOMMENDED. A
         # row already abstained needs no withdrawal, and the other games have
         # their own jobs at their own tip-offs.
+        #
+        # SCOPED BY EVENT IDENTITY, NOT BY TEAM NAME. The team filter was the
+        # only scope and the board carries no team: `projection_detail_rows`
+        # builds its rows without one, because `persist_projections` has no
+        # team column at all. So `player_team` is null on every live row, the
+        # filter matched NOTHING, and on 2026-11-09 all six pre-lock jobs
+        # reported "no recommended row on the board for this game" while the
+        # board held 312 RECOMMENDED rows. The availability re-check examined
+        # zero of them, every night, since it was written.
+        #
+        # `event_id` is already on both sides: the board writes `nba_game_id`
+        # into it, and this job is scheduled per game with that same id. The
+        # team filter stays as a fallback for a board written before that
+        # column existed, and is reported when it is what scoped the check.
         teams = {t for t in (home, away) if t}
+        scoped_by: str | None = None
         mine = frame
-        if teams and "player_team" in frame.columns:
+        if event_id and "event_id" in frame.columns:
+            by_event = frame[frame["event_id"].astype(str) == str(event_id)]
+            if not by_event.empty:
+                mine, scoped_by = by_event, "event_id"
+        if scoped_by is None and teams and "player_team" in frame.columns:
             in_game = frame["player_team"].isin(teams)
             if "opponent" in frame.columns:
                 in_game = in_game | frame["opponent"].isin(teams)
-            mine = frame[in_game]
+            by_team = frame[in_game]
+            if not by_team.empty:
+                mine, scoped_by = by_team, "player_team/opponent"
+
+        if scoped_by is None:
+            # NOT THE WHOLE BOARD. The previous version left `mine = frame`
+            # here, so a job that could not identify its own game would have
+            # scratch-checked every OTHER game's rows and posted the result
+            # under this game's name. Refusing is the honest answer: an
+            # unscopeable check is a check that did not happen.
+            logger.warning(
+                "PRE-LOCK %s COULD NOT BE SCOPED TO ITS GAME. The board has "
+                "no row matching event_id=%s and no usable team column, so "
+                "this game's recommendations were NOT re-checked for "
+                "availability before tip. Columns present: %s.",
+                game, event_id, sorted(frame.columns)[:12],
+            )
+            return {
+                "status": "DATA_NOT_AVAILABLE",
+                "reason": "board rows could not be scoped to this game",
+                "game": game,
+            }
+
         if "decision_status" in mine.columns:
             mine = mine[mine["decision_status"] == "RECOMMENDED"]
         if mine.empty:
             logger.info(
-                "Pre-lock %s: no recommended row on the board for this game.", game
+                "Pre-lock %s: no recommended row on the board for this game "
+                "(scoped by %s).", game, scoped_by,
             )
-            return {"status": "SKIPPED", "reason": "no recommended rows", "game": game}
+            return {"status": "SKIPPED", "reason": "no recommended rows",
+                    "game": game, "scoped_by": scoped_by}
 
         work = mine.copy()
         # apply_scratch_filter reads PLAYER_NAME; the board CSV is lowercase.
@@ -2347,10 +2396,10 @@ def run_prelock(
 
         tipoff_display = _tipoff_display(tipoff_iso)
         logger.info(
-            "Pre-lock %s (tip %s): %d recommended row(s) checked, %d withdrawn, "
-            "%d unknown, feed verified=%s.",
-            game, tipoff_display or "unknown", len(rows), len(withheld),
-            len(unknown), result.verified,
+            "Pre-lock %s (tip %s, scoped by %s): %d recommended row(s) "
+            "checked, %d withdrawn, %d unknown, feed verified=%s.",
+            game, tipoff_display or "unknown", scoped_by, len(rows),
+            len(withheld), len(unknown), result.verified,
         )
 
         # NOTHING TO SAY IS STILL SAID, unless abstentions are muted: a clear
@@ -2362,6 +2411,7 @@ def run_prelock(
             return {
                 "status": "OK", "game": game, "checked": len(rows),
                 "withheld": 0, "unknown": 0, "sent": False,
+                "scoped_by": scoped_by,
             }
 
         if not _flag(ENV_DISPATCH, webhook_configured()):
@@ -2369,6 +2419,7 @@ def run_prelock(
             return {
                 "status": "OK", "game": game, "checked": len(rows),
                 "withheld": len(withheld), "unknown": len(unknown), "sent": False,
+                "scoped_by": scoped_by,
             }
 
         embed = build_prelock_correction_embed(
@@ -2383,6 +2434,11 @@ def run_prelock(
         return {
             "status": sent.status, "game": game, "checked": len(rows),
             "withheld": len(withheld), "unknown": len(unknown), "sent": True,
+            # HOW THIS CHECK FOUND ITS ROWS. "0 checked" meant two different
+            # things for as long as this job existed -- no recommendation for
+            # this game, or no idea which rows were this game's -- and the
+            # second was what was actually happening every night.
+            "scoped_by": scoped_by,
         }
     except DiscordDispatchError as exc:
         logger.error("Pre-lock dispatch refused for %s: %s", game, exc)
