@@ -19,10 +19,13 @@
 # must be contiguous: a streak advances one pick at a time, so a gap means a
 # missing tier rather than an unreachable one.
 #
-# NOTE 2-6 COINCIDE WITH `underdog.power` in dfs_payouts.yaml as recorded on
-# 2026-09-28. Recorded here separately anyway: two products agreeing today is
-# not the same as one product, and sharing the numbers would hide the first
-# divergence.
+# NOTE 2-6 COINCIDE WITH `underdog.power` in dfs_payouts.yaml, on the
+# 2026-09-28 tables and still on the 2026-11-10 ones that replaced them.
+# Recorded here separately anyway: two products agreeing twice running is not
+# the same as one product, and sharing the numbers would hide the first
+# divergence. 7 and 8 do NOT coincide -- the standard entry pays 75x and 150x
+# where the streak pays 65x and 120x -- which is the divergence this note was
+# written for.
 
 as_of: "2026-10-19"
 source: "user-supplied 2026-10-19; not verified against a live operator page from this environment"

@@ -19,6 +19,7 @@ the original named six docs and a module that do not exist here. See
 | Bet sizes are advisory metadata, never bound to an execution script | same; `recommended_units` is read-only output |
 | No EV, CLV or stake unless the market is real | `src/quant/contracts.py:187` — `context.status != "VALID"` returns a verdict with a reason and no number |
 | Pick'em multipliers are not valid two-way EV | `src/quant/dfs_payouts.py`, `src/quant/dfs_entry.py` — a payout multiple is a payout multiple; a one-sided benchmark is refused outright |
+| A slip never carries two legs from one game | `src/quant/parlay_builder.py:395` — the exact Poisson-binomial the slip is priced with assumes independence, and no NBA teammate correlation has ever been estimated here from settled data, so the constraint is what makes the pricing correct rather than a preference |
 | No card is published on an uncalibrated model | `src/quant/publication_gate.py:160` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
 | No board is published from a stale model artifact | `src/quant/publication_gate.py:378` `artifact_freshness_gate()`; `src/models/artifact_freshness.py:177` ages it on file age AND training recency, and an artifact whose age cannot be read withholds too |
 | No claim words | `tests/test_publication_gate.py:66` fails the build if `"guaranteed"`, `"profitable"`, `"lock"` or `"certain"` appears in the disclaimer |
@@ -200,8 +201,24 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   Underdog Streak valuations by backward induction, and every multiple it
   reads from `config/streaks.yaml` is **user-supplied and has never been read
   from a live operator page from this environment**, as that file's own
-  provenance comments state. Nothing trades any of it: the user's sequencing is
-  singles only until per-leg calibration is measured on real lines.
+  provenance comments state. Nothing trades any of it. The user's sequencing is
+  **singles only on STREAKS** — a streak's legs are chosen one at a time after
+  the first two win, so each is decided on its own; this once read "singles
+  only" without qualification and was corrected on 2026-11-10, because it had
+  been taken to forbid slips as well, which it never did.
+- **A slip's EV is arithmetic on the model's own probabilities, not an edge.**
+  `src/quant/parlay_builder.py` assembles 2-to-5 leg pick'em slips from the
+  board, one leg per game and one per player, and prices each against
+  `config/dfs_payouts.yaml`. Two things about every number it returns. The
+  payout table is **user-supplied on 2026-11-10 and has never been read from a
+  live operator page here**, and it is the largest error term: the revision it
+  replaced moved entry EV by up to 20 points and flipped the sign on two tiers.
+  And every leg resolves to `ProbabilitySource.MODEL`, so a positive entry EV
+  is the model's own claim restated in payout terms — at a flat per-leg 0.57
+  nearly every tier in the catalogue prices positive, which is a fact about
+  0.57 and the table, not about this model. **Zero legs have been graded yet.**
+  Independence across games is an approximation, recorded on every evaluation
+  as `independence_basis`, not a claim.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

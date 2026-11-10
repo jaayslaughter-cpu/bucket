@@ -1,46 +1,64 @@
 # DFS pick'em payout matrices.
 #
-# PROVENANCE: user-supplied on 2026-09-28 and described by them as verified.
+# PROVENANCE: user-supplied on 2026-11-10 as the operators' current tables.
 # NOT independently verified by this repo — the environment's network policy
 # denies every operator host, so no run here has read a live payout page. Treat
 # these as the operator's terms AS RECORDED ON THAT DATE.
 #
-# THESE CHANGE. Operators alter multiples by market, promotion and region, and a
-# stale table misprices every entry built on it in whichever direction the
-# change went. Re-check before a live slate and update `as_of` when you do.
+# THESE CHANGE, AND THE 2026-09-28 SET THEY REPLACE PROVES IT. Priced at a flat
+# per-leg 0.57 the two sets disagree by up to 20 points of entry EV and in two
+# places disagree about the SIGN: underdog:flex:3 went +0.059 -> -0.025 and
+# prizepicks:power:3 went -0.074 -> +0.111. A stale table does not merely
+# mis-state an edge, it can invent or erase one. The old set is in git history,
+# not here: two tables side by side is the two-definitions defect, and a reader
+# cannot tell which one priced a slip. Re-check before a live slate and update
+# `as_of` when you do.
 #
 # `payouts` maps HITS -> total returned per 1 staked, GROSS (so 2-for-2 at 3.0
 # returns 3.0 and nets +2.0). A hit count that pays nothing is simply absent.
+#
+# NAMING: Underdog calls its all-or-nothing entry STANDARD; this file calls it
+# `power` for both operators because the loader keys on `platform:variant:n`
+# and one word per shape keeps `is_all_or_nothing` meaning one thing. The
+# operator's own word is in the label comment on each block.
 #
 # Sleeper is deliberately absent: it prices per-leg dynamic odds rather than a
 # fixed tiered matrix, so it does not fit this shape. Its legs would go through
 # benchmark_fair_probability and the two-way path instead.
 
-as_of: "2026-09-28"
-source: "user-supplied 2026-09-28; not verified against a live operator page from this environment"
+as_of: "2026-11-10"
+source: "user-supplied 2026-11-10; not verified against a live operator page from this environment"
 
 platforms:
   underdog:
+    # Underdog "Standard" — all legs must hit. Expands to 8 legs.
     power:
       2: {2: 3.0}
       3: {3: 6.0}
       4: {4: 10.0}
       5: {5: 20.0}
       6: {6: 35.0}
+      7: {7: 75.0}
+      8: {8: 150.0}
+    # Underdog "Flex" — 1 miss allowed on 3-5, up to 2 misses on 6-8.
     flex:
-      3: {3: 3.25, 2: 1.09}
-      4: {4: 6.0, 3: 1.4}
+      3: {3: 3.0, 2: 1.0}
+      4: {4: 6.0, 3: 1.5}
       5: {5: 10.0, 4: 2.5}
-      6: {6: 25.0, 5: 2.6, 4: 0.25}
-      7: {7: 40.0, 6: 2.75, 5: 0.5}
-      8: {8: 80.0, 7: 3.0, 6: 1.0}
+      6: {6: 25.0, 5: 3.0, 4: 0.5}
+      7: {7: 40.0, 6: 4.0, 5: 0.75}
+      8: {8: 80.0, 7: 6.0, 6: 1.0}
   prizepicks:
+    # PrizePicks "Power Play" — all legs must hit.
     power:
       2: {2: 3.0}
-      3: {3: 5.0}
+      3: {3: 6.0}
       4: {4: 10.0}
+      5: {5: 20.0}
+      6: {6: 37.5}
+    # PrizePicks "Flex Play" — 1 miss allowed on 3-4, up to 2 misses on 5-6.
     flex:
-      3: {3: 2.25, 2: 1.25}
-      4: {4: 5.0, 3: 1.5}
+      3: {3: 3.0, 2: 1.0}
+      4: {4: 6.0, 3: 1.5}
       5: {5: 10.0, 4: 2.0, 3: 0.4}
       6: {6: 25.0, 5: 2.0, 4: 0.4}
