@@ -1758,6 +1758,12 @@ def assemble_projections(
 
     out = pd.concat(frames, ignore_index=True)
     out["LINE"] = _attach_prop_lines(out, prop_lines)
+    # THE PRICE TRAVELS WITH THE LINE IT CAME FROM. Both read one resolved
+    # lookup, so a row's odds and its line cannot come from different players.
+    _prices = _attach_prop_line_prices(out, prop_lines)
+    out["ODDS_OVER"] = _prices["ODDS_OVER"]
+    out["ODDS_UNDER"] = _prices["ODDS_UNDER"]
+    out["LINE_SOURCE"] = _prices["LINE_SOURCE"]
     out["MARKET_STATUS"], out["MARKET_STATUS_REASON"] = _market_status_per_row(
         out, gate_by_key
     )
@@ -1893,6 +1899,110 @@ def _under_push_and_reason(
     )
 
 
+def _resolved_board_lookup(
+    projections: pd.DataFrame, prop_lines: pd.DataFrame
+) -> dict[tuple[Any, Any], dict[str, Any]]:
+    """
+    The captured board keyed by ``(panel name, market)``, resolved ONCE.
+
+    ONE RESOLUTION, TWO READERS. `_attach_prop_lines` takes the line out of
+    this and `_attach_prop_line_prices` takes the odds. Calling
+    `resolve_board_names` twice would be two chances for the line and the
+    price on the same row to come from different players -- which is exactly
+    the failure the crosswalk exists to prevent, reintroduced one layer up.
+
+    `keep="last"` matches the recorder: the most recent capture wins.
+    """
+    from src.ingestion.id_crosswalk import apply_name_map, resolve_board_names
+
+    name_map, _report = resolve_board_names(prop_lines, projections)
+    resolved = apply_name_map(prop_lines, name_map)
+    frame = (
+        resolved.dropna(subset=["player_name", "market"])
+        .drop_duplicates(subset=["player_name", "market"], keep="last")
+    )
+    return {
+        (row["player_name"], row["market"]): row
+        for row in frame.to_dict("records")
+    }
+
+
+def _attach_prop_line_prices(
+    projections: pd.DataFrame, prop_lines: pd.DataFrame | None
+) -> pd.DataFrame:
+    """
+    The two-way American odds and the book behind each matched line.
+
+    WHY THIS EXISTS. The EV gate passed 17,210 two-way quotes on 2026-11-09
+    and the board reported `n_consider_with_book_ev: 0, sources_used: []`.
+    The price was fetched, gated and de-vigged, and then dropped: nothing
+    carried it from the matched board row onto the projection, so every board
+    row was `model_lean` with `ev: None` BY CONSTRUCTION. "No positive-EV prop
+    tonight" and "no price ever reached the ranker" were the same output, and
+    it was always the second.
+
+    A PICK'EM MULTIPLIER IS NOT ODDS. `is_pickem` rows carry a payout
+    multiplier, not a two-way American price; `market_ev_gate` refuses them
+    and `quant.dfs_payouts` is where they belong. Writing one into these
+    columns would make the two indistinguishable to everything downstream.
+
+    Columns, all null where no two-way price was matched: ``ODDS_OVER``,
+    ``ODDS_UNDER``, ``LINE_SOURCE``.
+    """
+    empty = pd.DataFrame(
+        {"ODDS_OVER": None, "ODDS_UNDER": None, "LINE_SOURCE": None},
+        index=projections.index,
+    )
+    if prop_lines is None or prop_lines.empty:
+        return empty
+    if not {"player_name", "market", "line"}.issubset(prop_lines.columns):
+        return empty
+    if "PLAYER_NAME" not in projections.columns or "MARKET" not in projections.columns:
+        return empty
+
+    lookup = _resolved_board_lookup(projections, prop_lines)
+    over: list[Any] = []
+    under: list[Any] = []
+    source: list[Any] = []
+    for key in zip(projections["PLAYER_NAME"], projections["MARKET"]):
+        row = lookup.get(key) or {}
+        if not row or bool(row.get("is_pickem")):
+            over.append(None)
+            under.append(None)
+            source.append(None)
+            continue
+        over.append(_int_or_none_american(row.get("over_odds_american")))
+        under.append(_int_or_none_american(row.get("under_odds_american")))
+        source.append(_text_or_none(row.get("source")))
+
+    priced = sum(1 for o, u in zip(over, under) if o is not None and u is not None)
+    logger.info(
+        "Book prices attached to %d of %d projection row(s); %d row(s) matched "
+        "a line with no usable two-way price (one side missing, or a pick'em "
+        "multiplier, which is routed to quant.dfs_payouts rather than de-vigged).",
+        priced, len(projections),
+        sum(1 for o, u in zip(over, under) if o is None or u is None),
+    )
+    return pd.DataFrame(
+        {"ODDS_OVER": over, "ODDS_UNDER": under, "LINE_SOURCE": source},
+        index=projections.index,
+    )
+
+
+def _int_or_none_american(value: Any) -> int | None:
+    """American odds as an int, or None. 0 is not a price."""
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number or None
+
+
+def _text_or_none(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
 def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | None) -> pd.Series:
     """
     Exact-match join of captured prop lines onto projections.
@@ -1921,19 +2031,9 @@ def _attach_prop_lines(projections: pd.DataFrame, prop_lines: pd.DataFrame | Non
         )
         return null
 
-    from src.ingestion.id_crosswalk import apply_name_map, resolve_board_names
-
-    name_map, _report = resolve_board_names(prop_lines, projections)
-    resolved = apply_name_map(prop_lines, name_map)
-
-    lookup = (
-        resolved.dropna(subset=["player_name", "market"])
-        .drop_duplicates(subset=["player_name", "market"], keep="last")
-        .set_index(["player_name", "market"])["line"]
-    )
-
+    lookup = _resolved_board_lookup(projections, prop_lines)
     keys = list(zip(projections["PLAYER_NAME"], projections["MARKET"]))
-    values = [lookup.get(k) for k in keys]
+    values = [(lookup.get(k) or {}).get("line") for k in keys]
     result = pd.Series(values, index=projections.index, dtype="object")
 
     unmatched = int(result.isna().sum())

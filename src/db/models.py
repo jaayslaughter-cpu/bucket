@@ -336,6 +336,21 @@ class Projection(Base):
     # in exactly that case and returns the reason.
     prob_under: Mapped[float | None] = mapped_column(Float)
     prob_push: Mapped[float | None] = mapped_column(Float)
+
+    # THE PRICE THIS PROJECTION WAS MADE AGAINST. Migration 010.
+    #
+    # Without these the board could never establish book EV: on 2026-11-09
+    # the EV gate passed 17,210 two-way quotes and the board reported
+    # `n_consider_with_book_ev: 0, sources_used: []`, because the price
+    # stopped here. Every row came out `model_lean` by construction, which is
+    # indistinguishable in the output from "no priced market existed".
+    #
+    # NULL means no two-way price was matched -- never 0, which reads as
+    # even money. A pick'em multiplier is NOT written here; those are routed
+    # to `quant.dfs_payouts` and `market_ev_gate` refuses them.
+    odds_over_american: Mapped[int | None] = mapped_column(Integer)
+    odds_under_american: Mapped[int | None] = mapped_column(Integer)
+    line_source: Mapped[str | None] = mapped_column(String(32), index=True)
     model_version: Mapped[str | None] = mapped_column(String(64))
 
     # PER ROW, from this row's own prop line. It used to be the slate-wide EV

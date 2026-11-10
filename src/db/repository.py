@@ -1047,6 +1047,10 @@ PROJECTION_BOARD_COLS: tuple[str, ...] = (
     "market", "final_projection", "baseline_projection", "line",
     "prob_over", "prob_under", "prob_push", "market_status",
     "market_status_reason", "ev_per_dollar", "model_version",
+    # THE PRICE, so the board can establish book EV rather than only a lean.
+    # Reading the line without the odds is what made every board row
+    # `model_lean` on a slate where 17,210 two-way quotes passed the gate.
+    "odds_over_american", "odds_under_american", "line_source",
 )
 
 
@@ -1168,6 +1172,13 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
             # 1 - P(over). See the note on Projection.prob_under.
             "prob_under": r.get("PROB_UNDER"),
             "prob_push": r.get("PROB_PUSH"),
+            # THE PRICE THIS PROJECTION WAS MADE AGAINST (migration 010).
+            # Without it the board cannot establish book EV: 17,210 gated
+            # two-way quotes reached the EV gate on 2026-11-09 and the board
+            # reported sources_used: [].
+            "odds_over_american": r.get("ODDS_OVER"),
+            "odds_under_american": r.get("ODDS_UNDER"),
+            "line_source": r.get("LINE_SOURCE"),
             "market_status": r.get("MARKET_STATUS", "DATA_NOT_AVAILABLE"),
             # The reason behind the status, kept beside it rather than folded
             # into `notes`: notes already carries the under/push refusal, and

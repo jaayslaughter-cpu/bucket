@@ -260,6 +260,19 @@ def enrich_row_with_book(
         return out
 
     out.book_status = "VALID"
+    # WHICH FEED PRICED IT. `decision_board.decision_board_summary` builds
+    # `sources_used` from this field, so leaving it null reported an empty
+    # source list on a board that was fully priced -- the enriched row knew
+    # the book and the summary said nobody had quoted it. The other path
+    # (`decision_board.resolve_market`) has always set it; this one did not.
+    #
+    # AFTER THE GATE, NOT BEFORE. Set above the refusal, a row whose quote the
+    # gate rejected still named the book that posted it, so "which feeds
+    # priced this board" would have counted a source that supplied nothing
+    # usable. `book_sources_skipped` is where a passed-over feed belongs.
+    source = getattr(market, "source", None)
+    if source:
+        out.book_source = str(source)
     if out.model_p_over is None or out.book_over_american is None or out.book_under_american is None:
         out.warnings.append("Model P(over) or American odds missing for EV")
         return out
@@ -469,7 +482,69 @@ def research_slate_from_predictions(
                 warnings=warnings,
             )
         )
+        # THE BOOK EV THE BOARD COULD NEVER ESTABLISH. `enrich_row_with_book`
+        # has existed the whole time and the live path never called it,
+        # because nothing carried a price this far: `projections` stopped at
+        # the line. On 2026-11-09 the EV gate passed 17,210 two-way quotes and
+        # the board reported `n_consider_with_book_ev: 0, sources_used: []`.
+        # Migration 010 carries the odds; this is what reads them.
+        #
+        # A ROW WITH NO PRICE IS LEFT ALONE, not enriched with an absence:
+        # `enrich_row_with_book(row, None)` stamps DATA_NOT_AVAILABLE and
+        # appends "No priced market attached", which on a board where most
+        # rows are legitimately unpriced is a warning on nearly every row and
+        # tells a reader nothing. `book_status` already defaults to
+        # DATA_NOT_AVAILABLE, which is the same fact without the noise.
+        market = _market_context_from_detail(chosen, board[-1])
+        if market is not None:
+            board[-1] = enrich_row_with_book(board[-1], market)
     return board
+
+
+def _market_context_from_detail(
+    detail: dict[str, Any], row: ResearchSlateRow
+) -> MarketContext | None:
+    """
+    The captured two-way price on a detail row, as the gate's input.
+
+    None when the row carries no usable price, which is every row written
+    before migration 010 and every row whose book posted one side or none.
+    The gate would refuse those anyway; returning None keeps the refusal
+    silent rather than warning on most of a board.
+
+    `status` is VALID because these odds came from a captured snapshot the
+    ingest already marked VALID -- `market_ev_gate` still re-checks the line
+    and both sides, so nothing here can promote an unpriceable row.
+    """
+    over = detail.get("odds_over_american")
+    under = detail.get("odds_under_american")
+    if over is None or under is None:
+        return None
+    try:
+        over_i, under_i = int(over), int(under)
+    except (TypeError, ValueError):
+        return None
+    if not over_i or not under_i:
+        return None
+    line = detail.get("prop_line")
+    if line is None:
+        return None
+    return MarketContext(
+        game_id=str(detail.get("event_id") or row.event_id or ""),
+        status="VALID",
+        market=str(row.target_market),
+        player_name=row.player_name,
+        line=float(line),
+        over_odds_american=over_i,
+        under_odds_american=under_i,
+        is_pickem=False,
+        source=_as_text(detail.get("line_source")),
+    )
+
+
+def _as_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def log_manual_bet(

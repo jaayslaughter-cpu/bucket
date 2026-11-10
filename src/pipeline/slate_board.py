@@ -192,6 +192,9 @@ def projection_detail_rows(projections: pd.DataFrame) -> list[dict[str, Any]]:
         "nba_game_id", "nba_player_id", "player_name", "market", "game_date",
         "final_projection", "line", "prob_over", "prob_under", "prob_push",
     )
+    # OPTIONAL, because a board built from rows written before migration 010
+    # has no price and must still rank on lean rather than raise.
+    priced = ("odds_over_american", "odds_under_american", "line_source")
     missing = [c for c in wanted if c not in projections.columns]
     if missing:
         raise ValueError(
@@ -235,6 +238,10 @@ def projection_detail_rows(projections: pd.DataFrame) -> list[dict[str, Any]]:
             "probability_over_raw": record.get("prob_over"),
             "probability_under_raw": record.get("prob_under"),
             "probability_push_raw": record.get("prob_push"),
+            # THE TWO-WAY PRICE, carried so `research_slate_from_predictions`
+            # can enrich the row with book EV. `enrich_row_with_book` has
+            # existed the whole time; nothing ever had a price to hand it.
+            **{k: record.get(k) for k in priced},
         })
     return rows
 
