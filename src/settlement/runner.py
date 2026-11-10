@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from typing import Any
 
 import requests
@@ -75,12 +74,29 @@ class SettlementReport:
         }
 
 
-def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | None:
+#: Why `_match_player` declined. THE CALLER USED TO GUESS THIS AND GUESSED
+#: WRONG: it logged "Likely a name-format mismatch; route through
+#: id_crosswalk" for every failure, unconditionally, including for players
+#: `espn_boxscore` had ALREADY identified in the line above as scratches who
+#: did not travel. Two readers of one fact, and the less-informed one reached
+#: the log -- acting on it would have added crosswalk aliases for names that
+#: are spelled perfectly correctly. The matcher knows which case it is, so it
+#: says.
+MATCH_AMBIGUOUS = "ambiguous_name"
+MATCH_ABSENT = "absent_from_box_score"
+
+
+def _match_player(
+    stats_by_name: dict[str, dict], player_name: str
+) -> tuple[dict | None, str | None]:
     """
     Exact match, then a single normalised retry (casefold + strip
     punctuation). Deliberately NOT fuzzy: mis-matching one player onto
     another's prop would produce a confidently wrong settlement. Genuine
     name variance should be routed through PropIQ's id_crosswalk.
+
+    Returns ``(stats, None)`` on a match, or ``(None, reason)`` where reason is
+    ``MATCH_AMBIGUOUS`` or ``MATCH_ABSENT`` -- see the note above those.
     """
     if player_name in stats_by_name:
         candidate = stats_by_name[player_name]
@@ -90,8 +106,8 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
                 "Grading either would be a coin flip on whose line it was.",
                 player_name,
             )
-            return None
-        return candidate
+            return None, MATCH_AMBIGUOUS
+        return candidate, None
 
     target = normalise_player_name(player_name)
     norm = normalise_player_name
@@ -103,9 +119,9 @@ def _match_player(stats_by_name: dict[str, dict], player_name: str) -> dict | No
                     "players in this game.",
                     player_name,
                 )
-                return None
-            return stats
-    return None
+                return None, MATCH_AMBIGUOUS
+            return stats, None
+    return None, MATCH_ABSENT
 
 
 #: What `extract_player_stats` has always implied without saying: a row with
@@ -120,14 +136,18 @@ def _result_source(player_stats: dict) -> str:
     return ESPN_RESULT_SOURCE if player_stats.get("source") == "espn" else CDN_RESULT_SOURCE
 
 
-def stake_or_default(stake: Decimal | None) -> Decimal:
-    """Default a NULL stake to one unit — and only a NULL one.
-
-    Written as an explicit None check because ``stake or Decimal(1)`` treats
-    Decimal("0") as falsey: a row deliberately staked at zero would be
-    re-staked at one unit and booked into profit_units as a real bet.
-    """
-    return Decimal(1) if stake is None else stake
+# `stake_or_default` USED TO LIVE HERE AND IT WAS THE DEFECT. It turned the
+# recorder's deliberate NULL stake into one unit at grading time, so every
+# graded prediction booked a notional 1-unit bet and the results card reported
+# "ROI -3.83% on 288.00 unit(s) staked" for props that were never recommended
+# -- the board was WITHHELD that night -- never staked and never shown to
+# anyone as a pick. The NULL is now passed through and `settle_prop` abstains
+# from ROI on it, which is what `recorder.py`'s docstring and
+# `notify.discord.build_win_loss_embed`'s both already claimed happened.
+#
+# Do not reintroduce a default here. A caller that genuinely stakes a row
+# passes `stake_units` explicitly; acquiring a stake by omission is how a
+# research ledger becomes a betting record nobody decided to keep.
 
 
 def settle_pending_props(
@@ -220,14 +240,74 @@ def settle_pending_props(
                 continue
 
             for prop in props:
-                player_stats = _match_player(stats_by_name, prop.player_name)
-                if player_stats is None:
+                player_stats, miss = _match_player(stats_by_name, prop.player_name)
+                if player_stats is None and miss == MATCH_AMBIGUOUS:
+                    # STAYS PENDING, and this is the one case where that is
+                    # right: the player IS in the box score, twice, and a
+                    # crosswalk entry really would resolve it. Voiding would
+                    # discard a row that is recoverable.
                     report.props_unmatched += 1
                     logger.warning(
-                        "No box-score match for %r in game %s — left PENDING. "
-                        "Likely a name-format mismatch; route through id_crosswalk.",
+                        "Two players in game %s share the name %r — left "
+                        "PENDING. Resolvable: add the id_crosswalk entry that "
+                        "says which one this prop belongs to.",
+                        game_id, prop.player_name,
+                    )
+                    continue
+                if player_stats is None:
+                    # VOID, NOT PENDING. The game is final and its box score
+                    # was fetched whole, so a player with no line in it
+                    # produced no stat and this prop can never grade to
+                    # WIN/LOSS/PUSH -- PENDING was a state it would sit in
+                    # until the 14-day age cutoff dropped it silently.
+                    #
+                    # AND THE CAUSE IS NOT ASSERTED, because from here it
+                    # cannot be told. A scratch who did not dress and a
+                    # spelling this matcher cannot resolve are the SAME
+                    # observation: absent from a complete box score. The old
+                    # message picked one ("Likely a name-format mismatch") and
+                    # pointed at the wrong fix for the common case.
+                    # `espn_boxscore` logs the players it could not find on the
+                    # slate, which is the evidence that separates them.
+                    report.props_unmatched += 1
+                    logger.warning(
+                        "No box-score line for %r in final game %s — VOIDED, "
+                        "excluded from W-L and ROI. Either a scratch who did "
+                        "not dress (see the box-score fetcher's own list for "
+                        "this slate) or a spelling this matcher cannot resolve; "
+                        "from here those are the same observation. If the "
+                        "player did play, the fix is an id_crosswalk entry.",
                         prop.player_name, game_id,
                     )
+                    void = settle_prop(
+                        market=prop.market,
+                        predicted_line=prop.predicted_line,
+                        predicted_side=prop.predicted_side,
+                        player_stats=None,
+                    )
+                    if not dry_run:
+                        prop.outcome_status = str(void.outcome)
+                        prop.actual_result = None
+                        prop.stake_units = None
+                        prop.profit_units = None
+                        prop.settlement_note = (
+                            "No box-score line for this player in a final game, "
+                            "so the prop can never grade to WIN/LOSS/PUSH. "
+                            "VOIDED and excluded from W-L and ROI. The cause is "
+                            "a scratch who did not dress OR a name this matcher "
+                            "could not resolve; from the settlement runner those "
+                            "are the same observation and neither is asserted "
+                            "here."
+                        )
+                        prop.settled_at_utc = datetime.now(timezone.utc)
+                        # DELIBERATELY NOT SET: `did_not_play`, `minutes_played`,
+                        # `result_source` and `raw_boxscore_json`. Writing
+                        # did_not_play=True would assert the scratch reading over
+                        # the name-mismatch one, which is the exact
+                        # over-confidence this change removes; and there is no
+                        # box-score row to record provenance for or to store.
+                    report.props_graded += 1
+                    report.voids += 1
                     continue
 
                 try:
@@ -239,7 +319,9 @@ def settle_pending_props(
                         odds=prop.odds,
                         did_not_play=player_stats.get("did_not_play", False),
                         minutes_played=player_stats.get("minutes_played"),
-                        stake_units=stake_or_default(prop.stake_units),
+                        # PASSED THROUGH, NEVER DEFAULTED. See the note where
+                        # `stake_or_default` used to be.
+                        stake_units=prop.stake_units,
                         # THE OPERATOR, FOR FPTS ONLY. A fantasy score is
                         # scored on the book's own multipliers, so the row's
                         # source IS the scoring matrix; every other market

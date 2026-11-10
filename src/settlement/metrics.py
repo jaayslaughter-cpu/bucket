@@ -13,6 +13,16 @@ THREE DELIBERATE SEPARATIONS
    for them. They still count toward W-L-P. `unpriced_graded_n` makes
    the size of that exclusion visible rather than silently dropping it.
 
+2b. ROI ALSO NEEDS A STAKE, AND THIS PIPELINE RECORDS NONE. `recorder.py`
+   writes a NULL `stake_units` deliberately — it records predictions and
+   places no wager — so in normal operation every priced prop settles
+   unstaked and `roi_pct` is None. That is correct, not a gap. It was
+   briefly otherwise: settlement defaulted a missing stake to one unit,
+   and the results card reported "ROI -3.83% on 288.00 unit(s) staked"
+   across 288 predictions that were never recommended (the board was
+   withheld that night), never staked and never shown as picks. The
+   default is gone; `roi.note` now says which exclusion applied.
+
 3. CLV IS NOT ROI. It is a market-quality signal — whether the line/price
    moved toward you after you took it. It correlates with long-run edge
    in the literature, but it is not profit and is never summed into the
@@ -56,6 +66,42 @@ class RoiBlock:
     profit_units: float | None = None
     roi_pct: float | None = None
     note: str = ""
+
+
+def roi_exclusion_notes(roi: "RoiBlock") -> list[str]:
+    """Why ROI is absent, as a list so SEVERAL reasons can be reported.
+
+    A FUNCTION RATHER THAN AN if/elif INSIDE `get_performance_summary`, for two
+    reasons. The chain it replaced could only report its first match, and a
+    slate can carry pick'em rows AND no stakes at once -- so the second
+    exclusion went unmentioned on the card. And a card showing no ROI with no
+    reason reads as a broken pipeline rather than as the designed state.
+
+    THE NO-STAKE CASE IS THE NORMAL ONE HERE. `recorder.py` writes a NULL
+    `stake_units` on purpose, because this project records predictions and
+    places no wager, and settlement no longer defaults one. Before that default
+    was removed the 2026-11-09 results card reported "ROI -3.83% on 288.00
+    unit(s) staked" across 288 predictions that were never recommended -- the
+    publication gate withheld the board that night -- never staked and never
+    shown to anyone as a pick.
+    """
+    notes: list[str] = []
+    if roi.unpriced_graded_n:
+        notes.append(
+            f"{roi.unpriced_graded_n} graded prop(s) excluded from ROI — pick'em "
+            f"payout multipliers are not two-way American odds, so ROI is "
+            f"undefined for them. They ARE included in the W-L-P record."
+        )
+    if roi.priced_n == 0:
+        notes.append("No priced props settled — ROI not computable.")
+    elif not roi.staked_units:
+        notes.append(
+            f"{roi.priced_n} priced prop(s) settled and none carries a stake, "
+            f"so ROI is not computable — this pipeline records predictions and "
+            f"places no wager. A figure here would be a notional bet nobody "
+            f"made."
+        )
+    return notes
 
 
 @dataclass
@@ -193,14 +239,7 @@ def get_performance_summary(
     roi.profit_units = _f(row.profit)
     if roi.staked_units and roi.profit_units is not None:
         roi.roi_pct = round(roi.profit_units / roi.staked_units * 100, 2)
-    if roi.unpriced_graded_n:
-        roi.note = (
-            f"{roi.unpriced_graded_n} graded prop(s) excluded from ROI — pick'em "
-            f"payout multipliers are not two-way American odds, so ROI is "
-            f"undefined for them. They ARE included in the W-L-P record."
-        )
-    elif roi.priced_n == 0:
-        roi.note = "No priced props settled — ROI not computable."
+    roi.note = " ".join(roi_exclusion_notes(roi))
 
     # --- clv ----------------------------------------------------------
     clv = summary.clv

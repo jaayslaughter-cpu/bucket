@@ -296,7 +296,7 @@ def settle_prop(
     odds: int | None = None,
     did_not_play: bool = False,
     minutes_played: Any = None,
-    stake_units: Any = Decimal(1),
+    stake_units: Any = None,
     platform: Any = None,
 ) -> Settlement:
     """
@@ -306,9 +306,32 @@ def settle_prop(
     is not a losing bet — books void these, and counting them as losses
     would understate the model's real strike rate.
 
-    Returns profit_units = None when `odds` is None (pick'em multiplier
-    rather than a two-way American price). The row is still graded
-    W/L/P — only ROI abstains.
+    ROI ABSTAINS ON TWO SEPARATE TRIGGERS, and the row still grades W/L/P
+    under both:
+
+      ``odds is None``         a pick'em payout multiplier rather than a
+                               two-way American price, so there is no price
+                               to compute a return against.
+      ``stake_units is None``  NO STAKE WAS RECORDED. This is the normal case
+                               in this pipeline and the default, which is why
+                               the default is None and not one unit.
+
+    THE DEFAULT USED TO BE ``Decimal(1)`` AND THAT WAS THE DEFECT.
+    ``recorder.py`` deliberately writes a NULL stake -- its docstring says so
+    in as many words, because this project records PREDICTIONS and places no
+    wager -- and then ``runner.stake_or_default`` supplied one unit at grading
+    time and overrode that refusal. The result was a Discord results card
+    reading "ROI -3.83% on 288.00 unit(s) staked" for 288 props that were
+    never recommended (the board was WITHHELD that night, so nothing was
+    published), never staked, and never seen by anyone as a pick. A research
+    ledger had quietly become a notional betting record, and
+    ``notify.discord.build_win_loss_embed``'s own docstring asserted the
+    opposite -- "nothing in this pipeline writes stake_units" -- which the
+    card disproved.
+
+    A stake passed EXPLICITLY is still honoured: a backtest that stakes one
+    unit per row is a legitimate caller. What is gone is acquiring one by
+    omission.
 
     `platform` is the operator the line came from, and is required ONLY by
     FPTS, whose multipliers are an operator's terms rather than arithmetic.
@@ -361,9 +384,18 @@ def settle_prop(
         return Settlement(
             outcome=Outcome.PUSH,
             actual_result=actual,
-            stake_units=_to_decimal(stake_units, "stake_units") if odds is not None else None,
-            # Push returns the stake: zero profit, not a loss.
-            profit_units=Decimal(0) if odds is not None else None,
+            stake_units=(
+                _to_decimal(stake_units, "stake_units")
+                if odds is not None and stake_units is not None
+                else None
+            ),
+            # Push returns the stake: zero profit, not a loss. With no stake
+            # recorded there is no zero to return either -- profit_units stays
+            # None so the row is excluded from ROI rather than counted as a
+            # break-even bet that never happened.
+            profit_units=(
+                Decimal(0) if odds is not None and stake_units is not None else None
+            ),
             note=f"PUSH: {market} {actual} exactly equals line {line}.",
         )
 
@@ -380,6 +412,19 @@ def settle_prop(
                 f"{outcome}: {market} {actual} vs {side} {line}. "
                 f"No two-way American odds (pick'em payout multiplier) — "
                 f"ROI not computed for this row."
+            ),
+        )
+
+    if stake_units is None:
+        return Settlement(
+            outcome=outcome,
+            actual_result=actual,
+            stake_units=None,
+            profit_units=None,
+            note=(
+                f"{outcome}: {market} {actual} vs {side} {line} @ {odds:+d}. "
+                f"No stake was recorded, so ROI is not computed for this row. "
+                f"This pipeline records predictions and places no wager."
             ),
         )
 

@@ -514,10 +514,19 @@ def test_a_player_with_unreadable_minutes_is_graded_from_the_stat_line():
 
 
 def test_settlement_refuses_an_ambiguous_name():
-    from src.settlement.runner import _match_player
+    """
+    `_match_player` now returns ``(stats, reason)`` so the caller stops
+    GUESSING why it declined -- it logged "Likely a name-format mismatch" for
+    every failure, including for scratches the box-score fetcher had already
+    identified. The refusal this test guards is unchanged; what is added is
+    that the reason is reported, and that THIS case is the one that stays
+    PENDING rather than being voided, because a crosswalk entry really can
+    resolve it.
+    """
+    from src.settlement.runner import MATCH_AMBIGUOUS, _match_player
 
     stats = {"Chris Johnson": {"player_name": "Chris Johnson", "ambiguous_name": True}}
-    assert _match_player(stats, "Chris Johnson") is None
+    assert _match_player(stats, "Chris Johnson") == (None, MATCH_AMBIGUOUS)
 
 
 def test_capture_time_is_not_defaulted_to_the_ingest_time():
@@ -579,17 +588,57 @@ def test_pra_is_a_real_sum_and_is_actually_labellable():
     assert build_feature_matrix(partial)["PRA"].isna().sum() >= 5
 
 
-def test_stake_of_zero_is_not_promoted_to_one_unit():
-    """`stake or Decimal(1)` graded a zero-stake row as a one-unit bet.
+def test_a_missing_stake_is_not_promoted_to_one_unit():
+    """`stake_or_default` is gone, and this is the stronger rule that replaced it.
 
-    Decimal("0") is falsey, so the row was silently restaked and its
-    profit_units entered the ROI sums as though a wager had been placed.
+    The old guard only stopped Decimal("0") being read as falsey and restaked
+    at one unit. It left the NULL case doing exactly that BY DESIGN --
+    `stake_or_default(None) == Decimal(1)` was its asserted behaviour -- and
+    `recorder.py` writes NULL on every row on purpose, because this project
+    records predictions and places no wager. So every graded prediction booked
+    a notional 1-unit bet, and the 2026-11-09 results card reported "ROI
+    -3.83% on 288.00 unit(s) staked" across 288 props that were never
+    recommended (the board was withheld that night), never staked and never
+    shown to anyone as a pick.
+
+    Now: a missing stake grades the row and abstains from ROI, exactly as a
+    missing price already did.
     """
-    from src.settlement.runner import stake_or_default
+    from src.settlement.evaluator import Outcome, SettlementError, settle_prop
 
-    assert stake_or_default(None) == Decimal(1)
-    assert stake_or_default(Decimal("0")) == Decimal("0")
-    assert stake_or_default(Decimal("2.5")) == Decimal("2.5")
+    graded = settle_prop(
+        market="PTS", predicted_line=Decimal("25.5"), predicted_side="OVER",
+        player_stats={"points": 30}, odds=-110,
+    )
+    assert graded.outcome is Outcome.WIN, "the row must still grade"
+    assert graded.stake_units is None, "settlement invented a stake"
+    assert graded.profit_units is None, "settlement booked a profit on no stake"
+    assert "no stake" in graded.note.lower()
+
+    # A PUSH is the same: no stake means no break-even bet to report either.
+    push = settle_prop(
+        market="PTS", predicted_line=Decimal("26"), predicted_side="OVER",
+        player_stats={"points": 26}, odds=-110,
+    )
+    assert push.outcome is Outcome.PUSH
+    assert push.stake_units is None and push.profit_units is None
+
+    # An EXPLICIT stake is still honoured — a backtest is a legitimate caller.
+    staked = settle_prop(
+        market="PTS", predicted_line=Decimal("25.5"), predicted_side="OVER",
+        player_stats={"points": 30}, odds=-110, stake_units=Decimal("2.5"),
+    )
+    assert staked.stake_units == Decimal("2.5")
+    assert staked.profit_units is not None and staked.profit_units > 0
+
+    # And zero is still refused outright rather than treated as absent: a row
+    # that says it staked nothing is a different statement from one that says
+    # nothing about a stake, and it is not a sensible wager.
+    with pytest.raises(SettlementError):
+        settle_prop(
+            market="PTS", predicted_line=Decimal("25.5"), predicted_side="OVER",
+            player_stats={"points": 30}, odds=-110, stake_units=Decimal("0"),
+        )
 
 
 # --------------------------------------------------------------------------

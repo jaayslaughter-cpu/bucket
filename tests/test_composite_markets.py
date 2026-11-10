@@ -774,13 +774,28 @@ def test_an_exact_fpts_tie_is_a_push_not_a_refusal():
 
     box = {"points": 20, "reboundsTotal": 5, "assists": 1,
            "steals": 0, "blocks": 0, "turnovers": 0}
+    # THE STAKE IS NOW PASSED EXPLICITLY. `settle_prop` no longer defaults one:
+    # `recorder.py` writes a NULL stake on purpose and settlement used to
+    # override it, which put a fabricated ROI on the results card. This test is
+    # about the FPTS tie, so it states the stake it then asserts about rather
+    # than inheriting one.
     graded = settle_prop(
         market="FPTS", predicted_line=27.5, predicted_side="OVER",
         player_stats=box, odds=-110, platform="underdog",
+        stake_units=Decimal(1),
     )
     assert str(graded.outcome) == "PUSH"
     assert graded.actual_result == Decimal("27.5")
     assert graded.profit_units == Decimal(0), "a push returns the stake"
+
+    # And with no stake recorded there is no zero to return either: the row
+    # still PUSHes and simply carries no ROI.
+    unstaked = settle_prop(
+        market="FPTS", predicted_line=27.5, predicted_side="OVER",
+        player_stats=box, odds=-110, platform="underdog",
+    )
+    assert str(unstaked.outcome) == "PUSH"
+    assert unstaked.stake_units is None and unstaked.profit_units is None
 
 
 def test_the_fractional_push_guard_still_bites_on_counting_stats():
