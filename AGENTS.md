@@ -19,7 +19,7 @@ the original named six docs and a module that do not exist here. See
 | Bet sizes are advisory metadata, never bound to an execution script | same; `recommended_units` is read-only output |
 | No EV, CLV or stake unless the market is real | `src/quant/contracts.py:187` — `context.status != "VALID"` returns a verdict with a reason and no number |
 | Pick'em multipliers are not valid two-way EV | `src/quant/dfs_payouts.py`, `src/quant/dfs_entry.py` — a payout multiple is a payout multiple; a one-sided benchmark is refused outright |
-| A slip never carries two legs from one game | `src/quant/parlay_builder.py:395` — the exact Poisson-binomial the slip is priced with assumes independence, and no NBA teammate correlation has ever been estimated here from settled data, so the constraint is what makes the pricing correct rather than a preference |
+| A slip never carries two legs from one game | `src/quant/parlay_builder.py:426` — the exact Poisson-binomial the slip is priced with assumes independence, and no NBA teammate correlation has ever been estimated here from settled data, so the constraint is what makes the pricing correct rather than a preference |
 | No card is published on an uncalibrated model | `src/quant/publication_gate.py:160` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
 | No board is published from a stale model artifact | `src/quant/publication_gate.py:378` `artifact_freshness_gate()`; `src/models/artifact_freshness.py:177` ages it on file age AND training recency, and an artifact whose age cannot be read withholds too |
 | No claim words | `tests/test_publication_gate.py:66` fails the build if `"guaranteed"`, `"profitable"`, `"lock"` or `"certain"` appears in the disclaimer |
@@ -218,7 +218,15 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   nearly every tier in the catalogue prices positive, which is a fact about
   0.57 and the table, not about this model. **Zero legs have been graded yet.**
   Independence across games is an approximation, recorded on every evaluation
-  as `independence_basis`, not a claim.
+  as `independence_basis`, not a claim. The slips DO now reach Discord
+  (`PROPIQ_DISPATCH_SLIPS`, on by default), and the reason none did before was
+  not a filter: `notify.discord.build_dfs_entry_embed` existed and its only
+  caller in the repository was `scripts/nba_model_cli.py`, so a slip could
+  arrive only from a hand-run command. Nothing logged a refusal because
+  nothing tried. The publication gate still decides what each slip embed
+  shows, so while nothing is graded every one of them carries the gate's
+  reason in place of its numbers — which is the correct output, not a
+  failure.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

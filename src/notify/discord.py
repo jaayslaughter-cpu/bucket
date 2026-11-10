@@ -552,11 +552,25 @@ def build_dfs_entry_embed(
     """
     entry = getattr(evaluation, "payout", None)
     legs = list(getattr(evaluation, "legs", []) or [])
-    status = str(getattr(evaluation, "status", "") or "")
+    # THE PAYOUT CARRIES ITS OWN STATUS AND THE WRAPPER'S WAS A SECOND READER
+    # OF IT. `dfs_entry.EntryEvaluation` copies `payout.status` onto itself, so
+    # for that one type the two were always equal and the duplication was
+    # invisible. `quant.parlay_builder.SlipEvaluation` wraps the SAME payout
+    # under its own vocabulary (SLIP_READY), and reading the wrapper refused a
+    # slip that had in fact been priced. Read the entry, which is the only
+    # object that knows.
+    status = str(getattr(entry, "status", "") or "")
     source = getattr(evaluation, "probability_source", None)
     source_label = getattr(source, "value", None) or "UNSPECIFIED"
     structure = getattr(evaluation, "structure_label", None) or "entry"
-    title = f"Recommended DFS entry — {structure}" + (
+    # "DFS entry", NOT "Recommended DFS entry". This same function renders the
+    # refusals -- an entry the publication gate withheld, and a slip that could
+    # not be built at all -- and it put the word "Recommended" in the title of
+    # both. A heading asserting a recommendation above a body explaining that
+    # there is none is the kind of claim AGENTS.md section 1 exists to stop. It
+    # mattered little while the only caller was a hand-run CLI; it goes out
+    # nightly now that `scheduler_worker` builds slips.
+    title = f"DFS entry — {structure}" + (
         f" · {slate_date}" if slate_date else ""
     )
 

@@ -109,6 +109,27 @@ ENV_DISPATCH_ABSTENTIONS = "PROPIQ_DISPATCH_ABSTENTIONS"
 #: this shows the inputs to a claim nobody is making yet. No probability
 #: and no EV appear, because with no artifact there are none.
 ENV_RESEARCH_PREVIEW = "PROPIQ_RESEARCH_PREVIEW"
+#: Append one embed per DFS SLIP SIZE -- 2 to 5 legs, one leg per game --
+#: priced against `config/dfs_payouts.yaml`. ON BY DEFAULT.
+#:
+#: WHY IT EXISTS AND WHY IT DEFAULTS ON. No slip had ever reached Discord from
+#: a scheduled run, and the cause was not a filter rejecting them:
+#: `notify.discord.build_dfs_entry_embed` existed, and the ONLY caller in the
+#: repository was `scripts/nba_model_cli.py`. A slip could therefore arrive
+#: only from a hand-run command. Nothing logged a refusal, because nothing
+#: tried. That is the same "N readers, no writer" shape this repository keeps
+#: producing, and the preview flag above defaults OFF only because it
+#: duplicates what the board already says -- a slip is not in the board at all.
+#:
+#: IT DOES NOT OPEN THE PUBLICATION GATE. The verdict is passed to every slip
+#: embed, so a withheld slate shows the slip and the gate's reason in place of
+#: its numbers, exactly as the board card does.
+ENV_DISPATCH_SLIPS = "PROPIQ_DISPATCH_SLIPS"
+#: Which operator and which entry shape the slips are priced against. The
+#: catalogue keys on `platform:variant:n`; an unknown pair abstains with the
+#: key it looked for named, rather than silently pricing something else.
+ENV_SLIP_PLATFORM = "PROPIQ_SLIP_PLATFORM"
+ENV_SLIP_VARIANT = "PROPIQ_SLIP_VARIANT"
 ENV_CALIBRATION_REPORT = "PROPIQ_CALIBRATION_REPORT"
 ENV_BOARD_CSV = "PROPIQ_BOARD_CSV"
 ENV_BOARD_MARKETS = "PROPIQ_BOARD_MARKETS"
@@ -1881,7 +1902,14 @@ def run_dispatch() -> dict[str, Any]:
                 title="No recommendations",
             )]
         else:
-            frame = pd.read_csv(board_csv)
+            # dtype=str ON THE IDS. An NBA game id is zero-prefixed
+            # (`0022600321`) and a player id can be too; pandas infers int64
+            # and silently drops the prefix, which is the defect the pre-lock
+            # check hit on this same board file. It matters more now that the
+            # slip builder groups by `event_id` to enforce one leg per game.
+            frame = pd.read_csv(
+                board_csv, dtype={"event_id": str, "player_id": str},
+            )
             # THE SECOND HALF OF THE SAME GUARD, and the half that cannot be
             # bypassed by a future code path. `run_board` removes a stale
             # board when IT refuses, but dispatch reads this file without
@@ -1966,6 +1994,13 @@ def run_dispatch() -> dict[str, Any]:
                 embeds.append(build_research_preview_embed(
                     rows, slate_date=slate, publication=verdict,
                 ))
+            # THE SLIPS, APPENDED LIKE THE PREVIEW AND FOR THE SAME REASON.
+            # See ENV_DISPATCH_SLIPS: nothing in the scheduled path had ever
+            # built one, so none could be filtered out -- there was no writer.
+            if _flag(ENV_DISPATCH_SLIPS, True):
+                embeds.extend(_slip_embeds(
+                    rows, slate_date=slate, publication=verdict,
+                ))
             if not verdict.allowed and not _flag(ENV_DISPATCH_ABSTENTIONS, True):
                 logger.info("Board withheld and abstentions muted — nothing sent.")
                 return {
@@ -1983,6 +2018,92 @@ def run_dispatch() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Dispatch raised; the scheduler stays up.")
         return {"status": "FAILED", "error": str(exc)}
+
+
+def _slip_embeds(
+    rows: list[Any],
+    *,
+    slate_date: str | None,
+    publication: Any,
+) -> list[dict[str, Any]]:
+    """One embed per slip size the catalogue offers for the configured product.
+
+    EVERY OUTCOME IS AN EMBED OR A NAMED REFUSAL, never an empty list that the
+    channel cannot tell from "no slate". A board with four eligible legs
+    produces three priced slips and one embed saying the 5-pick needed five;
+    a missing catalogue produces one embed saying so.
+
+    The abstaining ones follow ENV_DISPATCH_ABSTENTIONS, like every other
+    refusal this worker posts: the house rule is that a refusal is posted too,
+    because silence reads as "nothing good today".
+    """
+    from src.notify.discord import (
+        MAX_EMBEDS_PER_MESSAGE,
+        build_abstention_embed,
+        build_dfs_entry_embed,
+    )
+    from src.quant.dfs_payouts import DfsPayoutError, load_payout_catalog
+    from src.quant.parlay_builder import SLIP_READY, build_slips
+
+    platform = (os.environ.get(ENV_SLIP_PLATFORM) or "underdog").strip().lower()
+    variant = (os.environ.get(ENV_SLIP_VARIANT) or "power").strip().lower()
+    show_refusals = _flag(ENV_DISPATCH_ABSTENTIONS, True)
+
+    try:
+        catalog = load_payout_catalog()
+    except DfsPayoutError as exc:
+        logger.error("No slips priced: %s", exc)
+        if not show_refusals:
+            return []
+        return [build_abstention_embed(
+            f"No DFS slip was priced: {exc}",
+            title="No DFS slips",
+        )]
+
+    slips = build_slips(rows, catalog, platform=platform, variant=variant)
+    priced = [s for s in slips if s.status == SLIP_READY]
+    unpriced = [s for s in slips if s.status != SLIP_READY]
+
+    out: list[dict[str, Any]] = [
+        build_dfs_entry_embed(s, publication=publication, slate_date=slate_date)
+        for s in priced
+    ]
+    # ONE EMBED FOR EVERY SIZE THAT COULD NOT BE BUILT, not one each. On a
+    # withheld slate every board row is ABSTAIN, so all four sizes fail for the
+    # SAME reason and four near-identical refusals would go out every night --
+    # which is how a channel gets trained to ignore the section. The sizes and
+    # their reasons are all still named; what is removed is the repetition.
+    if unpriced and show_refusals:
+        out.append(build_abstention_embed(
+            "No slip was built at these sizes. "
+            + " ".join(
+                f"[{s.n_legs_requested}-leg] {s.reason or 'no reason given'}"
+                for s in unpriced
+            ),
+            title=f"DFS slips not built — {platform}:{variant}"
+            + (f" · {slate_date}" if slate_date else ""),
+        ))
+    logger.info(
+        "Slips: %d of %d priced on %s:%s (%s)",
+        sum(1 for s in slips if s.status == SLIP_READY), len(slips),
+        platform, variant,
+        "; ".join(
+            f"{s.n_legs_requested}-leg {s.status}" for s in slips
+        ),
+    )
+    # ROOM FOR THE CARDS THAT WERE ALREADY GOING OUT. Discord takes ten embeds
+    # per message and `send_embeds` refuses the whole batch over that, so a
+    # slate that produced a long slip list would take the board card down with
+    # it. Two slots are reserved for the board and the preview.
+    room = MAX_EMBEDS_PER_MESSAGE - 2
+    if len(out) > room:
+        logger.warning(
+            "%d slip embed(s) trimmed to %d: Discord takes %d embeds per "
+            "message and the board card keeps its slot.",
+            len(out), room, MAX_EMBEDS_PER_MESSAGE,
+        )
+        out = out[:room]
+    return out
 
 
 def _attach_advisory_units(rows: list[Any]) -> None:

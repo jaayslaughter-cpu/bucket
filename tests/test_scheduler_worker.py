@@ -2982,6 +2982,11 @@ def test_the_preview_is_off_by_default_so_no_prop_reaches_the_card(
     monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
     monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
     monkeypatch.delenv(worker.ENV_RESEARCH_PREVIEW, raising=False)
+    # ONE SUBJECT PER TEST. The slips are a separate section with its own
+    # default (ON) and its own tests in tests/test_slip_dispatch.py; counting
+    # total embeds here was a proxy for "no preview", and the proxy broke the
+    # day a second section existed. Switched off so this asserts the preview.
+    monkeypatch.setenv(worker.ENV_DISPATCH_SLIPS, "false")
 
     import src.notify.discord as discord_mod
 
@@ -3016,6 +3021,8 @@ def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path
     monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
     monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
     monkeypatch.setenv(worker.ENV_RESEARCH_PREVIEW, "true")
+    # See the note in the test above: the slips are their own section.
+    monkeypatch.setenv(worker.ENV_DISPATCH_SLIPS, "false")
 
     import src.notify.discord as discord_mod
 

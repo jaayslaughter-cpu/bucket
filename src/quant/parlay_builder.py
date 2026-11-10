@@ -143,6 +143,19 @@ class SlipLeg:
     line: float
     probability: float
 
+    @property
+    def probability_source(self) -> ProbabilitySource:
+        """MODEL, always, and recorded PER LEG rather than only per entry.
+
+        ``notify.discord.build_dfs_entry_embed`` prints each leg's source on
+        the face of the embed, because a market-grounded leg and a
+        model-grounded one are different claims and look identical once the
+        column headers are gone. A leg that answered ``?`` there would read, in
+        a channel, as provenance somebody forgot to record rather than as a leg
+        the model priced on its own.
+        """
+        return ProbabilitySource.MODEL
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "LEG_ID": self.leg_id,
@@ -183,6 +196,24 @@ class SlipEvaluation:
     @property
     def expected_value(self) -> float | None:
         return None if self.payout is None else self.payout.expected_value
+
+    # ``structure_label`` and ``probability_source`` are the names
+    # ``notify.discord.build_dfs_entry_embed`` reads off an evaluation, and
+    # ``dfs_entry.EntryEvaluation`` is what taught it those names. Satisfied
+    # here deliberately so ONE embed serves both shapes: a second,
+    # slip-shaped embed would start identical and drift, and the two would
+    # then disagree about how a withheld entry looks in the channel.
+    @property
+    def structure_label(self) -> str:
+        return self.structure_key
+
+    @property
+    def probability_source(self) -> ProbabilitySource:
+        return (
+            self.payout.probability_source
+            if self.payout is not None
+            else ProbabilitySource.UNSPECIFIED
+        )
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
