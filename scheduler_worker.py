@@ -3624,16 +3624,37 @@ def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
 
     target = calibration_report_path(path)
     try:
-        # ONE READ, TWO REPORTS. The ledger fit and the ECE report must
-        # describe the same sample; two queries could land either side of a
-        # settlement write and disagree about how many rows they saw.
+        # ONE READ, TWO REPORTS, BUT NOT AT THE COST OF THE SEAM. The ledger
+        # fit and the ECE report should describe the same sample: two queries
+        # could land either side of a settlement write and disagree about how
+        # many rows they saw. So the rows are loaded once here and passed to
+        # both.
+        #
+        # THE `rows = None` FALLBACK IS NOT DEFENSIVE PADDING. Loading here
+        # moved the database read OUTSIDE
+        # `prop_result_calibration_report`, which is the function
+        # `tests/test_scheduler_worker.py` substitutes to drive this job
+        # without a database. The read then raised `DatabaseConfigError`
+        # before the substitute was ever reached, and the job returned FAILED
+        # instead of writing the abstaining report -- CI run 186, two
+        # failures, and Railway skipped the deploy because `checkSuites` is
+        # on. Falling back to `rows=None` lets the report do its own load, as
+        # it did before, so the seam the tests use still exists.
         from src.db.repository import load_graded_prop_results
         from src.settlement.calibration import (
             prop_result_calibration_report,
             summarise,
         )
 
-        rows = load_graded_prop_results(lookback_days=180, market=None)
+        try:
+            rows = load_graded_prop_results(lookback_days=180, market=None)
+        except Exception:  # noqa: BLE001 — the report loads its own below
+            logger.warning(
+                "Pre-loading the graded ledger failed; the calibration report "
+                "will load its own rows and the ledger fit will abstain.",
+                exc_info=True,
+            )
+            rows = None
         report = prop_result_calibration_report(rows=rows)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
@@ -3671,6 +3692,15 @@ def _run_ledger_calibration(rows: Any, calibration_target: Any) -> dict[str, Any
         from src.models.ledger_calibration import fit_ledger_calibration
         from src.models.ledger_calibration import summarise as summarise_ledger
 
+        if rows is None:
+            # The caller could not read the ledger. Abstaining is the honest
+            # answer; loading it again here would just reproduce the failure.
+            logger.info(
+                "Ledger calibration skipped: no rows were available to fit.",
+            )
+            return {"status": "DATA_NOT_AVAILABLE",
+                    "reason": "the graded ledger could not be read",
+                    "out": str(out_path)}
         report = fit_ledger_calibration(rows)
         out_path.write_text(
             json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8",
