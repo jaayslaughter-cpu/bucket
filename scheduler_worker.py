@@ -49,6 +49,7 @@ project's own test runs, three concurrent suites turned a 126s run into over
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import signal
@@ -4777,7 +4778,22 @@ def run_lineup_stints() -> dict[str, Any]:
         panel = load_player_panel()
         if not panel.empty:
             validation = validate_stints_against_minutes(on_court, panel)
-            validation_ran = bool(validation.get("n", 0))
+            # MEASURED MEANS JOINED **AND** FINITE. `np.corrcoef` returns NaN
+            # when either side has zero variance, and `nan < 0.9` is False --
+            # so a NaN correlation fell straight through the ALERT branch into
+            # "OK", reporting agreement on the strength of a comparison that
+            # returned nothing. That is the same defect as reading an empty
+            # dict as a correlation of zero, one branch further down, and it
+            # survived the fix for that one.
+            # ONE CONDITION, BECAUSE THERE IS ONLY ONE FACT. An earlier
+            # version also tested `n`, which is dead weight: when nothing
+            # joins, `validate_stints_against_minutes` returns `{"n": 0.0}`
+            # with no `corr` key at all, so `corr is None` already covers it.
+            # A mutation test proved it -- deleting the `n` half changed no
+            # behaviour any test could see, which is how redundant logic
+            # announces itself.
+            corr = validation.get("corr")
+            validation_ran = corr is not None and math.isfinite(corr)
     except Exception as exc:  # noqa: BLE001 — report, do not guess
         logger.warning("Stint validation could not read the panel: %s", exc)
 
@@ -4808,16 +4824,18 @@ def run_lineup_stints() -> dict[str, Any]:
     if not validation_ran:
         out["validation_status"] = "CANNOT_TELL"
         logger.error(
-            "LINEUP STINTS WERE NOT VALIDATED: %s joined zero player-games "
-            "against the panel, so the correlation with the box score's own "
-            "minutes is unmeasured -- NOT measured and bad. The stints were "
-            "still written, and they are unverified as written.", validation,
+            "LINEUP STINTS WERE NOT VALIDATED: %s produced no usable "
+            "correlation with the box score's own minutes -- it joined no "
+            "player-games, or the comparison had no variance to correlate. "
+            "Either way the agreement is unmeasured, NOT measured and bad. "
+            "The stints were still written, and they are unverified as "
+            "written.", validation,
         )
         notify_failure(
             "lineup-stints",
             "The stint reconstruction was written but NOT validated: the "
-            "check against the box score's minutes joined zero player-games, "
-            "so its agreement is unknown rather than poor.",
+            "check against the box score's minutes produced no usable "
+            "correlation, so its agreement is unknown rather than poor.",
         )
     elif validation["corr"] < 0.9:
         out["validation_status"] = "ALERT"

@@ -75,16 +75,19 @@ ANCHORS = [
     # (`run_dispatch` and friends now log and return the webhook's reason)
     # added lines above `build_scheduler`. Moved again, 4140/4141 ->
     # 4335/4336 on 2026-11-11: the Basketball Reference, ESPN-plays and
-    # stint jobs were registered above it. The findings did not move either
-    # time; this row is the record of the file growing underneath them.
-    ("scheduler_worker.py", 4335, "job_defaults"),
-    ("scheduler_worker.py", 4336, "max_instances"),
+    # stint jobs were registered above it. Moved once more, 4335/4336 ->
+    # 4336/4337 the same day, by a single `import math` added for the
+    # NaN-correlation guard: one line at the top of the file moves every
+    # anchor below it, which is the whole reason these are pinned by
+    # substring and refreshed by exact pair. The findings never moved.
+    ("scheduler_worker.py", 4336, "job_defaults"),
+    ("scheduler_worker.py", 4337, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1927, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1928, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 769, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
@@ -104,6 +107,26 @@ ANCHORS = [
     ("src/utils/timezones.py", 11, 'DISPLAY_TZ_NAME = "America/Los_Angeles"'),
     ("src/quant/publication_gate.py", 65, "DEFAULT_MAX_ECE = 0.05"),
     ("src/quant/publication_gate.py", 70, "DEFAULT_MIN_SCORED = 100"),
+    # Added 2026-11-11. These six lived in two audit docs that NOTHING
+    # anchored, and every one of them had rotted: `test_every_cited_line_exists`
+    # only checks a number is in range, so all six passed while pointing at
+    # docstring fragments and comments. Found by checking them after an
+    # `import math` shifted the file, measured, and relocated by content:
+    #
+    #   configuration_audit F5  3178-3185 -> 4334-4341  (BlockingScheduler)
+    #   configuration_audit F7        645 ->       802  (board_markets)
+    #   configuration_audit O6       3270 ->      4538  (configure_logging call)
+    #   early_season table           1482 ->      1639  (min_ev env read)
+    #   early_season min_lean   1543-1548 -> 1700-1706  (the live board call)
+    #
+    # Anchored now so the next refactor fails a test instead of quietly
+    # turning three audits into prose with no evidence behind it.
+    ("scheduler_worker.py", 4334, "scheduler = BlockingScheduler("),
+    ("scheduler_worker.py", 802, "def board_markets("),
+    ("scheduler_worker.py", 4538, "configure_logging()"),
+    ("scheduler_worker.py", 1639, "os.environ.get(ENV_MIN_EV)"),
+    ("scheduler_worker.py", 1705, "min_ev=min_ev,"),
+    ("scheduler_worker.py", 1700, "build_board_from_projections("),
 ]
 
 #: AUDIT PROSE BOUND TO AN ANCHORED LINE, which `test_every_cited_line_exists`
@@ -119,7 +142,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "wired into the nightly dispatch at",
-        ("scheduler_worker.py", 1927, "artifact_freshness_verdict()"),
+        ("scheduler_worker.py", 1928, "artifact_freshness_verdict()"),
     ),
     # A1's two entry points. This entry described a SHIPPED guardrail as an
     # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
@@ -130,7 +153,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "scheduled slate at",
-        ("scheduler_worker.py", 1268, "with write_lock() as acquired:"),
+        ("scheduler_worker.py", 1269, "with write_lock() as acquired:"),
     ),
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",

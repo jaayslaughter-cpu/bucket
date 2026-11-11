@@ -255,7 +255,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/quant/publication_gate.py:378` as a second verdict beside
   `calibration_gate`, combined by `first_refusal` so the reason that fired is
   the reason shown; wired into the nightly dispatch at
-  `scheduler_worker.py:1927` and into the deploy probe as a FAILURE at
+  `scheduler_worker.py:1928` and into the deploy probe as a FAILURE at
   `scripts/railway_healthcheck.py:269`.
 - **Licence note.** `Kevocado` is unlicensed, so this is the idea and the
   reasoning, cited — not their code. Every line is ours.
@@ -278,7 +278,7 @@ most of what looks like autonomy is a laptop — but these two are real.
 - **CLOSED, and this entry said otherwise for three weeks.**
   `src/utils/write_lock.py` landed in `89be638` on 2026-10-11 — the same day
   this evaluation was written — and is taken by BOTH entry points: the
-  scheduled slate at `scheduler_worker.py:1268` and the manual
+  scheduled slate at `scheduler_worker.py:1269` and the manual
   `python main.py` at `main.py:2411`. It **declines** rather than waits, and
   says so: *"Another process holds the slate write lock, so the 09:00 PT run
   is SKIPPED … A deliberate decline, not a failure."* The scope deliberately

@@ -12,6 +12,7 @@ put back.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -520,3 +521,40 @@ def test_a_validation_that_disagrees_with_the_box_score_alerts(
     assert "NOT validated" not in detail, (
         f"a measured disagreement was reported as an unmeasured one: {detail!r}"
     )
+
+
+def test_a_correlation_that_is_not_a_number_is_not_a_pass(
+    monkeypatch, tmp_path,
+) -> None:
+    """
+    `nan < 0.9` IS FALSE, SO A NaN CORRELATION FELL THROUGH TO "OK".
+
+    The same defect as `validation.get("corr", 0)` one line above it, and it
+    survived the fix for that one: a verdict branch that cannot represent
+    "no answer" quietly calls it a pass. `np.corrcoef` returns NaN when
+    either side has zero variance, which this panel produces by joining only
+    the two players whose reconstructed minutes are equal.
+
+    A degenerate slate, yes -- but the point is that the job must not report
+    a reconstruction as agreeing with the box score on the strength of a
+    comparison that returned nothing. It is CANNOT_TELL, like any other
+    unmeasured check.
+    """
+    panel = pd.DataFrame([
+        {"GAME_ID": GAME, "PLAYER_ID": "espn:p1", "MIN": 6.0},
+        {"GAME_ID": GAME, "PLAYER_ID": "espn:p6", "MIN": 6.0},
+    ])
+    worker, sent = _stint_job_env(monkeypatch, tmp_path, panel)
+
+    out = worker.run_lineup_stints()
+
+    assert out["validation"]["n"] == 2.0, out["validation"]
+    assert not np.isfinite(out["validation"]["corr"]), (
+        f"this panel was built to produce a NaN correlation and did not, so "
+        f"the test no longer covers what it is named for: {out['validation']}"
+    )
+    assert out["validation_status"] == "CANNOT_TELL", (
+        f"a correlation of {out['validation']['corr']} was reported as "
+        f"{out['validation_status']}"
+    )
+    assert sent, "an unmeasurable correlation passed in silence"
