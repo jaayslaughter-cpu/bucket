@@ -701,6 +701,63 @@ def test_a_board_for_today_is_not_refused_as_stale(monkeypatch, tmp_path):
     assert "describes" not in str(out.get("reason", ""))
 
 
+def test_a_failed_send_carries_the_webhook_reason_in_the_return(
+    monkeypatch, tmp_path
+):
+    """
+    THE FAILURE PATH'S OWN SILENCE, the other half of the one
+    `test_dispatch_is_off_without_a_webhook` guards. `send_embeds` returns a
+    FAILED result whose `reason` carries the HTTP status and the redacted
+    response body -- the full detail of why the webhook refused -- and
+    `run_dispatch` logged only `result.status` and returned only the status
+    and the publication verdict. A webhook failing in production therefore
+    read in Railway's log view as "Dispatch: FAILED", with the one line that
+    named the HTTP response dropped on the floor. `notify_failure` is
+    deliberately NOT used here (see its docstring: alerting about a broken
+    webhook through that webhook is a loop with no exit), so the ERROR log
+    line and the return value are where the detail must live.
+    """
+    import pandas as pd
+
+    def fake_send(embeds, config=None, **kw):
+        return type("R", (), {
+            "status": "FAILED",
+            "reason": "HTTP 503: upstream unavailable",
+            "http_status": 503,
+            "embeds_sent": 0,
+        })()
+
+    today = _frozen_pacific_day(monkeypatch)
+    board = tmp_path / "board.csv"
+    pd.DataFrame([{
+        "slate_date": str(today),
+        "decision_status": "RECOMMENDED",
+        "decision_basis": "model_lean", "player_name": "DEMO_FAIL",
+        "target_market": "PTS", "side": "over", "line": 24.5,
+        "model_prob": 0.71, "book_ev": None, "american_odds": None,
+        "book_source": None,
+    }]).to_csv(board, index=False)
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(board))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_dispatch()
+
+    assert out["status"] == "FAILED"
+    assert out.get("reason") == "HTTP 503: upstream unavailable", (
+        f"the webhook's own reason did not survive the return: {sorted(out)}"
+    )
+    assert out.get("http_status") == 503
+    # AND THE GATE'S VERDICT STILL TRAVELS, as on every other return.
+    assert "PUBLICATION_STATUS" in out["publication"]
+
+
 def test_settlement_rebuilds_the_calibration_report(monkeypatch, tmp_path):
     """
     The order is the dependency: grade, then recompute the evidence, so the
@@ -3137,3 +3194,59 @@ def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path
     assert "withheld from publication" in blob
     assert "RECOMMENDED prop(s)" in blob, blob[:200]
     assert "not recommendations" in blob.lower()
+
+
+def test_a_failed_results_card_send_carries_the_webhook_reason(monkeypatch):
+    """
+    THE THIRD SEND SITE THE 2026-11-11 AUDIT CHANGED, and the second of two it
+    did not test -- both survived its own suite as mutations.
+
+    `send_embeds` returns a result whose `reason` carries the HTTP status and
+    the redacted response body; this job returned only the status, the day and
+    the graded count. `notify_failure` is deliberately not used on a dispatch
+    path (alerting about a broken webhook through that webhook is a loop with
+    no exit), so the ERROR line and the return value are where the detail has
+    to live.
+    """
+    import src.notify.discord as discord_mod
+    import src.settlement.metrics as metrics_mod
+
+    class _Record:
+        graded_n = 42
+        wins = 20
+        losses = 22
+        pushes = 0
+        voids = 0
+        decided_n = 42
+        strike_rate_pct = 47.6
+
+    class _Summary:
+        record = _Record()
+        roi = None
+        clv = None
+
+    monkeypatch.setattr(
+        metrics_mod, "get_performance_summary", lambda **_k: _Summary(),
+    )
+    monkeypatch.setattr(
+        discord_mod, "send_embeds",
+        lambda embeds, config=None, **kw: type("R", (), {
+            "status": "FAILED",
+            "reason": "HTTP 401: invalid webhook token",
+            "http_status": 401,
+            "embeds_sent": 0,
+        })(),
+    )
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_RESULTS_CARD, "true")
+
+    out = worker.run_results_card(slate_date="2026-11-09")
+
+    assert out["status"] == "FAILED"
+    assert out.get("reason") == "HTTP 401: invalid webhook token", (
+        f"the webhook's reason did not survive the return: {sorted(out)}"
+    )
+    assert out.get("http_status") == 401
+    # AND THE DAY AND THE COUNT STILL TRAVEL.
+    assert out["slate_date"] == "2026-11-09"
+    assert out["graded"] == 42

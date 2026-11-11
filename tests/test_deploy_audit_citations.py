@@ -71,8 +71,11 @@ ANCHORS = [
     ("src/features/schedule.py", 69, "haversine_miles"),
     ("src/features/fatigue_logic.py", 22, "altitude"),
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
-    ("scheduler_worker.py", 4087, "job_defaults"),
-    ("scheduler_worker.py", 4088, "max_instances"),
+    # Moved 4087/4088 -> 4140/4141 on 2026-11-10: the dispatch-reason fix
+    # (`run_dispatch` and friends now log and return the webhook's reason)
+    # added lines above `build_scheduler`. The findings did not move.
+    ("scheduler_worker.py", 4140, "job_defaults"),
+    ("scheduler_worker.py", 4141, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.

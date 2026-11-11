@@ -18,6 +18,8 @@ RESEARCH_ONLY. Synthetic rows; nothing here is a real recommendation.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
@@ -173,3 +175,57 @@ def test_a_player_ruled_out_is_still_withdrawn_on_a_live_shaped_board(
 
     assert out["checked"] == 1
     assert out["withheld"] == 1, "the ruled-out player was not withdrawn"
+
+
+# --- the send's own failure reason -------------------------------------
+
+
+def test_a_failed_prelock_send_carries_the_webhook_reason(monkeypatch, tmp_path):
+    """
+    THE SEND SITE THE 2026-11-11 AUDIT CHANGED AND DID NOT TEST.
+
+    `send_embeds` returns a result whose `reason` carries the HTTP status and
+    the redacted response body, and this job returned only `sent.status`. A
+    pre-lock card failing read as "FAILED" at the one moment a withdrawal
+    matters most -- a player ruled out after the 09:00 slate, minutes before
+    tip. `notify_failure` is deliberately not used on a dispatch path (see its
+    docstring: alerting about a broken webhook through that webhook is a loop
+    with no exit), so the return value is where the detail has to live.
+
+    The audit's patch covered three send sites and tested one; two mutations
+    survived its own test suite. This is one of the two.
+    """
+    monkeypatch.setenv("PROPIQ_BOARD_CSV", str(_live_board(tmp_path)))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv("PROPIQ_PRELOCK", "true")
+    monkeypatch.setattr(
+        "src.ingestion.espn_availability.fetch_injuries",
+        # ATTRIBUTES, NOT DICT KEYS: `scratches.apply_scratch_filter` reads
+        # `row.player_name`, so a dict here fails before the send is reached.
+        lambda **k: _Report(injuries=[
+            SimpleNamespace(player_name="A. Player", status="OUT", team="DAL",
+                            detail="ruled out", status_raw="OUT"),
+        ]),
+    )
+
+    def fake_send(embeds, config=None, **kw):
+        return type("R", (), {
+            "status": "FAILED",
+            "reason": "HTTP 429: rate limited",
+            "http_status": 429,
+            "embeds_sent": 0,
+        })()
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+
+    out = worker.run_prelock(event_id=EVENT, home="DAL", away="IND")
+
+    assert out["status"] == "FAILED"
+    assert out.get("reason") == "HTTP 429: rate limited", (
+        f"the webhook's reason did not survive the return: {sorted(out)}"
+    )
+    assert out.get("http_status") == 429
+    # AND THE SCOPE STILL TRAVELS, as every other return on this job carries it.
+    assert out.get("scoped_by") == "event_id"

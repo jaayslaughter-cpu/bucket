@@ -2010,8 +2010,33 @@ def run_dispatch() -> dict[str, Any]:
                 }
 
         result = send_embeds(embeds, config=DiscordConfig(dry_run=False))
-        logger.info("Dispatch: %s", result.status)
-        return {"status": result.status, "publication": verdict.as_dict()}
+        # THE REASON IS THE LINE THAT NAMES THE FAILURE, and before this it
+        # reached neither the log nor the return value: `send_embeds` had
+        # already learned the HTTP status and the redacted response body, and
+        # `run_dispatch` logged only `result.status`, so a webhook failing in
+        # production read in Railway's log view as "Dispatch: FAILED" and
+        # nothing more. The failure alerter is deliberately not called here
+        # (see its docstring: alerting about a broken webhook through that
+        # webhook is a loop with no exit), so this ERROR line and the return
+        # value are where the detail lives.
+        if result.status == "OK":
+            logger.info(
+                "Dispatch: %s (%d embed(s) delivered).",
+                result.status, getattr(result, "embeds_sent", 0),
+            )
+        else:
+            logger.error(
+                "Dispatch %s: %s (HTTP %s). The scheduler stays up.",
+                result.status, getattr(result, "reason", None),
+                getattr(result, "http_status", None),
+            )
+        return {
+            "status": result.status,
+            "reason": getattr(result, "reason", None),
+            "http_status": getattr(result, "http_status", None),
+            "embeds_sent": getattr(result, "embeds_sent", 0),
+            "publication": verdict.as_dict(),
+        }
     except DiscordDispatchError as exc:
         logger.error("Dispatch refused: %s", exc)
         return {"status": "REFUSED", "error": str(exc)}
@@ -2595,9 +2620,20 @@ def run_prelock(
             reason=result.reason,
         )
         sent = send_embeds([embed], config=DiscordConfig(dry_run=False))
+        # The reason travels, as on every other send: a pre-lock card that
+        # failed with only "FAILED" told the operator nothing at the moment
+        # the withdrawal check mattered most.
+        if sent.status != "OK":
+            logger.error(
+                "Pre-lock card for %s %s: %s (HTTP %s).",
+                game, sent.status, getattr(sent, "reason", None),
+                getattr(sent, "http_status", None),
+            )
         return {
             "status": sent.status, "game": game, "checked": len(rows),
             "withheld": len(withheld), "unknown": len(unknown), "sent": True,
+            "reason": getattr(sent, "reason", None),
+            "http_status": getattr(sent, "http_status", None),
             # HOW THIS CHECK FOUND ITS ROWS. "0 checked" meant two different
             # things for as long as this job existed -- no recommendation for
             # this game, or no idea which rows were this game's -- and the
@@ -3351,8 +3387,25 @@ def run_results_card(slate_date: str | None = None) -> dict[str, Any]:
             summary, slate_date=day, min_sample_for_rate=MIN_SAMPLE_FOR_RATE
         )
         result = send_embeds([embed], config=DiscordConfig(dry_run=False))
-        logger.info("Results card for %s: %s (%d graded)", day, result.status, graded)
-        return {"status": result.status, "slate_date": day, "graded": graded}
+        # Same fix as `run_dispatch`'s send: the reason names the HTTP status
+        # and the redacted body, and logging only the status dropped it.
+        if result.status == "OK":
+            logger.info(
+                "Results card for %s: %s (%d graded)", day, result.status, graded
+            )
+        else:
+            logger.error(
+                "Results card for %s %s: %s (HTTP %s). The scheduler stays up.",
+                day, result.status, getattr(result, "reason", None),
+                getattr(result, "http_status", None),
+            )
+        return {
+            "status": result.status,
+            "reason": getattr(result, "reason", None),
+            "http_status": getattr(result, "http_status", None),
+            "slate_date": day,
+            "graded": graded,
+        }
     except DiscordDispatchError as exc:
         logger.error("Results card refused: %s", exc)
         return {"status": "REFUSED", "error": str(exc)}

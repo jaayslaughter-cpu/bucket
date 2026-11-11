@@ -239,17 +239,63 @@ def load_player_game_logs(config: BoxScoreLoadConfig | None = None) -> pd.DataFr
     for i, season in enumerate(config.seasons):
         cache = _cache_path(config, season)
         if config.use_cache and cache.exists():
-            logger.info("Using cached player logs for %s (%s)", season, cache)
-            frames.append(pd.read_parquet(cache))
-            continue
+            try:
+                frames.append(pd.read_parquet(cache))
+                logger.info("Using cached player logs for %s (%s)", season, cache)
+                continue
+            except Exception as exc:  # noqa: BLE001 — the cache is a fallback
+                # A CACHE FILE IS NOT THE DATA. `pyarrow` lives in the optional
+                # ``stats`` extra, which the deployed image does not install,
+                # so a cache written by a deploy that had it can be unreadable
+                # by one that does not; a truncated file is the same problem.
+                # Failing the fetch here would invert the dependency -- the
+                # offline fallback taking down the live path -- so the read is
+                # best-effort and the season is fetched instead.
+                logger.warning(
+                    "Cached player logs for %s are unreadable (%s: %s); "
+                    "fetching the season instead.",
+                    season, type(exc).__name__, exc,
+                )
 
         if i:
             time.sleep(config.pause_between_seasons)
         season_frame = fetch_season_player_logs(season, config, session=session)
 
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        season_frame.to_parquet(cache, index=False)
-        logger.info("Cached %d rows to %s", len(season_frame), cache)
+        # THE CACHE WRITE IS BEST-EFFORT, FOR THE SAME REASON THE READ IS.
+        # `to_parquet` needs an engine the deployed image does not ship:
+        # `pyarrow` is declared in the optional ``stats`` extra and the
+        # Dockerfile installs ``[ml,db,deploy]``. So on the deployed worker
+        # this line would raise ImportError if it were reached.
+        #
+        # WHAT THIS IS NOT, recorded because an audit on 2026-11-11 asserted
+        # it and the logs contradict it. It was claimed that an ImportError
+        # here "failed the WHOLE SLATE, nightly, over an offline cache nobody
+        # needed". Neither half holds against this tree. `to_parquet` is not
+        # reached on the deployment at all -- `fetch_season_player_logs` hits
+        # stats.nba.com, which does not answer from a datacenter IP, and
+        # raises `BoxScoreFetchError` first; the 09:00 PT slate logged exactly
+        # that on 2026-11-05 through 11-10 inclusive and went on to record 312
+        # and 257 predictions on two of those nights. And
+        # `main.refresh_player_logs` has a bare `except Exception` after its
+        # named handler, so an ImportError would have been caught there and
+        # the slate would have continued regardless.
+        #
+        # IT IS KEPT ANYWAY, as hardening rather than as a fix for a live
+        # fault. The path becomes reachable the moment stats.nba.com answers
+        # -- from `scripts/nba_model_cli.py` on a machine with network access
+        # but without the ``stats`` extra installed -- and there an offline
+        # cache is not worth losing a fetched season over. The frame still
+        # reaches the upsert; only the fallback is lost.
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            season_frame.to_parquet(cache, index=False)
+            logger.info("Cached %d rows to %s", len(season_frame), cache)
+        except Exception as exc:  # noqa: BLE001 — the cache is a fallback
+            logger.warning(
+                "Player-log cache not written for %s (%s: %s). The fetch "
+                "itself succeeded and the frame is still returned.",
+                season, type(exc).__name__, exc,
+            )
         frames.append(season_frame)
 
     panel = pd.concat(frames, ignore_index=True).sort_values(["PLAYER_ID", "GAME_DATE"])

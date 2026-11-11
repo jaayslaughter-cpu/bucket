@@ -119,3 +119,100 @@ def test_personal_fouls_come_through_the_live_parser():
     as_text = parse_league_game_log(_payload([row]), season="2025-26")
     assert pd.api.types.is_numeric_dtype(as_text["PF"])
     assert as_text["PF"].iloc[0] == 3.0
+
+
+def test_a_failed_parquet_cache_write_does_not_take_the_fetch_with_it(
+    monkeypatch, tmp_path
+):
+    """
+    THE DEPLOYED IMAGE HAS NO PYARROW, and this cache write used to assume it.
+
+    `pyarrow` is declared in the optional ``stats`` extra and the Dockerfile
+    installs ``[ml,db,deploy]``, so the deployed worker has no parquet engine
+    and this line would raise ImportError if it were reached.
+
+    WHAT THIS TEST DOES NOT GUARD, because it was claimed and is not true. An
+    audit on 2026-11-11 said the ImportError "failed the whole slate,
+    nightly". It did not, for two independent reasons: `to_parquet` is never
+    reached on the deployment, because `fetch_season_player_logs` hits
+    stats.nba.com and raises `BoxScoreFetchError` first -- logged on
+    2026-11-05 through 11-10 inclusive, on nights the slate went on to record
+    312 and 257 predictions -- and `main.refresh_player_logs` has a bare
+    `except Exception` after its named handler that would have caught it
+    anyway.
+
+    WHAT IT DOES GUARD is the reachable case: `scripts/nba_model_cli.py` on a
+    machine that CAN reach stats.nba.com but has not installed the ``stats``
+    extra. There, losing a fetched season to a failed offline cache write
+    would be a real loss. The frame must still be returned.
+    """
+    import pandas as pd
+
+    from src.ingestion.boxscores import BoxScoreLoadConfig, load_player_game_logs
+
+    def broken_to_parquet(self, *args, **kwargs):
+        raise ImportError(
+            "Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'."
+        )
+
+    def fake_fetch(season, config, session=None):
+        return pd.DataFrame([{
+            "PLAYER_ID": "201939", "PLAYER_NAME": "Test Player",
+            "GAME_ID": "0022500001", "GAME_DATE": "2025-10-21",
+            "MIN": 34.0, "PTS": 25, "REB": 5, "AST": 6,
+        }])
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", broken_to_parquet)
+    monkeypatch.setattr(
+        "src.ingestion.boxscores.fetch_season_player_logs", fake_fetch
+    )
+
+    config = BoxScoreLoadConfig(
+        seasons=("2025-26",), use_cache=False, cache_dir=tmp_path / "logs"
+    )
+    # Before the fix this raised ImportError; now it returns the frame.
+    panel = load_player_game_logs(config)
+    assert len(panel) == 1
+    assert panel["PLAYER_ID"].iloc[0] == "201939"
+    # And nothing was left behind claiming to be a cache.
+    assert not list((tmp_path / "logs").rglob("*.parquet"))
+
+
+def test_an_unreadable_parquet_cache_falls_through_to_the_fetch(
+    monkeypatch, tmp_path
+):
+    """
+    THE OTHER HALF OF THE SAME DEFECT. A cache file can exist on a volume from
+    a deploy that DID have pyarrow while the image no longer does, and the
+    read is on the same critical path as the write was. An unreadable cache
+    must degrade to a live fetch rather than failing the run.
+    """
+    import pandas as pd
+
+    from src.ingestion.boxscores import BoxScoreLoadConfig, load_player_game_logs
+
+    cache = tmp_path / "logs" / "player_game_logs_2025-26_regular_season.parquet"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"not a parquet file")
+
+    def broken_read_parquet(*args, **kwargs):
+        raise ImportError(
+            "Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'."
+        )
+
+    def fake_fetch(season, config, session=None):
+        return pd.DataFrame([{
+            "PLAYER_ID": "201939", "PLAYER_NAME": "Test Player",
+            "GAME_ID": "0022500001", "GAME_DATE": "2025-10-21",
+            "MIN": 34.0, "PTS": 25, "REB": 5, "AST": 6,
+        }])
+
+    monkeypatch.setattr(pd, "read_parquet", broken_read_parquet)
+    monkeypatch.setattr(
+        "src.ingestion.boxscores.fetch_season_player_logs", fake_fetch
+    )
+
+    config = BoxScoreLoadConfig(seasons=("2025-26",), cache_dir=tmp_path / "logs")
+    panel = load_player_game_logs(config)
+    assert len(panel) == 1
+    assert panel["PLAYER_ID"].iloc[0] == "201939"
