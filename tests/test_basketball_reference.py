@@ -13,6 +13,7 @@ mention: https://www.basketball-reference.com/
 from __future__ import annotations
 
 import io
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -376,3 +377,311 @@ def test_attribution_travels_with_every_frame():
     feats = prior_season_features(table, target_season="2025-26")
     assert feats.attrs["attribution"] == SR_ATTRIBUTION
     assert describe_sr_csv(io.StringIO(PER_GAME_CSV), season="2024-25")["attribution"] == SR_ATTRIBUTION
+
+
+# ---------------------------------------------------------------------------
+# The bot wall. Added 2026-11-11, after measuring it.
+# ---------------------------------------------------------------------------
+#
+# basketball-reference.com returns HTTP 403 to a client that says who it is
+# and 200 to one whose User-Agent claims to be Chrome. The fetch added on
+# 2026-11-10 shipped the Chrome string as its default, which made the default
+# behaviour of this project "defeat the host's bot wall". These two tests are
+# the record that it does not, and they fail if either half is reverted.
+
+
+def test_the_default_user_agent_does_not_impersonate_a_browser() -> None:
+    """
+    THE DEFAULT AGENT IDENTIFIES THIS PROJECT, NOT A BROWSER.
+
+    A 200 from this host obtained with a Chrome string is obtained by telling
+    it something untrue. Whether to do that is an operator decision with
+    terms-of-service consequences, reachable through
+    `$PROPIQ_BBREF_USER_AGENT`; it is not this module's default. If this
+    assertion ever fails, someone put the browser string back.
+    """
+    from src.ingestion.basketball_reference import SR_USER_AGENT
+
+    lowered = SR_USER_AGENT.lower()
+    for impersonation in (
+        "mozilla", "applewebkit", "khtml", "chrome", "safari",
+        "firefox", "gecko", "edg/", "opera", "webkit",
+    ):
+        assert impersonation not in lowered, (
+            f"the default User-Agent claims to be a browser ({impersonation!r} "
+            f"in {SR_USER_AGENT!r}). That is bot-wall circumvention as a "
+            f"default, which this project does not ship."
+        )
+    assert "propiq" in lowered, (
+        f"the default User-Agent should say who this is: {SR_USER_AGENT!r}"
+    )
+
+
+def test_the_basketball_reference_job_is_off_unless_switched_on() -> None:
+    """
+    A JOB THAT CANNOT SUCCEED IS NOT SCHEDULED.
+
+    With the honest default agent the fetch is a measured 403, so leaving the
+    job on would buy one Discord failure notice per night and no data. It
+    returns SKIPPED unless the operator sets the flag -- and because `_flag`
+    is what reads the default, the assertion runs the real job body with the
+    variable absent rather than reading the constant.
+    """
+    import scheduler_worker
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.delenv(scheduler_worker.ENV_BBREF_INGEST, raising=False)
+        out = scheduler_worker.run_basketball_reference()
+    finally:
+        monkey.undo()
+
+    assert out["status"] == "SKIPPED", out
+    assert scheduler_worker.ENV_BBREF_INGEST in out["reason"], out
+
+
+# ---------------------------------------------------------------------------
+# The current-season fetch. Added 2026-11-11.
+# ---------------------------------------------------------------------------
+
+
+def test_the_season_underway_window_opens_and_closes() -> None:
+    """
+    `is_current_season` over the boundaries that matter.
+
+    The window runs from October 20th of the starting year to June 30th of
+    the ending one. June 30th is still live; July 1st the season is over and
+    its table is final. The named caveat in the build report -- that the
+    opening gate is a date and not the league's calendar -- is accepted here
+    deliberately, so this pins the date rather than pretending it is derived.
+    """
+    from src.ingestion.basketball_reference import is_current_season
+
+    assert not is_current_season("2026-27", date(2026, 10, 19))
+    assert is_current_season("2026-27", date(2026, 10, 20))
+    assert is_current_season("2026-27", date(2027, 6, 30))
+    assert not is_current_season("2026-27", date(2027, 7, 1))
+    # A season two years gone is never underway.
+    assert not is_current_season("2024-25", date(2026, 11, 11))
+
+
+def test_the_fetch_wants_the_prior_season_and_the_live_one() -> None:
+    """
+    Mid-season: two seasons. Off-season: one, because nothing is underway.
+
+    On 2026-07-01 the 2025-26 season has just ended, so the prior-season
+    default names it and there is no live season to add -- a fetch list of
+    one, not a silently empty one.
+    """
+    from src.ingestion.basketball_reference import default_fetch_seasons
+
+    assert default_fetch_seasons(date(2026, 11, 11)) == ["2025-26", "2026-27"]
+    assert default_fetch_seasons(date(2026, 7, 1)) == ["2025-26"]
+
+
+def test_a_live_snapshot_is_never_served_as_the_finished_season(tmp_path) -> None:
+    """
+    THE DEFECT THIS REPLACED, and it was silent and permanent.
+
+    One cache path served both a live season's snapshot and a dead season's
+    final table. So: fetch 2026-27 in December, write twelve games to
+    `sr_2026-27_advanced.csv`, let the season turn over. `is_current_season`
+    goes false, `refresh` resolves to False, the file exists -- and from then
+    on a twelve-game December snapshot is `prior_season_features`' idea of
+    the completed 2026-27 season, with no request and no warning.
+
+    The two live at different paths now, so a final read cannot see a
+    partial one. Asserted on the paths rather than by driving a fetch,
+    because the point is that one file is invisible to the other read.
+    """
+    from src.ingestion.basketball_reference import sr_cache_path
+
+    live = sr_cache_path("2026-27", "advanced", cache_dir=tmp_path, partial=True)
+    final = sr_cache_path("2026-27", "advanced", cache_dir=tmp_path)
+
+    assert live != final, (
+        "a live snapshot and a finished season's table share a cache path, so "
+        "the snapshot is served as the table once the season ends"
+    )
+    assert live.name.endswith(".partial.csv"), live.name
+
+    live.write_text("a twelve-game snapshot", encoding="utf-8")
+    assert not final.exists(), (
+        "writing the live snapshot created the finished season's table"
+    )
+
+
+def test_the_live_table_still_cannot_become_a_same_season_feature() -> None:
+    """
+    FETCHING IS NOT JOINING, and the guard is on the join.
+
+    The build report's central safety claim: a current-season table is data
+    for the A/B harness and can never be a feature of its own season. The
+    guard that makes that true is `prior_season_features`, not the fetch, so
+    this asserts it against a table labelled with the season that is live.
+    """
+    table = read_sr_season_csv(io.StringIO(PER_GAME_CSV), season="2026-27")
+
+    with pytest.raises(SeasonAggregateLeakageError):
+        prior_season_features(table, target_season="2026-27")
+
+
+# ---------------------------------------------------------------------------
+# Driving the fetch itself, which arrived with no tests of any kind.
+# ---------------------------------------------------------------------------
+
+
+def _advanced_html(*names: str) -> str:
+    """The smallest page shaped like SR's advanced table."""
+    keys = (
+        "ranker", "name_display", "age", "team_name_abbr", "pos", "games",
+        "games_started", "mp", "per", "ts_pct", "fg3a_per_fga_pct",
+        "fta_per_fga_pct", "orb_pct", "drb_pct", "trb_pct", "ast_pct",
+        "stl_pct", "blk_pct", "tov_pct", "usg_pct", "ows", "dws", "ws",
+        "ws_per_48", "obpm", "dbpm", "bpm", "vorp", "awards",
+    )
+    rows = []
+    for idx, name in enumerate(names, start=1):
+        slug = name.lower().replace(" ", "")[:8] + "01"
+        cells = []
+        for key in keys:
+            if key == "ranker":
+                value = str(idx)
+            elif key == "name_display":
+                value = f'<a href="/players/{slug[0]}/{slug}.html">{name}</a>'
+            elif key == "team_name_abbr":
+                value = "PHI"
+            elif key == "pos":
+                value = "PG"
+            elif key == "awards":
+                value = ""
+            else:
+                value = "4.3"
+            cells.append(f'<td data-stat="{key}">{value}</td>')
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        '<html><table id="advanced"><tbody>'
+        + "".join(rows)
+        + "</tbody></table></html>"
+    )
+
+
+class _StubResponse:
+    def __init__(self, text: str) -> None:
+        self.status_code = 200
+        self.text = text
+        self.headers: dict[str, str] = {}
+
+
+class _StubSession:
+    """Counts requests, so 'served from cache' is a measured claim."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.calls: list[str] = []
+
+    def get(self, url, **_kw):  # noqa: ANN001, ANN003
+        self.calls.append(url)
+        return _StubResponse(self._text)
+
+
+def test_a_live_seasons_fetch_writes_the_partial_file(tmp_path) -> None:
+    """
+    MUTATION THAT SURVIVED THE FIRST ATTEMPT: making `fetch_sr_season_table`
+    ignore the partial split and go back to one cache path. The path test
+    above asserts the two names differ; nothing asserted that the FETCH
+    picks the right one, which is where the promotion bug actually lived.
+
+    2026-27 is underway as of the date this was written, so its fetch is a
+    snapshot and belongs in `.partial.csv`.
+    """
+    from src.ingestion.basketball_reference import (
+        fetch_sr_season_table,
+        sr_cache_path,
+    )
+
+    session = _StubSession(_advanced_html("Tyrese Maxey", "Joel Embiid"))
+    table = fetch_sr_season_table(
+        "2026-27", "advanced", session=session, cache_dir=tmp_path,
+    )
+
+    assert len(table.frame) == 2
+    assert table.kind == "advanced"
+    partial = sr_cache_path("2026-27", "advanced", cache_dir=tmp_path, partial=True)
+    final = sr_cache_path("2026-27", "advanced", cache_dir=tmp_path)
+    assert partial.exists(), "a live season's snapshot was not cached as partial"
+    assert not final.exists(), (
+        "a live season's snapshot was written where the finished season's "
+        "table belongs, so it will be served as that table once the season ends"
+    )
+
+
+def test_a_finished_seasons_second_read_makes_no_request(tmp_path) -> None:
+    """
+    The one-request-per-table-ever claim, measured on the request count.
+
+    A season that is over is final, so the first read fetches and the second
+    reads the file. `refresh=None` is left at its default, because that
+    resolution is the thing under test.
+    """
+    from src.ingestion.basketball_reference import fetch_sr_season_table
+
+    session = _StubSession(_advanced_html("Nikola Jokic"))
+    first = fetch_sr_season_table(
+        "2024-25", "advanced", session=session, cache_dir=tmp_path,
+    )
+    second = fetch_sr_season_table(
+        "2024-25", "advanced", session=session, cache_dir=tmp_path,
+    )
+
+    assert len(session.calls) == 1, (
+        f"a finished season's table was fetched {len(session.calls)} times; "
+        f"it is final, so the cache IS the table"
+    )
+    assert len(first.frame) == len(second.frame) == 1
+
+
+def test_the_scheduled_job_asks_for_the_live_season_too(monkeypatch) -> None:
+    """
+    MUTATION THAT SURVIVED THE FIRST ATTEMPT: reverting `_bbref_seasons` to
+    `default_prior_seasons`. Every assertion above is on the ingestion
+    module, so the scheduler could go on asking for prior seasons only and
+    the live table would never be fetched by anything that runs.
+    """
+    import scheduler_worker as worker
+
+    monkeypatch.delenv(worker.ENV_BBREF_SEASONS, raising=False)
+    seasons = worker._bbref_seasons()
+
+    assert len(seasons) == 2, (
+        f"the job asks for {seasons}; the live season is missing, so nothing "
+        f"scheduled ever fetches this season's table"
+    )
+
+
+def test_a_live_seasons_second_read_fetches_again(tmp_path) -> None:
+    """
+    MUTATION THAT SURVIVED: resolving `refresh` to False for a live season.
+
+    The mirror of the finished-season test, and the reason the partial file
+    exists at all. A live season's table changes after every game night, so
+    its cache is last night's snapshot and not the table -- serving it would
+    mean the "current season" rows silently stopped moving on whatever night
+    they were first fetched. Two reads, two requests.
+    """
+    from src.ingestion.basketball_reference import fetch_sr_season_table
+
+    session = _StubSession(_advanced_html("Tyrese Maxey"))
+    fetch_sr_season_table("2026-27", "advanced", session=session, cache_dir=tmp_path)
+    fetch_sr_season_table("2026-27", "advanced", session=session, cache_dir=tmp_path)
+
+    assert len(session.calls) == 2, (
+        f"a live season was fetched {len(session.calls)} time(s); its cached "
+        f"snapshot was served as though the season had stopped"
+    )
+    # And an explicit False still pins the snapshot, which is how an A/B run
+    # is reproduced against one night's data.
+    fetch_sr_season_table(
+        "2026-27", "advanced", session=session, cache_dir=tmp_path, refresh=False,
+    )
+    assert len(session.calls) == 2, "refresh=False still went to the network"

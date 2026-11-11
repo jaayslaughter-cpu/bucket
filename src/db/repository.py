@@ -21,6 +21,8 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.db.models import (
+    EspnPlay,
+    EspnStarter,
     GameMarketLine,
     ParlayLegRow,
     ParlayTicketRow,
@@ -1513,3 +1515,187 @@ def load_graded_prop_results(
         })
     logger.info("Loaded %d graded prop result(s) for calibration", len(out))
     return out
+
+
+# ---------------------------------------------------------------------------
+# ESPN play-by-play and starters (migration 011)
+# ---------------------------------------------------------------------------
+#
+# WHY THESE EXIST. The nightly ESPN ingest already downloads and parses the
+# summary payload that contains the play feed; `espn_game.parse_plays` reads
+# participants, coordinates, substitutions, and the whole feed was then
+# discarded — kept nowhere. The box score's `starter` flag is the same story
+# one level up. `src/features/stints.py` needs both to reconstruct lineups,
+# and it cannot read a table that nothing writes.
+#
+# THE UPSERT PATTERN IS THE ONE EVERY TABLE HERE USES: `pg_insert` with
+# `on_conflict_do_update`, every written column in the update set, batched
+# against the bind-parameter limit. A play row that changes (ESPN re-orders
+# the feed, adds a coordinate) corrects in place rather than duplicating.
+
+
+def upsert_espn_plays(df: pd.DataFrame) -> int:
+    """
+    Write ESPN play-by-play rows, keyed on (game, sequence number).
+
+    A play with no sequence number is REFUSED rather than stored with a NULL
+    key: the sequence number is the order ESPN itself puts the feed in, and a
+    play that cannot be ordered cannot take part in a stint.
+    """
+    if df.empty:
+        logger.warning("No ESPN plays to write")
+        return 0
+    required = {"NBA_GAME_ID", "SEQUENCE_NUMBER"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"DATA_NOT_AVAILABLE: ESPN plays missing {sorted(missing)}")
+    work = pd.DataFrame({
+        "nba_game_id": df["NBA_GAME_ID"].astype(str),
+        "sequence_number": pd.to_numeric(df["SEQUENCE_NUMBER"], errors="coerce"),
+        "play_id": df.get("PLAY_ID"),
+        "period": pd.to_numeric(df.get("PERIOD"), errors="coerce"),
+        "clock_display": df.get("CLOCK_DISPLAY"),
+        "espn_team_id": df.get("ESPN_TEAM_ID"),
+        "play_type_id": df.get("PLAY_TYPE_ID"),
+        "play_type_text": df.get("PLAY_TYPE_TEXT"),
+        "play_text": df.get("PLAY_TEXT"),
+        "score_value": pd.to_numeric(df.get("SCORE_VALUE"), errors="coerce"),
+        "scoring_play": df.get("SCORING_PLAY"),
+        "participant_athlete_ids": df.get("PARTICIPANT_ATHLETE_IDS"),
+        "coord_x": pd.to_numeric(df.get("COORD_X"), errors="coerce"),
+        "coord_y": pd.to_numeric(df.get("COORD_Y"), errors="coerce"),
+        "game_date": pd.to_datetime(df.get("GAME_DATE"), errors="coerce").dt.date
+        if "GAME_DATE" in df.columns else None,
+    })
+    dropped = int(work["sequence_number"].isna().sum())
+    if dropped:
+        logger.warning(
+            "Dropping %d ESPN play row(s) with no sequence number. They "
+            "cannot be ordered, so a stint built on them would be built on "
+            "nothing.", dropped,
+        )
+    work = work.loc[work["sequence_number"].notna()]
+    if work.empty:
+        return 0
+    work["sequence_number"] = work["sequence_number"].astype("int64")
+
+    rows = _records(work)
+    written = 0
+    with session_scope() as session:
+        for batch in batched(rows):
+            stmt = pg_insert(EspnPlay).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "sequence_number"],
+                set_={c: stmt.excluded[c] for c in (
+                    "play_id", "period", "clock_display", "espn_team_id",
+                    "play_type_id", "play_type_text", "play_text",
+                    "score_value", "scoring_play", "participant_athlete_ids",
+                    "coord_x", "coord_y", "game_date",
+                )},
+            )
+            session.execute(stmt)
+            written += len(batch)
+    logger.info("Upserted %d ESPN play rows", written)
+    return written
+
+
+def upsert_espn_starters(df: pd.DataFrame) -> int:
+    """
+    Write who started, keyed on (game, team, player).
+
+    The starters are what a stint builder opens each lineup from, so a game
+    with no starters row has no lineups at all rather than a wrong first
+    five — which is the state the box score's `starter` flag already
+    reports, kept verbatim rather than inferred.
+    """
+    if df.empty:
+        logger.warning("No ESPN starters to write")
+        return 0
+    required = {"NBA_GAME_ID", "ESPN_TEAM_ID", "ESPN_ATHLETE_ID"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"DATA_NOT_AVAILABLE: ESPN starters missing {sorted(missing)}")
+    work = pd.DataFrame({
+        "nba_game_id": df["NBA_GAME_ID"].astype(str),
+        "espn_team_id": df["ESPN_TEAM_ID"].astype(str),
+        "espn_athlete_id": df["ESPN_ATHLETE_ID"].astype(str),
+        "player_name": df.get("PLAYER_NAME"),
+    })
+    rows = _records(work)
+    written = 0
+    with session_scope() as session:
+        for batch in batched(rows):
+            stmt = pg_insert(EspnStarter).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["nba_game_id", "espn_team_id", "espn_athlete_id"],
+                set_={"player_name": stmt.excluded["player_name"]},
+            )
+            session.execute(stmt)
+            written += len(batch)
+    logger.info("Upserted %d ESPN starter rows", written)
+    return written
+
+
+def load_espn_plays(nba_game_ids: Sequence[str] | None = None) -> pd.DataFrame:
+    """
+    The play rows, ordered by game and then by ESPN's own sequence number.
+
+    THE ORDER IS THE DATA. A stint builder applied to an unordered feed
+    would invent lineups that never existed, so the order is asserted here
+    rather than trusted to the caller.
+    """
+    with session_scope() as session:
+        stmt = select(EspnPlay).order_by(EspnPlay.nba_game_id, EspnPlay.sequence_number)
+        if nba_game_ids:
+            stmt = stmt.where(EspnPlay.nba_game_id.in_([str(g) for g in nba_game_ids]))
+        rows = session.execute(stmt).scalars().all()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "NBA_GAME_ID": r.nba_game_id,
+        "SEQUENCE_NUMBER": r.sequence_number,
+        "PLAY_ID": r.play_id,
+        "PERIOD": r.period,
+        "CLOCK_DISPLAY": r.clock_display,
+        "ESPN_TEAM_ID": r.espn_team_id,
+        "PLAY_TYPE_ID": r.play_type_id,
+        "PLAY_TYPE_TEXT": r.play_type_text,
+        "PLAY_TEXT": r.play_text,
+        "SCORE_VALUE": r.score_value,
+        "SCORING_PLAY": r.scoring_play,
+        "PARTICIPANT_ATHLETE_IDS": r.participant_athlete_ids,
+        "COORD_X": r.coord_x,
+        "COORD_Y": r.coord_y,
+        "GAME_DATE": r.game_date,
+    } for r in rows])
+
+
+def load_espn_starters(nba_game_ids: Sequence[str] | None = None) -> pd.DataFrame:
+    """The starters, in the shape `upsert_espn_starters` writes."""
+    with session_scope() as session:
+        stmt = select(EspnStarter)
+        if nba_game_ids:
+            stmt = stmt.where(EspnStarter.nba_game_id.in_([str(g) for g in nba_game_ids]))
+        rows = session.execute(stmt).scalars().all()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([{
+        "NBA_GAME_ID": r.nba_game_id,
+        "ESPN_TEAM_ID": r.espn_team_id,
+        "ESPN_ATHLETE_ID": r.espn_athlete_id,
+        "PLAYER_NAME": r.player_name,
+    } for r in rows])
+
+
+def espn_plays_game_ids() -> set[str]:
+    """
+    The games that already have plays, as game ids.
+
+    THE BACKFILL'S SKIP KEY. The nightly ESPN ingest keys its skip on the
+    panel (`ingested_keys_present`), and the panel already holds every game
+    the backfill needs, so a plays backfill that keyed its skip there would
+    fetch nothing forever. This is keyed on the plays table itself: a game
+    is held when its rows are in `espn_plays`, not when the panel knows it.
+    """
+    with session_scope() as session:
+        return {str(g) for g, in session.execute(select(EspnPlay.nba_game_id)).all()}

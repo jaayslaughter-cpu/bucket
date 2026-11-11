@@ -60,7 +60,7 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 from src.ingestion.espn_client import CORE_API_BASE, EspnError, get_json, site_url
-from src.ingestion.espn_game import parse_box_score
+from src.ingestion.espn_game import parse_box_score, parse_plays
 from src.ingestion.espn_schedule import normalize_team
 from src.utils.ids import ESPN_ID_PREFIX, espn_game_id
 from src.utils.timezones import to_pacific
@@ -632,3 +632,149 @@ def fetch_player_rows_for_dates(
         if any(not f.empty for f in frames) else pd.DataFrame()
     )
     return out, combined
+
+
+# ---------------------------------------------------------------------------
+# Play-by-play and starters, collected alongside the panel (2026-11-10)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS HERE. The summary payload the panel already fetches carries the
+# whole play feed and the box score's starter flags, and both were parsed
+# (`espn_game.parse_plays`, `BoxScoreRow.starter`) and then discarded. Stints
+# -- who shared the floor with whom, for how long -- are the cheapest
+# remaining player data after the Basketball Reference tables, and they are
+# reconstructable from exactly what this module already downloads. Collecting
+# them in the same pass costs nothing extra in HTTP: one summary per event,
+# the same call the panel makes.
+#
+# THE SAME GUARDS THE PANEL APPLIES, for the same reasons: a game that is not
+# final has plays that can still change, and a playoff or preseason game is
+# not the population the panel models. A game refused here is refused with a
+# reason in the report, not silently.
+
+
+def parse_plays_and_starters_payload(
+    payload: dict[str, Any],
+    event_id: str,
+    *,
+    report: EspnPanelReport | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    One game's plays and starters, or two empty lists with a reason.
+
+    PURE, like `parse_summary_payload`, so every refusal is testable against
+    a saved fixture. The plays are the rows `repository.upsert_espn_plays`
+    writes; the starters are the rows `repository.upsert_espn_starters`
+    writes. A game that is final regular season but whose plays feed is
+    absent yields NO starters and NO plays with a note, not an error: the
+    feed being empty is a fact about the payload, and the backfill's next
+    pass will try the game again.
+    """
+    rep = report if report is not None else EspnPanelReport()
+    rep.games_seen += 1
+    comp = _competition(payload)
+
+    status = ((comp.get("status") or {}).get("type") or {}).get("name")
+    if status != STATUS_FINAL:
+        rep.skipped_not_final.append(f"{event_id} ({status or 'no status'})")
+        return [], []
+
+    season = (payload.get("header") or {}).get("season") or {}
+    if season.get("type") != SEASON_TYPE_REGULAR:
+        rep.skipped_season_type.append(f"{event_id} (type {season.get('type')!r})")
+        return [], []
+
+    game_day = _tipoff_date(comp)
+    if game_day is None:
+        rep.skipped_no_date.append(str(event_id))
+        return [], []
+    game_id = espn_game_id(event_id)
+
+    # Starters, from the same box rows the panel reads. `starter` is ESPN's
+    # own flag: no starter rows means the payload named none, and a stint
+    # builder opening on nothing is refused there rather than guessed here.
+    box_rows, _notes = parse_box_score(payload, event_id)
+    starters: list[dict[str, Any]] = []
+    for row in box_rows:
+        if not row.starter:
+            continue
+        if not str(row.espn_athlete_id or "").strip():
+            rep.dropped_no_athlete_id += 1
+            continue
+        starters.append({
+            "NBA_GAME_ID": game_id,
+            "ESPN_TEAM_ID": str(row.espn_team_id or ""),
+            "ESPN_ATHLETE_ID": str(row.espn_athlete_id),
+            "PLAYER_NAME": row.player_name,
+        })
+
+    # Plays, through `espn_game`'s own parser, ordered by ESPN's sequence.
+    plays: list[dict[str, Any]] = []
+    for play in parse_plays(payload, event_id):
+        record = play.as_dict()
+        record["NBA_GAME_ID"] = game_id
+        record["GAME_DATE"] = game_day
+        plays.append(record)
+
+    if not starters:
+        rep.notes.append(
+            f"{event_id}: no starters in the box score; a stint builder "
+            f"would have no opening five"
+        )
+    if not plays:
+        rep.notes.append(f"{event_id}: no plays in the summary payload")
+    rep.games_parsed += 1
+    return plays, starters
+
+
+def fetch_plays_and_starters(
+    event_ids: Iterable[str],
+    *,
+    session: Any | None = None,
+    config: Any = None,
+    skip_game_ids: "frozenset[str] | set[str]" = frozenset(),
+) -> tuple[pd.DataFrame, pd.DataFrame, EspnPanelReport]:
+    """
+    The plays and starters for these events, and what was refused.
+
+    ``skip_game_ids`` IS KEYED ON THE PLAYS, not the panel. The history
+    backfill that shares this name keys its skip on what the panel holds,
+    and the panel already holds every game the plays backfill needs -- so a
+    plays fetch keyed there would skip every game forever. Callers pass the
+    games that already have plays (`repository.espn_plays_game_ids`), which
+    is the set this actually de-duplicates on.
+    """
+    report = EspnPanelReport()
+    plays: list[dict[str, Any]] = []
+    starters: list[dict[str, Any]] = []
+    skip = {str(g) for g in skip_game_ids}
+    for event_id in event_ids:
+        if skip and espn_game_id(event_id) in skip:
+            report.skipped_already_held += 1
+            continue
+        try:
+            payload = get_json(
+                site_url("summary"),
+                params={"event": str(event_id)},
+                config=config,
+                session=session,
+            )
+        except EspnError as exc:
+            report.notes.append(f"{event_id}: fetch failed -- {exc}")
+            logger.warning("ESPN summary %s failed: %s", event_id, exc)
+            continue
+        try:
+            game_plays, game_starters = parse_plays_and_starters_payload(
+                payload, str(event_id), report=report,
+            )
+            plays.extend(game_plays)
+            starters.extend(game_starters)
+        except Exception as exc:  # noqa: BLE001 — one game, not the run
+            report.notes.append(
+                f"{event_id}: unreadable payload -- {type(exc).__name__}: {exc}"
+            )
+            logger.warning(
+                "ESPN summary %s raised %s; the other games continue.",
+                event_id, type(exc).__name__,
+            )
+    return pd.DataFrame(plays), pd.DataFrame(starters), report

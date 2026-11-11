@@ -85,6 +85,17 @@ ENV_ESPN_HISTORY_SEASONS = "PROPIQ_ESPN_HISTORY_SEASONS"
 ENV_ESPN_HISTORY_CHUNK = "PROPIQ_ESPN_HISTORY_CHUNK_DAYS"
 ENV_ESPN_HISTORY_HOUR = "PROPIQ_ESPN_HISTORY_HOUR_PT"
 ENV_ESPN_HISTORY_MINUTE = "PROPIQ_ESPN_HISTORY_MINUTE_PT"
+ENV_BBREF_INGEST = "PROPIQ_BBREF_INGEST"
+ENV_BBREF_TABLES = "PROPIQ_BBREF_TABLES"
+ENV_BBREF_SEASONS = "PROPIQ_BBREF_SEASONS"
+ENV_BBREF_HOUR = "PROPIQ_BBREF_HOUR_PT"
+ENV_BBREF_MINUTE = "PROPIQ_BBREF_MINUTE_PT"
+ENV_ESPN_PLAYS_BACKFILL = "PROPIQ_ESPN_PLAYS_BACKFILL"
+ENV_ESPN_PLAYS_BACKFILL_HOUR = "PROPIQ_ESPN_PLAYS_BACKFILL_HOUR_PT"
+ENV_ESPN_PLAYS_BACKFILL_MINUTE = "PROPIQ_ESPN_PLAYS_BACKFILL_MINUTE_PT"
+ENV_STINTS = "PROPIQ_STINTS"
+ENV_STINTS_HOUR = "PROPIQ_STINTS_HOUR_PT"
+ENV_STINTS_MINUTE = "PROPIQ_STINTS_MINUTE_PT"
 ENV_SETTLE_HOUR = "PROPIQ_SETTLE_HOUR_PT"
 ENV_SETTLE_MINUTE = "PROPIQ_SETTLE_MINUTE_PT"
 ENV_MAX_THREADS = "PROPIQ_MAX_THREADS"
@@ -224,6 +235,31 @@ ESPN_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 #: no more urgent at 11:00, and firing it late would have it reading
 #: `player_game_logs` while the 09:00 slate does.
 ESPN_HISTORY_MISFIRE_GRACE_SECONDS = 30 * 60
+#: Basketball Reference season tables. ON BY DEFAULT because the fetch is
+#: one request per table per season -- a prior season's tables are final, so
+#: the cache the fetch writes is the table, and every nightly run after the
+#: first is a no-op that reads the cache and never touches the network. The
+#: kinds offered are the two the advanced-feature pipeline needs: per_game
+#: and advanced (BPM/PER/VORP). `play_by_play` and `adjusted_shooting`
+#: stay on the hand-exported CSV path; the fetcher refuses them loudly.
+DEFAULT_BBREF_TABLES = "per_game,advanced"
+#: 02:30 PT: after the 02:00 ESPN ingest, well before the 09:00 slate. The
+#: prior season's tables change zero times after they are fetched, so the
+#: only run that does work is the first one on a fresh volume.
+DEFAULT_BBREF_HOUR, DEFAULT_BBREF_MINUTE = 2, 30
+BBREF_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+#: The ESPN plays backfill, at 05:00 PT: after the 04:30 history backfill and
+#: well before the 09:00 slate. ON BY DEFAULT because it is season-to-date
+#: and idempotent -- the first run fills the table, every later run is a
+#: no-op that reads nothing and writes nothing. Env-gated like every job here.
+DEFAULT_ESPN_PLAYS_BACKFILL_HOUR, DEFAULT_ESPN_PLAYS_BACKFILL_MINUTE = 5, 0
+ESPN_PLAYS_BACKFILL_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+#: The stint builder, at 05:30 PT: after the plays backfill writes and before
+#: the 09:00 slate. ON BY DEFAULT: the stints are a CSV on the state root
+#: and nothing else reads them yet (the A/B rule), so a failure costs the CSV
+#: and nothing else.
+DEFAULT_STINTS_HOUR, DEFAULT_STINTS_MINUTE = 5, 30
+STINTS_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
 #: How long before the slate the history backfill must be scheduled. A chunk
 #: of 60 dates is on the order of twenty minutes, so an hour leaves room for a
 #: slow night without the two overlapping. Enforced rather than documented:
@@ -3196,6 +3232,165 @@ def run_history_backfill() -> dict[str, Any]:
         return _run_history_backfill_locked(seasons)
 
 
+def _bbref_tables() -> list[str]:
+    """
+    The configured Basketball Reference tables, named and dropped, never guessed.
+
+    A misspelling here is the shape of defect this project keeps finding: an
+    operator who writes ``PROPIQ_BBREF_TABLES=advancedd`` and gets per_game
+    only would believe the BPM table was refreshed when it was never
+    requested. Every name is echoed in the job's return so the log and the
+    channel both say exactly what ran.
+    """
+    from src.ingestion.basketball_reference import SR_PAGES
+
+    raw = os.environ.get(ENV_BBREF_TABLES, DEFAULT_BBREF_TABLES)
+    wanted: list[str] = []
+    unknown: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        name = part.strip()
+        if not name:
+            continue
+        if name in SR_PAGES and name not in wanted:
+            wanted.append(name)
+        elif name not in SR_PAGES:
+            unknown.append(name)
+    if unknown:
+        logger.error(
+            "%s names %s, which the fetcher cannot fetch (the offered kinds "
+            "are %s; play_by_play and adjusted_shooting stay on the "
+            "hand-exported CSV path). Fetching %s.",
+            ENV_BBREF_TABLES, unknown, sorted(SR_PAGES), wanted or "nothing",
+        )
+    return wanted
+
+
+def _bbref_seasons() -> list[str]:
+    """
+    The configured seasons: the prior season, plus the current one while it
+    is underway.
+
+    WHY THE CURRENT SEASON IS FETCHED BUT CANNOT LEAK. Fetching a
+    season-to-date table does not make it a feature. The leakage guard lives
+    where the JOIN happens -- `prior_season_features` refuses to attach a
+    season's aggregate onto its own season, current or final, with no flag to
+    switch it off -- so the live rows land where `scripts/feature_ab.py` can
+    measure them and nowhere else. Keeping the fetch prior-only would not
+    have made anything safer; it would only have meant the current season's
+    BPM did not exist in this project at all.
+    """
+    from src.ingestion.basketball_reference import default_fetch_seasons
+
+    raw = os.environ.get(ENV_BBREF_SEASONS)
+    if not raw:
+        return default_fetch_seasons()
+    seasons: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        name = part.strip()
+        if name and name not in seasons:
+            seasons.append(name)
+    return seasons
+
+
+def run_basketball_reference() -> dict[str, Any]:
+    """
+    Fetch the prior season's Basketball Reference tables, once per table.
+
+    THE CHEAPEST REMAINING PLAYER DATA. basketball-reference.com answers
+    this container (measured 2026-11-10, a 200 in 0.16s), the site's
+    season pages carry the advanced table -- PER, WS/48, OBPM/DBPM/BPM,
+    VORP -- and the only thing between that data and the feature panel
+    was a person downloading a CSV by hand. This job is that person,
+    once per table per season, and then it is done: a prior season's
+    tables are final, so the fetcher's cache is not staleness to be
+    re-fetched nightly, it IS the table.
+
+    NOTHING DOWNSTREAM OF THIS RUN IS WIRED, ON PURPOSE. The fetched
+    advanced rows are not new model features: adding a feature to the
+    matrix is a measurement (``scripts/feature_ab.py``), not an argument,
+    and the A/B rule means the new columns must win a holdout before they
+    reach the artifacts. This job puts the data where that measurement can
+    read it and stops there.
+
+    WHAT IT DOES ON A FRESH VOLUME. Two pages, two requests, a few
+    seconds: the per-game table and the advanced table for the prior
+    season. What it does on every night after: reads those cached CSVs and
+    never touches the network. A deploy loop that resets the volume
+    refetches; a stable deployment is silent.
+
+    NO 429 LOOP, EVER. The transport retries only what is genuinely
+    transient (connection faults, 429 and 503 honoring Retry-After), and
+    refuses rather than retries a 403 -- this host has a bot wall that
+    answers a datacenter IP where it answers a residential one, and the
+    failure mode here is a firewall, not flakiness. A 429 honored with
+    Retry-After, three attempts, and a hard stop.
+
+    RESEARCH_ONLY. Box-score aggregates from a third-party site, cached
+    with attribution, and no wager is placed or priced by anything here.
+    """
+    if not _flag(ENV_BBREF_INGEST, False):
+        logger.info("Basketball Reference ingest disabled (%s).", ENV_BBREF_INGEST)
+        return {"status": "SKIPPED", "reason": f"{ENV_BBREF_INGEST} is false"}
+
+    tables = _bbref_tables()
+    seasons = _bbref_seasons()
+    if not tables or not seasons:
+        return {"status": "SKIPPED", "reason": "nothing to fetch",
+                "tables": tables, "seasons": seasons}
+
+    from src.ingestion.basketball_reference import (
+        BasketballReferenceError,
+        fetch_sr_season_table,
+    )
+
+    fetched: dict[str, dict[str, Any]] = {}
+    failures: dict[str, str] = {}
+    for season in seasons:
+        for kind in tables:
+            key = f"{season}:{kind}"
+            try:
+                table = fetch_sr_season_table(season, kind)
+                fetched[key] = {
+                    "kind": table.kind,
+                    "players": int(len(table.frame)),
+                    "multi_team_rows": int(
+                        table.frame["IS_MULTI_TEAM_TOTAL"].fillna(False).sum()
+                    ) if "IS_MULTI_TEAM_TOTAL" in table.frame.columns else 0,
+                    "league_average": bool(table.league_average_row),
+                    "source": table.source,
+                }
+            except BasketballReferenceError as exc:
+                failures[key] = str(exc)
+            except Exception as exc:  # noqa: BLE001 — one table, not the run
+                logger.exception("Fetching %s raised.", key)
+                failures[key] = f"{type(exc).__name__}: {exc}"
+
+    status = "OK" if fetched and not failures else (
+        "PARTIAL" if fetched else "FAILED"
+    )
+    out = {
+        "status": status,
+        "tables": tables,
+        "seasons": seasons,
+        "fetched": fetched,
+        "failed": failures,
+    }
+    logger.info("Basketball Reference ingest: %s", out)
+    if failures:
+        logger.error(
+            "BASKETBALL REFERENCE INGEST DID NOT FETCH EVERY TABLE: %s. A "
+            "missing prior-season table means the advanced features it "
+            "carries simply do not exist yet, which is the honest state "
+            "rather than a broken job -- but it should be a deliberate "
+            "choice, not a silent one.", failures,
+        )
+        notify_failure(
+            "basketball-reference",
+            f"The 02:30 PT Basketball Reference fetch did not complete: {failures}",
+        )
+    return out
+
+
 def _run_history_backfill_locked(seasons: list[int]) -> dict[str, Any]:
     """
     The backfill body, with the slate write lock already held.
@@ -4189,6 +4384,54 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         misfire_grace_time=ESPN_HISTORY_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
+    # Basketball Reference, at 02:30 PT after the ESPN ingest: two requests
+    # per season per table, ever, and a cache hit thereafter. The misfire
+    # grace is six hours, same as the ingest -- a worker that was down at
+    # 02:30 should still pull the prior season's tables when it comes back,
+    # because nothing else in this deployment can reach them.
+    scheduler.add_job(
+        run_basketball_reference,
+        trigger="cron",
+        hour=_int_env(ENV_BBREF_HOUR, DEFAULT_BBREF_HOUR, low=0, high=23),
+        minute=_int_env(ENV_BBREF_MINUTE, DEFAULT_BBREF_MINUTE, low=0, high=59),
+        timezone=DISPLAY_TZ,
+        id="basketball_reference",
+        name="Fetch prior-season Basketball Reference tables (BPM/PER/VORP)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=BBREF_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    # The ESPN plays backfill and the stint builder, at 05:00 PT after the
+    # history backfill: the plays are season-to-date and the stints read
+    # them, so the writer goes first. Both are env-gated the way every job
+    # here is; both are no-ops once the season's games are held.
+    scheduler.add_job(
+        run_espn_plays_backfill,
+        trigger="cron",
+        hour=_int_env(ENV_ESPN_PLAYS_BACKFILL_HOUR, DEFAULT_ESPN_PLAYS_BACKFILL_HOUR, low=0, high=23),
+        minute=_int_env(ENV_ESPN_PLAYS_BACKFILL_MINUTE, DEFAULT_ESPN_PLAYS_BACKFILL_MINUTE, low=0, high=59),
+        timezone=DISPLAY_TZ,
+        id="espn_plays_backfill",
+        name="Backfill ESPN play-by-play for games the plays table does not hold",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=ESPN_PLAYS_BACKFILL_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_lineup_stints,
+        trigger="cron",
+        hour=_int_env(ENV_STINTS_HOUR, DEFAULT_STINTS_HOUR, low=0, high=23),
+        minute=_int_env(ENV_STINTS_MINUTE, DEFAULT_STINTS_MINUTE, low=0, high=59),
+        timezone=DISPLAY_TZ,
+        id="lineup_stints",
+        name="Build lineup stints from the stored ESPN plays (RESEARCH_ONLY)",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=STINTS_MISFIRE_GRACE_SECONDS,
+        replace_existing=True,
+    )
     # THE FIRST FIT DOES NOT WAIT FOR TOMORROW MORNING.
     #
     # Scheduled rather than run inline, and that is the whole point: a fit
@@ -4350,3 +4593,244 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# ESPN play-by-play persistence and the stint builder (2026-11-10)
+# ---------------------------------------------------------------------------
+#
+# WHY THE PLAYS BACKFILL IS ITS OWN JOB, AND WHY ITS SKIP KEY MATTERS.
+# The nightly ESPN ingest already fetches the summary payload that contains
+# the play feed, but its skip logic is keyed on the PANEL: a game the panel
+# already holds is never fetched again, so the existing deployment -- which
+# holds every game of the season to date -- would never fetch a single play.
+# The plays backfill therefore keys its skip on `espn_plays` itself: a game
+# is held when its rows are in that table, not when the panel knows it.
+#
+# SEASON-TO-DATE, BOUNDED. The backfill walks the current season's calendar
+# (the season's first date to today, Pacific) and fetches only the games the
+# plays table does not hold. It is idempotent and resumable: a run that
+# dies half way costs its chunk and nothing else, and the next run picks up
+# the same missing games.
+#
+# RESEARCH_ONLY. Stored events. Nothing here prices or places anything.
+
+
+def run_espn_plays_backfill(*, limit: int | None = None) -> dict[str, Any]:
+    """
+    Backfill the ESPN play rows and starters for games the table does not hold.
+
+    The `espn_plays` table is the persistence half of the stint pipeline; this
+    is the writer. The stint builder (`run_lineup_stints`) reads what this
+    writes and nothing else does, so a game skipped here is a game with no
+    stints tomorrow -- which is the honest state rather than a broken one.
+    """
+    if not _flag(ENV_ESPN_PLAYS_BACKFILL, True):
+        logger.info("ESPN plays backfill disabled (%s).", ENV_ESPN_PLAYS_BACKFILL)
+        return {"status": "SKIPPED", "reason": f"{ENV_ESPN_PLAYS_BACKFILL} is false"}
+
+    from src.db.repository import (
+        espn_plays_game_ids,
+        upsert_espn_plays,
+        upsert_espn_starters,
+    )
+    from src.ingestion.espn_panel import fetch_event_ids, fetch_plays_and_starters
+    from src.utils.timezones import pacific_calendar_date
+
+    try:
+        held = espn_plays_game_ids()
+    except Exception as exc:  # noqa: BLE001 — report, do not guess
+        logger.exception("espn_plays_game_ids failed; refusing the backfill.")
+        notify_failure("espn-plays-backfill",
+                       f"The ESPN plays backfill could not read espn_plays: {exc}")
+        return {"status": "FAILED", "error": str(exc)}
+
+    today = pacific_calendar_date()
+    season_start = _espn_season_start(today)
+    days = _season_days_between(season_start, today)
+
+    fetched_games = 0
+    written_plays = 0
+    written_starters = 0
+    for day in days:
+        try:
+            ids = fetch_event_ids(day)
+        except Exception as exc:  # noqa: BLE001 — one day, not the run
+            logger.warning("ESPN scoreboard %s failed: %s", day, exc)
+            continue
+        plays, starters, report = fetch_plays_and_starters(
+            ids, skip_game_ids=held,
+        )
+        if not plays.empty:
+            written_plays += upsert_espn_plays(plays)
+            fetched_games += plays["NBA_GAME_ID"].nunique()
+        if not starters.empty:
+            written_starters += upsert_espn_starters(starters)
+        for note in (report.notes or [])[:5]:
+            logger.info("ESPN plays backfill: %s", note)
+        if limit is not None and fetched_games >= limit:
+            break
+
+    out = {
+        "status": "OK",
+        "season_start": str(season_start),
+        "days_walked": len(days),
+        "games_fetched": fetched_games,
+        "plays_written": written_plays,
+        "starters_written": written_starters,
+    }
+    logger.info("ESPN plays backfill: %s", out)
+    return out
+
+
+def _espn_season_start(today: date) -> date:
+    """The current NBA season's first date, Pacific."""
+    from datetime import date as _date
+
+    if today.month >= 7:
+        return _date(today.year, 10, 1)
+    return _date(today.year - 1, 10, 1)
+
+
+def _season_days_between(start: date, end: date) -> list[date]:
+    """Every date from start through end, inclusive."""
+    from datetime import timedelta
+
+    out: list[date] = []
+    current = start
+    while current <= end:
+        out.append(current)
+        current += timedelta(days=1)
+    return out
+
+
+def run_lineup_stints() -> dict[str, Any]:
+    """
+    Build the lineup stints from the plays and starters, and validate them.
+
+    THE CHEAPEST REMAINING PLAYER DATA AFTER THE BASKETBALL REFERENCE TABLES.
+    The summary payload the panel already fetches carries the whole play feed;
+    `espn_plays` and `espn_starters` now hold it, and this job reads them and
+    writes the stints -- who shared the floor with whom, for how long -- to
+    a CSV on the state root.
+
+    NOTHING DOWNSTREAM IS WIRED, ON PURPOSE. The A/B rule: a new feature
+    reaches the model's matrix by winning a holdout in
+    `scripts/feature_ab.py`, not by being argued for. This job writes the
+    CSV where that measurement can read it and stops there.
+
+    THE VALIDATION IS THE POINT, not a nicety. The stints are built from a
+    starting five and a substitution stream; the box score's minutes are an
+    independent count of the same thing. Where the two disagree the
+    reconstruction is wrong, and this reports the correlation and the error
+    rather than trusting the stream. A floor-state violation refuses the
+    game outright rather than shipping a lineup that was never on the floor.
+    """
+    from src.db.repository import load_espn_plays, load_espn_starters, load_player_panel
+    if not _flag(ENV_STINTS, True):
+        logger.info("Lineup stints disabled (%s).", ENV_STINTS)
+        return {"status": "SKIPPED", "reason": f"{ENV_STINTS} is false"}
+
+    from src.features.stints import (
+        StintError,
+        build_stints,
+        player_seconds_on_court,
+        validate_stints_against_minutes,
+    )
+    from src.utils.volume import resolve_state_root
+
+    try:
+        plays = load_espn_plays()
+        starters = load_espn_starters()
+    except Exception as exc:  # noqa: BLE001 — report, do not guess
+        logger.exception("Loading espn_plays / espn_starters failed.")
+        notify_failure("lineup-stints",
+                       f"The stint builder could not read the plays: {exc}")
+        return {"status": "FAILED", "error": str(exc)}
+    if plays.empty:
+        logger.warning(
+            "LINEUP STINTS: espn_plays is empty. Nothing to build from. Run "
+            "the plays backfill first; this job is the reader, not the writer.",
+        )
+        return {"status": "SKIPPED", "reason": "espn_plays is empty"}
+
+    try:
+        stints = build_stints(plays, starters)
+    except StintError as exc:
+        logger.error("LINEUP STINTS REFUSED: %s", exc)
+        notify_failure("lineup-stints", f"The stint builder refused: {exc}")
+        return {"status": "REFUSED", "reason": str(exc)}
+
+    if stints.empty:
+        logger.warning(
+            "LINEUP STINTS: no stints survived the floor-state check. This "
+            "is the honest state rather than a broken job, but it should be "
+            "a deliberate choice.",
+        )
+        return {"status": "OK", "stints": 0, "reason": "no stints survived"}
+
+    # THE VALIDATION, against the box score's own minutes.
+    on_court = player_seconds_on_court(stints)
+    validation: dict[str, float] = {}
+    validation_ran = False
+    try:
+        panel = load_player_panel()
+        if not panel.empty:
+            validation = validate_stints_against_minutes(on_court, panel)
+            validation_ran = bool(validation.get("n", 0))
+    except Exception as exc:  # noqa: BLE001 — report, do not guess
+        logger.warning("Stint validation could not read the panel: %s", exc)
+
+    state_root = resolve_state_root()[0]
+    out_path = state_root / "espn_stints.csv"
+    stints.to_csv(out_path, index=False)
+    on_court.to_csv(state_root / "espn_stints_player_minutes.csv", index=False)
+
+    out = {
+        "status": "OK",
+        "stints": int(len(stints)),
+        "games": int(stints["NBA_GAME_ID"].nunique()),
+        "players": int(on_court["ESPN_ATHLETE_ID"].nunique()),
+        "validation": validation,
+        "out_path": str(out_path),
+    }
+    logger.info("Lineup stints: %s", out)
+
+    # A CHECK THAT DID NOT RUN IS NOT A CHECK THAT FAILED, and the first
+    # draft of this block could not tell the two apart: it read
+    # `validation.get("corr", 0)`, so an empty dict scored zero and sent a
+    # nightly notice claiming the reconstruction had fallen below 0.9
+    # correlation when nothing had been measured at all. That is the same
+    # defect as a gate named for the wrong fact -- it reports a verdict it
+    # does not hold -- and it is worse than silence, because a false alarm
+    # every night is how a real one gets ignored. The two states get two
+    # different messages, and neither is a pass.
+    if not validation_ran:
+        out["validation_status"] = "CANNOT_TELL"
+        logger.error(
+            "LINEUP STINTS WERE NOT VALIDATED: %s joined zero player-games "
+            "against the panel, so the correlation with the box score's own "
+            "minutes is unmeasured -- NOT measured and bad. The stints were "
+            "still written, and they are unverified as written.", validation,
+        )
+        notify_failure(
+            "lineup-stints",
+            "The stint reconstruction was written but NOT validated: the "
+            "check against the box score's minutes joined zero player-games, "
+            "so its agreement is unknown rather than poor.",
+        )
+    elif validation["corr"] < 0.9:
+        out["validation_status"] = "ALERT"
+        logger.error(
+            "LINEUP STINTS VALIDATION BELOW 0.9 CORRELATION WITH THE BOX "
+            "SCORE'S MINUTES: %s. The reconstruction is wrong and the stints "
+            "are not to be trusted as written.", validation,
+        )
+        notify_failure(
+            "lineup-stints",
+            f"The stint reconstruction's agreement with the box score's "
+            f"minutes fell below 0.9 correlation: {validation}",
+        )
+    else:
+        out["validation_status"] = "OK"
+    return out

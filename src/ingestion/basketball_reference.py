@@ -51,11 +51,20 @@ rather than fuzzy-matching; unmatched players keep NaN features.
 
 SCOPE: NBA only. Team codes are validated against the NBA set, so a college
 or G-League export is refused rather than silently ingested.
+
+RESEARCH_ONLY. No credential, no wager, no bot-wall bypass -- the same line
+`underdog_props.py` and `sleeper_props.py` carry, and it binds the fetch
+section at the bottom of this file too. This host's wall reads the client
+identity, so the scheduled fetch ships DISABLED with an honest User-Agent
+rather than enabled with a browser-shaped one; see `SR_USER_AGENT`.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -108,6 +117,11 @@ TABLE_PREFIXES: dict[str, str] = {
     "per_100_poss": "SR_P100",
     "play_by_play": "SR_PBP",
     "adjusted_shooting": "SR_ADJ",
+    # The advanced table (PER, WS, BPM) — the prior-season BPM source this
+    # project had no equivalent of. Distinct from SR_ADJ by one character,
+    # which is deliberate: they are different tables and a shared prefix
+    # would let one overwrite the other's columns on a merge.
+    "advanced": "SR_ADV",
     "unknown": "SR",
 }
 
@@ -218,6 +232,7 @@ _KIND_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("adjusted_shooting", ("TS_PLUS", "EFG_PLUS")),
     ("play_by_play", ("PG_PCT", "ONCOURT")),
     ("per_100_poss", ("ORTG", "DRTG", "PTS")),
+    ("advanced", ("PER", "WS", "BPM")),
     ("per_game", ("PTS", "TRB", "FG_PCT")),
 )
 
@@ -819,3 +834,399 @@ def describe_sr_table(table: SrSeasonTable) -> dict[str, Any]:
         "has_bbref_id": "BBREF_PLAYER_ID" in frame.columns,
         "attribution": table.attribution,
     }
+
+
+# ---------------------------------------------------------------------------
+# fetching the season tables from the site (added 2026-11-10)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS HERE. The parser above read CSVs a person exported by hand, so
+# the tables were one manual step away from being a feature at all, and
+# nothing scheduled ever refreshed them. This section makes the transport a
+# job instead of a human.
+#
+# BUT IT DOES NOT RUN BY DEFAULT, AND THE REASON IS NOT POLITENESS.
+# basketball-reference.com answered a 200 in 0.16s from this environment on
+# 2026-11-10 (a 2.4 MB per-game page, a 2.2 MB advanced page) -- with a
+# browser-shaped User-Agent. Measured again on 2026-11-11 with an honest one:
+# 403, on both the prior season's page and the live one. The host's wall reads
+# the client identity, so the 200 was bought by claiming to be a browser.
+# `$PROPIQ_BBREF_INGEST` therefore defaults false and `SR_USER_AGENT` is
+# honest; everything below is a parser, a cache and a backoff that a
+# deployment with a legitimate route to this data can switch on deliberately.
+#
+# NO NEW DEPENDENCY, ON PURPOSE. The HTML is parsed with the standard library
+# (regex over the table's own ``data-stat`` cell attributes), not lxml or
+# BeautifulSoup or pandas.read_html: this project's rule is that a feature
+# another repository has does not justify a new import, and SR's markup is
+# regular enough that the machine keys are the robust interface — a header
+# TEXT change does not move anything, and the CSV headers emitted below are
+# the same ones the hand-exported CSVs carried, so ``read_sr_season_csv``
+# (and every guard in it: the League Average trailer, the multi-team blocks,
+# the NBA-only assertion, the leakage refusal) runs unchanged over what the
+# fetch produces. One parse path, two transports.
+#
+# PRIOR-SEASON TABLES ARE FINAL, SO THE CACHE IS FOREVER. A season's per-game
+# and advanced tables stop changing when that season ends, so a cached CSV is
+# not staleness to be re-fetched nightly — it IS the table. The job fetches
+# once per (season, table) and no-ops on every later run unless
+# ``refresh=True``. That is also the polite rate limit: one request per table
+# per season, ever.
+#
+# ATTRIBUTION TRAVELS WITH THE TABLE, as SR's terms ask for.
+
+#: kind -> (page slug, HTML table id). Verified against the live pages on
+#: 2026-11-10: the per-game page carries ``per_game_stats`` and the advanced
+#: page carries ``advanced`` (``advanced_post`` is the playoffs table, a
+#: different season type, and is deliberately not offered here).
+SR_PAGES: dict[str, tuple[str, str]] = {
+    "per_game": ("per_game", "per_game_stats"),
+    "advanced": ("advanced", "advanced"),
+}
+
+#: The pages' own machine keys -> the CSV headers the parser expects. The
+#: keys are SR's ``data-stat`` cell attributes; the values are the headers
+#: the "Get table as CSV" export produces, which is the shape
+#: ``read_sr_season_csv`` was built against. ``mp`` is TOTAL minutes in the
+#: advanced table and PER GAME in the per-game table — the prefixes keep
+#: them apart downstream.
+DATA_STAT_TO_HEADER: dict[str, dict[str, str]] = {
+    "per_game": {
+        "ranker": "Rk", "name_display": "Player", "age": "Age",
+        "team_name_abbr": "Team", "pos": "Pos", "games": "G",
+        "games_started": "GS", "mp_per_g": "MP",
+        "fg_per_g": "FG", "fga_per_g": "FGA", "fg_pct": "FG%",
+        "fg3_per_g": "3P", "fg3a_per_g": "3PA", "fg3_pct": "3P%",
+        "fg2_per_g": "2P", "fg2a_per_g": "2PA", "fg2_pct": "2P%",
+        "efg_pct": "eFG%", "ft_per_g": "FT", "fta_per_g": "FTA",
+        "ft_pct": "FT%", "orb_per_g": "ORB", "drb_per_g": "DRB",
+        "trb_per_g": "TRB", "ast_per_g": "AST", "stl_per_g": "STL",
+        "blk_per_g": "BLK", "tov_per_g": "TOV", "pf_per_g": "PF",
+        "pts_per_g": "PTS", "awards": "Awards",
+    },
+    "advanced": {
+        "ranker": "Rk", "name_display": "Player", "age": "Age",
+        "team_name_abbr": "Team", "pos": "Pos", "games": "G",
+        "games_started": "GS", "mp": "MP", "per": "PER",
+        "ts_pct": "TS%", "fg3a_per_fga_pct": "3PAr",
+        "fta_per_fga_pct": "FTr", "orb_pct": "ORB%", "drb_pct": "DRB%",
+        "trb_pct": "TRB%", "ast_pct": "AST%", "stl_pct": "STL%",
+        "blk_pct": "BLK%", "tov_pct": "TOV%", "usg_pct": "USG%",
+        "ows": "OWS", "dws": "DWS", "ws": "WS", "ws_per_48": "WS/48",
+        "obpm": "OBPM", "dbpm": "DBPM", "bpm": "BPM", "vorp": "VORP",
+        "awards": "Awards",
+    },
+}
+
+#: AN HONEST CLIENT IDENTITY, AND IT GETS A 403. Measured 2026-11-11 from
+#: this container: this exact User-Agent returns HTTP 403 on
+#: ``NBA_2026_advanced.html``. A browser-shaped string was what the original
+#: draft of this module shipped, and it is what makes the fetch return 200 --
+#: which means a 200 here is obtained by telling the host this is a browser
+#: when it is not. THAT IS THE BOT WALL, NOT A TRANSPORT DETAIL, so the
+#: default does not do it. The job ships disabled (see
+#: ``$PROPIQ_BBREF_INGEST``) and the honest agent stays the default, so the
+#: failure mode out of the box is a refusal this project reports rather than a
+#: circumvention it performs.
+#:
+#: The parser, cache and backoff below are the reusable part and are
+#: exercised by ``tests/test_basketball_reference.py`` against stored HTML; a
+#: deployment that has a legitimate route to this data (the site's own export,
+#: a licence, or a residential egress its operator is entitled to use) sets
+#: ``$PROPIQ_BBREF_USER_AGENT`` and ``$PROPIQ_BBREF_INGEST`` itself. That is
+#: the operator's call to make, not this file's.
+SR_USER_AGENT = "PropIQ-Research/1.0 (+non-commercial NBA research)"
+
+#: Where the fetched CSVs are cached. The raw CSVs are licensed third-party
+#: data and gitignored; the deployed path is the volume-backed state root.
+SR_CACHE_DIR = Path("data/external/basketball_reference")
+
+#: Politeness: the same backoff shape every client in this project uses.
+SR_RETRY_ATTEMPTS = 3
+SR_RETRY_BACKOFF_SECONDS = 2.0
+SR_TIMEOUT_SECONDS = 30.0
+
+
+def sr_page_url(season: str, kind: str) -> str:
+    """``('2025-26', 'advanced')`` -> the season's advanced-table page URL."""
+    slug, _table_id = _sr_page(kind)
+    end_year = season_start_year(season) + 1
+    return f"https://www.basketball-reference.com/leagues/NBA_{end_year}_{slug}.html"
+
+
+def _sr_page(kind: str) -> tuple[str, str]:
+    try:
+        return SR_PAGES[kind]
+    except KeyError as exc:
+        raise BasketballReferenceError(
+            f"No Basketball-Reference page mapping for {kind!r}. Fetched "
+            f"kinds are {sorted(SR_PAGES)}; the play-by-play and "
+            "adjusted-shooting tables stay on the hand-exported CSV path."
+        ) from exc
+
+
+def default_prior_seasons(now: Any | None = None) -> list[str]:
+    """
+    The immediately preceding NBA season, as a one-element list.
+
+    '2025-26' for any date in the 2026-27 season. The prior season's tables
+    are the only ones the leakage guard admits as features, so they are what
+    a scheduled fetch wants by default.
+    """
+    from datetime import date
+
+    from src.utils.timezones import pacific_calendar_date
+
+    today = now if isinstance(now, date) else pacific_calendar_date()
+    current_start = today.year if today.month >= 7 else today.year - 1
+    prior_start = current_start - 1
+    return [f"{prior_start}-{str(prior_start + 1)[-2:]}"]
+
+
+#: The month and day the NBA regular season is underway by. The league has
+#: tipped off on or before October 22nd every season since 1980, so a table
+#: fetched on this date has rows; before it, the current season's page has
+#: nothing to parse. The 20th trades a few days' delay in a
+#: late-starting season for never fetching a table that cannot exist yet.
+SR_REGULAR_SEASON_UNDERWAY = (10, 20)
+
+
+def default_current_season(now: Any | None = None) -> str:
+    """
+    The season currently underway: ``'2026-27'`` for any date from July 2026
+    through June 2027. July is the new season's first month, so a July date
+    still names the season that October will tip off.
+    """
+    from datetime import date
+
+    from src.utils.timezones import pacific_calendar_date
+
+    today = now if isinstance(now, date) else pacific_calendar_date()
+    start = today.year if today.month >= 7 else today.year - 1
+    return f"{start}-{str(start + 1)[-2:]}"
+
+
+def is_current_season(season: str, now: Any | None = None) -> bool:
+    """
+    Is ``season`` the NBA season currently being played?
+
+    True only while the regular season is underway — from October 20th of
+    the starting year through June 30th of the ending one. July 1st the
+    season is over: the table is final and is no longer a live object.
+    """
+    from datetime import date
+
+    from src.utils.timezones import pacific_calendar_date
+
+    today = now if isinstance(now, date) else pacific_calendar_date()
+    start = season_start_year(season)
+    if today.year == start:
+        month, day = SR_REGULAR_SEASON_UNDERWAY
+        return today.month > month or (today.month == month and today.day >= day)
+    if today.year == start + 1:
+        return today.month <= 6
+    return False
+
+
+def default_fetch_seasons(now: Any | None = None) -> list[str]:
+    """
+    The seasons the scheduled fetch wants: the prior season's final tables
+    plus the current season's while it is underway.
+
+    The current-season table is season-to-date data, not a final table, and
+    fetching it does NOT make it a feature. The leakage guard
+    (``prior_season_features``) still refuses to join a season's aggregate
+    onto its own season, so the fetched rows are data for the A/B
+    measurement — and, the day the season ends, the cache file already IS
+    next season's prior table, which the prior-only fetch then serves
+    without a request.
+    """
+    seasons = default_prior_seasons(now)
+    current = default_current_season(now)
+    if is_current_season(current, now) and current not in seasons:
+        seasons.append(current)
+    return seasons
+
+
+def sr_cache_path(season: str, kind: str, *, cache_dir: str | Path | None = None,
+                  partial: bool = False) -> Path:
+    """
+    Where one (season, table) CSV is cached.
+
+    TWO NAMES, BECAUSE A SNAPSHOT IS NOT A TABLE. A season that is OVER has
+    one final table, cached at ``sr_<season>_<kind>.csv`` and served forever.
+    A season that is UNDERWAY has only a season-to-date snapshot, and that
+    goes to ``.partial.csv``.
+
+    The split is the guard, and it replaces a one-path cache that could not
+    tell the two apart: fetch 2026-27 in December, let the season turn over,
+    and `is_current_season` goes false, `refresh` resolves to False, and a
+    twelve-game December snapshot is served from then on as the completed
+    season's table -- feeding `prior_season_features` a partial season
+    labelled as a whole one, silently and permanently. A reader that cannot
+    distinguish a snapshot from a final table will eventually mistake one for
+    the other, so the file name distinguishes them and a final read never
+    looks at a partial file.
+
+    The cost is two requests, once, in the season after the handoff: the
+    first final read of a season that has ended fetches it rather than
+    promoting the last snapshot. That is the correct table instead of a
+    convenient one.
+    """
+    root = Path(cache_dir) if cache_dir is not None else SR_CACHE_DIR
+    suffix = ".partial.csv" if partial else ".csv"
+    return root / f"sr_{season}_{kind}{suffix}"
+
+
+def _sr_rows_to_csv(body: str, kind: str) -> str:
+    """The table's rows as the CSV text ``read_sr_season_csv`` expects."""
+    import csv
+    import io
+
+    mapping = DATA_STAT_TO_HEADER[kind]
+    rows: list[list[str]] = [[*mapping.values(), "Player-additional"]]
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S):
+        cells = re.findall(r'<t[dh][^>]*data-stat="([^"]*)"[^>]*>(.*?)</t[dh]>', tr, re.S)
+        if not cells:
+            continue
+        by_key: dict[str, str] = {}
+        name_html = ""
+        for key, html in cells:
+            text = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+            text = re.sub(r"<[^>]+>", "", text).strip()
+            by_key[key] = text
+            if key == "name_display":
+                name_html = html
+        if "name_display" not in by_key:
+            continue
+        name = by_key["name_display"]
+        is_league_average = name.strip().lower() == LEAGUE_AVERAGE_LABEL
+        # The player id comes from the anchor inside the name cell, which is
+        # the same id the CSV export's trailing '-additional' column carries.
+        # The League Average row has no anchor and gets SR's own null
+        # sentinel, so the parser's existing trailer handling sees the exact
+        # shape its CSV path always had.
+        link = re.search(r'href="/players/[a-z]/([a-z0-9]+)\.html"', name_html)
+        player_id = link.group(1) if link else (SR_NULL_SENTINEL if is_league_average else "")
+        rows.append([by_key.get(key, "") for key in mapping] + [player_id])
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
+def _sr_get(url: str, *, session: Any | None = None) -> str:
+    """GET the page, retrying only what is genuinely transient."""
+    import time
+
+    import requests
+
+    from src.utils.http_retry import retry_after_seconds
+
+    get = (session or requests).get
+    headers = {"User-Agent": os.environ.get("PROPIQ_BBREF_USER_AGENT") or SR_USER_AGENT}
+    last = "no attempt made"
+    for attempt in range(1, SR_RETRY_ATTEMPTS + 1):
+        try:
+            response = get(url, headers=headers, timeout=SR_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 — redacted into `last`
+            last = f"{type(exc).__name__}: {exc}"
+            if attempt < SR_RETRY_ATTEMPTS:
+                time.sleep(SR_RETRY_BACKOFF_SECONDS ** attempt)
+            continue
+        if response.status_code in (200,):
+            return response.text
+        if response.status_code in (429, 503):
+            wait = retry_after_seconds(response.headers, SR_RETRY_BACKOFF_SECONDS ** attempt)
+            last = f"HTTP {response.status_code}"
+            if attempt < SR_RETRY_ATTEMPTS:
+                time.sleep(wait)
+            continue
+        raise BasketballReferenceError(
+            f"GET {url}: HTTP {response.status_code}. A 403 from this host is "
+            "its bot wall, and measurement on 2026-11-11 says it reads the "
+            "CLIENT IDENTITY, not only the IP: this same container got 403 "
+            "with an honest User-Agent and 200 with a browser-shaped one. So "
+            "retrying will not change it, and the thing that would change it "
+            "is claiming to be a browser -- an operator decision with "
+            f"terms-of-service consequences, taken by setting "
+            f"$PROPIQ_BBREF_USER_AGENT, not by this module's default."
+        )
+    raise BasketballReferenceError(
+        f"GET {url} failed after {SR_RETRY_ATTEMPTS} attempts: {last}"
+    )
+
+
+def fetch_sr_season_table(
+    season: str,
+    kind: str,
+    *,
+    session: Any | None = None,
+    cache_dir: str | Path | None = None,
+    refresh: bool | None = None,
+) -> SrSeasonTable:
+    """
+    One season table, from the cache or the site, parsed by the one parser.
+
+    THE CACHE IS THE SCHEDULED JOB'S DE-DUPLICATION — for a season that is
+    OVER. A prior season's table is final, so the first fetch writes the
+    CSV and every later call reads it and never touches the network — one
+    request per table per season, ever. A LIVE season's table is not final:
+    it changes after every game night, so its cache is a snapshot of the
+    last fetch, not the table. ``refresh=None`` (the default) therefore
+    refreshes exactly the seasons that are underway (``is_current_season``)
+    and serves the cache for the ones that are over; an explicit True or
+    False overrides for one call, which is how a single night's snapshot
+    is pinned for reproducing an A/B run exactly.
+
+    The fetched rows go through ``read_sr_season_csv`` unchanged, so every
+    guard it carries applies to fetched data too: the League Average
+    trailer, the multi-team blocks, the NBA-only refusal, and — because the
+    caller must state the season — the leakage check downstream. That
+    check still refuses to join a season's aggregate onto its own season,
+    current or not: fetching season-to-date data does not make it a
+    feature.
+    """
+    _sr_page(kind)  # refuse unknown kinds before any I/O
+    season_start_year(season)
+
+    underway = is_current_season(season)
+    if refresh is None:
+        refresh = underway
+
+    # A snapshot of a live season and the final table of a dead one are
+    # different files; see `sr_cache_path`. A final read never reads a
+    # partial, which is what stops a mid-season snapshot being promoted to
+    # "the season's table" the day the season ends.
+    cache = sr_cache_path(season, kind, cache_dir=cache_dir, partial=underway)
+    if cache.exists() and not refresh:
+        return read_sr_season_csv(cache, season=season, kind=kind)
+
+    _slug, table_id = SR_PAGES[kind]
+    html = _sr_get(sr_page_url(season, kind), session=session)
+    table = re.search(
+        r'<table[^>]*id="' + re.escape(table_id) + r'"[^>]*>(.*?)</table>',
+        html, re.S,
+    )
+    if table is None:
+        raise BasketballReferenceError(
+            f"The {season} {kind} page has no table id {table_id!r}. SR "
+            "renamed the table, and this fetcher needs the new id."
+        )
+    body = re.search(r"<tbody[^>]*>(.*?)</tbody>", table.group(1), re.S)
+    if body is None:
+        raise BasketballReferenceError(
+            f"The {season} {kind} table has no tbody; nothing to parse."
+        )
+    csv_text = _sr_rows_to_csv(body.group(1), kind)
+
+    if cache_dir is not None or SR_CACHE_DIR.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(csv_text, encoding="utf-8")
+
+    table_obj = read_sr_season_csv(io.StringIO(csv_text), season=season, kind=kind)
+    # The source name for a fetched table is the page, so a bad row names
+    # where it came from.
+    table_obj = dataclasses.replace(table_obj, source=sr_page_url(season, kind))
+    return table_obj

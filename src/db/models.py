@@ -526,6 +526,55 @@ class ParlayLegRow(Base):
     )
 
 
+class EspnPlay(Base):
+    """
+    One ESPN play-by-play row, ordered by ESPN's own sequence number.
+
+    WHY THIS EXISTS. The nightly ESPN ingest already downloads and parses
+    the summary payload that contains the play feed, and then discarded it:
+    the box score was kept, the plays were not. Player-market research
+    wants to know who was on the court with a player, and the stints that
+    answer that are reconstructable from the starters plus the type-584
+    substitutions this table holds. `src/features/stints.py` is the reader.
+
+    RESEARCH_ONLY. Stored events. Nothing here prices or places anything.
+    """
+    __tablename__ = "espn_plays"
+
+    nba_game_id: Mapped[str] = mapped_column(String(32), primary_key=True, index=True)
+    sequence_number: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    play_id: Mapped[str | None] = mapped_column(String(32))
+    period: Mapped[int | None] = mapped_column(Integer)
+    clock_display: Mapped[str | None] = mapped_column(String(16))
+    espn_team_id: Mapped[str | None] = mapped_column(String(16))
+    play_type_id: Mapped[str | None] = mapped_column(String(16))
+    play_type_text: Mapped[str | None] = mapped_column(String(64))
+    play_text: Mapped[str | None] = mapped_column(Text)
+    score_value: Mapped[int | None] = mapped_column(Integer)
+    scoring_play: Mapped[bool | None] = mapped_column(Boolean)
+    participant_athlete_ids: Mapped[str | None] = mapped_column(Text)
+    coord_x: Mapped[float | None] = mapped_column(Float)
+    coord_y: Mapped[float | None] = mapped_column(Float)
+    game_date: Mapped[datetime | None] = mapped_column(Date, index=True)
+
+
+class EspnStarter(Base):
+    """
+    Who started, per game and team, from the box score ESPN already gave us.
+
+    The counterpart to `EspnPlay`: a stint builder needs a starting five
+    before it can apply the first substitution, and the box score's
+    `starter: true` flag is that five. Keyed on the panel's game id so a
+    stint joins to the panel with no translation.
+    """
+    __tablename__ = "espn_starters"
+
+    nba_game_id: Mapped[str] = mapped_column(String(32), primary_key=True, index=True)
+    espn_team_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    espn_athlete_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    player_name: Mapped[str | None] = mapped_column(String(128))
+
+
 class SchemaMigration(Base):
     """
     Which `migrations/*.sql` file has been applied to THIS database.
