@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -137,29 +138,44 @@ def probability_of_taken_side(
     return 1.0 - p_over
 
 
-def calibration_from_graded_rows(
-    rows: Iterable[Mapping[str, Any]],
-    *,
-    n_bins: int = 10,
-    min_bin_coverage: float = 0.8,
-    as_of: str | None = None,
-) -> dict[str, Any]:
+@dataclass(frozen=True)
+class ScoredPairs:
     """
-    Build a ``publication_gate``-shaped report from graded prop_results rows.
+    The (probability, outcome) pairs a graded ledger yields, plus what it cost.
 
-    Pure: no database, no network. ``rows`` are mappings with ``outcome_status``,
-    ``prob_over``, ``predicted_side`` and ``predicted_line`` — the columns
-    ``db.models.PropResult`` defines.
+    ONE READER OF THE PROP_RESULTS CONTRACT. `outcome_status`, `prob_over`,
+    `predicted_side` and `predicted_line` are read in exactly one place --
+    `taken_side_pairs` -- because a second reader of those four columns is how
+    two callers come to disagree about which rows are scorable. The ECE report
+    and the ledger calibration fit both consume this.
 
-    Abstains with ``status`` DATA_NOT_AVAILABLE and a named reason rather than
-    returning a figure built on nothing. Every excluded row is counted by reason,
-    because a report that silently scored a third of its input would misrepresent
-    how much evidence stands behind it.
+    `dates` is positionally aligned with `probabilities` and `outcomes`, and is
+    what lets a caller fold chronologically. A row with no `game_date` gets
+    `None` here rather than a guessed one.
     """
-    stamp = as_of or format_pacific_iso(now_pacific())
+
+    probabilities: tuple[float, ...]
+    outcomes: tuple[float, ...]
+    dates: tuple[Any, ...]
+    excluded: dict[str, int]
+    considered: int
+
+    def __len__(self) -> int:
+        return len(self.probabilities)
+
+
+def taken_side_pairs(rows: Iterable[Mapping[str, Any]]) -> ScoredPairs:
+    """
+    Extract the scorable (P(taken side), outcome, date) triples from the ledger.
+
+    Pure. Every row that cannot be scored is counted by reason rather than
+    dropped silently, because a figure built on a third of its input while
+    reporting the whole count misrepresents the evidence behind it.
+    """
     excluded: dict[str, int] = {}
     probabilities: list[float] = []
     outcomes: list[float] = []
+    dates: list[Any] = []
     considered = 0
 
     def drop(reason: str) -> None:
@@ -186,6 +202,42 @@ def calibration_from_graded_rows(
             continue
         probabilities.append(float(p_taken))
         outcomes.append(1.0 if status == "WIN" else 0.0)
+        dates.append(row.get("game_date"))
+
+    return ScoredPairs(
+        probabilities=tuple(probabilities),
+        outcomes=tuple(outcomes),
+        dates=tuple(dates),
+        excluded=excluded,
+        considered=considered,
+    )
+
+
+def calibration_from_graded_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    n_bins: int = 10,
+    min_bin_coverage: float = 0.8,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build a ``publication_gate``-shaped report from graded prop_results rows.
+
+    Pure: no database, no network. ``rows`` are mappings with ``outcome_status``,
+    ``prob_over``, ``predicted_side`` and ``predicted_line`` — the columns
+    ``db.models.PropResult`` defines.
+
+    Abstains with ``status`` DATA_NOT_AVAILABLE and a named reason rather than
+    returning a figure built on nothing. Every excluded row is counted by reason,
+    because a report that silently scored a third of its input would misrepresent
+    how much evidence stands behind it.
+    """
+    stamp = as_of or format_pacific_iso(now_pacific())
+    pairs = taken_side_pairs(rows)
+    excluded = pairs.excluded
+    probabilities = list(pairs.probabilities)
+    outcomes = list(pairs.outcomes)
+    considered = pairs.considered
 
     base: dict[str, Any] = {
         "report_timestamp_pt": stamp,
@@ -255,6 +307,7 @@ def prop_result_calibration_report(
     market: str | None = None,
     n_bins: int = 10,
     min_bin_coverage: float = 0.8,
+    rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Read graded rows from Postgres and build the report.
@@ -262,10 +315,18 @@ def prop_result_calibration_report(
     Separated from ``calibration_from_graded_rows`` so the arithmetic is testable
     without a database — which is also the only way it gets tested in an
     environment with no DATABASE_URL.
-    """
-    from src.db.repository import load_graded_prop_results
 
-    rows = load_graded_prop_results(lookback_days=lookback_days, market=market)
+    ``rows`` lets a caller that has ALREADY loaded the ledger pass it in rather
+    than provoke a second identical query. The 04:00 job does exactly that: it
+    feeds the same list to this report and to
+    ``models.ledger_calibration.fit_ledger_calibration``, so the two cannot
+    disagree about which rows they describe — two queries could land either
+    side of a settlement write and silently report different samples.
+    """
+    if rows is None:
+        from src.db.repository import load_graded_prop_results
+
+        rows = load_graded_prop_results(lookback_days=lookback_days, market=market)
     report = calibration_from_graded_rows(
         rows, n_bins=n_bins, min_bin_coverage=min_bin_coverage,
     )

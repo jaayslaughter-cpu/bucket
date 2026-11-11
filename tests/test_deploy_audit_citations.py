@@ -79,9 +79,13 @@ ANCHORS = [
     # 4336/4337 the same day, by a single `import math` added for the
     # NaN-correlation guard: one line at the top of the file moves every
     # anchor below it, which is the whole reason these are pinned by
-    # substring and refreshed by exact pair. The findings never moved.
-    ("scheduler_worker.py", 4336, "job_defaults"),
-    ("scheduler_worker.py", 4337, "max_instances"),
+    # substring and refreshed by exact pair. And once more, 4336/4337 ->
+    # 4387/4388, when 256 lines of job definitions were moved from BELOW the
+    # `__main__` guard to above it -- the fix for the NameError that crashed
+    # deploy eee9dbe9. The findings never moved; the file did, four times in
+    # one day.
+    ("scheduler_worker.py", 4387, "job_defaults"),
+    ("scheduler_worker.py", 4388, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
@@ -121,9 +125,9 @@ ANCHORS = [
     #
     # Anchored now so the next refactor fails a test instead of quietly
     # turning three audits into prose with no evidence behind it.
-    ("scheduler_worker.py", 4334, "scheduler = BlockingScheduler("),
+    ("scheduler_worker.py", 4385, "scheduler = BlockingScheduler("),
     ("scheduler_worker.py", 802, "def board_markets("),
-    ("scheduler_worker.py", 4538, "configure_logging()"),
+    ("scheduler_worker.py", 4589, "configure_logging()"),
     ("scheduler_worker.py", 1639, "os.environ.get(ENV_MIN_EV)"),
     ("scheduler_worker.py", 1705, "min_ev=min_ev,"),
     ("scheduler_worker.py", 1700, "build_board_from_projections("),

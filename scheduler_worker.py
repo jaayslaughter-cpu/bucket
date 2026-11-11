@@ -3624,20 +3624,71 @@ def rebuild_calibration_report(path: str | None = None) -> dict[str, Any]:
 
     target = calibration_report_path(path)
     try:
+        # ONE READ, TWO REPORTS. The ledger fit and the ECE report must
+        # describe the same sample; two queries could land either side of a
+        # settlement write and disagree about how many rows they saw.
+        from src.db.repository import load_graded_prop_results
         from src.settlement.calibration import (
             prop_result_calibration_report,
             summarise,
         )
 
-        report = prop_result_calibration_report()
+        rows = load_graded_prop_results(lookback_days=180, market=None)
+        report = prop_result_calibration_report(rows=rows)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
         logger.info("Calibration report -> %s: %s", target, summarise(report))
+
+        ledger = _run_ledger_calibration(rows, target)
         return {"out": str(target), "status": report.get("status"),
-                "n_scored": report.get("n_scored"), "ece": report.get("ece")}
+                "n_scored": report.get("n_scored"), "ece": report.get("ece"),
+                "ledger_calibration": ledger}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Calibration report failed; the scheduler stays up.")
         return {"status": "FAILED", "error": str(exc), "out": str(target)}
+
+
+def _run_ledger_calibration(rows: Any, calibration_target: Any) -> dict[str, Any]:
+    """
+    Measure a candidate calibration map on the ledger, beside the ECE report.
+
+    WHY IT RIDES THIS JOB. The rows are already in hand here, and a separate
+    job would need its own schedule, its own read and its own failure mode to
+    answer a question about the same sample. Same reasoning as `self_check`
+    riding the 04:00 analysis.
+
+    WHY IT FAILS SOFT. This is a measurement, not a gate: the publication gate
+    reads `calibration.json`, which is written BEFORE this runs and is
+    unaffected by it. A fit that raises must not cost the report that withholds
+    publication, so the exception is caught, logged and returned.
+
+    NOTHING HERE CHANGES WHAT SERVES. The map is reported, not installed.
+    """
+    import json
+
+    out_path = calibration_target.parent / "ledger_calibration.json"
+    try:
+        from src.models.ledger_calibration import fit_ledger_calibration
+        from src.models.ledger_calibration import summarise as summarise_ledger
+
+        report = fit_ledger_calibration(rows)
+        out_path.write_text(
+            json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8",
+        )
+        for line in summarise_ledger(report):
+            logger.info("Ledger calibration: %s", line)
+        return {
+            "out": str(out_path),
+            "status": report.get("status"),
+            "chosen_method": report.get("chosen_method"),
+            "beats_constant_half": report.get("beats_constant_half"),
+        }
+    except Exception as exc:  # noqa: BLE001 — a measurement, never the gate
+        logger.exception(
+            "Ledger calibration failed. The publication gate is UNAFFECTED: it "
+            "reads the calibration report written before this ran.",
+        )
+        return {"status": "FAILED", "error": str(exc), "out": str(out_path)}
 
 
 def _training_markets() -> list[str]:
@@ -4592,10 +4643,6 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # ---------------------------------------------------------------------------
 # ESPN play-by-play persistence and the stint builder (2026-11-10)
 # ---------------------------------------------------------------------------
@@ -4852,3 +4899,25 @@ def run_lineup_stints() -> dict[str, Any]:
     else:
         out["validation_status"] = "OK"
     return out
+
+
+# ---------------------------------------------------------------------------
+# THE ENTRYPOINT GUARD GOES LAST, AND THAT IS NOT A STYLE PREFERENCE.
+# ---------------------------------------------------------------------------
+#
+# This block ran at line 4645 while `run_espn_plays_backfill` and
+# `run_lineup_stints` were defined at 4671 and 4759 -- BELOW it. Under
+# `import scheduler_worker` that is harmless: `__name__` is not "__main__",
+# the guard is skipped, the module finishes, and every function exists. The
+# whole test suite imports the module, so all 3894 tests passed.
+#
+# Under `python scheduler_worker.py`, which is what the container runs, the
+# guard fires BEFORE execution reaches those definitions. `main()` calls
+# `build_scheduler()`, which references `run_espn_plays_backfill`, and the
+# worker died with `NameError: name 'run_espn_plays_backfill' is not defined`
+# after passing every health check -- deploy eee9dbe9, 2026-11-11 16:05 UTC.
+#
+# `tests/test_scheduler_entrypoint.py` now fails if anything is defined after
+# this line, because no import-based test can see this class of defect.
+if __name__ == "__main__":
+    sys.exit(main())
