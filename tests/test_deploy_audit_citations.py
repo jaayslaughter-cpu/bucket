@@ -73,17 +73,20 @@ ANCHORS = [
     ("src/quant/line_diff.py", 103, "_over_given_no_push"),
     # Moved 4087/4088 -> 4140/4141 on 2026-11-10: the dispatch-reason fix
     # (`run_dispatch` and friends now log and return the webhook's reason)
-    # added lines above `build_scheduler`. The findings did not move.
-    ("scheduler_worker.py", 4140, "job_defaults"),
-    ("scheduler_worker.py", 4141, "max_instances"),
+    # added lines above `build_scheduler`. Moved again, 4140/4141 ->
+    # 4335/4336 on 2026-11-11: the Basketball Reference, ESPN-plays and
+    # stint jobs were registered above it. The findings did not move either
+    # time; this row is the record of the file growing underneath them.
+    ("scheduler_worker.py", 4335, "job_defaults"),
+    ("scheduler_worker.py", 4336, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1891, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1927, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
-    ("src/db/repository.py", 767, "def newest_team_game_date"),
+    ("src/db/repository.py", 769, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
     # configured. Anchored so the correction cannot rot the same way the
     # line it replaced did -- that row named `logging.basicConfig` for
@@ -116,7 +119,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "wired into the nightly dispatch at",
-        ("scheduler_worker.py", 1891, "artifact_freshness_verdict()"),
+        ("scheduler_worker.py", 1927, "artifact_freshness_verdict()"),
     ),
     # A1's two entry points. This entry described a SHIPPED guardrail as an
     # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
@@ -127,7 +130,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "scheduled slate at",
-        ("scheduler_worker.py", 1232, "with write_lock() as acquired:"),
+        ("scheduler_worker.py", 1268, "with write_lock() as acquired:"),
     ),
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
@@ -364,6 +367,21 @@ README_ENV_VARS = (
     "PROPIQ_ESPN_HISTORY_CHUNK_DAYS",
     "PROPIQ_ESPN_HISTORY_HOUR_PT",
     "PROPIQ_ESPN_HISTORY_MINUTE_PT",
+    # The Basketball Reference fetch and the ESPN plays/stints jobs, added to
+    # the README on 2026-11-10 and to THIS list on 2026-11-11 -- a day in
+    # which they were documented but not validated, which is the exact gap
+    # `test_the_table_and_the_validated_set_are_the_same_set` exists to close.
+    "PROPIQ_BBREF_INGEST",
+    "PROPIQ_BBREF_TABLES",
+    "PROPIQ_BBREF_SEASONS",
+    "PROPIQ_BBREF_HOUR_PT",
+    "PROPIQ_BBREF_MINUTE_PT",
+    "PROPIQ_ESPN_PLAYS_BACKFILL",
+    "PROPIQ_ESPN_PLAYS_BACKFILL_HOUR_PT",
+    "PROPIQ_ESPN_PLAYS_BACKFILL_MINUTE_PT",
+    "PROPIQ_STINTS",
+    "PROPIQ_STINTS_HOUR_PT",
+    "PROPIQ_STINTS_MINUTE_PT",
     "PROPIQ_MAX_MARKET_LAG_DAYS",
     "PROPIQ_MAX_PANEL_LAG_DAYS",
     "LOG_LEVEL",
