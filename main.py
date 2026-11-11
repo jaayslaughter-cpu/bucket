@@ -106,7 +106,7 @@ MODEL_ARTIFACT_DEFAULT = Path("models/xgb_prop_over.json")
 #: line. Set this to "xgboost" to restore the previous behaviour.
 ENV_SCORING_COMPONENT = "PROPIQ_SCORING_COMPONENT"
 DEFAULT_SCORING_COMPONENT = "distribution"
-SCORING_COMPONENTS = ("distribution", "line_aware", "xgboost")
+SCORING_COMPONENTS = ("distribution", "line_aware", "minutes_aware", "xgboost")
 
 
 def scoring_component() -> str:

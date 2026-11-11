@@ -301,6 +301,39 @@ def _group_shift_roll(
     return df.groupby(group_keys, sort=False)[col].transform(_prior)
 
 
+def _prior_window_std(series: pd.Series, *, window: int, min_periods: int = 3) -> pd.Series:
+    """Prior-games rolling SD. Same ``.shift(1)`` as every mean above.
+
+    WHY A SPREAD AND NOT JUST A MEAN. Every rolling feature in this file is a
+    LOCATION estimate, and the serving model's variance was therefore a
+    function of its mean alone: two players projected for the same number got
+    the same uncertainty, however differently their minutes swing. A rotation
+    regular and a big whose minutes depend on matchup are not equally
+    predictable at the same projection, and on 2026-11-09 the board's most
+    confident rows were exactly the second kind -- 288 graded rows came back at
+    a 0.510 strike rate against a 0.702 mean stated probability.
+
+    ``min_periods=3`` because an SD from one or two prior games is noise
+    pretending to be a spread; fewer than three games leaves this NaN and the
+    consumer must then say so rather than substitute a number.
+
+    NOT THE SAME FACT AS ``MINUTES_STABLE`` OR ``MINUTES_TREND_RATIO``, which
+    `features.hot_hand` already produces, and the difference is the whole
+    point. Those measure LEVEL DRIFT -- whether MIN_L5 has moved away from
+    MIN_SEASON -- and a player can sit at a dead-stable level while swinging
+    12 and 35 minutes on alternate nights. That player is precisely the one
+    whose prop is unpredictable at a given projection, and a drift check calls
+    him stable. Do not consolidate the two.
+
+    `hot_hand` also has a rolling-SD helper of its own; it is not reused here
+    because it carries `min_periods=5` and a reindex built for the stat
+    z-score, and the minutes level and its spread should come off the same
+    window as each other (10 games, matching MIN_L10) rather than off the
+    window a different feature needed.
+    """
+    return series.shift(1).rolling(window, min_periods=min_periods).std(ddof=1)
+
+
 def attach_team_pace(df: pd.DataFrame) -> pd.DataFrame:
     """
     Estimate team pace from box scores, never from market totals.
@@ -540,6 +573,15 @@ def build_feature_matrix(
                 _prior_window_mean, window=window
             )
         df[f"{stat}_SEASON"] = by_season[stat].transform(_expanding_prior_mean)
+    # MINUTES SPREAD, FOR THE MINUTES-AWARE VARIANCE. Only MIN gets one: it is
+    # the quantity whose uncertainty the count models do not carry, because
+    # their dispersion is a function of the projected mean and nothing else.
+    # Rolled over the same 10-game window as MIN_L10 so the spread and the
+    # level describe the same games.
+    if "MIN" in present:
+        df["MIN_SD_L10"] = by_player["MIN"].transform(
+            _prior_window_std, window=10,
+        )
     if "PRA" in present:
         df = attach_pra_from_components(df, ("L5", "L10", "SEASON"))
 

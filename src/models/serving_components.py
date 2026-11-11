@@ -56,12 +56,22 @@ def _line_aware() -> Any:
     return LineAwarePropModel
 
 
+def _minutes_aware() -> Any:
+    from src.models.minutes_aware import MinutesAwarePropModel
+
+    return MinutesAwarePropModel
+
+
 #: component name -> a thunk returning its class. Imported lazily because
 #: `line_aware` pulls in the booster adapters, and the resolver is called on
 #: paths where that cost is pure waste.
 LINE_TAKING_COMPONENTS: dict[str, Any] = {
     "distribution": _distribution,
     "line_aware": _line_aware,
+    # `distribution`'s mean with the minutes variance added. Listed so it can
+    # be SHADOW-scored beside whatever serves; see its module docstring on why
+    # its phi is not interchangeable with `distribution`'s.
+    "minutes_aware": _minutes_aware,
 }
 
 

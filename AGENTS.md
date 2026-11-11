@@ -44,7 +44,7 @@ the first question about any change, not the last.
 
 - Every grouped rolling feature is `.shift(1)` within player-season. No
   exceptions, including the ones that look harmless.
-- `src/features/builder.py:778` `assert_no_lookahead()` runs over whatever the
+- `src/features/builder.py:820` `assert_no_lookahead()` runs over whatever the
   layers produced and is not optional.
 - Season grouping comes from `src/features/season.py`. A layer that needs a
   season key and has none derives it **privately** and drops it before
@@ -227,6 +227,24 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   shows, so while nothing is graded every one of them carries the gate's
   reason in place of its numbers — which is the correct output, not a
   failure.
+- **`minutes_aware` is a reallocation of variance, not a measured gain.**
+  `src/models/minutes_aware.py` takes `distribution`'s mean unchanged and adds
+  the minutes term its variance never carried — `Var(S) = Var(S|M) + mu^2 *
+  CV_M^2`, so `phi_eff = Var(S|M)/mu + mu * CV_M^2`. It exists because
+  `CountDispersion.variance_for` is a function of the projected mean and
+  nothing else, so a 34-minute starter and a big whose minutes swing 12 to 35
+  got identical uncertainty at the same projection. Two things are **not**
+  true of it. It has **never served and has no graded rows**: it is registered
+  so the nightly shadow scoring can measure it beside whatever serves, and
+  promoting it needs forward evidence like any other component. And it is a
+  REALLOCATION — a stable player gets a *narrower* distribution than
+  `distribution` gave him, a volatile one a wider — so it is not obviously
+  better in aggregate and nothing here says it is. Its `CV_M` is a
+  backward-looking ten-game spread that cannot see tonight's blowout, an
+  in-game injury or a rotation change, which makes it a floor on minutes
+  uncertainty rather than a measure of it. `src/models/minutes_model.py`
+  (CatBoost, P10/P50/P90) would give a forward-looking spread and still has
+  **no training entry and no artifact**, so it remains unwired.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

@@ -110,8 +110,27 @@ def test_the_serving_component_is_never_its_own_shadow(artifacts):
 
 
 def test_switching_what_serves_switches_what_shadows(artifacts, monkeypatch):
+    """
+    THE RULE, NOT A FIXED LIST. This asserted ``== ("distribution",)`` and so
+    failed the moment a third line-taking component was registered -- which is
+    the thing shadow scoring exists to support, not a regression. What must
+    hold is that every line-taking component EXCEPT the one serving is
+    shadowed, whatever the registry contains.
+    """
+    from src.models.serving_components import LINE_TAKING_COMPONENTS
+
     monkeypatch.setenv("PROPIQ_SCORING_COMPONENT", "line_aware")
-    assert propiq_main.shadow_components() == ("distribution",)
+    shadows = set(propiq_main.shadow_components())
+
+    assert "line_aware" not in shadows, "the serving component shadowed itself"
+    assert shadows == set(LINE_TAKING_COMPONENTS) - {"line_aware"}, (
+        f"shadows {sorted(shadows)} against registry "
+        f"{sorted(LINE_TAKING_COMPONENTS)}"
+    )
+    assert len(shadows) >= 2, (
+        "the registry no longer holds enough components for this test to "
+        "distinguish the rule from a hardcoded single entry"
+    )
 
 
 def test_it_can_be_turned_off(artifacts, monkeypatch):
