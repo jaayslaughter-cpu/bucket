@@ -2962,6 +2962,32 @@ def _withheld_board(tmp_path, slate):
     return board
 
 
+def _recommended_board(tmp_path, slate):
+    """The same board with the rows RECOMMENDED.
+
+    WHY THIS FIXTURE NOW EXISTS. The preview carries RECOMMENDED rows only,
+    so the all-ABSTAIN board above no longer puts anything on it -- which is a
+    real consequence of that change and is asserted in its own test below
+    rather than hidden by relaxing this one. A board with recommendations is
+    what the 2026-11-09 and 11-10 slates actually produced (257 and 312 of
+    them), so it is the state worth testing the card's content against.
+    """
+    import pandas as pd
+
+    board = tmp_path / "board_recommended.csv"
+    rows = [
+        {"slate_date": slate, "game_date": slate, "event_id": "espn:401",
+         "player_id": "espn:1", "player_name": "HARNESS JOKIC",
+         "target_market": "PTS", "side": side, "line": 27.5,
+         "prediction_mean": 29.1, "model_prob": 0.61, "book_ev": None,
+         "american_odds": None, "book_source": None,
+         "decision_status": "RECOMMENDED", "decision_basis": "model_lean"}
+        for side in ("under", "over")
+    ]
+    pd.DataFrame(rows).to_csv(board, index=False)
+    return board
+
+
 def test_the_preview_is_off_by_default_so_no_prop_reaches_the_card(
     monkeypatch, tmp_path
 ):
@@ -3001,6 +3027,48 @@ def test_the_preview_is_off_by_default_so_no_prop_reaches_the_card(
     )
 
 
+def test_a_board_with_only_abstentions_previews_nothing_and_says_why(
+    monkeypatch, tmp_path,
+):
+    """
+    THE COST OF SHOWING RECOMMENDED ROWS ONLY, asserted rather than left to be
+    discovered on a quiet slate.
+
+    The preview was BUILT for this state: its own docstring says it exists
+    because "with no model artifact every board row is ABSTAIN, so the
+    recommendation card names nobody and an operator has nowhere to look but
+    the CSV". Filtering to RECOMMENDED empties it in exactly that state. That
+    is what was asked for, and the card must then report its own state rather
+    than look broken -- so this pins the message, and anyone who wants the old
+    behaviour back can start from this test.
+    """
+    sent = {}
+
+    def fake_send(embeds, config=None, **kw):
+        sent["embeds"] = list(embeds)
+        return type("R", (), {"status": "OK"})()
+
+    slate = str(_frozen_pacific_day(monkeypatch))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+    monkeypatch.setenv(worker.ENV_DISPATCH, "true")
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
+    monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
+    monkeypatch.setenv(worker.ENV_RESEARCH_PREVIEW, "true")
+    monkeypatch.setenv(worker.ENV_DISPATCH_SLIPS, "false")
+
+    import src.notify.discord as discord_mod
+
+    monkeypatch.setattr(discord_mod, "send_embeds", fake_send)
+    worker.run_dispatch()
+    blob = str(sent["embeds"])
+
+    assert "No row was RECOMMENDED" in blob, blob[:300]
+    assert "reporting its own state" in blob
+    assert "HARNESS JOKIC" not in blob, (
+        "an ABSTAIN row reached the card through the dispatch path"
+    )
+
+
 def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path):
     """
     WITH THE FLAG ON, the props are visible AND the refusal still goes out.
@@ -3018,7 +3086,8 @@ def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path
     slate = str(_frozen_pacific_day(monkeypatch))
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
     monkeypatch.setenv(worker.ENV_DISPATCH, "true")
-    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_withheld_board(tmp_path, slate)))
+    # THE RECOMMENDED BOARD, because the card carries only those rows now.
+    monkeypatch.setenv(worker.ENV_BOARD_CSV, str(_recommended_board(tmp_path, slate)))
     monkeypatch.setenv(worker.ENV_CALIBRATION_REPORT, str(tmp_path / "absent.json"))
     monkeypatch.setenv(worker.ENV_RESEARCH_PREVIEW, "true")
     # See the note in the test above: the slips are their own section.
@@ -3057,5 +3126,14 @@ def test_the_preview_shows_the_props_without_claiming_them(monkeypatch, tmp_path
         "de-duplicating on (player, market) rather than picking the lean"
     )
     # NO FABRICATED NUMBER. There is no probability, so none may appear.
-    assert "ABSTAIN" in blob
+    # THE PER-ROW ABSTAIN IS GONE AND TWO GUARDS REMAIN, which is what this
+    # line now asserts. The card carries RECOMMENDED rows only, so a status
+    # printed on each one would repeat a constant; what stops a reader taking
+    # an uncalibrated lean for a recommendation is the heading saying so and
+    # the gate's own verdict sitting above the rows. Both are checked here.
+    assert "not recommendations" in blob, (
+        "the heading no longer disclaims what the rows are"
+    )
+    assert "withheld from publication" in blob
+    assert "RECOMMENDED prop(s)" in blob, blob[:200]
     assert "not recommendations" in blob.lower()

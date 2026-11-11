@@ -404,3 +404,80 @@ def test_a_zero_prefixed_game_id_survives_the_board_csv(dispatched, monkeypatch)
     ids = {str(r.event_id) for r in seen}
     assert "0022600320" in ids, f"the leading zeros were stripped: {sorted(ids)}"
     assert all(len(i) == 10 for i in ids), sorted(ids)
+
+
+# --- the card names people, not join keys --------------------------------
+
+
+def test_a_slip_leg_is_labelled_with_the_player_not_the_join_key():
+    """
+    `SlipLeg.leg_id` keys on game, player, market, side and line --
+    "0022601101:KCP:AST:over:0.5" -- and the embed printed it verbatim, so a
+    card going out nightly named a game id where it should name a person.
+    """
+    from src.quant.parlay_builder import admit_leg
+
+    leg = admit_leg({
+        "event_id": "0022600001", "player_id": "espn:1", "line": 0.5,
+        "player_name": "Andre Drummond", "target_market": "AST",
+        "side": "over", "model_prob": 0.9, "decision_status": "RECOMMENDED",
+    })
+    assert leg.display_name == "Andre Drummond AST"
+    assert "0022600001" not in leg.display_name
+    assert ":" not in leg.display_name
+    # The key is unchanged -- it is still what dedupes across slips.
+    assert "0022600001" in leg.leg_id
+
+    # AND THE EMBED MUST ACTUALLY USE IT. The first version of this test
+    # asserted only the property, so reverting the embed to `leg_id` changed
+    # nothing it could see and the mutation survived. The card is what goes
+    # out, so the card is what is asserted.
+    slip = build_slip(
+        board_rows(2), load_payout_catalog()["underdog:power:2"],
+        structure_key="underdog:power:2",
+    )
+    field_names = " ".join(
+        f["name"] for f in build_dfs_entry_embed(slip, publication=Verdict(True))["fields"]
+    )
+    assert "Player 0" in field_names, field_names
+    assert "002260032" not in field_names, (
+        f"the card printed a game id where it should name a person: {field_names}"
+    )
+
+
+def test_a_leg_with_no_player_name_falls_back_to_the_id_not_a_blank():
+    from src.quant.parlay_builder import admit_leg
+
+    leg = admit_leg({
+        "event_id": "0022600001", "player_id": "espn:1966", "line": 24.5,
+        "player_name": None, "target_market": "PTS",
+        "side": "over", "model_prob": 0.57, "decision_status": "RECOMMENDED",
+    })
+    assert leg.display_name == "espn:1966 PTS"
+
+
+def test_the_routed_entry_path_keeps_its_own_leg_id(catalog):
+    """
+    `dfs_entry.LegResolution` has no `display_name`, and for that path the
+    `leg_id` IS the caller's label. The fallback must not blank it.
+    """
+    import json
+
+    from src.quant.contracts import MarketContext
+    from src.quant.dfs_entry import PickemLeg, route_pickem_entry
+
+    legs = [
+        PickemLeg(
+            leg_id=f"caller-label-{i}",
+            market=MarketContext(
+                game_id=f"G{i}", market="PTS", player_name=f"Player {i}",
+                line=24.5, payout_multiplier=3.0, is_pickem=True,
+                status="VALID", source="operator",
+            ),
+            model_probability=0.57,
+        )
+        for i in range(2)
+    ]
+    entry = route_pickem_entry(catalog["underdog:power:2"], legs)
+    rendered = json.dumps(build_dfs_entry_embed(entry, publication=Verdict(True)))
+    assert "caller-label-0" in rendered

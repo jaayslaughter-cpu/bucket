@@ -22,7 +22,12 @@ from types import SimpleNamespace
 from src.notify.discord import build_research_preview_embed
 
 
-def _row(player, market, side, line, proj, status="ABSTAIN"):
+# RECOMMENDED BY DEFAULT, because the card now carries only those. The default
+# used to be ABSTAIN -- correct when the preview listed every row and printed
+# each status, and it would now silently empty every fixture below and make
+# their assertions vacuous rather than failing. The one test that cares about
+# the filter passes a status explicitly.
+def _row(player, market, side, line, proj, status="RECOMMENDED"):
     return SimpleNamespace(
         player_name=player,
         target_market=market,
@@ -83,7 +88,7 @@ def test_a_prop_with_no_posted_line_is_not_previewable(monkeypatch):
     )
     # THE COUNT IS OF WHAT IS PREVIEWABLE, not of what arrived. A headline
     # claiming 2 props above a card showing 1 is the same lie in miniature.
-    assert "1 prop(s) with a posted line" in body, (
+    assert "1 RECOMMENDED prop(s)" in body, (
         f"the headline counted rows it refused to show: {body[:200]!r}"
     )
 
@@ -151,7 +156,7 @@ def test_max_rows_caps_the_card_and_keeps_the_largest_leans():
 
     shown = [ln for ln in body.splitlines() if ln.startswith("`")]
     assert len(shown) == 5
-    assert "40 prop(s) with a posted line" in body, (
+    assert "40 RECOMMENDED prop(s)" in body, (
         "the cap must not change the count: PLAYER 00's lean is exactly 0.0, "
         "which is still a prop with a posted line, just the least interesting"
     )
@@ -164,7 +169,10 @@ def test_max_rows_caps_the_card_and_keeps_the_largest_leans():
 def _previewable(model_prob, *, player="A. Player", line=24.5, proj=27.0):
     return type("C", (), {
         "player_name": player, "target_market": "PTS", "side": "over",
-        "line": line, "prediction_mean": proj, "decision_status": "ABSTAIN",
+        # RECOMMENDED, for the reason given on `_row`'s default: the card
+        # carries only those now, and an ABSTAIN here would empty every
+        # probability test below into a vacuous pass.
+        "line": line, "prediction_mean": proj, "decision_status": "RECOMMENDED",
         "model_prob": model_prob,
     })()
 
@@ -236,3 +244,46 @@ def test_a_probability_outside_zero_to_one_is_not_counted():
         [_previewable(1.4)], slate_date="2026-11-09",
     )
     assert "none was computed" in embed["description"]
+
+
+# --- RECOMMENDED only ----------------------------------------------------
+
+
+def test_only_recommended_rows_reach_the_card():
+    """
+    The card used to list every row with a line and a projection and print its
+    status at the end, so an ABSTAIN sat beside a RECOMMENDED separated by one
+    word -- and ABSTAINs are the majority on most slates. A reader scanning
+    for something to act on had to filter by eye.
+    """
+    rows = [
+        _row("Keeper One", "PTS", "over", 10.5, 15.0),
+        _row("Dropped Two", "PTS", "over", 10.5, 99.0, status="ABSTAIN"),
+        _row("Dropped Three", "AST", "under", 6.5, 1.0, status="PENDING"),
+    ]
+    embed = build_research_preview_embed(rows, publication=_withheld())
+    body = embed["description"]
+
+    assert "Keeper One" in body
+    assert "Dropped Two" not in body, "an ABSTAIN reached the card"
+    assert "Dropped Three" not in body
+    # Dropped Two has by far the largest lean, so a filter applied AFTER the
+    # ordering and the max_rows cut would still have let it through.
+    assert "1 RECOMMENDED prop(s)" in body, body
+
+
+def test_the_per_row_status_is_gone_now_that_it_cannot_differ():
+    rows = [_row("Keeper One", "PTS", "over", 10.5, 15.0)]
+    body = build_research_preview_embed(rows, publication=_withheld())["description"]
+    assert "RECOMMENDED prop(s)" in body, "the count line lost the word"
+    assert "· RECOMMENDED" not in body, (
+        "the per-row suffix repeats a constant on every line"
+    )
+    assert "ABSTAIN" not in body
+
+
+def test_a_slate_with_only_abstentions_says_so_rather_than_looking_broken():
+    rows = [_row("Nobody", "PTS", "over", 10.5, 15.0, status="ABSTAIN")]
+    body = build_research_preview_embed(rows, publication=_withheld())["description"]
+    assert "No row was RECOMMENDED" in body
+    assert "reporting its own state" in body

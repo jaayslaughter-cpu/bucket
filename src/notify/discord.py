@@ -604,8 +604,14 @@ def build_dfs_entry_embed(
     fields: list[dict[str, Any]] = []
     for leg in legs:
         fields.append({
+            # `display_name` WHERE THE LEG HAS ONE, `leg_id` OTHERWISE.
+            # `parlay_builder.SlipLeg` keys itself by game, player, market,
+            # side and line -- a join key, not a label -- and printing it
+            # verbatim named a game id where the card should name a person.
+            # `dfs_entry.LegResolution` has no such property and keeps its
+            # `leg_id`, which for that path IS the caller's own label.
             "name": _clip(
-                f"{getattr(leg, 'leg_id', '?')} "
+                f"{getattr(leg, 'display_name', None) or getattr(leg, 'leg_id', '?')} "
                 f"{str(getattr(leg, 'side', '') or '').upper()} "
                 f"{getattr(leg, 'line', '—')}",
                 MAX_FIELD_NAME,
@@ -1028,6 +1034,19 @@ def build_research_preview_embed(
         # The leaning side only. A projection above the line leans over.
         if (lean > 0 and side != "over") or (lean < 0 and side != "under"):
             continue
+        # RECOMMENDED ONLY. The card used to list every row that had a line
+        # and a projection and print each one's status, so an ABSTAIN sat
+        # beside a RECOMMENDED with nothing but a word at the end of the line
+        # to separate them -- and the ABSTAINs are the majority on most
+        # slates. A reader scanning for something to act on had to filter by
+        # eye, which is the kind of work a card exists to have already done.
+        #
+        # IT DOES NOT WIDEN WHAT IS PUBLISHED: this only ever REMOVES rows,
+        # and the publication gate's verdict still sits on the card above
+        # them. A RECOMMENDED row is still the model's own lean with no price
+        # behind it, which is what the heading says.
+        if str(getattr(c, "decision_status", "") or "") != "RECOMMENDED":
+            continue
         key = (player, market)
         if key not in best or abs(lean) > abs(best[key][0]):
             best[key] = (lean, c)
@@ -1047,13 +1066,14 @@ def build_research_preview_embed(
     lines: list[str] = []
     for (player, market), (lean, c) in ordered[:max_rows]:
         side = str(getattr(c, "side", "") or "").upper()
-        status = str(getattr(c, "decision_status", "") or "?")
         line_v = getattr(c, "line", "?")
         proj_v = float(getattr(c, "prediction_mean", 0.0) or 0.0)
+        # The per-row status is gone with the ABSTAINs: every row here is
+        # RECOMMENDED now, so printing it on each one repeated a constant and
+        # left the reader checking a word that could no longer differ.
         lines.append(
             f"`{lean:+.1f}` **{player}** {market} {side} "
-            f"{line_v} — proj {proj_v:.1f} "
-            f"· {status}"
+            f"{line_v} — proj {proj_v:.1f}"
         )
 
     verdict_line = ""
@@ -1065,13 +1085,15 @@ def build_research_preview_embed(
 
     if not lines:
         body = (
-            f"No row carried both a line and a projection, so there is "
-            f"nothing to preview.{verdict_line}"
+            f"No row was RECOMMENDED with both a line and a projection, so "
+            f"there is nothing to preview. On a slate with no model artifact "
+            f"every row abstains, which is this card reporting its own state "
+            f"rather than a slate with nothing in it.{verdict_line}"
         )
     else:
         body = (
             f"**RESEARCH PREVIEW — not recommendations.** "
-            f"{len(best)} prop(s) with a posted line, ordered by model lean "
+            f"{len(best)} RECOMMENDED prop(s), ordered by model lean "
             f"(projection − line). A lean is not an edge and not an EV: it "
             f"says the model disagrees with the line, not that the "
             f"disagreement is worth anything. {_probability_note(priced)}"

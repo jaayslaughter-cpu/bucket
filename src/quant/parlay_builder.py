@@ -144,6 +144,18 @@ class SlipLeg:
     probability: float
 
     @property
+    def display_name(self) -> str:
+        """What a reader needs on the card: the player and the market.
+
+        `leg_id` is a join key -- "0022601101:KCP:AST:over:0.5" -- and the
+        embed printed it verbatim, so a Discord card named a game id where it
+        should have named a person. The key still identifies the leg; this is
+        what is shown.
+        """
+        who = self.player_name or self.player_id
+        return f"{who} {self.market}".strip()
+
+    @property
     def probability_source(self) -> ProbabilitySource:
         """MODEL, always, and recorded PER LEG rather than only per entry.
 

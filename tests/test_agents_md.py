@@ -37,7 +37,7 @@ CITATIONS = [
     ("src/utils/timezones.py", 12, 'STORAGE_TZ_NAME = "UTC"'),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate"),
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
-    ("src/quant/parlay_builder.py", 426, "if outcome.event_id in games:"),
+    ("src/quant/parlay_builder.py", 438, "if outcome.event_id in games:"),
 ]
 
 
