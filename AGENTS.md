@@ -245,6 +245,22 @@ Kept here on purpose, so nobody reads an ambition as a fact.
   uncertainty rather than a measure of it. `src/models/minutes_model.py`
   (CatBoost, P10/P50/P90) would give a forward-looking spread and still has
   **no training entry and no artifact**, so it remains unwired.
+- **The self-check watches outputs, not exceptions, and it is new.**
+  `notify_failure` alerted only when a job RAISED, and every defect found in
+  the week to 2026-11-11 was the other class — a job returning `status: OK`
+  while doing nothing, found by a person reading Railway logs by hand.
+  `src/pipeline/self_check.py` runs five invariants inside the 04:00 job and
+  routes any break to `notify_failure` as one `self_check` alert: a slate was
+  recorded recently, the recorded volume has not collapsed, every component
+  answered, aged slates are graded, and the records are chained. It has a
+  third status, `CANNOT_TELL`, and uses it rather than reporting a green OK on
+  no evidence. **It has never fired in production** — it ships tonight, and
+  what it catches is five named classes, not every way this pipeline can go
+  quiet. Two limits are known: it cannot see a SMALL stranded set (24 of 312
+  on 2026-11-09 was 7.7%, under the 25% bar, and voided rows are legitimately
+  ungraded, so no threshold separates them without a PENDING count the caller
+  does not read), and `run_dispatch` still does not alert on purpose, because
+  alerting about a broken webhook through that webhook is a loop with no exit.
 - **No model is profitable.** None has been shown profitable, and none may be
   described that way. Forward, leakage-safe, settled results are the only
   evidence that would count, and there are not enough of them yet.

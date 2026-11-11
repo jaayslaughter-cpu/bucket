@@ -2106,6 +2106,49 @@ def _slip_embeds(
     return out
 
 
+def _run_self_check(
+    records: list[Any], graded_rows: list[Any],
+) -> dict[str, Any]:
+    """Run the pipeline invariants and alert on any that broke.
+
+    ONE ALERT FOR THE SWEEP, NOT ONE PER CHECK. `notify_failure` dedupes by
+    stage per day, so five separate stages would send five messages the first
+    night and then none of them again; one `self_check` stage carries every
+    broken invariant in its body and re-sends tomorrow if any still is.
+
+    NEVER RAISES. A monitor that takes the report down with it is worse than
+    no monitor, and this one runs inside the section that produces the night's
+    residuals.
+    """
+    try:
+        from src.pipeline.self_check import run_all, summarise
+        from src.utils.timezones import pacific_calendar_date
+
+        results = run_all(
+            records,
+            [r.get("game_date") for r in graded_rows],
+            as_of=pacific_calendar_date(),
+        )
+        summary = summarise(results)
+        for r in results:
+            logger.info("Self-check [%s] %s: %s", r.status, r.name, r.reason)
+        if summary["alerting"]:
+            notify_failure(
+                "self_check",
+                f"{len(summary['alerting'])} pipeline invariant(s) broken: "
+                + " | ".join(summary["reasons"]),
+            )
+        else:
+            logger.info(
+                "Self-check: %d check(s), %s. Nothing alerting.",
+                summary["checks"], summary["by_status"],
+            )
+        return summary
+    except Exception as exc:  # noqa: BLE001 — the monitor must not kill the job
+        logger.exception("Self-check could not run")
+        return {"status": "FAILED", "error": str(exc)}
+
+
 def _attach_advisory_units(rows: list[Any]) -> None:
     """
     Set ``advisory_units`` on each board row, or leave it None.
@@ -3590,7 +3633,16 @@ def run_training() -> dict[str, Any]:
             return {"status": "SKIPPED",
                     "reason": "another process holds the slate write lock",
                     "markets": markets}
-        return _run_training_locked(markets)
+        # ALERTS NOW -- see the note in `run_loss_analysis`. A training job
+        # that dies leaves yesterday's artifacts serving, which the freshness
+        # gate will eventually withhold on; being told at 07:00 is better than
+        # inferring it from a withheld board two days later.
+        try:
+            return _run_training_locked(markets)
+        except Exception as exc:  # noqa: BLE001 — report it, do not swallow it
+            logger.exception("The 07:00 PT training run raised.")
+            notify_failure("training", f"The 07:00 PT training run raised: {exc}")
+            return {"status": "FAILED", "error": str(exc), "markets": markets}
 
 
 def _run_training_locked(markets: list[str]) -> dict[str, Any]:
@@ -3784,7 +3836,18 @@ def run_loss_analysis() -> dict[str, Any]:
             )
             return {"status": "SKIPPED",
                     "reason": "another process holds the slate write lock"}
-        return _run_loss_analysis_locked()
+        # ALERTS NOW. This job and `run_training` were the two that did not:
+        # an exception propagated into APScheduler, which logs it and moves
+        # on, and in Railway's log view every Python line is already red
+        # (logging writes to stderr), so a real failure was indistinguishable
+        # from an INFO line by eye. The 04:00 job is also where the
+        # self-check lives, so losing it silently costs the monitor too.
+        try:
+            return _run_loss_analysis_locked()
+        except Exception as exc:  # noqa: BLE001 — report it, do not swallow it
+            logger.exception("The 04:00 PT loss analysis raised.")
+            notify_failure("loss_analysis", f"The 04:00 PT loss analysis raised: {exc}")
+            return {"status": "FAILED", "error": str(exc)}
 
 
 def _run_loss_analysis_locked() -> dict[str, Any]:
@@ -3873,6 +3936,17 @@ def _run_loss_analysis_locked() -> dict[str, Any]:
         )
         for finding in report["component_comparison"].get("findings", []):
             logger.info("Component comparison: %s", finding)
+
+        # THE SELF-CHECK, ON THE RECORDS THIS SECTION ALREADY READ. A separate
+        # job would re-read them and would need its own schedule, its own lock
+        # and its own failure mode, for no gain: `records` and `rows` here ARE
+        # the pipeline's outputs, which is what the invariants are about.
+        #
+        # `notify_failure` only ever fired on a RAISED exception, and every
+        # defect found in the week to 2026-11-11 was a job returning OK while
+        # doing nothing. See `pipeline.self_check` for the list. This is what
+        # watches for that class.
+        report["self_check"] = _run_self_check(records, rows)
     except Exception as exc:  # noqa: BLE001 — a section, not the report
         logger.warning(
             "Loss analysis: component comparison unavailable (%s). The "
@@ -3912,6 +3986,14 @@ def _run_loss_analysis_locked() -> dict[str, Any]:
         # a row can be graded and still join no recorded probability.
         "components_compared": sorted(comparison.get("components") or []),
         "paired_rows": comparison.get("paired_rows", 0),
+        # WHAT THE SWEEP FOUND, ON THE RETURN AND NOT ONLY IN THE REPORT FILE.
+        # The file lives on a volume an operator has to go and read; this dict
+        # is what the scheduler logs and what a caller can assert on. A
+        # monitor whose verdict reaches neither is the defect it exists for.
+        "self_check": (report.get("self_check") or {}).get(
+            "by_status", {"status": "not run"}
+        ),
+        "self_check_alerting": (report.get("self_check") or {}).get("alerting", []),
     }
 
 
