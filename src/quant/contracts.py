@@ -118,11 +118,46 @@ class PropMarketSnapshot:
         )
 
 
+#: The largest magnitude this project will accept as an American price.
+#:
+#: WHY A BOUND EXISTS AT ALL. On 2026-11-11 the 09:00 PT slate exited 1 with
+#: `(psycopg.errors.NumericValueOutOfRange) integer out of range` on the
+#: INSERT into `projections`, whose only INTEGER columns are
+#: `odds_over_american` and `odds_under_american`. A price arrived from the
+#: provider larger than a 32-bit integer, passed every check between the API
+#: and the database, and took the whole night's board with it: no projections
+#: written, no card sent, nothing scored.
+#:
+#: AND IT WOULD HAVE BEEN WORSE IF THE COLUMN HAD BEEN WIDER. This function
+#: refused 0 and nothing else, so odds of 3,000,000,000 return an implied
+#: probability of 3.3e-8 -- a number that de-vigs without complaint and reads
+#: as a near-certainty on the other side. The database error was the only
+#: thing that stopped an absurd price becoming an absurd probability.
+#:
+#: +100000 is 1000-to-1. Nothing a sportsbook posts on an NBA player prop
+#: comes near it, so the bound is generous by design: it separates "a price"
+#: from "not a price at all", and is not a view about which prices are good.
+AMERICAN_ODDS_LIMIT: int = 100_000
+
+
 def american_to_implied_probability(odds: int) -> float:
-    """Implied probability of a single American price, vig included."""
+    """
+    Implied probability of a single American price, vig included.
+
+    Raises for 0 and for anything beyond ``AMERICAN_ODDS_LIMIT``: both are
+    statements that the input is not a price, and returning a number for
+    either would propagate a fiction the caller cannot detect.
+    """
     odds = int(odds)
     if odds == 0:
         raise ValueError("American odds of 0 are not a price")
+    if abs(odds) > AMERICAN_ODDS_LIMIT:
+        raise ValueError(
+            f"American odds of {odds} are beyond the "
+            f"{AMERICAN_ODDS_LIMIT} this project accepts as a price. A value "
+            f"this large is a malformed field, not a long shot, and de-vigging "
+            f"it would return a probability near zero that reads as real."
+        )
     if odds > 0:
         return 100.0 / (odds + 100.0)
     return -odds / (-odds + 100.0)

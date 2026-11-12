@@ -1964,6 +1964,7 @@ def _attach_prop_line_prices(
     over: list[Any] = []
     under: list[Any] = []
     source: list[Any] = []
+    rejected: list[Any] = []
     for key in zip(projections["PLAYER_NAME"], projections["MARKET"]):
         row = lookup.get(key) or {}
         if not row or bool(row.get("is_pickem")):
@@ -1971,9 +1972,34 @@ def _attach_prop_line_prices(
             under.append(None)
             source.append(None)
             continue
-        over.append(_int_or_none_american(row.get("over_odds_american")))
-        under.append(_int_or_none_american(row.get("under_odds_american")))
+        raw_over = row.get("over_odds_american")
+        raw_under = row.get("under_odds_american")
+        clean_over = _int_or_none_american(raw_over)
+        clean_under = _int_or_none_american(raw_under)
+        # NAMED AND DROPPED, NEVER SILENTLY IGNORED. A price refused for being
+        # implausible looks exactly like a row the book never priced, and the
+        # two want different responses: one is normal, the other means the
+        # provider sent something that is not a price. Collected here and
+        # reported once below with samples, rather than logged per row.
+        for raw, clean in ((raw_over, clean_over), (raw_under, clean_under)):
+            if clean is None and raw not in (None, "") and str(raw) != "0":
+                rejected.append(raw)
+        over.append(clean_over)
+        under.append(clean_under)
         source.append(_text_or_none(row.get("source")))
+
+    if rejected:
+        from src.quant.contracts import AMERICAN_ODDS_LIMIT
+
+        logger.error(
+            "%d POSTED PRICE(S) WERE REFUSED AS IMPLAUSIBLE, magnitude over "
+            "%d: %s. These rows lose their price and are reported below as "
+            "unpriced. A value this size is a malformed provider field, not a "
+            "long shot -- and until 2026-11-11 one of them failed the entire "
+            "slate on the INSERT into `projections`, because that column is a "
+            "32-bit INTEGER.",
+            len(rejected), AMERICAN_ODDS_LIMIT, sorted({str(r) for r in rejected})[:5],
+        )
 
     priced = sum(1 for o, u in zip(over, under) if o is not None and u is not None)
     logger.info(
@@ -1990,10 +2016,31 @@ def _attach_prop_line_prices(
 
 
 def _int_or_none_american(value: Any) -> int | None:
-    """American odds as an int, or None. 0 is not a price."""
+    """
+    American odds as an int, or None. 0 is not a price, and nor is 3e9.
+
+    THE SINGLE GATE BETWEEN THE PROVIDER'S JSON AND AN INTEGER COLUMN.
+    `ODDS_OVER` and `ODDS_UNDER` are set only from here, and they land in
+    `projections.odds_over_american`, which is a Postgres INTEGER. On
+    2026-11-11 a price larger than a 32-bit integer came through this
+    function unchallenged, Postgres rejected the whole multi-row INSERT, and
+    the 09:00 PT slate exited 1: no board, no card, nothing scored for the
+    night, over one malformed field.
+
+    `OverflowError` is caught as well as TypeError/ValueError, because
+    `int(float("inf"))` raises that and nothing else here would.
+
+    A rejected value returns None, which is what an unpriced row already
+    looks like -- the caller counts those and says how many. One bad price
+    costs that row its price, not the slate.
+    """
+    from src.quant.contracts import AMERICAN_ODDS_LIMIT
+
     try:
         number = int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if abs(number) > AMERICAN_ODDS_LIMIT:
         return None
     return number or None
 
