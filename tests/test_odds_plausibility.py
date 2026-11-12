@@ -229,3 +229,74 @@ def test_an_unpriced_row_is_not_reported_as_a_refusal(caplog) -> None:
 
     assert pd.isna(out["ODDS_OVER"].iloc[0])
     assert "REFUSED AS IMPLAUSIBLE" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# ONE implementation. Added 2026-11-12, after the first fix moved the outage
+# instead of closing it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_recorder_refuses_an_implausible_price_too() -> None:
+    """
+    THE HOLE THE FIRST FIX LEFT, and it was the same outage one step later.
+
+    `settlement.recorder` reads `posted.get("over_odds_american")` -- the
+    board row straight from the provider, NOT the projections frame that
+    `main._int_or_none_american` guards. Its `_int_or_none` was
+    `int(_finite(value))`: finite, so 3e9 passed, and `prop_results.odds` is
+    an int4 column. The slate would have survived and the RECORDING would
+    have failed, which is the step that makes a prediction exist at all.
+    """
+    from src.settlement.recorder import _int_or_none
+
+    assert _int_or_none(BEYOND_INT4) is None
+    assert _int_or_none(-BEYOND_INT4) is None
+    assert _int_or_none(BEYOND_LIMIT_WITHIN_INT4) is None
+    # And it still reads a real price.
+    assert _int_or_none(-110) == -110
+    assert _int_or_none("250") == 250
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-110, "250", 0, None, "", "nonsense", BEYOND_INT4, -BEYOND_INT4,
+     BEYOND_LIMIT_WITHIN_INT4, float("inf"), float("-inf"), float("nan"),
+     AMERICAN_ODDS_LIMIT, -AMERICAN_ODDS_LIMIT],
+)
+def test_every_writer_of_an_odds_column_agrees_on_what_a_price_is(value) -> None:
+    """
+    N READERS OF ONE FACT, REMOVED RATHER THAN DOCUMENTED.
+
+    Three places decide whether a value may enter an integer odds column:
+    `contracts.plausible_american_odds`, `main._int_or_none_american` and
+    `recorder._int_or_none`. The first fix put the rule inline in the second
+    and left the third with none, which is how the gap existed at all.
+
+    The last two now delegate. This asserts they cannot drift: any
+    disagreement here means someone re-derived the rule.
+    """
+    import main
+    from src.quant.contracts import plausible_american_odds
+    from src.settlement.recorder import _int_or_none
+
+    expected = plausible_american_odds(value)
+    assert main._int_or_none_american(value) == expected, (
+        f"main disagrees with contracts on {value!r}"
+    )
+    assert _int_or_none(value) == expected, (
+        f"the recorder disagrees with contracts on {value!r}"
+    )
+
+
+def test_a_non_finite_price_is_refused_without_raising() -> None:
+    """
+    `int(float("inf"))` raises OverflowError, `int(float("nan"))` ValueError.
+
+    Both are caught, because a price matcher that propagates an exception
+    costs the slate exactly what a crash on the INSERT did.
+    """
+    from src.quant.contracts import plausible_american_odds
+
+    for value in (float("inf"), float("-inf"), float("nan")):
+        assert plausible_american_odds(value) is None

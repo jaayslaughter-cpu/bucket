@@ -2034,15 +2034,9 @@ def _int_or_none_american(value: Any) -> int | None:
     looks like -- the caller counts those and says how many. One bad price
     costs that row its price, not the slate.
     """
-    from src.quant.contracts import AMERICAN_ODDS_LIMIT
+    from src.quant.contracts import plausible_american_odds
 
-    try:
-        number = int(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if abs(number) > AMERICAN_ODDS_LIMIT:
-        return None
-    return number or None
+    return plausible_american_odds(value)
 
 
 def _text_or_none(value: Any) -> str | None:

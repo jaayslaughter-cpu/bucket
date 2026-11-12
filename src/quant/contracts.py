@@ -140,6 +140,49 @@ class PropMarketSnapshot:
 AMERICAN_ODDS_LIMIT: int = 100_000
 
 
+def plausible_american_odds(value: Any) -> int | None:
+    """
+    Coerce anything to an American price, or to None. THE ONLY IMPLEMENTATION.
+
+    WHY IT LIVES HERE AND NOT AT EACH WRITER. On 2026-11-11 a price larger
+    than a 32-bit integer failed the slate's INSERT into `projections`. The
+    first fix put a magnitude check inline in `main._int_or_none_american`,
+    which guarded that one column and created a SECOND reader of the rule --
+    and the recorder's own `_int_or_none` still had none. So the same bad
+    price would have passed the slate and failed the INSERT into
+    `prop_results.odds` instead: the same outage, one step later.
+
+    Every writer of an American price into an integer column calls this.
+    Three things make a value "not a price", and they are all here:
+
+      * unparseable, or non-finite -- `int(float("inf"))` raises
+        OverflowError, which a `(TypeError, ValueError)` handler misses;
+      * zero, which this module has always refused;
+      * beyond ``AMERICAN_ODDS_LIMIT``, which is a malformed field rather
+        than a long shot.
+
+    Returns None rather than raising, because a row losing its price is a
+    state every caller already handles, and one bad field must not cost a
+    slate.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    # `int()` IS THE FINITENESS CHECK, and an explicit `math.isfinite` above
+    # it was dead weight: `int(float("inf"))` raises OverflowError and
+    # `int(float("nan"))` raises ValueError, both caught here. A mutation
+    # deleting the isfinite guard changed no behaviour any test could see,
+    # which is how redundant logic announces itself.
+    try:
+        odds = int(number)
+    except (OverflowError, ValueError):
+        return None
+    if odds == 0 or abs(odds) > AMERICAN_ODDS_LIMIT:
+        return None
+    return odds
+
+
 def american_to_implied_probability(odds: int) -> float:
     """
     Implied probability of a single American price, vig included.

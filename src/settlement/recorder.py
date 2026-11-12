@@ -121,8 +121,23 @@ def _text(value: Any) -> str | None:
 
 
 def _int_or_none(value: Any) -> int | None:
-    number = _finite(value)
-    return int(number) if number is not None else None
+    """
+    An American price for `prop_results.odds`, or None.
+
+    DELEGATES, AND THAT IS THE POINT. This read is
+    `posted.get("over_odds_american")` -- the board row straight from the
+    provider, NOT the projections frame. So the bound added to
+    `main._int_or_none_american` on 2026-11-12 did not cover it: a price
+    beyond a 32-bit integer would have passed the slate and failed the
+    INSERT into `prop_results`, which is the step that records a prediction
+    at all. Same outage as 2026-11-11, one step later.
+
+    `contracts.plausible_american_odds` is the one implementation of what
+    counts as a price. Re-deriving it here is what produced the gap.
+    """
+    from src.quant.contracts import plausible_american_odds
+
+    return plausible_american_odds(value)
 
 
 def _line_lookup(
