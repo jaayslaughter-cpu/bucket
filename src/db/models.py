@@ -215,6 +215,16 @@ class PlayerGameLog(Base):
     # defaulted 0 is a division by zero rather than a convenience.
     fga: Mapped[int | None] = mapped_column(Integer)
     fta: Mapped[int | None] = mapped_column(Integer)
+    # Migration 011, and the migration 009 said to write: made shots and the
+    # rebound split, read by `features/box_rates.py` for EFG_PCT, FT_PCT,
+    # FG3A_RATE and OREB_SHARE. The ESPN ingest has fetched all five every
+    # night since the panel moved to that source; `scraper_panel.COLUMN_MAP`
+    # dropped them because this table had nowhere to put them.
+    fgm: Mapped[int | None] = mapped_column(Integer)
+    fg3a: Mapped[int | None] = mapped_column(Integer)
+    ftm: Mapped[int | None] = mapped_column(Integer)
+    oreb: Mapped[int | None] = mapped_column(Integer)
+    dreb: Mapped[int | None] = mapped_column(Integer)
     stl: Mapped[int | None] = mapped_column(Integer)
     blk: Mapped[int | None] = mapped_column(Integer)
     tov: Mapped[int | None] = mapped_column(Integer)

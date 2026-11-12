@@ -80,9 +80,15 @@ SOURCE_PRECEDENCE: tuple[str, ...] = (
 DEFAULT_SEASON_TYPES: tuple[str, ...] = ("Regular Season",)
 
 #: The scraper's canonical name -> the panel contract's name. Deliberately
-#: NOT every column it writes: `plus_minus`, `game_score`, `oreb`/`dreb`,
-#: `fgm`/`ftm` and `fg3a` have no column in `player_game_logs`, and inventing
-#: one here would be a schema change disguised as an import.
+#: NOT every column it writes: `plus_minus` and `game_score` have no column in
+#: `player_game_logs`, and inventing one here would be a schema change
+#: disguised as an import.
+#:
+#: `oreb`/`dreb`, `fgm`/`ftm` and `fg3a` WERE in that list until 2026-11-12,
+#: and the reason given was exactly right: the table had nowhere to put them.
+#: Migration 011 gave them somewhere, with `features/box_rates.py` as the
+#: reader, so they are mapped now. The schema change came first and this
+#: followed it, which is the order that comment was protecting.
 COLUMN_MAP: dict[str, str] = {
     "game_id": "GAME_ID",
     "player_id_nba": "PLAYER_ID",
@@ -97,6 +103,11 @@ COLUMN_MAP: dict[str, str] = {
     "fg3m": "FG3M",
     "fga": "FGA",
     "fta": "FTA",
+    "fgm": "FGM",
+    "fg3a": "FG3A",
+    "ftm": "FTM",
+    "oreb": "OREB",
+    "dreb": "DREB",
     "stl": "STL",
     "blk": "BLK",
     "tov": "TOV",

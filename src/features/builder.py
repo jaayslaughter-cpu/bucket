@@ -235,6 +235,15 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
         # creates, so their position in this list is not load-bearing.
         ("src.features.fouls", "attach_foul_features_layer", "fouls"),
         ("src.features.dvp", "attach_dvp_features_layer", "dvp"),
+        # box_rates is the reader migration 011 exists for -- eFG%, FT%, 3PAr
+        # and the offensive-rebound split, each as a shifted prior window. It
+        # sits with fouls and dvp because it is in the same category: NOT in
+        # the feature contract, emitted so `scripts/feature_ab.py` can measure
+        # whether any of it earns a place. Self-contained like they are: it
+        # reads only box-score columns and depends on no earlier layer, so its
+        # position here is not load-bearing. It abstains whole when migration
+        # 011's columns are absent, which is every panel written before it.
+        ("src.features.box_rates", "attach_box_rate_features", "box_rates"),
         # minutes_weighted LAST, because of the three unwired layers here its
         # columns are the closest to ones the contract already carries and so
         # the likeliest to be mistaken for shipped features: |r| 0.976-0.992

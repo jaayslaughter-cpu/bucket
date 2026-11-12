@@ -451,6 +451,16 @@ def upsert_player_game_logs(df: pd.DataFrame) -> int:
         # on every row. `.get` so a panel without them still writes.
         "fga": pd.to_numeric(df.get("FGA"), errors="coerce"),
         "fta": pd.to_numeric(df.get("FTA"), errors="coerce"),
+        # Migration 011. `.get` for the same reason as everything above: a
+        # panel built before this migration simply has no such column, and a
+        # null is the honest record of a source that did not report it. Never
+        # 0 -- FT% would read a zero as a missed free throw rather than an
+        # unknown one, and OREB_SHARE divides by (OREB + DREB).
+        "fgm": pd.to_numeric(df.get("FGM"), errors="coerce"),
+        "fg3a": pd.to_numeric(df.get("FG3A"), errors="coerce"),
+        "ftm": pd.to_numeric(df.get("FTM"), errors="coerce"),
+        "oreb": pd.to_numeric(df.get("OREB"), errors="coerce"),
+        "dreb": pd.to_numeric(df.get("DREB"), errors="coerce"),
         # The position the player STARTED at, when the caller has one. The
         # league game log does not carry it, so on the live path this is
         # normally absent here and filled later by
@@ -1003,6 +1013,14 @@ def load_player_panel(slate_date: str | None = None, lookback_days: int = 400) -
             "REB": r.reb,
             "AST": r.ast,
             "FG3M": r.fg3m,
+            # Migration 011. Present here because a column the panel does not
+            # carry is a column the feature builder cannot read, however well
+            # it is stored -- the lesson `FGA`/`FTA` taught below.
+            "FGM": r.fgm,
+            "FG3A": r.fg3a,
+            "FTM": r.ftm,
+            "OREB": r.oreb,
+            "DREB": r.dreb,
             "STL": r.stl,
             "BLK": r.blk,
             "TOV": r.tov,
