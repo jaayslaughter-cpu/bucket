@@ -1286,8 +1286,15 @@ def test_a_real_sized_artifact_reports_itself_and_raises_no_alarm(
     assert info["train_row_count"] == 214_381
     assert info["market"] == "PTS"
     assert info["feature_count"] == 3
-    # One artifact scores one market, and the log says which.
-    assert "fit for PTS only" in caplog.text
+    # The boot line names the artifact's market AND states the limit of what
+    # it knows. It used to say "fit for PTS only; every other market abstains
+    # this run", which stopped being true when `score_prob_over_by_market`
+    # landed and was later read as current evidence. See
+    # tests/test_market_coverage.py for the guard on that claim.
+    assert "fit for PTS" in caplog.text
+    assert "does NOT say which" in caplog.text, (
+        "the boot line no longer disclaims knowing what the slate will score"
+    )
     assert "ERROR" not in caplog.text.upper().replace("ERRORS", "")
 
 

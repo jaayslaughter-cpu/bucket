@@ -50,7 +50,34 @@ logger = logging.getLogger(__name__)
 #: continues. Carried over from `train-stats`, where it was found.
 CATEGORICAL_EXTRAS = ("TEAM_ABBREVIATION", "OPPONENT_ABBREVIATION", "SEASON")
 
+#: The markets this module can FIT. Three, not four.
 MARKETS = ("PTS", "REB", "AST")
+
+#: WHAT THE SLATE ASKS FOR THAT THIS MODULE CANNOT SUPPLY, named rather than
+#: discovered nightly.
+#:
+#: `main.DEFAULT_STATS` is ("PTS", "REB", "AST", "FG3M") -- the markets the
+#: slate loops over -- and `MARKETS` above is what training can produce. The
+#: difference is FG3M, so every slate since 2026-11-07 has logged
+#:
+#:     No artifact for ['FG3M'], so those rows carry no probability
+#:
+#: and skipped those rows. That is correct behaviour on an absent artifact,
+#: but it was a nightly surprise rather than a recorded decision: two lists
+#: of markets in two modules, disagreeing, with nothing stating that the
+#: disagreement was intended or what would close it.
+#:
+#: `tests/test_market_coverage.py` pins the difference to exactly this tuple,
+#: in both directions. So adding a fifth market to `DEFAULT_STATS`, or
+#: teaching this module to fit FG3M, fails a test and forces the decision to
+#: be made rather than absorbed.
+#:
+#: FG3M IS NOT MERELY UNTRAINED, it is unmodelled: a three-point make is a
+#: low-count, high-variance integer whose over/under at a 1.5 or 2.5 line is
+#: dominated by attempt volume rather than by the scoring rate the PTS model
+#: fits. Supplying it means a model, a feature set and a holdout under
+#: `scripts/feature_ab.py`, not a line in this tuple.
+MARKETS_WITHOUT_A_MODEL = ("FG3M",)
 
 
 class TrainingDataError(RuntimeError):

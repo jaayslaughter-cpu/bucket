@@ -84,14 +84,14 @@ ANCHORS = [
     # `__main__` guard to above it -- the fix for the NameError that crashed
     # deploy eee9dbe9. The findings never moved; the file did, four times in
     # one day.
-    ("scheduler_worker.py", 4417, "job_defaults"),
-    ("scheduler_worker.py", 4418, "max_instances"),
+    ("scheduler_worker.py", 4431, "job_defaults"),
+    ("scheduler_worker.py", 4432, "max_instances"),
     # A2, built 2026-10-11. The audit says where the refusal lives; these keep
     # that true. A staleness gate that the doc points at the wrong line for is
     # the same defect as a staleness gate nobody wired in.
     ("src/models/artifact_freshness.py", 177, "def artifact_freshness("),
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
-    ("scheduler_worker.py", 1928, "artifact_freshness_verdict()"),
+    ("scheduler_worker.py", 1942, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
     ("src/db/repository.py", 769, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
@@ -125,12 +125,12 @@ ANCHORS = [
     #
     # Anchored now so the next refactor fails a test instead of quietly
     # turning three audits into prose with no evidence behind it.
-    ("scheduler_worker.py", 4415, "scheduler = BlockingScheduler("),
+    ("scheduler_worker.py", 4429, "scheduler = BlockingScheduler("),
     ("scheduler_worker.py", 802, "def board_markets("),
-    ("scheduler_worker.py", 4619, "configure_logging()"),
-    ("scheduler_worker.py", 1639, "os.environ.get(ENV_MIN_EV)"),
-    ("scheduler_worker.py", 1705, "min_ev=min_ev,"),
-    ("scheduler_worker.py", 1700, "build_board_from_projections("),
+    ("scheduler_worker.py", 4633, "configure_logging()"),
+    ("scheduler_worker.py", 1653, "os.environ.get(ENV_MIN_EV)"),
+    ("scheduler_worker.py", 1719, "min_ev=min_ev,"),
+    ("scheduler_worker.py", 1714, "build_board_from_projections("),
 ]
 
 #: AUDIT PROSE BOUND TO AN ANCHORED LINE, which `test_every_cited_line_exists`
@@ -146,7 +146,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "wired into the nightly dispatch at",
-        ("scheduler_worker.py", 1928, "artifact_freshness_verdict()"),
+        ("scheduler_worker.py", 1942, "artifact_freshness_verdict()"),
     ),
     # A1's two entry points. This entry described a SHIPPED guardrail as an
     # open gap from 2026-10-11 to 2026-11-03 -- the lock landed the same day
@@ -157,7 +157,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "scheduled slate at",
-        ("scheduler_worker.py", 1269, "with write_lock() as acquired:"),
+        ("scheduler_worker.py", 1283, "with write_lock() as acquired:"),
     ),
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",

@@ -1216,14 +1216,28 @@ def check_model_artifact() -> dict[str, Any]:
         info["feature_schema_version"], info["saved_at_utc"],
     )
 
-    # ONE MARKET PER ARTIFACT. score_prob_over takes a single model_path, so
-    # whichever market this was fit for is the only one that can carry a
-    # probability this run. Said here because the resolver's glob picks the
-    # NEWEST artifact, which is not necessarily the market anyone intended.
+    # WHAT THIS LINE MAY AND MAY NOT CLAIM. This function is a BOOT
+    # DIAGNOSTIC: it resolves ONE artifact, through the single-artifact
+    # resolver, to report that the volume carries something scoreable. The
+    # SLATE does not score that way -- `main.score_prob_over_by_market` loops
+    # `DEFAULT_STATS` and resolves `xgboost_{MARKET}.json` per market, so
+    # several markets carry probabilities on the same run.
+    #
+    # THIS LINE USED TO SAY "every other market abstains this run", which was
+    # written before that loop existed and became false when it landed. On
+    # 2026-11-12 it was read as current and reported to the operator as a
+    # finding -- that only one market scored per night, chosen by file mtime.
+    # The live logs refute it: every slate since 2026-11-07 scored PTS, REB
+    # and AST and logged "No artifact for ['FG3M']" alone. A log line that
+    # overstates its own scope is worse than no line, because it is evidence,
+    # and this one cost a wrong diagnosis.
     if info["market"]:
         logger.info(
-            "This artifact is fit for %s only; every other market abstains this "
-            "run, and the recorder skips a row with no probability.",
+            "Boot check resolved one artifact, fit for %s. This says the "
+            "volume carries a scoreable artifact; it does NOT say which "
+            "markets tonight's slate will score -- that resolves one "
+            "artifact per market at run time, and the slate logs the markets "
+            "it could not find.",
             info["market"],
         )
 

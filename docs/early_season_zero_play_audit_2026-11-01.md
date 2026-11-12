@@ -89,7 +89,7 @@ The real thresholds, and their actual values:
 
 | Threshold | Tested at | Default | Overridable? | **Live value (2026-11-03)** | Effect |
 |---|---|---|---|---|---|
-| `min_ev` | `decision_board.py:448` | 0.0 (`slate_board.py:248`) | yes — `PROPIQ_MIN_EV`, parsed at `scheduler_worker.py:1639` | **0.0** — the override is unset | any EV strictly above zero recommends |
+| `min_ev` | `decision_board.py:448` | 0.0 (`slate_board.py:248`) | yes — `PROPIQ_MIN_EV`, parsed at `scheduler_worker.py:1653` | **0.0** — the override is unset | any EV strictly above zero recommends |
 | `min_lean` | `decision_board.py:471` | 0.0 (`slate_board.py:249`) | no — `run_board` never passes it | **0.0** | any lean above zero recommends — **P(side) > 0.500**, over or under |
 
 Two corrections to the first version of this table, both from review on #32.
@@ -98,7 +98,7 @@ Two corrections to the first version of this table, both from review on #32.
 `decision_board.py:124` is that module's own default, reached only by a caller
 that does not override it. `build_board_from_projections` declares
 `min_lean: float = 0.0` (`slate_board.py:249`) and `run_board` passes only
-`min_ev` (`scheduler_worker.py:1700-1706`), so the scheduled board takes the
+`min_ev` (`scheduler_worker.py:1714-1720`), so the scheduled board takes the
 0.0. Nothing in the environment can raise it; closing it needs a code change.
 
 **`min_ev` is 0.0 LIVE, and this took two corrections to get right.** The
@@ -107,7 +107,7 @@ of a function signature; review on #32 pointed out that it is read from the
 environment —
 
 ```python
-min_ev = float(os.environ.get(ENV_MIN_EV) or 0.0)   # scheduler_worker.py:1639
+min_ev = float(os.environ.get(ENV_MIN_EV) or 0.0)   # scheduler_worker.py:1653
 ```
 
 — so the second version downgraded it to "the default, and I have not read the
