@@ -17,7 +17,7 @@ the original named six docs and a module that do not exist here. See
 |---|---|
 | No wager is ever placed, and no code path can place one | `src/quant/advisory_sizing.py:114` writes `"AUTO_PLACED": False` into every size it returns |
 | Bet sizes are advisory metadata, never bound to an execution script | same; `recommended_units` is read-only output |
-| No EV, CLV or stake unless the market is real | `src/quant/contracts.py:187` — `context.status != "VALID"` returns a verdict with a reason and no number |
+| No EV, CLV or stake unless the market is real | `src/quant/contracts.py:222` — `context.status != "VALID"` returns a verdict with a reason and no number |
 | Pick'em multipliers are not valid two-way EV | `src/quant/dfs_payouts.py`, `src/quant/dfs_entry.py` — a payout multiple is a payout multiple; a one-sided benchmark is refused outright |
 | A slip never carries two legs from one game | `src/quant/parlay_builder.py:438` — the exact Poisson-binomial the slip is priced with assumes independence, and no NBA teammate correlation has ever been estimated here from settled data, so the constraint is what makes the pricing correct rather than a preference |
 | No card is published on an uncalibrated model | `src/quant/publication_gate.py:160` `calibration_gate()`; absent, sparse, undated or future-dated evidence all withhold |
