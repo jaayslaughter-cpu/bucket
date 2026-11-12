@@ -24,7 +24,7 @@ TEXT = AGENTS.read_text(encoding="utf-8")
 #: file when AGENTS.md was written; this is what keeps it honest as code moves.
 CITATIONS = [
     ("src/quant/advisory_sizing.py", 114, '"AUTO_PLACED": False'),
-    ("src/quant/contracts.py", 222, 'context.status != "VALID"'),
+    ("src/quant/contracts.py", 265, 'context.status != "VALID"'),
     ("src/quant/publication_gate.py", 160, "def calibration_gate"),
     ("src/features/builder.py", 820, "def assert_no_lookahead"),
     ("src/features/builder.py", 133, "from src.models.compare import load_comparison_config"),
