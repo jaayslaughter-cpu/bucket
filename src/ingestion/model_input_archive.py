@@ -254,6 +254,33 @@ class InputArchive:
             raise InputError("only report PDF blobs may be archived")
         return str(self._put(self.root / "reports", pdf, ".pdf").relative_to(self.root))
 
+    def all_snapshots(self, kind) -> list[dict]:
+        """Every archived snapshot of ``kind``, checksum-verified, unfiltered.
+
+        ONE READER of the archive's on-disk layout: ``as_of`` selects from
+        this rather than globbing again, so the checksum check cannot come to
+        exist in one path and not the other.
+
+        NO TIME FILTER, SO MIND WHAT THIS IS USED FOR. Anything derived from
+        it that feeds a prediction must apply its own cutoff --
+        ``as_of`` is that, and it is what absences go through. The legitimate
+        unfiltered use is REFERENCE data, where the fact being read is not
+        about any game: a club's abbreviation does not leak, because knowing
+        "Chicago Bulls" is CHI from a report published next week says nothing
+        about tonight's result. Outcome-adjacent rows are a different matter
+        and do not belong here.
+        """
+        folder = self.root / "snapshots" / kind
+        if kind not in {"availability", "odds"}:
+            raise InputError("unknown snapshot kind")
+        snapshots: list[dict] = []
+        for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+            content = path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != path.stem:
+                raise InputError("archive checksum mismatch")
+            snapshots.append(json.loads(content))
+        return snapshots
+
     def as_of(self, kind, cutoff, *, mode="system", max_age_hours=6) -> list[dict]:
         """System mode requires publication AND actual local collection <= cutoff.
 
@@ -267,11 +294,7 @@ class InputArchive:
             raise InputError("max age must be positive")
         cutoff = timestamp(cutoff)
         candidates: dict[str, list[dict]] = defaultdict(list)
-        for path in sorted((self.root / "snapshots" / kind).glob("*.json")):
-            content = path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != path.stem:
-                raise InputError("archive checksum mismatch")
-            snapshot = json.loads(content)
+        for snapshot in self.all_snapshots(kind):
             published = timestamp(snapshot["observed_at_utc"])
             collected = timestamp(snapshot["collected_at_utc"])
             if published > cutoff or (mode == "system" and collected > cutoff):

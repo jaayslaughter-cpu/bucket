@@ -364,3 +364,80 @@ def test_the_bridge_never_changes_the_panels_row_count() -> None:
         panel, result.inactives, covered_team_games=result.covered_team_games
     )
     assert len(out) == len(panel)
+
+
+# ---------------------------------------------------------------------------
+# IDENTITY ACCUMULATES; ABSENCES DO NOT
+# ---------------------------------------------------------------------------
+
+
+def test_identity_resolves_across_reports_that_one_report_cannot() -> None:
+    """
+    THE DIFFERENCE BETWEEN THIS WORKING AND ABSTAINING FOREVER.
+
+    `team_identity` separates two clubs by seeing them against DIFFERENT
+    opponents. A single report cannot tell GSW from SAS when they play only
+    each other, so a bridge that infers the map from one report leaves those
+    clubs unresolved -- and since the as-of window is six hours and `as_of`
+    selects the latest full report, inferring from the window means inferring
+    from exactly one. Every run would start over and most clubs would never
+    resolve.
+
+    Across two nights the constraint closes: Golden State seen in GSW@SAS and
+    then GSW@LAL can only be GSW.
+    """
+    one_night = [report_row("GSW@SAS", "Golden State Warriors", "A", "OUT")]
+    assert infer_team_abbreviations(one_night).abbreviation(
+        "Golden State Warriors"
+    ) is None
+
+    two_nights = one_night + [
+        report_row("GSW@LAL", "Golden State Warriors", "A", "OUT", date="2026-11-15"),
+    ]
+    assert infer_team_abbreviations(two_nights).abbreviation(
+        "Golden State Warriors"
+    ) == "GSW"
+
+
+def test_the_archive_reader_verifies_checksums_and_filters_nothing() -> None:
+    """
+    `all_snapshots` is the unfiltered reference read, and it must still refuse
+    a corrupted file -- the integrity check cannot exist in `as_of` and not
+    here, which is why `as_of` now selects from this.
+    """
+    import json as _json
+
+    from src.ingestion.model_input_archive import InputArchive, InputError
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = InputArchive(tmp)
+        archive.write(
+            kind="availability", source="official",
+            source_url="https://example.test/r.pdf",
+            observed_at="2026-11-13T01:15:00+00:00",
+            collected_at="2026-11-13T01:20:00+00:00",
+            status="OK",
+            rows=[report_row("CLE@MIA", "Cleveland Cavaliers", "A", "OUT")],
+        )
+        assert len(archive.all_snapshots("availability")) == 1
+
+        # Corrupt it: the content no longer hashes to its own filename.
+        import pathlib
+        target = next((pathlib.Path(tmp) / "snapshots" / "availability").glob("*.json"))
+        payload = _json.loads(target.read_text())
+        payload["status"] = "FAILED"
+        target.write_text(_json.dumps(payload))
+        with pytest.raises(InputError, match="checksum"):
+            archive.all_snapshots("availability")
+
+
+def test_an_unknown_snapshot_kind_is_refused() -> None:
+    import tempfile
+
+    from src.ingestion.model_input_archive import InputArchive, InputError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(InputError, match="unknown snapshot kind"):
+            InputArchive(tmp).all_snapshots("not_a_kind")
