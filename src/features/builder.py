@@ -251,6 +251,18 @@ def _additive_feature_layers() -> list[tuple[str, object]]:
         # excluded for. They are built so feature_ab can measure them under test; see the
         # module docstring for the numbers and labels.py for the comparison.
         ("src.features.minutes_weighted", "attach_minutes_weighted_features", "minutes_weighted"),
+        # return_ramp is the return-from-absence count and flag. It sits with
+        # box_rates, fouls, dvp and minutes_weighted for the same reason: NOT
+        # in the feature contract, emitted so `scripts/feature_ab.py` can
+        # measure whether it earns a place.
+        #
+        # Self-contained, so its position here is not load-bearing: it reads
+        # PLAYER_ID, TEAM_ABBREVIATION, GAME_ID, GAME_DATE and MIN, all of
+        # which are panel columns, and depends on no earlier layer. It does
+        # NOT read the absence layers -- it derives the absence from the gap
+        # in a player's appearances against his team's schedule, because this
+        # panel holds only players who appeared.
+        ("src.features.return_ramp", "attach_return_ramp_features", "return_ramp"),
     ):
         if _module_has(module_path, func_name):
             module = __import__(module_path, fromlist=[func_name])
