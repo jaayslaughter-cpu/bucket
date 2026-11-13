@@ -292,3 +292,109 @@ def test_the_layer_emits_exactly_what_it_advertises() -> None:
     for column in EMITTED:
         assert column in out.columns
     assert out["RET_STATUS"].iloc[0] == "OK"
+
+
+# ---------------------------------------------------------------------------
+# REAL-WORLD DATA SHAPES -- added 2026-11-13, after probing the layer with
+# malformed input rather than the clean panels above.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_rows_for_one_game_never_produce_a_negative_count() -> None:
+    """
+    THE DEFECT NINETEEN PASSING TESTS DID NOT SEE.
+
+    Every test above supplies one row per appearance, which is what a healthy
+    panel holds. A panel that carries a DUPLICATE (player, team, game) row --
+    a data defect, but a reachable one -- made the first version of this layer
+    difference a team-game number against ITSELF: 0 - 1 = -1, emitted as
+    RET_GAMES_MISSED = -1.0.
+
+    A negative count of games missed is meaningless, it did not crash, and it
+    would have travelled into the A/B feature matrix looking like a number.
+    That is the same shape as the outage earlier in this project's week: a
+    fault invisible to tests built on clean input and visible only against a
+    real-world shape.
+    """
+    rows = [
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g0",
+         "GAME_DATE": "2026-11-01", "MIN": 30.0},
+        # The duplicate.
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g0",
+         "GAME_DATE": "2026-11-01", "MIN": 30.0},
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g1",
+         "GAME_DATE": "2026-11-02", "MIN": 30.0},
+    ]
+    out = attach_return_ramp_features(pd.DataFrame(rows))
+
+    counts = out["RET_GAMES_MISSED"].dropna()
+    assert (counts >= 0).all(), (
+        f"a negative games-missed reached the output: {counts.tolist()}"
+    )
+    # Both duplicate rows describe the same game, so both must carry the same
+    # value -- one right answer and one nonsense answer is not a fix.
+    duplicated = out[out["GAME_ID"] == "g0"]["RET_GAMES_MISSED"]
+    assert duplicated.isna().all(), duplicated.tolist()
+    # And the following game still reads as played-the-last-one.
+    assert float(out[out["GAME_ID"] == "g1"]["RET_GAMES_MISSED"].iloc[0]) == 0.0
+
+
+def test_a_duplicated_game_counts_once_in_the_baseline_window() -> None:
+    """
+    A duplicate must not be allowed to weight one night twice. With a 40-minute
+    game duplicated and four 10-minute games after it, a window that counted
+    the duplicate twice would pull the mean above the honest figure.
+    """
+    rows = [
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g0",
+         "GAME_DATE": "2026-11-01", "MIN": 40.0},
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g0",
+         "GAME_DATE": "2026-11-01", "MIN": 40.0},
+    ] + [
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": f"g{g}",
+         "GAME_DATE": f"2026-11-{g + 1:02d}", "MIN": 10.0}
+        for g in range(1, 5)
+    ]
+    out = attach_return_ramp_features(pd.DataFrame(rows))
+    # Last row's window: g0(40), g1(10), g2(10), g3(10) -> 17.5.
+    # Counting g0 twice would give (40+40+10+10+10)/5 = 22.0.
+    assert float(out["RET_BASELINE_MIN_L5"].iloc[-1]) == pytest.approx(17.5)
+
+
+def test_a_missing_team_or_game_id_degrades_rather_than_crashing() -> None:
+    """A null join key must not take the slate down; it costs its own row."""
+    rows = [
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": None, "GAME_ID": "g0",
+         "GAME_DATE": "2026-11-01", "MIN": 30.0},
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": None,
+         "GAME_DATE": "2026-11-02", "MIN": 30.0},
+        {"PLAYER_ID": 1, "TEAM_ABBREVIATION": "LAL", "GAME_ID": "g2",
+         "GAME_DATE": "2026-11-03", "MIN": 30.0},
+    ]
+    out = attach_return_ramp_features(pd.DataFrame(rows))
+    assert len(out) == 3
+    assert out["RET_STATUS"].iloc[0] == "OK"
+
+
+def test_an_empty_panel_passes_through_without_raising() -> None:
+    """A slate with no rows is a real state; it must not be an exception."""
+    empty = pd.DataFrame(columns=["PLAYER_ID", "TEAM_ABBREVIATION", "GAME_ID",
+                                  "GAME_DATE", "MIN"])
+    out = attach_return_ramp_features(empty)
+    assert len(out) == 0
+    for column in EMITTED:
+        assert column in out.columns
+
+
+def test_the_row_count_is_never_changed_by_this_layer() -> None:
+    """
+    A feature layer that merges must not duplicate or drop rows. The gap is
+    computed on a deduplicated frame and merged back `many_to_one`, so a
+    regression that broke that validation would multiply panel rows -- and a
+    silently longer panel is a very expensive defect downstream.
+    """
+    frame = panel({"A": [0, 1, 4], "B": list(range(6))})
+    assert len(attach_return_ramp_features(frame)) == len(frame)
+    # And with duplicates present.
+    doubled = pd.concat([frame, frame.head(2)], ignore_index=True)
+    assert len(attach_return_ramp_features(doubled)) == len(doubled)

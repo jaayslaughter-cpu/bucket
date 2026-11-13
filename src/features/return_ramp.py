@@ -155,38 +155,86 @@ def attach_return_ramp_features(df: pd.DataFrame) -> pd.DataFrame:
         on=["team", "game"], how="left", validate="many_to_one",
     )
 
-    # His own appearances for this team, in schedule order. The gap is the
-    # difference in team-game number, less one.
-    work = work.sort_values(["player", "team", "team_game_no"], kind="mergesort")
-    grouped = work.groupby(["player", "team"], sort=False)["team_game_no"]
-    previous = grouped.shift(1)
-    missed = work["team_game_no"] - previous - 1.0
+    # ONE ROW PER APPEARANCE, and the gap computed on THAT, not on the panel
+    # rows.
+    #
+    # THE BUG THIS EXISTS TO PREVENT, found by probing the layer with
+    # real-world data shapes rather than the clean synthetic panels the tests
+    # were built from. When a player has DUPLICATE (player, team, game) rows --
+    # a data defect, but one this panel can carry -- computing the gap directly
+    # over panel rows differences a team-game number against ITSELF. The
+    # subtraction then yields 0 - 1 = -1, and the layer emitted
+    # RET_GAMES_MISSED = -1.0: a negative count of games missed, which is
+    # meaningless, does not crash, and would have travelled into the A/B
+    # feature matrix as a plausible-looking number. Nineteen passing tests did
+    # not see it, because every one of them supplied one row per appearance.
+    #
+    # Deduplicating first makes the arithmetic correct AND gives both duplicate
+    # rows the same honest value, rather than one right answer and one
+    # nonsense one. `min` is averaged across duplicates: they are meant to be
+    # the same game, so if they disagree the mean is the least-committal
+    # reading, and the alternative (taking whichever sorted first) would make
+    # the baseline depend on row order.
+    appearances = (
+        work.loc[:, ["player", "team", "team_game_no", "min"]]
+        .groupby(["player", "team", "team_game_no"], sort=False, as_index=False)
+        .agg(min=("min", "mean"))
+        .sort_values(["player", "team", "team_game_no"], kind="mergesort")
+    )
 
+    previous = appearances.groupby(["player", "team"], sort=False)["team_game_no"].shift(1)
+    missed = appearances["team_game_no"] - previous - 1.0
     first_for_team = previous.isna()
-    work["RET_GAMES_MISSED"] = missed.where(~first_for_team, np.nan)
-    work["RET_FIRST_APPEARANCE_FOR_TEAM"] = first_for_team.astype(float)
-    work["RET_IS_RETURNING"] = np.where(
-        first_for_team, np.nan,
-        (work["RET_GAMES_MISSED"] >= RETURNING_THRESHOLD).astype(float),
+
+    # Negative is impossible now: team_game_no strictly increases within a
+    # player's distinct appearances for one team.
+    #
+    # SO THIS BRANCH IS UNREACHABLE, and that is stated rather than implied.
+    # Deleting it leaves all 24 tests passing -- it was mutation-tested and
+    # confirmed dead -- so it is NOT a guard any test covers. It stays as a
+    # runtime net on a path that runs on every slate: if a future change
+    # reintroduces a duplicate into this frame, NaN ("cannot tell") is the
+    # right output and -1 is not. A reader should not mistake it for a
+    # behaviour under test.
+    if (missed.dropna() < 0).any():
+        logger.warning(
+            "return_ramp computed %d negative games-missed values; emitting "
+            "NaN for them rather than a meaningless count",
+            int((missed.dropna() < 0).sum()),
+        )
+        missed = missed.where(missed >= 0, np.nan)
+
+    appearances["RET_GAMES_MISSED"] = missed.where(~first_for_team, np.nan)
+    appearances["RET_FIRST_APPEARANCE_FOR_TEAM"] = first_for_team.astype(float)
+    appearances["RET_IS_RETURNING"] = np.where(
+        first_for_team | appearances["RET_GAMES_MISSED"].isna(), np.nan,
+        (appearances["RET_GAMES_MISSED"] >= RETURNING_THRESHOLD).astype(float),
     )
 
     # SHIFTED, per CLAUDE.md rule 1, and shifted INSIDE the group.
     #
-    # THE BUG THIS SPELLING EXISTS TO PREVENT, which the first version of this
-    # line had. `groupby(...)["min"].shift(1).rolling(W).mean()` groups only
-    # the shift: `.rolling` then runs down the whole Series and its window
+    # THE OTHER BUG THIS SPELLING EXISTS TO PREVENT, which the first version of
+    # this line had. `groupby(...)["min"].shift(1).rolling(W).mean()` groups
+    # only the shift: `.rolling` then runs down the whole Series and its window
     # crosses from one player into the next. On the smoke sample that gave the
     # second player a 30.0 baseline on his FIRST appearance, borrowed from the
     # previous player's rows, where the honest answer is NaN. `transform` with
     # both steps in the callable keeps the window inside the group.
-    work["RET_BASELINE_MIN_L5"] = (
-        work.groupby(["player", "team"], sort=False)["min"]
+    #
+    # Computed on appearances, so a duplicated game counts once in the window
+    # instead of twice.
+    appearances["RET_BASELINE_MIN_L5"] = (
+        appearances.groupby(["player", "team"], sort=False)["min"]
         .transform(
             lambda s: s.shift(1).rolling(BASELINE_WINDOW, min_periods=1).mean()
         )
         .to_numpy()
     )
 
+    work = work.merge(
+        appearances.loc[:, ["player", "team", "team_game_no", *EMITTED]],
+        on=["player", "team", "team_game_no"], how="left", validate="many_to_one",
+    )
     restored = work.sort_values("_idx", kind="mergesort")
     for column in EMITTED:
         out[column] = restored[column].to_numpy()
