@@ -4605,6 +4605,10 @@ def build_scheduler(scheduler: Any | None = None) -> Any:
         misfire_grace_time=SETTLE_MISFIRE_GRACE_SECONDS,
         replace_existing=True,
     )
+    # Opt-in research capture, independent of serving and the inactive cache.
+    from src.ingestion.model_input_collection import register_model_input_job
+
+    register_model_input_job(scheduler)
     return scheduler
 
 

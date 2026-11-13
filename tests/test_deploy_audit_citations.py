@@ -127,7 +127,7 @@ ANCHORS = [
     # turning three audits into prose with no evidence behind it.
     ("scheduler_worker.py", 4429, "scheduler = BlockingScheduler("),
     ("scheduler_worker.py", 802, "def board_markets("),
-    ("scheduler_worker.py", 4633, "configure_logging()"),
+    ("scheduler_worker.py", 4637, "configure_logging()"),
     ("scheduler_worker.py", 1653, "os.environ.get(ENV_MIN_EV)"),
     ("scheduler_worker.py", 1719, "min_ev=min_ev,"),
     ("scheduler_worker.py", 1714, "build_board_from_projections("),

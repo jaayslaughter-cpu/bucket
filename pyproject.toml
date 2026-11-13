@@ -70,6 +70,9 @@ edge = [
 # The deployed worker. Kept out of the base install so a local checkout that
 # only runs the CLI does not pull a scheduler it never starts.
 deploy = [
+    # Already used by the official-report parser; required in the worker image,
+    # not just the local dev extra.
+    "pdfplumber>=0.11,<1",
     # <4 IS THE IMPORTANT ONE. APScheduler 4 is a rewrite: `BlockingScheduler`
     # moves, the trigger API changes, and `scheduler_worker.build_scheduler`
     # would fail at import — on a redeploy, with the previous image gone.
