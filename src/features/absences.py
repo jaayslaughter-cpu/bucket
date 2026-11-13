@@ -100,8 +100,18 @@ def load_availability_absences(panel: pd.DataFrame):
         logger.info("absences: availability fallback unavailable (%s)", exc)
         return None
 
-    root = Path(resolve_state_root()) / "model_inputs"
+    # `resolve_state_root` returns (path, how) -- the second element is the
+    # point of it, and `Path(resolve_state_root())` raises TypeError on a
+    # tuple. That was this function's first spelling, and because the whole
+    # path is behind a default-off toggle it would have raised the moment
+    # someone enabled it rather than when it was written.
+    state_root, how = resolve_state_root()
+    root = Path(state_root) / "model_inputs"
     if not (root / "snapshots" / "availability").exists():
+        logger.debug(
+            "absences: no availability archive under %s (state root chosen by %s)",
+            root, how,
+        )
         return None
     archive = InputArchive(root)
     try:

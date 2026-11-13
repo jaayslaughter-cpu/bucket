@@ -441,3 +441,43 @@ def test_an_unknown_snapshot_kind_is_refused() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         with pytest.raises(InputError, match="unknown snapshot kind"):
             InputArchive(tmp).all_snapshots("not_a_kind")
+
+
+def test_the_loader_itself_runs_and_abstains_without_an_archive(monkeypatch) -> None:
+    """
+    THE BUG THIS EXISTS TO PREVENT, which 30 passing tests did not see.
+
+    Every test above calls `availability_absences` directly. The function the
+    feature layer actually calls is
+    `absences.load_availability_absences`, and its first spelling was
+    `Path(resolve_state_root()) / "model_inputs"` -- but
+    `resolve_state_root` returns `(path, how)`, so that raises TypeError on a
+    tuple. The whole path sits behind a default-off toggle, so it would have
+    raised on the day someone enabled it, not on the day it was written. This
+    drives the real entry point.
+    """
+    from src.features import absences as absences_module
+
+    panel = pd.DataFrame([panel_row("1", "CLE", "MIA", False, "p1", "A")])
+    assert absences_module.load_availability_absences(panel) is None
+
+
+def test_the_layer_abstains_cleanly_with_the_toggle_on_and_no_archive(
+    monkeypatch, tmp_path,
+) -> None:
+    """
+    Enabling the fallback on a deployment whose archive is empty -- which is
+    every deployment until the collection job has run -- must abstain by name,
+    not raise into the feature build.
+    """
+    from src.features import absences as absences_module
+
+    monkeypatch.setenv(absences_module.ENV_AVAILABILITY_FALLBACK, "1")
+    monkeypatch.setenv("PROPIQ_STATE_DIR", str(tmp_path))
+    panel = pd.DataFrame([panel_row("1", "CLE", "MIA", False, "p1", "A")])
+    out = absences_module.attach_absence_features_layer(
+        panel, cache_root=tmp_path / "no-cache"
+    )
+    assert out["BBS_INACTIVE_SOURCE"].iloc[0] == "DATA_NOT_AVAILABLE"
+    assert out["BBS_TEAMMATES_OUT"].isna().all()
+    assert len(out) == len(panel)
