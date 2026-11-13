@@ -2026,10 +2026,19 @@ def _attach_prop_line_prices(
         priced, len(projections),
         sum(1 for o, u in zip(over, under) if o is None or u is None),
     )
-    return pd.DataFrame(
+    priced_frame = pd.DataFrame(
         {"ODDS_OVER": over, "ODDS_UNDER": under, "LINE_SOURCE": source},
         index=projections.index,
     )
+    # THE REFUSALS AS DATA, NOT ONLY AS A LOG LINE. A caller -- and a test --
+    # cannot read a logger, and a test that tries depends on whatever handler
+    # state the rest of the suite left behind: the first version of
+    # `test_an_unpriced_side_is_not_logged_as_an_implausible_price` passed
+    # alone and failed in the full suite for exactly that reason, while the
+    # message was being emitted correctly the whole time. The same `.attrs`
+    # carriage `score_prob_over_by_market` uses for `artifact`.
+    priced_frame.attrs["refused_prices"] = sorted({str(r) for r in rejected})
+    return priced_frame
 
 
 def _int_or_none_american(value: Any) -> int | None:

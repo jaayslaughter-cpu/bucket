@@ -264,25 +264,17 @@ def test_an_unpriced_side_is_not_logged_as_an_implausible_price() -> None:
     IMPLAUSIBLE price. On 2026-11-12's board that would have been 212 of 444
     rows. The test was right about the rule and wrong about the value.
     """
-    import io
-    import logging
-
     import main
 
-    # NOT caplog. `configure_logging` leaves `propiq.main` non-propagating, so
-    # caplog captures nothing from it and the first version of this test
-    # asserted against an empty string -- which would have passed any claim
-    # about absence. A handler on the logger itself sees what is logged
-    # regardless of propagation. The same trap makes
-    # `test_a_real_sized_artifact_reports_itself_and_raises_no_alarm` pass
-    # only when earlier tests in its file have run.
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    logger = logging.getLogger("propiq.main")
-    previous_handlers, previous_level = logger.handlers, logger.level
-    logger.handlers = [handler]
-    logger.setLevel(logging.ERROR)
-
+    # ASSERTED ON DATA, NOT ON A LOG LINE. Two earlier versions of this test
+    # chased the logger and both were wrong about their own subject: `caplog`
+    # captures nothing from the non-propagating `propiq.main`, so the first
+    # asserted against an empty string and would have "passed" any claim
+    # about absence; the second attached its own handler and still saw
+    # nothing in the full suite, because another test had left the handler
+    # state changed -- while the message was being emitted correctly all
+    # along. `_attach_prop_line_prices` now carries the refusals on the
+    # returned frame's `.attrs`, which no other test can perturb.
     projections = pd.DataFrame({
         "PLAYER_NAME": ["A B", "C D", "E F"], "MARKET": ["PTS"] * 3,
     })
@@ -296,18 +288,17 @@ def test_an_unpriced_side_is_not_logged_as_an_implausible_price() -> None:
         "source": ["book"] * 3,
     })
 
-    try:
-        main._attach_prop_line_prices(projections, lines)
-    finally:
-        logger.handlers, logger.level = previous_handlers, previous_level
-    text = stream.getvalue()
+    out = main._attach_prop_line_prices(projections, lines)
+    refused = out.attrs["refused_prices"]
 
-    assert text, "nothing was logged, so this test asserts nothing"
-    assert "REFUSED AS IMPLAUSIBLE" in text
-    assert "1 POSTED PRICE" in text, (
-        f"the unpriced row was counted as a refusal: {text}"
+    assert len(refused) == 1, (
+        f"expected only the implausible price to be refused, got {refused} -- "
+        f"an unpriced side is an ABSENT price, not a malformed one"
     )
-    assert "nan" not in text.lower(), (
-        f"a NaN was named as an implausible price; it is an absent one: {text}"
+    assert "3000000000" in refused[0], refused
+    assert not any("nan" in r.lower() for r in refused), (
+        f"a NaN was named as an implausible price: {refused}"
     )
-    assert "3000000000" in text
+    # And the row still loses its price, which is the behaviour either way.
+    assert pd.isna(out["ODDS_OVER"].iloc[1])
+    assert pd.isna(out["ODDS_OVER"].iloc[2])
