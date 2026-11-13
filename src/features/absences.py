@@ -42,6 +42,91 @@ CACHE_GLOB_DIR = Path("data/external/inactive_players")
 # when no explicit root is passed.
 ENV_CACHE_DIR = "PROPIQ_INACTIVE_CACHE_DIR"
 
+# THE AVAILABILITY FALLBACK, and why it is OFF by default.
+#
+# `src/ingestion/availability_bridge.py` can turn archived official pregame
+# availability reports into exactly the frame this layer feeds
+# `attach_absence_features`, with (game, team) coverage so a club that did not
+# file reads pd.NA rather than 0. That closes the gap where the archive filled
+# up nightly while every BBS_ column stayed null.
+#
+# It is nonetheless default OFF, and the reason is TRAIN/SERVE SKEW rather
+# than any doubt about the bridge. The scoring artifacts on the volume were
+# fit on a panel whose BBS_TEAMMATES_OUT and BBS_VACATED_USAGE were null on
+# every row, because nothing had ever written them. Switching the fallback on
+# would start handing a live slate real counts for a column the model only
+# ever saw as missing -- a distribution it was never fitted against, at
+# serving time, with no measurement. Per AGENTS.md that is an A/B question:
+# enable it, rebuild the panel, refit, and let `scripts/feature_ab.py` say
+# whether it earns its place.
+#
+# So the switch exists, the path is tested, and turning it on is a deliberate
+# act with a retrain behind it.
+ENV_AVAILABILITY_FALLBACK = "PROPIQ_AVAILABILITY_ABSENCES"
+
+#: How far back a report may have been published and still describe the slate
+#: being built. Mirrors the archive's own default.
+AVAILABILITY_MAX_AGE_HOURS = 6.0
+
+
+def _availability_fallback_enabled() -> bool:
+    raw = (os.environ.get(ENV_AVAILABILITY_FALLBACK) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def load_availability_absences(panel: pd.DataFrame):
+    """Absences and their coverage from the archived availability reports.
+
+    Returns ``(inactives, covered_team_games)`` or ``None`` when the archive
+    holds nothing usable. Deliberately quiet about every ordinary reason it
+    might find nothing -- no archive directory, no report inside the age
+    window, no club resolved -- because this is a fallback and a missing
+    optional input is not an error.
+
+    The cutoff is NOW, so only reports published and collected before this
+    moment are read; `InputArchive.as_of(mode="system")` enforces both. That
+    makes it right for the slate being built and silent on history, which the
+    archive does not yet hold.
+    """
+    try:
+        from datetime import datetime
+
+        from src.ingestion.availability_bridge import availability_absences
+        from src.ingestion.model_input_archive import InputArchive
+        from src.utils.timezones import UTC
+        from src.utils.volume import resolve_state_root
+    except ImportError as exc:  # pragma: no cover - optional path
+        logger.info("absences: availability fallback unavailable (%s)", exc)
+        return None
+
+    root = Path(resolve_state_root()) / "model_inputs"
+    if not (root / "snapshots" / "availability").exists():
+        return None
+    try:
+        snapshots = InputArchive(root).as_of(
+            "availability", datetime.now(UTC),
+            mode="system", max_age_hours=AVAILABILITY_MAX_AGE_HOURS,
+        )
+    except Exception as exc:  # noqa: BLE001 - a bad archive must not fail the build
+        logger.warning("absences: could not read the availability archive: %s", exc)
+        return None
+    if not snapshots:
+        return None
+
+    result = availability_absences(snapshots, panel)
+    if not result.usable:
+        logger.info(
+            "absences: availability archive held no resolvable absence (%s)",
+            result.report.get("coverage_counts"),
+        )
+        return None
+    logger.info(
+        "absences: availability fallback supplied %d absence(s) over %d covered "
+        "(game, team) pair(s)",
+        len(result.inactives), len(result.covered_team_games),
+    )
+    return result.inactives, result.covered_team_games
+
 
 def _cache_dir(root: Path | None = None) -> Path:
     if root is not None:
@@ -105,8 +190,25 @@ def load_cached_absences(root: Path | None = None) -> pd.DataFrame | None:
 def attach_absence_features_layer(
     df: pd.DataFrame, *, cache_root: Path | None = None
 ) -> pd.DataFrame:
-    """Additive layer: absence counts and vacated usage, or a named abstention."""
+    """Additive layer: absence counts and vacated usage, or a named abstention.
+
+    PRECEDENCE. The cached official INACTIVE LIST wins when it is present,
+    because it records who actually did not play and is settled after the
+    fact. The archived pregame AVAILABILITY REPORT is the fallback: it is the
+    only one of the two that exists before tip-off, which is when a slate is
+    built, and it is correspondingly a forecast rather than a record. It is
+    read only when the cache has nothing and only when
+    PROPIQ_AVAILABILITY_ABSENCES is set -- see the note on train/serve skew
+    beside that constant.
+    """
     inactives = load_cached_absences(cache_root)
+    covered_team_games = None
+
+    if (inactives is None or inactives.empty) and _availability_fallback_enabled():
+        fallback = load_availability_absences(df)
+        if fallback is not None:
+            inactives, covered_team_games = fallback
+
     if inactives is None or inactives.empty:
         out = df.copy()
         for column in ABSENCE_COLUMNS:
@@ -124,7 +226,9 @@ def attach_absence_features_layer(
     )
 
     try:
-        return attach_absence_features(df, inactives)
+        return attach_absence_features(
+            df, inactives, covered_team_games=covered_team_games
+        )
     except InactiveListError as exc:
         # A layer that cannot run says so and leaves the frame usable, rather
         # than taking down a feature build that has nothing else wrong with it.

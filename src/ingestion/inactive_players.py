@@ -465,6 +465,7 @@ def attach_absence_features(
     *,
     team_map: Mapping[str, str] | None = None,
     usage_col: str = DEFAULT_USAGE_COLUMN,
+    covered_team_games: Iterable[tuple[Any, Any]] | None = None,
 ) -> pd.DataFrame:
     """
     Add the absence features the cascade layer consumes, per (team, game):
@@ -491,6 +492,27 @@ def attach_absence_features(
     Games with no cached inactive list get ``pd.NA``, NOT 0. "We did not fetch
     this game" and "nobody was out in this game" are different statements and
     only one of them is evidence.
+
+    ``covered_team_games`` -- WHO COVERED WHAT, at (game, team) granularity.
+
+    Absent (the default), coverage is per GAME: every row of a game that
+    appears anywhere in ``inactives`` is treated as covered, so a team with no
+    absences in a fetched game correctly reads 0. That is right for the
+    official INACTIVE LIST, which is fetched per game and returns both teams
+    at once -- having the game means having both rosters.
+
+    It is WRONG for a source filed per team, such as the official pregame
+    availability report, where one team can submit and its opponent not. Under
+    per-game coverage the non-submitting team's rows would be filled with 0 and
+    assert a full-strength roster from no evidence -- which is why
+    ``model_input_archive.build_absence_export`` deliberately refuses to write
+    this cache at all. Pass the (game, team) pairs actually covered and those
+    pairs alone are filled; every other row stays ``pd.NA`` and reports
+    DATA_NOT_AVAILABLE.
+
+    Supplying it narrows what counts as evidence; it can never widen it. A pair
+    listed here that contributed no absence row still reads 0, because that is
+    what "this team filed and listed nobody" means.
     """
     required = {"GAME_ID", "TEAM_ABBREVIATION"}
     missing = required - set(panel.columns)
@@ -592,7 +614,25 @@ def attach_absence_features(
     # A game present in the pull but with nobody out is a real 0. A game absent
     # from the pull stays NA. fetched_games was taken from every input row above,
     # sentinels included, so an empty inactive list still counts as covered.
-    in_pull = merged["_gid"].isin(fetched_games)
+    #
+    # With `covered_team_games`, the unit of coverage becomes the (game, team)
+    # pair rather than the game -- see the docstring. A per-team source cannot
+    # use the per-game rule without fabricating a 0 for the team that did not
+    # file.
+    if covered_team_games is None:
+        in_pull = merged["_gid"].isin(fetched_games)
+    else:
+        pairs = {
+            (normalize_game_id(str(game)), str(team))
+            for game, team in covered_team_games
+        }
+        in_pull = pd.Series(
+            [
+                (gid, str(team)) in pairs
+                for gid, team in zip(merged["_gid"], merged["TEAM_ABBREVIATION"])
+            ],
+            index=merged.index, dtype=bool,
+        )
     for column in value_columns:
         merged.loc[in_pull, column] = merged.loc[in_pull, column].fillna(0)
     merged["BBS_TEAMMATES_OUT"] = merged["BBS_TEAMMATES_OUT"].astype("Int64")
