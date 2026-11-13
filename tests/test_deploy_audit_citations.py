@@ -93,7 +93,7 @@ ANCHORS = [
     ("src/quant/publication_gate.py", 378, "def artifact_freshness_gate("),
     ("scheduler_worker.py", 1942, "artifact_freshness_verdict()"),
     ("scripts/railway_healthcheck.py", 269, "def _check_artifact_freshness("),
-    ("src/db/repository.py", 769, "def newest_team_game_date"),
+    ("src/db/repository.py", 779, "def newest_team_game_date"),
     # O6 was corrected on 2026-11-01 to cite where logging is ACTUALLY
     # configured. Anchored so the correction cannot rot the same way the
     # line it replaced did -- that row named `logging.basicConfig` for
@@ -162,7 +162,7 @@ BOUND_CITATIONS = [
     (
         "docs/candidate_repo_evaluation_2026-10-11.md",
         "`python main.py` at",
-        ("main.py", 2452, "with write_lock() as _acquired:"),
+        ("main.py", 2469, "with write_lock() as _acquired:"),
     ),
 ]
 

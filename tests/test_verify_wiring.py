@@ -195,3 +195,30 @@ def test_the_verifier_reports_a_check_that_raises_as_a_failure():
 def test_every_section_is_runnable_on_its_own(section):
     code = vw.main(["--section", section])
     assert isinstance(code, int)
+
+
+def test_the_synthetic_panel_is_internally_consistent() -> None:
+    """
+    MIGRATION 011'S COLUMNS MUST NOT CONTRADICT EACH OTHER.
+
+    Carrying them is not enough -- `features/box_rates` DIVIDES by them. An
+    FGM above FGA yields an eFG% over 1.0 and an FTM above FTA an FT% over
+    1.0, and a wiring check feeding a layer impossible inputs tells you
+    nothing about the layer while looking like it passed.
+
+    The first version drew each of the five from its own independent range,
+    which could produce exactly those contradictions. They are bound as
+    locals now, each dependent value drawn inside its parent's range; this
+    holds that in place.
+    """
+    from scripts.verify_wiring import synthetic_panel
+
+    df = synthetic_panel()
+    assert (df["FGM"] <= df["FGA"]).all(), "made more field goals than attempted"
+    assert (df["FTM"] <= df["FTA"]).all(), "made more free throws than attempted"
+    assert (df["FG3M"] <= df["FG3A"]).all(), "made more threes than attempted"
+    assert (df["FG3M"] <= df["FGM"]).all(), "made more threes than field goals"
+    assert ((df["OREB"] + df["DREB"]) == df["REB"]).all(), (
+        "the rebound split does not sum to REB, so OREB_SHARE describes a "
+        "different total than the panel reports"
+    )

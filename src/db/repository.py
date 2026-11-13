@@ -1167,8 +1167,46 @@ def persist_projections(df: pd.DataFrame, run_id: str) -> int:
     if df.empty:
         return 0
 
+    # NaN IS NOT NULL, AND THIS COST TWO SLATES. `_records` above exists for
+    # exactly this and says so in its own docstring -- "the driver receives a
+    # float NaN where an integer column expects NULL and the insert fails" --
+    # but this function hand-builds its rows with `r.get(...)` and never went
+    # through it.
+    #
+    # Migration 010 (2026-11-10) gave `projections` its first two INTEGER
+    # columns, `odds_over_american` and `odds_under_american`, and
+    # `_attach_prop_line_prices` began filling them. A board is only ever
+    # PARTLY priced -- 541 of 1140 rows on 2026-11-11, 232 of 444 on
+    # 2026-11-12 -- so the column pandas builds is float64 with NaN in the
+    # unpriced rows, `r.get("ODDS_OVER")` returns that NaN, and Postgres
+    # casting a float8 NaN to INTEGER raises
+    #
+    #     (psycopg.errors.NumericValueOutOfRange) integer out of range
+    #
+    # which failed the whole multi-row INSERT and the whole slate, on both
+    # nights and every night in between, from the day the columns landed.
+    #
+    # AND `iterrows` IS THE OTHER HALF OF THE TRAP. Converting the frame and
+    # then iterating it with `iterrows` does NOT work: the cell holds None
+    # afterwards, but `iterrows` rebuilds each row as a Series and hands back
+    # a float NaN again. Measured, because the first attempt at this fix did
+    # exactly that and changed nothing:
+    #
+    #     converted.iloc[1]["ODDS_OVER"]            -> None
+    #     converted.to_dict("records")[1][...]      -> None
+    #     list(converted.iterrows())[1][1].get(...) -> nan
+    #
+    # That is why `_records` ends in `to_dict(orient="records")`. Iterating
+    # its dicts instead of the frame's rows is the whole fix; `.get` behaves
+    # identically on a dict, so the body below is unchanged.
+    #
+    # It also stops NaN reaching the NUMERIC columns, where Postgres accepts
+    # 'NaN' as a VALUE rather than erroring -- so a missing `line` or
+    # `prob_over` was stored as the float NaN instead of NULL, which this
+    # repository refuses everywhere else: a null means "unknown", and
+    # NaN-as-a-value is a fabrication that compares false against itself.
     rows = []
-    for _, r in df.iterrows():
+    for r in _records(df):
         rows.append({
             "run_id": run_id,
             "nba_player_id": r.get("PLAYER_ID"),

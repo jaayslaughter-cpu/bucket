@@ -1982,8 +1982,22 @@ def _attach_prop_line_prices(
         # provider sent something that is not a price. Collected here and
         # reported once below with samples, rather than logged per row.
         for raw, clean in ((raw_over, clean_over), (raw_under, clean_under)):
-            if clean is None and raw not in (None, "") and str(raw) != "0":
-                rejected.append(raw)
+            # `pd.isna` FIRST, AND THAT WAS A REAL BUG. The lookup row comes
+            # from a DataFrame, so a side the book never priced arrives as
+            # float NaN rather than None -- and `nan not in (None, "")` is
+            # True while `str(nan) != "0"` is also True, so every ordinary
+            # unpriced row was logged as a REFUSED IMPLAUSIBLE price. On
+            # 2026-11-12's board that was 212 of 444 rows.
+            #
+            # `test_an_unpriced_row_is_not_reported_as_a_refusal` was written
+            # for this and passed anyway, because its fixture put a literal
+            # None in the frame where the real lookup yields NaN. The test
+            # was right about the rule and wrong about the value.
+            if clean is not None or pd.isna(raw) or raw in (None, ""):
+                continue
+            if str(raw).strip() == "0":
+                continue
+            rejected.append(raw)
         over.append(clean_over)
         under.append(clean_under)
         source.append(_text_or_none(row.get("source")))
@@ -1994,10 +2008,13 @@ def _attach_prop_line_prices(
         logger.error(
             "%d POSTED PRICE(S) WERE REFUSED AS IMPLAUSIBLE, magnitude over "
             "%d: %s. These rows lose their price and are reported below as "
-            "unpriced. A value this size is a malformed provider field, not a "
-            "long shot -- and until 2026-11-11 one of them failed the entire "
-            "slate on the INSERT into `projections`, because that column is a "
-            "32-bit INTEGER.",
+            "unpriced. A value this size is a malformed provider field rather "
+            "than a long shot, so it is refused instead of priced. NOTE: this "
+            "bound was added on 2026-11-12 believing it was the cause of the "
+            "slate failing on the projections INSERT; it was not. That was a "
+            "float NaN in an INTEGER column, fixed in `persist_projections`. "
+            "This refusal stands on its own merits and has never yet fired on "
+            "live data.",
             len(rejected), AMERICAN_ODDS_LIMIT, sorted({str(r) for r in rejected})[:5],
         )
 

@@ -119,6 +119,22 @@ def synthetic_panel(n_players: int = 4, n_games: int = 24) -> pd.DataFrame:
     rows = []
     for p in range(n_players):
         for g in range(n_games):
+            # MIGRATION 011'S COLUMNS, AND THEY MUST BE CONSISTENT WITH EACH
+            # OTHER, not merely present. `features/box_rates` divides by them:
+            # an FGM above FGA would publish an eFG% over 1.0 and an FTM above
+            # FTA an FT% over 1.0, and a wiring check that feeds a layer
+            # impossible inputs tells you nothing about the layer. Bound as
+            # locals so each dependent value is drawn inside its parent's
+            # range rather than from an overlapping one.
+            fga = int(rng.integers(8, 24))
+            fgm = int(rng.integers(2, max(3, fga - 2)))
+            fg3a = int(rng.integers(0, max(1, fga - fgm + 1)))
+            fg3m = int(rng.integers(0, max(1, min(fg3a, fgm) + 1)))
+            fta = int(rng.integers(0, 9))
+            ftm = int(rng.integers(0, max(1, fta + 1)))
+            reb = int(rng.integers(1, 13))
+            oreb = int(rng.integers(0, max(1, reb)))
+            dreb = reb - oreb
             rows.append({
                 "PLAYER_ID": f"20000{p:02d}",
                 "PLAYER_NAME": f"Player {p}",
@@ -131,14 +147,24 @@ def synthetic_panel(n_players: int = 4, n_games: int = 24) -> pd.DataFrame:
                 "IS_NEUTRAL_SITE": False,
                 "MIN": float(rng.integers(24, 38)),
                 "PTS": float(rng.integers(8, 34)),
-                "REB": float(rng.integers(1, 13)),
+                "REB": float(reb),
                 "AST": float(rng.integers(0, 11)),
-                "FG3M": float(rng.integers(0, 6)),
+                "FG3M": float(fg3m),
                 "STL": float(rng.integers(0, 4)),
                 "BLK": float(rng.integers(0, 3)),
                 "TOV": float(rng.integers(0, 5)),
-                "FGA": float(rng.integers(8, 24)),
-                "FTA": float(rng.integers(0, 9)),
+                "FGA": float(fga),
+                "FTA": float(fta),
+                # Migration 011. Read by features/box_rates for EFG_PCT,
+                # FT_PCT, FG3A_RATE and OREB_SHARE. Present here because
+                # test_the_synthetic_panel_carries_what_the_repository_returns
+                # requires this fixture to carry everything load_player_panel
+                # returns -- the same guard that caught PF above.
+                "FGM": float(fgm),
+                "FG3A": float(fg3a),
+                "FTM": float(ftm),
+                "OREB": float(oreb),
+                "DREB": float(dreb),
                 # Personal fouls, so the fouls layer runs in this check too.
                 # load_player_panel returns PF, and
                 # test_the_synthetic_panel_carries_what_the_repository_returns

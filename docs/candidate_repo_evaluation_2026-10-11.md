@@ -279,7 +279,7 @@ most of what looks like autonomy is a laptop — but these two are real.
   `src/utils/write_lock.py` landed in `89be638` on 2026-10-11 — the same day
   this evaluation was written — and is taken by BOTH entry points: the
   scheduled slate at `scheduler_worker.py:1283` and the manual
-  `python main.py` at `main.py:2452`. It **declines** rather than waits, and
+  `python main.py` at `main.py:2469`. It **declines** rather than waits, and
   says so: *"Another process holds the slate write lock, so the 09:00 PT run
   is SKIPPED … A deliberate decline, not a failure."* The scope deliberately
   covers the board write and the dispatch, not only the scoring, because a

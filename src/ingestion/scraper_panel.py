@@ -103,16 +103,33 @@ COLUMN_MAP: dict[str, str] = {
     "fg3m": "FG3M",
     "fga": "FGA",
     "fta": "FTA",
-    "fgm": "FGM",
-    "fg3a": "FG3A",
-    "ftm": "FTM",
-    "oreb": "OREB",
-    "dreb": "DREB",
     "stl": "STL",
     "blk": "BLK",
     "tov": "TOV",
     "pf": "PF",
     "source": "SOURCE",
+}
+
+#: Migration 011's columns, mapped WHEN PRESENT rather than required.
+#:
+#: These are not in `COLUMN_MAP` because that map is hard-selected --
+#: `work[list(COLUMN_MAP)]` -- which makes every entry mandatory, and that is
+#: a guard worth keeping: a parquet missing `pts` fails loudly there instead
+#: of writing a column of nulls and reporting success.
+#:
+#: Putting the five in it made them mandatory too, and broke seventeen tests
+#: whose synthetic frames predate migration 011 -- along with every real
+#: parquet written before it and the Kaggle archive path. They are genuinely
+#: optional: `player_game_logs` had nowhere to put them until 011, so no
+#: older source carries them, and `upsert_player_game_logs` uses `.get()` for
+#: exactly this case. An absent one stays NULL and `features/box_rates`
+#: abstains whole, which is the honest state rather than a defaulted zero.
+OPTIONAL_COLUMN_MAP: dict[str, str] = {
+    "fgm": "FGM",
+    "fg3a": "FG3A",
+    "ftm": "FTM",
+    "oreb": "OREB",
+    "dreb": "DREB",
 }
 
 #: Columns that must be present for the mapping to mean anything. A parquet
@@ -334,6 +351,22 @@ def to_player_panel(
     report.duplicate_rows_resolved = before - len(work)
 
     out = work[list(COLUMN_MAP)].rename(columns=COLUMN_MAP).copy()
+    # Migration 011's columns, when the source has them. Mapped separately
+    # from COLUMN_MAP so their absence is not an error: see
+    # OPTIONAL_COLUMN_MAP for why the hard selection above stays hard.
+    present = {k: v for k, v in OPTIONAL_COLUMN_MAP.items() if k in work.columns}
+    for source_name, panel_name in present.items():
+        out[panel_name] = pd.to_numeric(work[source_name], errors="coerce")
+    if len(present) not in (0, len(OPTIONAL_COLUMN_MAP)):
+        # ALL OR NONE, AND SAY SO. `box_rates` needs every one of the five and
+        # abstains on any gap, so a source carrying three of them produces no
+        # features and would otherwise look like it had contributed.
+        logger.info(
+            "scraper_panel: this source carries %s of migration 011's five "
+            "shooting columns (%s), so features/box_rates will abstain -- it "
+            "needs all five and will not derive part of the set.",
+            len(present), sorted(present),
+        )
     out["GAME_DATE"] = pd.to_datetime(work["game_date"], errors="coerce")
     out["IS_HOME"] = work["home_away"].astype(str).str.lower().eq("home")
     # Minutes, from seconds. `upsert_player_game_logs` writes this to a Float

@@ -367,8 +367,30 @@ def test_the_sweep_routes_alerts_to_notify_failure(monkeypatch):
 
 
 def test_a_healthy_sweep_sends_nothing(monkeypatch):
-    """Silence is the correct output when every invariant holds."""
+    """
+    Silence is the correct output when every invariant holds.
+
+    THE CLOCK IS FROZEN, AND IT HAD TO BE. These fixture dates are relative
+    to a "now" of 2026-11-11, and `_run_self_check` reads
+    `pacific_calendar_date()`. On 2026-11-13 the 2026-11-10 slate became old
+    enough for `aged_slates_are_graded` to expect it settled, so a sweep that
+    was healthy when written began alerting:
+
+        aged_slates_are_graded: 2026-11-10: 280 of 280 recorded row(s) never
+        graded (100%)
+
+    A test whose verdict depends on the day it runs is a test that stops
+    testing. `self_check.run_all` is pure and takes `as_of` for exactly this
+    reason; the job computes it, so the job's clock is what gets pinned.
+    """
+    import datetime as _dt
+
     import scheduler_worker as worker
+
+    monkeypatch.setattr(
+        "src.utils.timezones.pacific_calendar_date",
+        lambda: _dt.date(2026, 11, 11),
+    )
 
     sent = []
     monkeypatch.setattr(
